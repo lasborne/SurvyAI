@@ -1,0 +1,57 @@
+# =============================================================================
+# SurvyAI Requirements
+# =============================================================================
+# IMPORTANT: Use flexible version constraints (>=) to avoid conflicts.
+# Never use strict pins (==) unless absolutely necessary for compatibility.
+# After modifying, run: pip uninstall survyai -y && pip install -e .
+# =============================================================================
+
+# Core AI/ML Libraries
+langchain>=1.1.0
+langchain-community>=0.3.0
+langchain-core>=1.1.0
+langchain-openai>=0.3.0
+langchain-anthropic>=0.3.0
+langchain-google-genai>=3.2.0
+openai>=1.12.0
+anthropic>=0.34.0
+
+# Document Processing
+pandas>=2.2.0
+openpyxl>=3.1.2
+xlrd>=2.0.1
+python-docx>=1.1.0
+PyPDF2>=3.0.1
+pdfplumber>=0.10.3
+
+# CAD Processing
+pywin32>=306  # Windows COM interface for AutoCAD
+ezdxf>=1.3.0  # Fallback DXF/DWG reader (works without AutoCAD)
+
+# GIS and Geospatial
+geopandas>=0.14.1
+shapely>=2.0.2
+pyproj>=3.6.1
+fiona>=1.9.5
+
+# Utilities
+python-dotenv>=1.0.0
+pydantic>=2.7.4,<3.0.0
+pydantic-settings>=2.1.0
+typing-extensions>=4.7.0
+
+# CLI and API
+click>=8.1.7
+fastapi>=0.109.0
+uvicorn>=0.27.0
+
+# Additional utilities
+numpy>=1.26.0,<2.0.0
+requests>=2.31.0
+
+# Vector Database and Embeddings
+chromadb>=0.4.22
+sentence-transformers>=2.2.2
+langchain-chroma>=0.1.0
+tiktoken>=0.5.0
+
