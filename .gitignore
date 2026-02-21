@@ -46,6 +46,7 @@ Thumbs.db
 data/
 output/
 temp/
+UsedFiles/
 *.dwg
 *.dxf
 *.xlsx

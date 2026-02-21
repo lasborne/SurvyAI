@@ -51,6 +51,11 @@ MODULES AND DEPENDENCIES:
 - langchain_openai: OpenAI models (GPT-4/4o/5) and OpenAI-compatible API (for DeepSeek)
 - langchain_anthropic: Anthropic Claude models (Opus/Sonnet/Haiku)
 
+REFACTORED LAYOUT:
+-----------------
+- agent.prompts: SYSTEM_PROMPT and other prompt strings (editable without touching agent logic).
+- agent.state: AgentState (LangGraph state), RAGRouteDecision, and looks_like_file_driven_task().
+
 Author: SurvyAI Team
 License: MIT
 ================================================================================
@@ -66,17 +71,7 @@ import json
 import operator
 import uuid
 from pathlib import Path
-from typing import (
-    Annotated,
-    Any,
-    Dict,
-    List,
-    Literal,
-    Optional,
-    Sequence,
-    TypedDict,
-    Union,
-)
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 # Ensure Any is available globally (for Pydantic model evaluation)
 # This prevents "name 'Any' is not defined" errors
@@ -144,42 +139,9 @@ from utils.coordinate_parsing import extract_points, infer_crs_from_text
 from utils.area import best_area
 from utils.internet import internet_search as _internet_search
 
-
-# ==============================================================================
-# AGENTIC RAG ROUTING (Router RAG)
-# ==============================================================================
-
-class RAGRouteDecision(BaseModel):
-    """
-    Routing decision for Agentic RAG:
-    - llm_only: no retrieval/search augmentation
-    - vector: retrieve from local vector store
-    - internet: web search (permissioned)
-    - hybrid: both vector + internet
-    """
-
-    route: Literal["llm_only", "vector", "internet", "hybrid"] = Field(
-        "llm_only", description="Chosen route"
-    )
-    use_vector: bool = Field(False, description="Whether to retrieve local context")
-    vector_collections: List[str] = Field(
-        default_factory=list,
-        description="Collections to prioritize (documents/drawings/coordinates/conversations)",
-    )
-    use_internet: bool = Field(False, description="Whether to run an internet search (permissioned)")
-    internet_query: Optional[str] = Field(None, description="Suggested web search query")
-    reason: str = Field("", description="Short reason for routing choice")
-
-
-def _looks_like_file_driven_task(query: str) -> bool:
-    q = query or ""
-    ql = q.lower()
-    if any(ext in ql for ext in [".docx", ".pdf", ".xlsx", ".xls", ".dwg", ".dxf", ".csv", ".shp", ".aprx"]):
-        return True
-    # Windows path patterns
-    if "\\Users\\" in q or ":\\" in q:
-        return True
-    return False
+# Prompts and state live in separate modules for smaller, maintainable agent.py
+from agent.prompts import SYSTEM_PROMPT
+from agent.state import AgentState, RAGRouteDecision, looks_like_file_driven_task
 
 # ==============================================================================
 # LOGGING SETUP
@@ -188,295 +150,6 @@ def _looks_like_file_driven_task(query: str) -> bool:
 # Get a logger instance for this module
 # All log messages will be prefixed with 'agent' for easy filtering
 logger = get_logger(__name__)
-
-
-# ==============================================================================
-# SYSTEM PROMPT
-# ==============================================================================
-
-# The system prompt defines the agent's personality, capabilities, and behavior.
-# This is injected at the start of every conversation to guide the LLM.
-
-SYSTEM_PROMPT = """You are SurvyAI, an expert AI assistant for land surveyors and geospatial professionals.
-
-VERIFICATION (NO-HALLUCINATION) RULES:
-- NEVER claim you created/updated a file unless you verified it exists on disk after the tool run.
-- NEVER claim you imported points / created GIS layers / computed areas or bearings unless the tool output includes
-  a verified inserted-point count and/or explicitly printed RESULT_ values.
-- If inputs are missing/defective (e.g., no usable X/Y values), WARN clearly and stop — do not invent results.
-
-INTERNET ACCESS (PERMISSIONED, MUST-HIGHLIGHT):
-- You MAY source up-to-date information from the internet using the `internet_search` tool ONLY after the user explicitly grants permission.
-- If the user has NOT granted permission and internet info would help, ASK ONCE:
-  "May I search the internet for up-to-date information? (yes/no)"
-- If permission is denied, do not browse; continue using offline knowledge + local tools.
-- Whenever you use internet_search results, you MUST clearly label a dedicated section:
-  "Internet-sourced (external) information" and include the returned URLs.
-- Treat internet-sourced info as external and potentially unverified: state that it was sourced from the internet and include citations/links.
-
-CRITICAL CONTEXT ISOLATION RULE:
-- Each conversation is INDEPENDENT - do NOT mix data from different conversations
-- When user asks to save a summary, use ONLY the data you JUST extracted and displayed in YOUR CURRENT RESPONSE
-- NEVER use data from previous conversations, even if it seems similar
-- Before saving, verify the content matches the document you just worked on in THIS conversation
-- If you extracted from "Document A" and user asks to save, save Document A's data, NOT Document B's data from a previous conversation
-
-CRITICAL FILE PATH MEMORY RULE:
-- When you create a file and mention its path in your response (e.g., "saved as C:\\path\\file.docx"), REMEMBER that path
-- If user later says "the same document" or "the same file" or "save in the same new summary document", they mean the file you JUST created
-- Use the file path from your previous response - don't ask the user for it
-- PROACTIVELY use document_read_word and document_update_word with paths you already know
-- When user asks to modify a document you just created, the workflow is: document_read_word([path you mentioned]) → Process → document_update_word([same path], new_content)
-- DO NOT ask for file paths, uploads, or paste - you already have the information from the conversation
-- Example: If you said "saved as C:\\Users\\...\\Summary_Ogbotobo_RigRouteDredge.docx", and user says "make it shorter", use that exact path with document_read_word
-
-CRITICAL OUTPUT LOCATION DEFAULT RULE (MANDATORY):
-- When user does NOT explicitly specify where to create/locate a file, folder, project, or operation output, 
-  you MUST default to the SAME FOLDER as the input file/folder/document.
-- This applies to ALL operations: ArcGIS projects, Excel outputs, document exports, CSV files, geodatabases, etc.
-- Examples:
-  * Input: "C:\\Users\\...\\data.xlsx" → Output project_folder should be "C:\\Users\\..." (parent of data.xlsx)
-  * Input: "C:\\Users\\...\\input.docx" → Output document should be in "C:\\Users\\..." (same folder)
-  * Input: "C:\\Users\\...\\survey.dwg" → Output Excel should be in "C:\\Users\\..." (same folder)
-- If user says "save as filename.xlsx" without a path, resolve it to: (input_file.parent / "filename.xlsx")
-- If user says "create project named X" without specifying folder, use: (input_file.parent / "X")
-- If user says "save results as result.csv" without path, use: (input_file.parent / "result.csv")
-- NEVER ask "where should I save this?" if you have an input file path - use its parent folder automatically
-- This rule ensures consistency and prevents errors from missing path parameters
-- When calling tools, if a path parameter is optional and not provided, automatically infer it from input file paths in the query
-
-CRITICAL RULE FOR GEOGRAPHIC CALCULATOR QUERIES:
-- If user asks about Geographic Calculator availability, installation, or file path, you MUST IMMEDIATELY call the geographic_calculator_check tool
-- DO NOT ask for permission, DO NOT provide menus, DO NOT ask for more information
-- Just call the tool immediately - it's a read-only check that requires no permission
-- If user grants permission after you ask, IMMEDIATELY call geographic_calculator_check - do not provide menus or unrelated responses
-
-You have direct access to control software on the user's computer through API connections:
-
-AUTOCAD CONTROL:
-- Open/read DWG and DXF drawings
-- Extract text content (for titles, owner names, annotations)
-- Get entities by type, layer, or color
-- Calculate areas of closed shapes (using AutoCAD's native precision)
-- Execute AutoCAD commands directly
-
-ARCGIS PRO CONTROL:
-- Launch ArcGIS Pro application (use arcgis_launch)
-- Create new ArcGIS Pro projects with specified coordinate systems (use arcgis_create_project)
-- Open existing ArcGIS Pro projects (use arcgis_open_project)
-- Set coordinate systems for maps (use arcgis_set_coordinate_system)
-- Get project information (use arcgis_get_project_info)
-- List available coordinate systems with WKID codes (use arcgis_list_coordinate_systems)
-
-GEOGRAPHIC CALCULATOR CONTROL:
-- Check if Geographic Calculator CLI is installed (use geographic_calculator_check)
-- Execute pre-configured Geographic Calculator jobs/projects/workspaces (use geographic_calculator_execute_job)
-- Geographic Calculator is used for professional coordinate conversions and geodetic transformations
-- CRITICAL RULE: When user asks about Geographic Calculator availability, installation status, or file path:
-  * DO NOT ask for permission
-  * DO NOT provide menus or lists of options
-  * DO NOT ask for more information
-  * IMMEDIATELY call the geographic_calculator_check tool - this is a read-only check that does NOT require user permission
-  * Example: User asks "Check if Geographic Calculator is available" → IMMEDIATELY call geographic_calculator_check tool
-- If user grants permission after you ask (e.g., responds "yes"), IMMEDIATELY call geographic_calculator_check tool - do not provide menus or unrelated responses
-- Job files (.gpj, .gpp, .gpw) must be created in Geographic Calculator GUI before execution
-
-SUPPORTED COORDINATE SYSTEMS:
-- Geographic: WGS84, NAD83, NAD27
-- UTM Zones: UTM Zone 1N through 36N (Northern), 1S through 36S (Southern)
-  Format: "UTM Zone 32N" or just "32N"
-- Web Mercator, British National Grid, OSGB36
-- EPSG codes: "EPSG:4326", "EPSG:32632"
-- WKID numbers: "4326", "32632"
-- Coordinate formats: decimal degrees OR DMS/DM strings (e.g., 6°12'30.5"N, 3°21'10"E). If DMS/DM is present, use coordinate_converter_auto to normalize to decimal and convert.
-
-VECTOR DATABASE (Semantic Search):
-- Search for relevant documents, drawings, or coordinates using natural language
-- Store important information for future retrieval
-- Collections: documents (reports, text), drawings (CAD data), coordinates (survey points)
-- Use semantic_search to find previously stored information
-- Use store_document to save extracted data for future queries
-
-SYSTEM ACCESS AND PERMISSIONS:
-- For read-only system checks (like software availability), use the appropriate check tools immediately - NO permission needed
-  * geographic_calculator_check - Use immediately when asked about Geographic Calculator availability
-  * These tools only check installation paths and do not access or modify files
-- For operations that access or modify files, you may need user permission
-- IMPORTANT PRACTICAL RULE (CLI/Explicit File Requests): If the user provides a specific file path and explicitly asks you to read/convert/process it (e.g., "Go to this Excel file ... and convert..."), treat that as permission granted and proceed WITHOUT asking redundant permission questions.
-- If a tool requires system access beyond read-only checks, clearly explain WHY you need it and WHAT you will do with it
-- Ask the user interactively: "May I check [specific thing]? I need this to [reason]. I will [action]."
-- Examples:
-  * "May I check the file system? I need this to locate your CAD files. I will only read file paths, not file contents."
-- Always respect user privacy and only request access when necessary for the task
-- If user grants permission, IMMEDIATELY proceed with the tool - do not ask again or provide unrelated responses
-- If denied, suggest alternative approaches
-
-OTHER CAPABILITIES:
-- Process Excel files with coordinate data
-- Convert coordinates between reference systems
-- Advanced document extraction from PDF/Word documents
-
-DOCUMENT PROCESSING (Advanced, AI-driven extraction):
-For professional document review and extraction (survey reports, probing reports, engineering documents):
-
-CRITICAL FOR LARGE DOCUMENTS (>50 pages, >25K words, >50K tokens, or >3MB file):
-MANDATORY WORKFLOW - DO NOT SKIP THESE STEPS:
-1. FIRST: Call document_get_resource_estimation(file_path) - this is REQUIRED for all document processing
-2. Review the output: file size, estimated tokens, cost, warnings, and recommendations
-3. If document is large (>50 pages or >25K words or >50K tokens or >3MB file):
-   a. DO NOT use document_get_text or document_get_full_text - it will cause TPM overflow (429 rate limit)
-   b. Call document_get_structure(file_path) to understand document organization
-   c. Call document_extract_sections_by_keywords(file_path, keywords=['Location', 'Personnel', 'Contractor', 'Client', 'Purpose', 'Date', 'Equipment', 'Quantities', 'Coordinates', 'Projects', 'Control Points'])
-   d. Process ONLY the extracted sections - never process the full document
-4. If document is small (<50 pages, <25K words), you can use document_get_text normally
-
-REMEMBER: document_get_text will automatically block and return an error for large documents. 
-You MUST use document_extract_sections_by_keywords for large documents.
-
-FOR SMALLER DOCUMENTS:
-1. START with document_get_metadata to understand document structure (tables, pages, etc.)
-2. For general text extraction: use document_get_text (preserves structure)
-3. For tabular data (feature lists, measurements): use document_get_tables
-4. For specific sections (signatures, summaries): use document_get_section with section_title
-5. For searching specific information: use document_search_text with patterns
-6. For quick structured data extraction: use document_extract_structured_data (dates, names, numbers, etc.)
-7. DYNAMIC APPROACH: Choose tools based on document type and task - don't use all tools, only what's needed
-8. For probing/survey reports: typically need metadata → text → tables → structured data (dates, names, depths)
-9. For signature blocks: use document_get_section with section_title="Signature" or search for "Surveyor", "Supervisor"
-10. For feature counts and depths: use document_get_tables or document_search_text with depth patterns
-
-DOCUMENT CREATION (CRITICAL - Follow user instructions immediately):
-UNDERSTANDING DOCUMENT TYPES:
-- "Executive Summary" = A concise, populated summary of key findings (NOT a template with placeholders)
-- "Summary" = Brief overview with actual data extracted from source
-- "Template" = Document with placeholders for future filling
-- When user asks for "Executive Summary" or "Summary", create a COMPLETE document with actual extracted data
-
-EXECUTIVE SUMMARY CREATION WORKFLOW:
-1. CRITICAL: Use ONLY the data you JUST extracted and displayed in THIS conversation - NEVER use data from previous conversations
-2. If you've already extracted and displayed data in your CURRENT response, THAT IS the content to save
-3. When user asks for "Executive Summary" or "save the summary", use the data from YOUR CURRENT RESPONSE above
-4. Format: Title → Key Findings → Personnel → Equipment → Methodology → Features Found → Conclusions
-5. Use actual values: names, dates, locations, counts, depths - NOT placeholders like "[Name]" or "[Date]"
-6. If you haven't extracted data yet, extract it first, then create the summary with that data
-7. The summary should be complete and ready to use - user wants the actual summary, not a template to fill later
-8. CONTEXT ISOLATION: Each conversation is independent - do NOT mix data from different documents or conversations
-9. When saving, look at what you JUST showed the user in your response - that's what they want saved
-
-When user asks to SAVE, EXPORT, or CREATE a document file:
-1. IMMEDIATELY use document_create_word or document_create_structured_word - DO NOT ask for confirmation again
-2. CRITICAL CONTEXT RULE: Use ONLY the data from YOUR IMMEDIATELY PRECEDING RESPONSE - look at what you just displayed to the user
-3. NEVER use data from previous conversations - each conversation is isolated and independent
-4. If user says "save as [filename]" or "export as [filename]", extract the filename and path from context
-5. If path not fully specified, use the same folder as the source document (if mentioned)
-6. User has already given permission when they explicitly ask to save/export - proceed immediately
-7. DO NOT ask "which file" or "where to save" if user already specified - use the information from conversation context
-8. If user confirms "Yes - save the file" after you've shown content, they mean save what you just showed them IN YOUR CURRENT RESPONSE
-9. Remember the full context: if you extracted data and user asks to save it, save the extracted/summarized content FROM THIS CONVERSATION ONLY
-10. For Word documents: use document_create_word with the content you've prepared - USE ACTUAL DATA FROM YOUR CURRENT RESPONSE, NOT PLACEHOLDERS
-11. File paths: construct from user's instructions (e.g., "same folder as X" means parent folder of X)
-12. CRITICAL: When user gives clear instruction to save/export, DO IT - don't ask again or forget context
-13. CRITICAL: When creating "Executive Summary" or "Summary", use the data you already extracted IN THIS CONVERSATION - create a complete document, not a template
-14. If you've already shown extracted data in your response, that IS the content to save - use it directly
-15. DO NOT create templates with placeholders when user asks for a summary - they want the actual summary with real data
-16. CONTEXT ISOLATION CHECK: Before saving, verify the content matches the document you just extracted from - if you extracted from "OGBOTOBO", save OGBOTOBO data, NOT "Soku" or other data from previous conversations
-
-APPROACH FOR COMPLEX QUERIES:
-1. Think step-by-step about what operations are needed
-2. First, use semantic_search to check if relevant information is already stored
-3. Use appropriate tools to gather new information
-4. For Geographic Calculator availability questions: IMMEDIATELY use geographic_calculator_check tool (no permission needed)
-5. For other system checks (like software availability), use the relevant check tools immediately
-6. For ArcGIS operations: use arcgis_launch first, then arcgis_create_project with coordinate_system parameter
-7. If calculating areas: use autocad_calculate_area with appropriate filters
-8. For finding names/titles: use autocad_search_text with patterns like "property of"
-9. Store important extracted information for future use with store_document
-10. STRICT: Survey plan template DWG files (e.g. survey_plan_template2.dwg) must NEVER be written or saved; they are read-only to avoid corruption. If anything fails or does not work properly, the template must still remain read-only.
-10. Report results clearly with appropriate units
-11. CRITICAL: When user grants permission (responds "yes" or "permission granted"), IMMEDIATELY call the tool you asked permission for - do not ask for more information or provide unrelated responses
-
-CONTEXT RETENTION AND FOLLOWING INSTRUCTIONS (CRITICAL):
-1. REMEMBER the full conversation context - don't forget what you just did or what the user asked
-2. When user says "save the file" after you've shown content, they mean save what you just prepared/shown IN THIS CONVERSATION
-3. CRITICAL: Use ONLY data from the CURRENT conversation - NEVER mix data from previous conversations or different documents
-4. If user specifies a filename and location earlier, remember it - don't ask again
-5. When user confirms with "Yes - save the file" or similar, they've already given clear instruction - proceed immediately
-6. If you've extracted data and user asks to save it, construct the file path from context (same folder as source, filename they specified)
-7. DO NOT ask "which file" if you've already prepared content and user asked to save it - use document_create_word with that content
-8. File path construction: If user says "same folder as X", use Path(X).parent / "newfilename.docx"
-9. When user gives clear, explicit instructions (e.g., "save as aiprobereport.docx in same folder"), follow them immediately
-10. If you're unsure about a detail, infer from context rather than asking again - user has already provided enough information
-11. After saving, confirm success with the full file path - don't ask what to save next
-12. REMEMBER: If you already extracted and displayed data IN YOUR CURRENT RESPONSE, that IS the content to save - don't create a template
-13. When user asks to "populate" or "update" a file you created, remember the file path from when you created it
-14. If user mentions a file you created earlier (e.g., "AIProbeReport.docx"), remember its location from context
-15. When user says "open it and populate", they mean: read the file you created, extract fresh data from source, update the file
-16. File paths you've used in this conversation are part of context - don't ask for them again
-17. CONTEXT ISOLATION: Each document extraction is independent - if you extracted from Document A, and user asks to save, save Document A's data, NOT Document B's data from a previous conversation
-18. When saving a summary, look at YOUR IMMEDIATELY PRECEDING RESPONSE - that's the content the user wants saved
-
-UPDATING EXISTING DOCUMENTS (CRITICAL WORKFLOW):
-When user asks to modify/update/shorten a document you JUST created in this conversation:
-1. REMEMBER the file path you just used - it's in your previous response where you said "saved as [path]" or "Location: [path]"
-2. If user says "the same document" or "the same file" or "save in the same new summary document", they mean the file you JUST created
-3. IMMEDIATELY use document_read_word with the file path from your previous response - don't ask for it
-4. Process/condense the content you read
-5. IMMEDIATELY use document_update_word with the same file path and new content - don't ask for confirmation
-6. DO NOT ask user for file path, file upload, or paste - you already know the path from when you created it
-7. Example workflow: User says "make it shorter" → You: document_read_word([path you just used]) → Condense → document_update_word([same path], condensed_content)
-8. If you mentioned a file path in your response (e.g., "saved as C:\\path\\file.docx" or "Location: C:\\path\\file.docx"), that IS the path to use - remember it
-9. PROACTIVE TOOL USE: Use your tools instead of asking - you have document_read_word and document_update_word available
-10. When user asks to modify a document, assume they mean the one you just created unless they specify otherwise
-
-SURVEY CONVENTIONS:
-- "Verged in red" = boundaries marked with red color (use color="red" filter)
-- "Plan shewing landed property of [NAME] at [LOCATION]" = common title format
-- Report areas in both metric (sq meters, hectares) and imperial (sq feet, acres)
-
-INTERACTIVE BEHAVIOR:
-- When users ask about system information or software availability, IMMEDIATELY use the appropriate check tools (geographic_calculator_check, etc.)
-- For Geographic Calculator availability questions: IMMEDIATELY call geographic_calculator_check tool - NO permission needed, NO menus, NO asking for more info
-- Be transparent about what you're checking and why
-- If a tool is available, use it immediately - don't ask the user to check manually
-- Always use tools to get real data - do not guess or make up information
-- CRITICAL: When user grants permission (e.g., responds "yes" to a permission request), IMMEDIATELY call the tool you asked permission for - do NOT provide menus, do NOT ask for more information, do NOT provide unrelated responses
-- Example: If you asked "May I check Geographic Calculator?" and user says "yes", IMMEDIATELY call geographic_calculator_check tool
-- If you need system access beyond read-only checks, ask clearly and wait for user confirmation before proceeding"""
-
-
-# ==============================================================================
-# STATE DEFINITION
-# ==============================================================================
-
-class AgentState(TypedDict):
-    """
-    Defines the state that flows through the LangGraph.
-    
-    In LangGraph, state is a dictionary-like object that gets passed between
-    nodes. Each node can read from and write to the state.
-    
-    Attributes:
-        messages: List of conversation messages (Human, AI, Tool messages).
-                  The Annotated type with operator.add means new messages
-                  are appended to existing ones rather than replacing them.
-    
-    Example state:
-        {
-            "messages": [
-                SystemMessage(content="You are SurvyAI..."),
-                HumanMessage(content="Calculate the area of red boundaries"),
-                AIMessage(content="I'll help...", tool_calls=[...]),
-                ToolMessage(content="Area: 1500 sq meters"),
-                AIMessage(content="The area is 1500 square meters...")
-            ]
-        }
-    """
-    
-    # The 'messages' field stores the conversation history.
-    # Annotated[list, operator.add] means:
-    # - When a node returns {"messages": [new_msg]}, it ADDS to the list
-    # - Without this annotation, it would REPLACE the list
-    messages: Annotated[Sequence[BaseMessage], operator.add]
 
 
 # ==============================================================================
@@ -1062,6 +735,30 @@ class SurvyAIAgent:
                     if m_offset_q:
                         off_val = m_offset_q.group(1) or m_offset_q.group(2)
                         access_road += f" offset {off_val}m"
+                else:
+                    # "Add an access of width 5m on the side of SC/CK 7330 and SC/CK 7331"
+                    m_ar3 = re.search(
+                        r"(?:add\s+)?an?\s+access\s+(?:road\s+)?of\s+width\s+(\d+(?:\.\d+)?)\s*m\s+.*?on\s+the\s+side\s+of\s+(.+?)(?:\.|$)",
+                        q,
+                        flags=re.IGNORECASE | re.DOTALL,
+                    )
+                    if m_ar3:
+                        w, ref = m_ar3.group(1), m_ar3.group(2).strip()
+                        access_road = f"{w}m width on the side of {ref}"
+                        m_offset_q = re.search(r"offset\s+of\s+(\d+(?:\.\d+)?)\s*m|offset\s+(\d+(?:\.\d+)?)\s*m", q, re.IGNORECASE)
+                        if m_offset_q:
+                            off_val = m_offset_q.group(1) or m_offset_q.group(2)
+                            access_road += f" offset {off_val}m"
+
+        # Parse user-requested plot scale (e.g. "Plot using scale 1:250", "scale 1:250")
+        user_scale_denom = None
+        scale_m = re.search(r"plot\s+using\s+scale\s+1\s*:\s*(\d+)|scale\s+1\s*:\s*(\d+)", q, re.IGNORECASE)
+        if scale_m:
+            user_scale_denom = int(scale_m.group(1) or scale_m.group(2) or 0)
+        if not user_scale_denom:
+            scale_m = re.search(r"1\s*:\s*(\d+)\s*(?:scale|plot)", q, re.IGNORECASE)
+            if scale_m:
+                user_scale_denom = int(scale_m.group(1))
 
         # Parse optional road title override (e.g. "title as 'UMUAKURU-UMUALILI ROAD'", "give it the title 'X'")
         access_road_title = None
@@ -1110,6 +807,7 @@ class SurvyAIAgent:
             certification_date=cert_date,
             access_road=access_road,
             access_road_title=access_road_title,
+            user_scale_denom=user_scale_denom,
         )
 
     def _learn_cadastral_template_profile(
@@ -1254,6 +952,7 @@ class SurvyAIAgent:
         certification_date: Optional[str] = None,
         access_road: Optional[str] = None,
         access_road_title: Optional[str] = None,
+        user_scale_denom: Optional[int] = None,
     ) -> Dict[str, Any]:
         import json as _json
         import math
@@ -1334,6 +1033,8 @@ class SurvyAIAgent:
                     bearing_road_height = float(hr["height"])
             except Exception:
                 pass
+        # Clamp only to a minimum to avoid corrupted or COM-default tiny height; no max so scaled height (e.g. 24 for 1:10000) is allowed
+        bearing_road_height = max(0.5, float(bearing_road_height))
         title_h = str((tables.get("title_block") or {}).get("handle") or "")
         plan_h = str((tables.get("plan_number") or {}).get("handle") or "")
         surv_h = str((tables.get("surveyor") or {}).get("handle") or "")
@@ -1520,6 +1221,227 @@ class SurvyAIAgent:
             base_x = float((primary_ins.get("insertion_point") or {}).get("x", 0.0)) if primary_ins else 0.0
             base_y = float((primary_ins.get("insertion_point") or {}).get("y", 0.0)) if primary_ins else 0.0
 
+            # Decide whether the template must be upscaled to the next allowed smaller plan scale
+            # (e.g. template labeled 1:500 → treat output as 1:1000) BEFORE plotting/aligning,
+            # so the result stays neat like the template.
+            scale_k = 1.0
+            try:
+                allowed_denoms = [250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 25000]
+
+                # Parse template denom from title block (best-effort)
+                template_denom = 500
+                if title_h:
+                    try:
+                        tbl = tables_now.get(title_h, {}) if isinstance(tables_now, dict) else {}
+                        rows = int(tbl.get("rows", 25))
+                        cols = int(tbl.get("cols", 2))
+                        # Parse template scale from title block. We must use the MAIN scale (e.g. 1:500), never "SCALE: to 1:1000".
+                        scale_pat = re.compile(r"1\s*:\s*(\d+)", re.IGNORECASE)
+                        secondary_re = re.compile(r"\bSCALE\b\s*:.*\bto\b", re.IGNORECASE)
+                        main_scale_re = re.compile(r"\bSCALE\b\s*:-?\s*", re.IGNORECASE)  # "SCALE:-" or "SCALE : -"
+                        candidates = []
+                        for r in range(min(rows, 60)):
+                            for c in range(min(cols, 10)):
+                                cell = _get_cell(title_h, r, c) or ""
+                                if secondary_re.search(cell):
+                                    continue
+                                m = scale_pat.search(cell)
+                                if not m:
+                                    continue
+                                d = int(m.group(1))
+                                if d not in allowed_denoms:
+                                    continue
+                                is_main = "SCALE" in cell.upper() and main_scale_re.search(cell) and not secondary_re.search(cell)
+                                candidates.append((is_main, r, d))
+                        if candidates:
+                            main_candidates = [c for c in candidates if c[0]]
+                            if main_candidates:
+                                template_denom = max(c[2] for c in main_candidates)
+                            else:
+                                template_denom = min(c[2] for c in candidates)
+                            found = True
+                        else:
+                            found = False
+                    except Exception:
+                        template_denom = 500
+                if template_denom not in allowed_denoms:
+                    template_denom = 500
+
+                # Interior border bbox (template coords)
+                interior_bb = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBORDER"])
+                if not interior_bb.get("success"):
+                    interior_bb = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBOUNDARY"])
+                if not interior_bb.get("success"):
+                    interior_bb = self.autocad.get_modelspace_bbox(block_name_contains="INTERIOR", prefer_largest=True)
+
+                # Boundary extents from user coordinates (meters)
+                es = [float(p.get("e", 0.0)) for p in pts]
+                ns = [float(p.get("n", 0.0)) for p in pts]
+                boundary_w = (max(es) - min(es)) if es else 0.0
+                boundary_h = (max(ns) - min(ns)) if ns else 0.0
+
+                # Debug always returned so we can see what happened
+                geometry["scale_debug"] = {
+                    "template_denom": int(template_denom),
+                    "boundary_w": float(boundary_w),
+                    "boundary_h": float(boundary_h),
+                    "interior_found": bool(interior_bb.get("success")),
+                }
+
+                if interior_bb.get("success") and boundary_w > 1e-6 and boundary_h > 1e-6:
+                    interior_w = float(interior_bb.get("maxx", 0.0)) - float(interior_bb.get("minx", 0.0))
+                    interior_h = float(interior_bb.get("maxy", 0.0)) - float(interior_bb.get("miny", 0.0))
+                    margin = 0.08
+                    interior_usable_w = interior_w * (1.0 - 2.0 * margin)
+                    interior_usable_h = interior_h * (1.0 - 2.0 * margin)
+                    geometry["scale_debug"].update({
+                        "interior_w": float(interior_w),
+                        "interior_h": float(interior_h),
+                        "interior_usable_w": float(interior_usable_w),
+                        "interior_usable_h": float(interior_usable_h),
+                        "margin": float(margin),
+                    })
+                    if interior_usable_w > 1e-6 and interior_usable_h > 1e-6:
+                        required_k = max(boundary_w / interior_usable_w, boundary_h / interior_usable_h)
+                        geometry["scale_debug"]["required_k"] = float(required_k)
+                        chosen_denom = template_denom
+                        # Prefer user-requested scale if it meets minimum standards and boundary fits
+                        if user_scale_denom and user_scale_denom in allowed_denoms:
+                            scale_k_user = float(user_scale_denom) / float(template_denom)
+                            if scale_k_user >= required_k:
+                                chosen_denom = user_scale_denom
+                                scale_k = scale_k_user
+                                geometry["scale_debug"].update({
+                                    "user_scale_used": True,
+                                    "chosen_denom": int(chosen_denom),
+                                    "k": float(scale_k),
+                                })
+                        if scale_k == 1.0 and required_k > 1.0 + 1e-6:
+                            target_denom = float(template_denom) * float(required_k) * 1.02
+                            candidates = [s for s in allowed_denoms if s >= target_denom and s >= template_denom]
+                            chosen_denom = min(candidates) if candidates else max(allowed_denoms)
+                            scale_k = float(chosen_denom) / float(template_denom)
+                            geometry["scale_debug"].update({
+                                "target_denom": float(target_denom),
+                                "chosen_denom": int(chosen_denom),
+                                "k": float(scale_k),
+                            })
+
+                        if scale_k != 1.0:
+                            # Scale the template/sheet about the TEMPLATE PRIMARY PILLAR (base_x/base_y).
+                            # This preserves arrow/coordinate geometry emanating from the pillar.
+                            layers_to_scale = list(profile.get("sheet_layers") or []) or [
+                                "CADA_BORDER",
+                                "CADA_INTERIORBORDER",
+                                "CADA_SCALEBAR",
+                                "CADA_NORTHARROW",
+                                "CADA_EASTARROW",
+                                "CADA_TITLEBLOCK",
+                                "CADA_PLANNUMBER",
+                                "CADA_CERTIFICATION",
+                                "CADA_SURVEYOR",
+                                "CADA_COORDINATES",
+                                "CADA_NORTHCOORDINATES",
+                                "CADA_EASTCOORDINATES",
+                                "CADA_PRIMARYPILLAR_ARROWS",
+                                "TITLE",
+                                "text",
+                            ]
+                            # Ensure critical template layers are always included even if the learned profile omitted them
+                            for req in [
+                                "CADA_BORDER",
+                                "CADA_INTERIORBORDER",
+                                "CADA_NORTHARROW",
+                                "CADA_EASTARROW",
+                                "CADA_NORTHCOORDINATES",
+                                "CADA_EASTCOORDINATES",
+                                "CADA_COORDINATES",
+                                "CADA_PRIMARYPILLAR_ARROWS",
+                                "CADA_SCALEBAR",
+                                "CADA_TITLEBLOCK",
+                            ]:
+                                if req not in layers_to_scale:
+                                    layers_to_scale.append(req)
+                            # Scale pillar-number TABLES too (they are part of the template look)
+                            layers_to_scale += ["CADA_PILLARNUMBERS"]
+                            sc = self.autocad.scale_modelspace_by_layers(base_x, base_y, scale_k, layers_to_scale)
+                            geometry["scale_debug"]["scaled_entities"] = int(sc.get("scaled_entities", 0) or 0) if sc.get("success") else 0
+
+                            # Keep scalebar labels consistent with the new plan scale.
+                            # The label factor is the same ratio used for the plan scale change (e.g., 1:500 -> 1:250 => 0.5).
+                            try:
+                                sb_factor = float(chosen_denom) / float(template_denom)
+                                if abs(sb_factor - 1.0) > 1e-9:
+                                    self.autocad.scale_scalebar_text_values(sb_factor, layers=["scalebar", "CADA_SCALEBAR"])
+                            except Exception:
+                                pass
+
+                            # Ensure new bearing/road text is created at the correct size
+                            try:
+                                bearing_road_height = float(bearing_road_height) * float(scale_k)
+                            except Exception:
+                                pass
+
+                            # Edit only the existing main scale text in CADA_TITLEBLOCK.
+                            # IMPORTANT: Clear the extra "SCALE: to 1:xxxx" line (row 9 should be empty).
+                            if title_h:
+                                try:
+                                    scale_pattern = re.compile(r"1\s*:\s*\d+", re.IGNORECASE)
+                                    replacement = f"1:{chosen_denom}"
+                                    # Locate the main "SCALE:- 1:xxx" cell and update only that one.
+                                    # Also remove any secondary "SCALE: to 1:xxx" cell so it stays blank.
+                                    tbl = tables_now.get(title_h, {}) if isinstance(tables_now, dict) else {}
+                                    rows = int(tbl.get("rows", 25))
+                                    cols = int(tbl.get("cols", 2))
+
+                                    main_scale_cell = None  # (r, c)
+                                    secondary_scale_cells = []  # [(r, c), ...]
+                                    secondary_re = re.compile(r"\bSCALE\b\s*:.*\bto\b", re.IGNORECASE)
+                                    main_hint_re = re.compile(r"\bSCALE\b\s*[:-]", re.IGNORECASE)  # SCALE:- / SCALE:
+
+                                    for r in range(min(rows, 60)):
+                                        for c in range(min(cols, 10)):
+                                            cell = _get_cell(title_h, r, c) or ""
+                                            if not cell.strip():
+                                                continue
+                                            if secondary_re.search(cell) and scale_pattern.search(cell):
+                                                secondary_scale_cells.append((r, c))
+                                                continue
+                                            if main_scale_cell is None and main_hint_re.search(cell) and scale_pattern.search(cell):
+                                                # Prefer the explicit "SCALE:- 1:xxx" style cell.
+                                                main_scale_cell = (r, c)
+
+                                    # Fallback to the previously-known position if we didn't locate it.
+                                    if main_scale_cell is None:
+                                        main_scale_cell = (8, 0)
+
+                                    mr, mc = main_scale_cell
+                                    cell_main = _get_cell(title_h, mr, mc) or ""
+                                    new_cell_main = scale_pattern.sub(replacement, cell_main)
+                                    if new_cell_main != cell_main:
+                                        _set_cell(title_h, mr, mc, new_cell_main)
+                                    elif not (cell_main or "").strip():
+                                        _set_cell(title_h, mr, mc, f"SCALE:- {replacement}")
+
+                                    # Clear secondary scale cells (row 9 should be empty / no duplicate scale line).
+                                    for (sr, sc_) in secondary_scale_cells:
+                                        try:
+                                            _set_cell(title_h, sr, sc_, "")
+                                        except Exception:
+                                            pass
+
+                                    # Extra safety: if row 9 contains a secondary "SCALE: to ..." line, blank it.
+                                    # (We only clear it when it matches the secondary pattern to avoid wiping other content.)
+                                    for rr in (9, 8):  # handle possible off-by-one table indexing variations
+                                        for cc in range(min(cols, 10)):
+                                            v = _get_cell(title_h, rr, cc) or ""
+                                            if v.strip() and secondary_re.search(v) and scale_pattern.search(v):
+                                                _set_cell(title_h, rr, cc, "")
+                                except Exception:
+                                    pass
+            except Exception:
+                scale_k = 1.0
+
             local_pts = [{"x": base_x + (p["e"] - e0), "y": base_y + (p["n"] - n0)} for p in pts]
 
             # Clear old parcel graphics (not tables/border)
@@ -1538,7 +1460,15 @@ class SurvyAIAgent:
             blk = profile.get("blocks", {}).get("pillars", {}).get("block_name") or "PEG_SYMBOL"
             inserted_ok = True
             for p in local_pts:
-                r = self.autocad.insert_block(str(blk), p["x"], p["y"], layer="CADA_PILLARS")
+                r = self.autocad.insert_block(
+                    str(blk),
+                    p["x"],
+                    p["y"],
+                    layer="CADA_PILLARS",
+                    xscale=float(scale_k),
+                    yscale=float(scale_k),
+                    zscale=float(scale_k),
+                )
                 if not r.get("success"):
                     inserted_ok = False
                     break
@@ -1584,6 +1514,12 @@ class SurvyAIAgent:
                             new_ent = ms_out.Paste()
                             try:
                                 new_ent.Layer = "CADA_PILLARS"
+                            except Exception:
+                                pass
+                            # Ensure pillar symbol scales to chosen plan scale
+                            try:
+                                for attr in ("XScaleFactor", "YScaleFactor", "ZScaleFactor"):
+                                    setattr(new_ent, attr, float(scale_k))
                             except Exception:
                                 pass
                             # move pasted peg so its insertion aligns to vertex
@@ -1836,6 +1772,14 @@ class SurvyAIAgent:
                         self.autocad.delete_entity_by_handle(h)
 
             # Bearings/distances (DD° MM' only) aligned to each edge, template-like MTEXT wrapper and height 1.2
+            # Re-ensure active document before drawing text (avoids one bearing/distance drawn wrong if COM glitched)
+            try:
+                self.autocad._ensure_active_document()
+                time.sleep(0.1)
+            except Exception:
+                pass
+            # Use scaled bearing/road height (no max cap so e.g. 1:500→1:10000 gives height 24)
+            _bd_height = max(0.5, float(bearing_road_height))
             def _bearing_ddmm(az_deg: float) -> str:
                 az_deg = az_deg % 360.0
                 d = int(az_deg)
@@ -1900,11 +1844,12 @@ class SurvyAIAgent:
                     midy,
                     layer="CADA_BEARING_DIST",
                     rotation_rad=rot,
-                    height=bearing_road_height,
+                    height=_bd_height,
                     width=w,
                     attachment_point=5,  # middle-center so it stays centered on the leg
                 )
                 geometry["bearing_mtext"] += 1
+                time.sleep(0.05)  # Brief pause between COM calls to reduce glitches when connection is under load
 
             try:
                 self.autocad.execute_command("REGEN")
@@ -1936,9 +1881,9 @@ class SurvyAIAgent:
                         offset = float(m_o.group(1))
 
                     # 3. Identify Reference Edge
-                    # "connecting X - Y", "joining pillars X and Y", "on the side joining pillars X and Y"
+                    # "connecting X - Y", "joining pillars X and Y", "on the side joining pillars X and Y", "on the side of X and Y"
                     ref_match = re.search(
-                        r"(?:linking|between|connecting|on|along|joining)\s+(?:the\s+)?(?:side\s+)?(?:boundary\s+)?(?:line\s+)?(?:pillars\s+)?(.*)$",
+                        r"(?:linking|between|connecting|on|along|joining)\s+(?:the\s+)?(?:side\s+)?(?:of\s+)?(?:boundary\s+)?(?:line\s+)?(?:pillars\s+)?(.*)$",
                         ar_lower,
                     )
                     target_idx = -1
@@ -2197,6 +2142,51 @@ class SurvyAIAgent:
                                 self.autocad.move_entities_by_handles(dx, dy, northing_handles)
                                 # Fine-tune block removed to prevent displacement issues
                                 # The text moves rigidly with the arrow layer, preserving template relative positions.
+                    except Exception:
+                        pass
+
+                    # Snap arrows + coordinate texts onto the (scaled) interior border edges (template-neat behavior)
+                    try:
+                        interior_bb = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBORDER"])
+                        if not interior_bb.get("success"):
+                            interior_bb = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBOUNDARY"])
+                        if interior_bb.get("success"):
+                            imin_x = float(interior_bb.get("minx", 0.0))
+                            imax_x = float(interior_bb.get("maxx", 0.0))
+                            imin_y = float(interior_bb.get("miny", 0.0))
+                            imax_y = float(interior_bb.get("maxy", 0.0))
+                            bcx = float((bc or {}).get("x", 0.0))
+                            bcy = float((bc or {}).get("y", 0.0))
+
+                            # East arrow should sit on left/right interior border (keep its Y already aligned to n0)
+                            ea_bb2 = self.autocad.get_modelspace_bbox(layers=["CADA_EASTARROW"])
+                            if ea_bb2.get("success"):
+                                eac = ea_bb2.get("center") or {}
+                                ea_cx = float(eac.get("x", 0.0))
+                                left_side = ea_cx < bcx
+                                if left_side:
+                                    dx2 = imin_x - float(ea_bb2.get("minx", 0.0))
+                                else:
+                                    dx2 = imax_x - float(ea_bb2.get("maxx", 0.0))
+                                if abs(dx2) > 1e-6:
+                                    self.autocad.move_modelspace_by_layers(dx2, 0.0, ["CADA_EASTARROW"])
+                                    if northing_handles:
+                                        self.autocad.move_entities_by_handles(dx2, 0.0, northing_handles)
+
+                            # North arrow should sit on top/bottom interior border (keep its X already aligned to e0)
+                            na_bb2 = self.autocad.get_modelspace_bbox(layers=["CADA_NORTHARROW"])
+                            if na_bb2.get("success"):
+                                nac = na_bb2.get("center") or {}
+                                na_cy = float(nac.get("y", 0.0))
+                                top_side = na_cy > bcy
+                                if top_side:
+                                    dy2 = imax_y - float(na_bb2.get("maxy", 0.0))
+                                else:
+                                    dy2 = imin_y - float(na_bb2.get("miny", 0.0))
+                                if abs(dy2) > 1e-6:
+                                    self.autocad.move_modelspace_by_layers(0.0, dy2, ["CADA_NORTHARROW"])
+                                    if easting_handles:
+                                        self.autocad.move_entities_by_handles(0.0, dy2, easting_handles)
                     except Exception:
                         pass
 
@@ -2639,7 +2629,6 @@ class SurvyAIAgent:
         - save to output_doc_path
         """
         from pathlib import Path
-        import threading
 
         output_path = Path(output_doc_path)
         if not output_path.is_absolute():
@@ -2700,37 +2689,24 @@ class SurvyAIAgent:
             f"{internet_block}\n"
         )
 
-        msg_container = [None]
-        err_container = [None]
-        llm_timeout = 180
-
-        def _invoke():
-            try:
-                msg_container[0] = llm.invoke([HumanMessage(content=prompt)])
-            except Exception as e:
-                err_container[0] = e
-
-        t = threading.Thread(target=_invoke)
-        t.daemon = True
-        t.start()
-        t.join(timeout=llm_timeout)
-
-        if t.is_alive():
+        report_msg, err, timed_out = self._run_with_timeout(
+            180, lambda: llm.invoke([HumanMessage(content=prompt)])
+        )
+        if timed_out:
             return {
                 "success": False,
-                "error": f"LLM report call timed out after {llm_timeout} seconds",
+                "error": "LLM report call timed out after 180 seconds",
                 "response": "LLM report call timed out. Try increasing AGENT_QUERY_TIMEOUT or using a smaller scope.",
                 "output_path": str(output_path),
             }
-        if err_container[0]:
+        if err:
             return {
                 "success": False,
-                "error": str(err_container[0]),
-                "response": f"LLM report call failed: {err_container[0]}",
+                "error": str(err),
+                "response": f"LLM report call failed: {err}",
                 "output_path": str(output_path),
             }
 
-        report_msg = msg_container[0]
         report_text = report_msg.content if hasattr(report_msg, "content") else str(report_msg)
         title = f"Report - {output_path.stem}"
         create_result = self.document_processor.create_word_document(str(output_path), report_text, title=title)
@@ -2837,39 +2813,23 @@ class SurvyAIAgent:
             f"{coord_snippets}\n"
         )
 
-        # Protect the single LLM call with a timeout to avoid hanging on slow network/API
-        import threading
-        llm_timeout = 120
-        msg_container = [None]
-        err_container = [None]
-
-        def _invoke():
-            try:
-                msg_container[0] = llm.invoke([HumanMessage(content=prompt)])
-            except Exception as e:
-                err_container[0] = e
-
-        t = threading.Thread(target=_invoke)
-        t.daemon = True
-        t.start()
-        t.join(timeout=llm_timeout)
-
-        if t.is_alive():
+        summary_msg, err, timed_out = self._run_with_timeout(
+            120, lambda: llm.invoke([HumanMessage(content=prompt)])
+        )
+        if timed_out:
             return {
                 "success": False,
-                "error": f"LLM summary call timed out after {llm_timeout} seconds",
+                "error": "LLM summary call timed out after 120 seconds",
                 "response": "LLM summary call timed out. Try increasing AGENT_QUERY_TIMEOUT or using a smaller keyword extract.",
                 "output_path": str(output_path),
             }
-        if err_container[0]:
+        if err:
             return {
                 "success": False,
-                "error": str(err_container[0]),
-                "response": f"LLM summary call failed: {err_container[0]}",
+                "error": str(err),
+                "response": f"LLM summary call failed: {err}",
                 "output_path": str(output_path),
             }
-
-        summary_msg = msg_container[0]
         summary_text = summary_msg.content if hasattr(summary_msg, "content") else str(summary_msg)
 
         title = f"Summary - {input_path.stem}"
@@ -3230,7 +3190,7 @@ class SurvyAIAgent:
 
         # If query includes explicit input file paths, prefer tool/document pipelines over RAG.
         # (RAG is still allowed if user asks "based on our previous conversation" etc.)
-        file_driven = _looks_like_file_driven_task(q) or bool(self._extract_document_paths(q))
+        file_driven = looks_like_file_driven_task(q) or bool(self._extract_document_paths(q))
 
         wants_memory = any(k in ql for k in [
             "previous", "earlier", "last time", "as we discussed", "from our conversation",
@@ -4164,29 +4124,64 @@ class SurvyAIAgent:
             return str(self.autocad.execute_command(command))
         
         # ==================================================================
-        # EXCEL TOOL
+        # EXCEL TOOLS
         # ==================================================================
-        
+
+        class ExcelInspectInput(BaseModel):
+            """Input for inspecting Excel workbook structure."""
+            file_path: str = Field(description="Path to the Excel file (.xlsx, .xls, .xlsm)")
+
+        def excel_inspect_workbook(file_path: str) -> str:
+            """
+            Inspect an Excel workbook: list all sheet names and each sheet's column headers.
+            MANDATORY FIRST STEP when the user refers to named data (e.g. 'Pre-fill', 'Post-fill',
+            'coordinates', 'X/Y/Z'): call this to discover actual sheet and column names, then
+            reason to map user terms to real names (e.g. 'Pre Fill' -> 'Pre_fill_2024', X/Y/Z -> EASTING, NORTHING, RL).
+            Only after this deep research should you call ArcGIS/Excel tools or report that data was not found.
+            """
+            import json
+            out = self.excel_processor.inspect_workbook(file_path)
+            return json.dumps(out, indent=2)
+
         class ExcelInput(BaseModel):
             """Input schema for Excel processing."""
             file_path: str = Field(description="Path to Excel file")
             x_column: Optional[str] = Field(
-                None, 
+                None,
                 description="Column name containing X coordinates"
             )
             y_column: Optional[str] = Field(
-                None, 
+                None,
                 description="Column name containing Y coordinates"
             )
-        
+
         def excel_processor_func(**kwargs) -> str:
             """
             Extract coordinate data from Excel spreadsheets.
-            
+
             Supports .xlsx and .xls formats. Can automatically detect
             coordinate columns or use specified column names.
             """
             return str(self.excel_processor.process_file(**kwargs))
+
+        class CsvToExcelInput(BaseModel):
+            """Input schema for CSV to Excel conversion."""
+            csv_path: str = Field(description="Path to the CSV file to convert")
+            output_excel_path: Optional[str] = Field(
+                None,
+                description="Path for the output .xlsx file. If omitted, same folder as CSV, same name with .xlsx extension."
+            )
+
+        def csv_to_excel(csv_path: str, output_excel_path: Optional[str] = None) -> str:
+            """
+            Convert a CSV file to an Excel workbook (.xlsx).
+
+            CRITICAL for workflows that start with CSV: ArcGIS ExcelToTable and many coordinate/import
+            tools accept only .xlsx/.xls. If the user provides a .csv (e.g. Coords.csv), call this
+            FIRST to create Coords.xlsx in the same folder, then use the Excel path for
+            excel_coordinate_convert, arcgis_import_xy_points_from_excel, etc.
+            """
+            return str(self.excel_processor.csv_to_excel(csv_path, output_excel_path))
         
         # ==================================================================
         # DOCUMENT PROCESSING TOOLS (Atomic, AI-driven extraction)
@@ -5060,10 +5055,32 @@ class SurvyAIAgent:
             
             # Other tools
             StructuredTool(
+                name="excel_inspect_workbook",
+                description=(
+                    "Inspect Excel workbook structure: list all sheet names and each sheet's column headers. "
+                    "MANDATORY FIRST when the user refers to named sheets or data (e.g. 'Pre-fill', 'Post-fill', "
+                    "'coordinates', 'X/Y/Z'): discover actual names, then reason to map user intent to real sheet/column names. "
+                    "Only report errors or ask for names after this deep research."
+                ),
+                func=excel_inspect_workbook,
+                args_schema=ExcelInspectInput
+            ),
+            StructuredTool(
                 name="excel_processor",
                 description="Extract coordinate data from Excel files (.xlsx, .xls).",
                 func=excel_processor_func,
                 args_schema=ExcelInput
+            ),
+            StructuredTool(
+                name="csv_to_excel",
+                description=(
+                    "Convert a CSV file to an Excel file (.xlsx). Use this FIRST when the user provides a .csv "
+                    "but downstream steps need Excel (e.g. coordinate conversion, ArcGIS import). "
+                    "Output defaults to same folder as CSV with .xlsx extension. "
+                    "Parameters: csv_path (required), output_excel_path (optional)."
+                ),
+                func=csv_to_excel,
+                args_schema=CsvToExcelInput,
             ),
             # Document processing tools (atomic, AI-driven)
             StructuredTool(
@@ -5865,7 +5882,52 @@ class SurvyAIAgent:
                 
                 res = self.arcgis_processor.excel_points_convex_hull_traverse(**kwargs)
                 return json.dumps(res, indent=2, ensure_ascii=False)
-            
+
+            # --- Tool: Fill volume (IDW + Cut Fill) - hardened workflow ---
+            class ArcGISFillVolumeIDWCutfillInput(BaseModel):
+                """Input for verified fill-volume workflow: Excel -> IDW rasters -> Cut Fill -> volume + results_fill.xlsx."""
+                excel_path: str = Field(description="Path to the Excel file (one sheet with X, Y, pre and post elevation columns)")
+                sheet_name: str = Field(description="Exact sheet name (from excel_inspect_workbook)")
+                x_field: str = Field(description="Easting/X column name (e.g. Eastings, EASTING)")
+                y_field: str = Field(description="Northing/Y column name (e.g. Northings, NORTHING)")
+                post_z_field: str = Field(description="Post-fill elevation column (e.g. 'post fill', Post)")
+                pre_z_field: str = Field(description="Pre-fill elevation column (e.g. 'pre fill', Pre)")
+                coordinate_system: str = Field(
+                    default="Minna / Nigeria Mid Belt",
+                    description="Coordinate system (e.g. Nigerian Mid-Belt, EPSG:26392)",
+                )
+                output_excel_path: Optional[str] = Field(
+                    None,
+                    description="Output Excel path (default: same folder as input, results_fill.xlsx)",
+                )
+
+            def arcgis_fill_volume_idw_cutfill(
+                excel_path: str,
+                sheet_name: str,
+                x_field: str,
+                y_field: str,
+                post_z_field: str,
+                pre_z_field: str,
+                coordinate_system: str = "Minna / Nigeria Mid Belt",
+                output_excel_path: Optional[str] = None,
+            ) -> str:
+                """
+                VERIFIED fill-volume workflow: no ArcGISProject('CURRENT'), ExcelToTable uses 3rd positional sheet.
+                Use this when the user asks for fill volume from Pre-fill/Post-fill data, IDW rasters, Cut Fill, metric, results_fill.xlsx.
+                Call excel_inspect_workbook first to get sheet and column names, then call this with the resolved names.
+                """
+                res = self.arcgis_processor.compute_fill_volume_idw_cutfill(
+                    excel_path=excel_path,
+                    sheet_name=sheet_name,
+                    x_field=x_field,
+                    y_field=y_field,
+                    post_z_field=post_z_field,
+                    pre_z_field=pre_z_field,
+                    coordinate_system=coordinate_system,
+                    output_excel_path=output_excel_path,
+                )
+                return json.dumps(res, indent=2, ensure_ascii=False)
+
             # --- Tool: Execute Python Code ---
             class ArcGISExecutePythonCodeInput(BaseModel):
                 """Input schema for executing dynamically generated Python/arcpy code."""
@@ -6110,6 +6172,17 @@ class SurvyAIAgent:
                     args_schema=ArcGISExcelHullTraverseInput,
                 ),
                 StructuredTool(
+                    name="arcgis_fill_volume_idw_cutfill",
+                    description=(
+                        "*** VERIFIED fill-volume workflow *** "
+                        "Excel -> IDW rasters (pre + post) -> Cut Fill -> fill volume (m³) -> results_fill.xlsx. "
+                        "Creates ArcGIS Pro project, adds all layers (pre_idw, post_idw, cutfill, points, post_hull) to map, and opens ArcGIS Pro—as if a GIS analyst did it manually. "
+                        "Use excel_inspect_workbook first for sheet/column names. Report project path and layers to user before final volume."
+                    ),
+                    func=arcgis_fill_volume_idw_cutfill,
+                    args_schema=ArcGISFillVolumeIDWCutfillInput,
+                ),
+                StructuredTool(
                     name="arcgis_finalize_visualization",
                     description=(
                         "Finalize ArcGIS Pro project visualization AFTER user operations complete. "
@@ -6124,7 +6197,7 @@ class SurvyAIAgent:
                 ),
             ])
             
-            logger.info(f"✓ Added {9} ArcGIS Pro tools")
+            logger.info(f"✓ Added {10} ArcGIS Pro tools")
         else:
             logger.info("⚠ ArcGIS Pro not installed - ArcGIS tools not available")
         
@@ -6134,50 +6207,48 @@ class SurvyAIAgent:
     # ==========================================================================
     # LLM INVOCATION HELPERS
     # ==========================================================================
-    
-    def _invoke_llm_with_retry(self, messages: List[Any]) -> Any:
+
+    def _run_with_timeout(
+        self, timeout_seconds: int, fn: Callable[[], Any]
+    ) -> Tuple[Optional[Any], Optional[Exception], bool]:
         """
-        Invoke LLM with timeout protection and rate limit retry.
-        
-        Args:
-            messages: List of messages to send to LLM
-            
-        Returns:
-            LLM response
+        Run a callable in a daemon thread with a timeout.
+        Returns (result, error, timed_out). Exactly one of result or error is set when not timed_out.
         """
         import threading
-        timeout_seconds = 60  # 60 second timeout per LLM call
-        response_container = [None]
-        exception_container = [None]
-        
-        def invoke_llm():
+        result_container: List[Any] = [None]
+        err_container: List[Optional[Exception]] = [None]
+
+        def run():
             try:
-                response_container[0] = self.llm_with_tools.invoke(messages)
+                result_container[0] = fn()
             except Exception as e:
-                exception_container[0] = e
-        
-        thread = threading.Thread(target=invoke_llm)
-        thread.daemon = True
-        thread.start()
-        thread.join(timeout=timeout_seconds)
-        
-        if thread.is_alive():
+                err_container[0] = e
+
+        t = threading.Thread(target=run)
+        t.daemon = True
+        t.start()
+        t.join(timeout=timeout_seconds)
+        return (result_container[0], err_container[0], t.is_alive())
+
+    def _invoke_llm_with_retry(self, messages: List[Any]) -> Any:
+        """Invoke LLM with timeout protection; raises TimeoutError or the LLM exception on failure."""
+        timeout_seconds = 60
+        result, error, timed_out = self._run_with_timeout(
+            timeout_seconds, lambda: self.llm_with_tools.invoke(messages)
+        )
+        if timed_out:
             logger.error(f"LLM invocation timed out after {timeout_seconds} seconds")
             raise TimeoutError(
                 f"LLM call timed out after {timeout_seconds} seconds. "
                 "The query may be too complex or the document too large. "
                 "Try breaking the task into smaller steps."
             )
-        
-        if exception_container[0]:
-            # Check if it's a rate limit error
-            error = exception_container[0]
-            error_str = str(error).lower()
-            if "429" in str(error) or "rate limit" in error_str or "tpm" in error_str:
+        if error:
+            if "429" in str(error) or "rate limit" in str(error).lower() or "tpm" in str(error).lower():
                 logger.warning("Rate limit error detected, will be handled by caller")
             raise error
-        
-        return response_container[0]
+        return result
 
     def _ensure_app_bound(self, llm: BaseChatModel, model_name: Optional[str], tools_to_bind: List[BaseTool]) -> None:
         """
@@ -6347,18 +6418,38 @@ class SurvyAIAgent:
             
             # Check iteration count to prevent infinite loops
             max_iterations = getattr(self.settings, 'agent_max_iterations', 20)
-            iteration_count = len([m for m in messages if isinstance(m, ToolMessage)])
-            
+            tool_messages = [m for m in messages if isinstance(m, ToolMessage)]
+            iteration_count = len(tool_messages)
+
             if iteration_count >= max_iterations:
                 logger.warning(
                     f"Max iterations ({max_iterations}) reached. "
                     "Stopping to prevent infinite loop. "
                     "The query may be too complex or require manual intervention."
                 )
-                # Signal that model switch might be needed
-                # Store this in state for process_query to detect
                 return "end"
-            
+
+            # Same-error stop: if last two tool results look like the same failure, end to avoid runaway cost
+            if iteration_count >= 2:
+                last_two = tool_messages[-2:]
+                contents = []
+                for tm in last_two:
+                    c = getattr(tm, "content", None) or ""
+                    if isinstance(c, list):
+                        c = " ".join(str(part.get("text", part)) for part in c if isinstance(part, dict))
+                    else:
+                        c = str(c)
+                    contents.append(c[:300].lower().strip())
+                if contents[0] and contents[1] and (
+                    contents[0] == contents[1]
+                    or (contents[0].split()[:20] == contents[1].split()[:20] and ("error" in contents[0] or "failed" in contents[0]))
+                ):
+                    logger.warning(
+                        "Same or very similar tool error repeated; stopping loop to prevent runaway cost. "
+                        "Report what was tried and suggest next step."
+                    )
+                    return "end"
+
             # Check if the AI wants to use tools
             # AIMessage has a tool_calls attribute when tools are requested
             if isinstance(last_message, AIMessage) and last_message.tool_calls:

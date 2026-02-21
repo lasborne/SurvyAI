@@ -2283,6 +2283,238 @@ class AutoCADProcessor:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def scale_modelspace_by_layers(
+        self,
+        base_x: float,
+        base_y: float,
+        scale_factor: float,
+        layers: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Scale all ModelSpace entities on the given layers by scale_factor about (base_x, base_y).
+        Uses AutoCAD COM ScaleEntity; best-effort across entity types.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        if not layers or float(scale_factor) <= 0.0:
+            return {"success": False, "error": "layers must be non-empty and scale_factor must be positive"}
+        try:
+            import pythoncom
+            import win32com.client
+
+            ms = self.doc.ModelSpace
+            want = {str(l).upper() for l in layers}
+            base_pt = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (float(base_x), float(base_y), 0.0))
+            sf = float(scale_factor)
+            scaled = 0
+            for i in range(ms.Count):
+                try:
+                    e = ms.Item(i)
+                    if str(getattr(e, "Layer", "")).upper() not in want:
+                        continue
+                    try:
+                        e.ScaleEntity(base_pt, sf)
+                        scaled += 1
+                    except Exception:
+                        try:
+                            e.ScaleEntity((float(base_x), float(base_y), 0.0), sf)
+                            scaled += 1
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            return {
+                "success": True,
+                "base_x": float(base_x),
+                "base_y": float(base_y),
+                "scale_factor": sf,
+                "layers": list(want),
+                "scaled_entities": scaled,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def scale_scalebar_text_values(
+        self,
+        scale_factor: float,
+        layers: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Multiply numeric values in TEXT/MTEXT entities on scalebar layers by scale_factor.
+
+        This is used to keep scale bar labels correct when a template sheet is scaled up/down.
+        Example: template 1:500 -> output 1:250 => factor = 250/500 = 0.5, so "10m" becomes "5m".
+
+        Notes:
+        - Only modifies entities whose Layer matches provided layers (case-insensitive).
+        - Attempts to update both ModelSpace entities and entities inside Block definitions.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        try:
+            import re
+
+            sf = float(scale_factor)
+            if sf <= 0:
+                return {"success": False, "error": "scale_factor must be positive"}
+
+            want = {str(l).upper() for l in (layers or ["SCALEBAR", "CADA_SCALEBAR"])}
+
+            num_re = re.compile(r"-?\d+(?:\.\d+)?")
+
+            def _fmt(x: float) -> str:
+                # Avoid -0, keep clean numeric formatting
+                if abs(x) < 5e-10:
+                    x = 0.0
+                xr = round(x, 6)
+                if abs(xr - round(xr)) < 1e-9:
+                    return str(int(round(xr)))
+                s = ("{:.6f}".format(xr)).rstrip("0").rstrip(".")
+                return s if s else "0"
+
+            def _should_update(text: str) -> bool:
+                # On scalebar layers, *all* numeric labels should scale (e.g. "10m" and "5").
+                # Only skip scale-ratio patterns if they ever appear (e.g. "1:250").
+                t = (text or "")
+                if re.search(r"\b1\s*:\s*\d+\b", t):
+                    return False
+                return bool(num_re.search(t))
+
+            def _scale_numbers(text: str) -> str:
+                if not text:
+                    return text
+                if not _should_update(text):
+                    return text
+
+                def repl(m: re.Match) -> str:
+                    try:
+                        v = float(m.group(0))
+                    except Exception:
+                        return m.group(0)
+                    return _fmt(v * sf)
+
+                return num_re.sub(repl, text)
+
+            def _get_text(ent) -> Optional[str]:
+                for prop in ("TextString", "Contents", "Text"):
+                    try:
+                        v = getattr(ent, prop, None)
+                        if v is not None:
+                            return str(v)
+                    except Exception:
+                        continue
+                return None
+
+            def _set_text(ent, new_text: str) -> bool:
+                for prop in ("TextString", "Contents", "Text"):
+                    try:
+                        if hasattr(ent, prop):
+                            setattr(ent, prop, str(new_text))
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _is_text_entity(ent) -> bool:
+                try:
+                    obj = str(getattr(ent, "ObjectName", "") or "")
+                except Exception:
+                    obj = ""
+                if obj in ("AcDbText", "AcDbMText"):
+                    return True
+                # Some AutoCAD variants expose attribute references as text-like
+                if "AcDbAttribute" in obj:
+                    return True
+                return False
+
+            def _layer_ok(ent) -> bool:
+                try:
+                    lyr = str(getattr(ent, "Layer", "") or "").upper()
+                    return lyr in want
+                except Exception:
+                    return False
+
+            updated = 0
+            scanned = 0
+
+            # 1) ModelSpace
+            ms = self.doc.ModelSpace
+            for i in range(ms.Count):
+                try:
+                    e = ms.Item(i)
+                    if not _is_text_entity(e) or not _layer_ok(e):
+                        continue
+                    scanned += 1
+                    old = _get_text(e)
+                    if old is None:
+                        continue
+                    new = _scale_numbers(old)
+                    if new != old and _set_text(e, new):
+                        updated += 1
+                except Exception:
+                    continue
+
+            # 2) Block definitions (covers scalebar text nested in blocks)
+            blocks_updated = 0
+            blocks_scanned = 0
+            blocks = getattr(self.doc, "Blocks", None)
+            if blocks is not None:
+                # Try index-based access first; if it fails, fallback to enumeration.
+                try:
+                    bcount = int(blocks.Count)
+                    block_iter = (blocks.Item(i) for i in range(bcount))
+                except Exception:
+                    try:
+                        block_iter = iter(blocks)
+                    except Exception:
+                        block_iter = []
+
+                for b in block_iter:
+                    try:
+                        # IMPORTANT: Blocks collection includes special blocks like "*Model_Space" and "*Paper_Space"
+                        # that reference the live contents of ModelSpace/PaperSpace. We already processed ModelSpace above,
+                        # so skipping these prevents applying the scale factor twice (e.g. 0.5 -> 0.25).
+                        try:
+                            bname = str(getattr(b, "Name", "") or "").upper()
+                            if bname in ("*MODEL_SPACE", "*PAPER_SPACE"):
+                                continue
+                        except Exception:
+                            pass
+                        blocks_scanned += 1
+                        try:
+                            ec = int(getattr(b, "Count", 0))
+                        except Exception:
+                            ec = 0
+                        for j in range(ec):
+                            try:
+                                e = b.Item(j)
+                                if not _is_text_entity(e) or not _layer_ok(e):
+                                    continue
+                                scanned += 1
+                                old = _get_text(e)
+                                if old is None:
+                                    continue
+                                new = _scale_numbers(old)
+                                if new != old and _set_text(e, new):
+                                    updated += 1
+                                    blocks_updated += 1
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+
+            return {
+                "success": True,
+                "scale_factor": sf,
+                "layers": list(want),
+                "text_entities_scanned": scanned,
+                "text_entities_updated": updated,
+                "blocks_scanned": blocks_scanned,
+                "block_text_entities_updated": blocks_updated,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def get_entity_insertion_xy(self, handle: str) -> Dict[str, Any]:
         """Get an entity's (x,y) from InsertionPoint/Position by handle (best-effort)."""
         if not self._ensure_active_document():
@@ -2349,6 +2581,15 @@ class AutoCADProcessor:
                     mt.Layer = str(layer)
                 except Exception:
                     pass
+            # Set height FIRST so the entity is never left at AutoCAD's default (often huge) if COM glitches.
+            req_height = float(height) if height is not None else None
+            if req_height is not None:
+                for prop in ("Height", "TextHeight"):
+                    try:
+                        setattr(mt, prop, req_height)
+                        break
+                    except Exception:
+                        continue
             # Middle-center by default for segment-centered labels
             try:
                 mt.AttachmentPoint = int(attachment_point)
@@ -2358,13 +2599,21 @@ class AutoCADProcessor:
                 mt.Rotation = float(rotation_rad)
             except Exception:
                 pass
-            if height is not None:
-                for prop in ("Height", "TextHeight"):
-                    try:
-                        setattr(mt, prop, float(height))
-                        break
-                    except Exception:
-                        continue
+            # Verify/correct height after AttachmentPoint/Rotation (COM can sometimes drop or wrong-foot height)
+            if req_height is not None:
+                try:
+                    actual = getattr(mt, "Height", None) or getattr(mt, "TextHeight", None)
+                    if actual is not None:
+                        actual = float(actual)
+                        if actual < 0.25 * req_height or actual > 4.0 * req_height:
+                            for prop in ("Height", "TextHeight"):
+                                try:
+                                    setattr(mt, prop, req_height)
+                                    break
+                                except Exception:
+                                    continue
+                except Exception:
+                    pass
 
             # IMPORTANT: AutoCAD can shift the InsertionPoint when AttachmentPoint/Rotation are set.
             # Re-anchor the MTEXT so its InsertionPoint ends up exactly at (x, y).

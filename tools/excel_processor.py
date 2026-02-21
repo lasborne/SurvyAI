@@ -15,27 +15,81 @@ class ExcelProcessor:
     def __init__(self):
         """Initialize the Excel processor."""
         self.supported_formats = ['.xlsx', '.xls', '.xlsm']
-    
-    def read_file(self, file_path: str) -> pd.DataFrame:
+
+    def list_sheets(self, file_path: str) -> Dict[str, Any]:
+        """
+        List all worksheet names in an Excel workbook.
+        Use this FIRST when the user refers to named data (e.g. "Pre-fill", "Post-fill")
+        so you can map their terms to actual sheet names.
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            return {"success": False, "error": f"File not found: {file_path}", "sheets": []}
+        if file_path.suffix not in self.supported_formats:
+            return {"success": False, "error": f"Unsupported format: {file_path.suffix}", "sheets": []}
+        try:
+            xl = pd.ExcelFile(file_path, engine="openpyxl")
+            sheets = xl.sheet_names
+            xl.close()
+            logger.info(f"Listed {len(sheets)} sheet(s) in {file_path}")
+            return {"success": True, "sheets": sheets, "file_path": str(file_path)}
+        except Exception as e:
+            logger.error(f"Error listing sheets: {e}")
+            return {"success": False, "error": str(e), "sheets": []}
+
+    def inspect_workbook(self, file_path: str) -> Dict[str, Any]:
+        """
+        Inspect workbook structure: list all sheet names and each sheet's column headers
+        (and optionally first row of data). Use this to discover actual sheet and column
+        names before calling ArcGIS/Excel tools—match user terms (e.g. "Pre-fill", "X/Y/Z")
+        to real names (e.g. "Pre_Fill_2024", "EASTING", "NORTHING", "RL").
+        """
+        file_path = Path(file_path)
+        if not file_path.exists():
+            return {"success": False, "error": f"File not found: {file_path}", "workbook": {}}
+        if file_path.suffix not in self.supported_formats:
+            return {"success": False, "error": f"Unsupported format: {file_path.suffix}", "workbook": {}}
+        try:
+            xl = pd.ExcelFile(file_path, engine="openpyxl")
+            workbook: Dict[str, Any] = {"file_path": str(file_path), "sheets": {}}
+            for name in xl.sheet_names:
+                try:
+                    df = pd.read_excel(xl, sheet_name=name, nrows=1, header=0)
+                    headers = [str(c) for c in df.columns]
+                    workbook["sheets"][name] = {"columns": headers}
+                except Exception as e:
+                    workbook["sheets"][name] = {"columns": [], "error": str(e)}
+            xl.close()
+            logger.info(f"Inspected workbook {file_path}: {list(workbook['sheets'].keys())}")
+            return {"success": True, "workbook": workbook}
+        except Exception as e:
+            logger.error(f"Error inspecting workbook: {e}")
+            return {"success": False, "error": str(e), "workbook": {}}
+
+    def read_file(self, file_path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
         """
         Read an Excel file and return as DataFrame.
-        
+
         Args:
             file_path: Path to the Excel file
-            
+            sheet_name: Optional sheet name or 0-based index. If None, reads first sheet.
+
         Returns:
             DataFrame containing the Excel data
         """
         file_path = Path(file_path)
         if not file_path.exists():
             raise FileNotFoundError(f"Excel file not found: {file_path}")
-        
+
         if file_path.suffix not in self.supported_formats:
             raise ValueError(f"Unsupported file format: {file_path.suffix}")
-        
+
         try:
-            df = pd.read_excel(file_path, engine='openpyxl')
-            logger.info(f"Successfully read Excel file: {file_path}")
+            kwargs = {"engine": "openpyxl"}
+            if sheet_name is not None:
+                kwargs["sheet_name"] = sheet_name
+            df = pd.read_excel(file_path, **kwargs)
+            logger.info(f"Successfully read Excel file: {file_path}" + (f" sheet={sheet_name}" if sheet_name is not None else ""))
             return df
         except Exception as e:
             logger.error(f"Error reading Excel file: {e}")
@@ -292,5 +346,57 @@ class ExcelProcessor:
             "total_rows": len(df),
             "columns": list(df.columns),
             "coordinates": coordinates
+        }
+
+    def csv_to_excel(
+        self,
+        csv_path: str,
+        output_excel_path: Optional[str] = None,
+        encoding: str = "utf-8",
+    ) -> Dict[str, Any]:
+        """
+        Convert a CSV file to an Excel workbook (.xlsx).
+
+        Use this when a downstream tool (e.g. ArcGIS ExcelToTable, excel_coordinate_convert,
+        or arcgis_import_xy_points_from_excel) requires .xlsx/.xls and the user provides a .csv.
+        Output defaults to the same folder as the CSV with the same base name and .xlsx extension.
+
+        Args:
+            csv_path: Path to the CSV file.
+            output_excel_path: Path for the output Excel file. If None, uses same folder as CSV, same stem, .xlsx.
+            encoding: CSV encoding (default utf-8). Tries utf-8 first, then latin-1 if needed.
+
+        Returns:
+            Dict with success, file_path, output_path, total_rows, columns, error.
+        """
+        csv_p = Path(csv_path).resolve()
+        if not csv_p.exists():
+            return {"success": False, "error": f"CSV file not found: {csv_path}"}
+        if csv_p.suffix.lower() != ".csv":
+            return {"success": False, "error": f"File is not a CSV: {csv_p.suffix}"}
+
+        out_p = Path(output_excel_path).resolve() if output_excel_path else csv_p.with_suffix(".xlsx")
+        out_p.parent.mkdir(parents=True, exist_ok=True)
+
+        try:
+            df = pd.read_csv(csv_p, encoding=encoding)
+        except Exception:
+            try:
+                df = pd.read_csv(csv_p, encoding="latin-1")
+            except Exception as e:
+                return {"success": False, "error": f"Failed to read CSV: {e}"}
+
+        try:
+            df.to_excel(out_p, index=False, engine="openpyxl")
+        except Exception as e:
+            return {"success": False, "error": f"Failed to write Excel: {e}"}
+
+        logger.info(f"Converted CSV to Excel: {csv_p} -> {out_p}, rows={len(df)}")
+        return {
+            "success": True,
+            "file_path": str(csv_p),
+            "output_path": str(out_p),
+            "total_rows": len(df),
+            "columns": list(df.columns),
         }
 
