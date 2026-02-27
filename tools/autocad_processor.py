@@ -2515,6 +2515,201 @@ class AutoCADProcessor:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def scale_hatch_pattern_scale_by_layers(
+        self,
+        scale_factor: float,
+        layers: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Multiply Hatch PatternScale for hatches on the specified layers by scale_factor.
+
+        Used so the scale bar hatching scales with the plan: e.g. template at 1:500 with
+        hatch PatternScale 4, output at 1:1000 → pass factor 2 so hatch becomes 8.
+
+        Notes:
+        - In ModelSpace, modifies hatch entities whose Layer matches provided layers (case-insensitive).
+        - In Block definitions, also modifies hatch entities in any block that is INSERTed on the provided
+          layers (even if the hatch's internal layer is "0"/ByBlock), since scalebars are often block-based.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        try:
+            sf = float(scale_factor)
+            if sf <= 0:
+                return {"success": False, "error": "scale_factor must be positive"}
+
+            want = {str(l).upper() for l in (layers or ["SCALEBAR", "CADA_SCALEBAR"])}
+
+            def _layer_ok(ent) -> bool:
+                try:
+                    lyr = str(getattr(ent, "Layer", "") or "").upper()
+                    return lyr in want
+                except Exception:
+                    return False
+
+            def _is_hatch_like(ent) -> bool:
+                try:
+                    obj = str(getattr(ent, "ObjectName", "") or "")
+                except Exception:
+                    obj = ""
+                if obj == "AcDbHatch":
+                    return True
+                # Best-effort: some variants expose hatch-like entities with PatternScale
+                try:
+                    return hasattr(ent, "PatternScale")
+                except Exception:
+                    return False
+
+            def _is_insert(ent) -> bool:
+                try:
+                    obj = str(getattr(ent, "ObjectName", "") or "")
+                except Exception:
+                    obj = ""
+                return obj in ("AcDbBlockReference", "AcDbMInsertBlock") or "BlockReference" in obj
+
+            def _get_block_name(ent) -> Optional[str]:
+                for prop in ("EffectiveName", "Name", "BlockName"):
+                    try:
+                        v = getattr(ent, prop, None)
+                        if v:
+                            return str(v)
+                    except Exception:
+                        continue
+                return None
+
+            updated = 0
+            scanned = 0
+            blocks_updated = 0
+            blocks_scanned = 0
+            blocks_targeted = 0
+            targeted_block_names: set[str] = set()
+
+            def _adjust(ent, *, ignore_layer: bool = False) -> bool:
+                try:
+                    if (not ignore_layer) and (not _layer_ok(ent)):
+                        return False
+                    if not _is_hatch_like(ent):
+                        return False
+                    if not hasattr(ent, "PatternScale"):
+                        return False
+                    old = getattr(ent, "PatternScale", None)
+                    if old is None:
+                        return False
+                    new = float(old) * sf
+                    if new <= 0:
+                        return False
+                    setattr(ent, "PatternScale", new)
+                    return True
+                except Exception:
+                    return False
+
+            def _scan_space_for_targets(space) -> None:
+                nonlocal targeted_block_names
+                try:
+                    for i in range(space.Count):
+                        try:
+                            e = space.Item(i)
+                            if not _is_insert(e) or not _layer_ok(e):
+                                continue
+                            bn = _get_block_name(e)
+                            if bn:
+                                targeted_block_names.add(str(bn).upper())
+                        except Exception:
+                            continue
+                except Exception:
+                    return
+
+            def _scale_space_hatches(space) -> None:
+                nonlocal scanned, updated
+                try:
+                    for i in range(space.Count):
+                        try:
+                            e = space.Item(i)
+                            if not _layer_ok(e) or not _is_hatch_like(e):
+                                continue
+                            scanned += 1
+                            if _adjust(e, ignore_layer=False):
+                                updated += 1
+                        except Exception:
+                            continue
+                except Exception:
+                    return
+
+            # 1) ModelSpace (+ PaperSpace if available)
+            ms = self.doc.ModelSpace
+            _scan_space_for_targets(ms)
+            _scale_space_hatches(ms)
+            try:
+                ps = getattr(self.doc, "PaperSpace", None)
+                if ps is not None:
+                    _scan_space_for_targets(ps)
+                    _scale_space_hatches(ps)
+            except Exception:
+                pass
+
+            # 2) Block definitions (covers scalebar hatch nested in blocks)
+            blocks = getattr(self.doc, "Blocks", None)
+            if blocks is not None:
+                try:
+                    bcount = int(blocks.Count)
+                    block_iter = (blocks.Item(i) for i in range(bcount))
+                except Exception:
+                    try:
+                        block_iter = iter(blocks)
+                    except Exception:
+                        block_iter = []
+
+                for b in block_iter:
+                    try:
+                        try:
+                            bname = str(getattr(b, "Name", "") or "").upper()
+                            if bname in ("*MODEL_SPACE", "*PAPER_SPACE"):
+                                continue
+                        except Exception:
+                            pass
+                        blocks_scanned += 1
+                        is_target_block = False
+                        try:
+                            is_target_block = bool(bname) and (bname in targeted_block_names)
+                        except Exception:
+                            is_target_block = False
+                        if is_target_block:
+                            blocks_targeted += 1
+                        try:
+                            ec = int(getattr(b, "Count", 0))
+                        except Exception:
+                            ec = 0
+                        for j in range(ec):
+                            try:
+                                e = b.Item(j)
+                                # In target blocks, allow hatch entities on layer "0"/ByBlock, etc.
+                                if (not is_target_block) and (not _layer_ok(e)):
+                                    continue
+                                if not _is_hatch_like(e):
+                                    continue
+                                scanned += 1
+                                if _adjust(e, ignore_layer=is_target_block):
+                                    updated += 1
+                                    blocks_updated += 1
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+
+            return {
+                "success": True,
+                "scale_factor": sf,
+                "layers": list(want),
+                "target_block_names": sorted(list(targeted_block_names))[:25],
+                "target_blocks_count": int(blocks_targeted),
+                "hatches_scanned": scanned,
+                "hatches_updated": updated,
+                "blocks_scanned": blocks_scanned,
+                "block_hatches_updated": blocks_updated,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def get_entity_insertion_xy(self, handle: str) -> Dict[str, Any]:
         """Get an entity's (x,y) from InsertionPoint/Position by handle (best-effort)."""
         if not self._ensure_active_document():

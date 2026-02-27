@@ -279,6 +279,7 @@ SURVEY CONVENTIONS:
 - "Verged in red" = boundaries marked with red color (use color="red" filter)
 - "Plan shewing landed property of [NAME] at [LOCATION]" = common title format
 - Report areas in both metric (sq meters, hectares) and imperial (sq feet, acres)
+- Concrete Wall Fence (C.W.F) / Dwarf Concrete Wall Fence (D.C.W.F): when requested, plot as single line(s) on layer CADA_CWF parallel to the referenced traverse leg(s), sitting outside the traverse. Offset scales with plan scale: 0.3 @ 1:500, 0.15 @ 1:250, 0.6 @ 1:1000, etc. Place centered label 'C.W.F' or 'D.C.W.F' above the line, aligned to the traverse bearing, using the same text height as bearing/distance. Multiple fences can exist across different legs, but not more than one fence per leg.
 
 PLAN PLOTTING AND SCALES (SURVEYOR CONVENTION IN AUTOCAD):
 - Survey scale is strictly 1:250, 1:500, 1:1000, 1:2000, 1:2500, 1:5000, 1:10000, 1:20000, 1:25000
@@ -289,6 +290,7 @@ PLAN PLOTTING AND SCALES (SURVEYOR CONVENTION IN AUTOCAD):
 - The scale is so chosen such that the plot (CADA_BOUNDARY, Bearings and distances, CADA_PILLARS, CADA_ROAD) does not touch/sit on the other elements of the survey plan e.g. CADA_TITLEBLOCK, CADA_INTERIORBOUNDARY, CADA_EASTCOORDINATES, CADA_NORTHCOORDINATES, CADA_NORTHARROW, CADA_EASTARROW.
 - Note that if the plot extent (i.e. CADA_BOUNDARY, Bearings and distances, CADA_PILLARS, CADA_ROAD) enters the territory of the other elements of the survey plan e.g. CADA_TITLEBLOCK, CADA_INTERIORBOUNDARY, CADA_EASTCOORDINATES, CADA_NORTHCOORDINATES, CADA_NORTHARROW, CADA_EASTARROW but does not touch them directly, it remains valid.
 - Ensure that whatever scale is used is the correct scale on the CADA_TITLEBLOCK, else, edit to the correct scale used by the SurvyAI agent.
+- Scale bar: the scale bar (including any hashing/hatching in it) is taken from the template DWG. To have new CAD files show a scale bar with hashing, use a template that includes it (e.g. survey_plan_template2.dwg). The agent copies the template and scales the CADA_SCALEBAR layer with the plan; hashing is preserved.
 
 INTERACTIVE BEHAVIOR:
 - When users ask about system information or software availability, IMMEDIATELY use the appropriate check tools (geographic_calculator_check, etc.)

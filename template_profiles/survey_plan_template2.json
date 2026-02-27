@@ -3,163 +3,114 @@
   "template": {
     "path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\survey_plan_template2.dwg",
     "name": "survey_plan_template2.dwg",
-    "learned_at": "2026-01-13 09:44:03",
-    "drawing_info": {
-      "success": true,
-      "file_path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\survey_plan_template2.dwg",
-      "drawing_name": "survey_plan_template2.dwg",
-      "units": "Unitless",
-      "layers": [
-        "0",
-        "Defpoints",
-        "55",
-        "text",
-        "TITLE",
-        "CADA_BOUNDARY",
-        "CADA_PEGS",
-        "CADA_TEXT",
-        "CADA_TITLEBLOCK",
-        "CADA_PILLARNUMBERS",
-        "CADA_PILLARS",
-        "CADA_PLANNUMBER",
-        "CADA_CERTIFICATION",
-        "CADA_SURVEYOR",
-        "CADA_COORDINATES",
-        "CADA_ROAD",
-        "CADA_BEARING_DIST",
-        "CADA_NORTHARROW",
-        "CADA_SCALEBAR",
-        "CADA_BORDER"
-      ],
-      "entity_count": 61,
-      "read_only": false
+    "learned_at": "2026-02-26 07:44:14",
+    "signature": {
+      "size_bytes": 83534,
+      "mtime_ns": 1772001578000000000
+    }
+  },
+  "drawing_info": {
+    "success": true,
+    "name": "survey_plan_template2.dwg",
+    "path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\survey_plan_template2.dwg",
+    "units": "Unitless",
+    "layers": [
+      "0",
+      "Defpoints",
+      "55",
+      "text",
+      "TITLE",
+      "CADA_BOUNDARY",
+      "CADA_PEGS",
+      "CADA_TEXT",
+      "CADA_TITLEBLOCK",
+      "CADA_PILLARNUMBERS",
+      "CADA_PILLARS",
+      "CADA_PLANNUMBER",
+      "CADA_CERTIFICATION",
+      "CADA_SURVEYOR",
+      "CADA_NORTHCOORDINATES",
+      "CADA_ROAD",
+      "CADA_BEARING_DIST",
+      "CADA_NORTHARROW",
+      "CADA_SCALEBAR",
+      "CADA_BORDER",
+      "CADA_PRIMARYPILLAR_ARROWS",
+      "CADA_INTERIORBORDER",
+      "CADA_EASTARROW",
+      "CADA_EASTCOORDINATES",
+      "CADA_CWF"
+    ],
+    "entity_counts": {
+      "TABLE": 12,
+      "MTEXT": 18,
+      "LWPOLYLINE": 3,
+      "LINE": 21,
+      "ARC": 5,
+      "INSERT": 5,
+      "HATCH": 2
     }
   },
   "layers_expected": [
-    "CADA_TITLEBLOCK",
-    "CADA_BORDER",
-    "CADA_INTERIORBORDER",
+    "text",
+    "TITLE",
     "CADA_BOUNDARY",
-    "CADA_CERTIFICATION",
-    "CADA_BEARING_DIST",
-    "CADA_COORDINATES",
-    "CADA_NORTHARROW",
+    "CADA_PEGS",
+    "CADA_TEXT",
+    "CADA_TITLEBLOCK",
     "CADA_PILLARNUMBERS",
     "CADA_PILLARS",
     "CADA_PLANNUMBER",
-    "CADA_ROAD",
-    "CADA_SCALEBAR",
+    "CADA_CERTIFICATION",
     "CADA_SURVEYOR",
-    "TITLE",
-    "text"
+    "CADA_NORTHCOORDINATES",
+    "CADA_ROAD",
+    "CADA_BEARING_DIST",
+    "CADA_NORTHARROW",
+    "CADA_SCALEBAR",
+    "CADA_BORDER",
+    "CADA_PRIMARYPILLAR_ARROWS",
+    "CADA_INTERIORBORDER",
+    "CADA_EASTARROW",
+    "CADA_EASTCOORDINATES",
+    "CADA_CWF"
   ],
   "sheet_layers": [
     "CADA_BORDER",
     "CADA_INTERIORBORDER",
     "CADA_SCALEBAR",
     "CADA_NORTHARROW",
+    "CADA_EASTARROW",
     "CADA_TITLEBLOCK",
     "CADA_PLANNUMBER",
     "CADA_CERTIFICATION",
     "CADA_SURVEYOR",
-    "CADA_COORDINATES",
+    "CADA_NORTHCOORDINATES",
+    "CADA_EASTCOORDINATES",
     "TITLE",
     "text"
   ],
+  "text_heights": {
+    "bearing_dist_road": 1.1999999999999997
+  },
   "tables": {
     "title_block": {
-      "handle": "1171",
-      "layer": "CADA_TITLEBLOCK",
-      "rows_0_based": {
-        "row0_main_title": 0,
-        "row1_of_static": 1,
-        "row2_buyer_name": 2,
-        "row3_at_static": 3,
-        "row4_location": 4,
-        "row5_lga": 5,
-        "row6_state": 6,
-        "row7_scale": 7,
-        "row8_reserved": 8,
-        "row9_reserved": 9,
-        "row10_reserved": 10,
-        "row11_origin_crs": 11,
-        "row12_area": 12
-      },
-      "rows_human": {
-        "row1_main_title": 1,
-        "row2_of_static": 2,
-        "row3_buyer_name": 3,
-        "row4_at_static": 4,
-        "row5_location": 5,
-        "row6_lga": 6,
-        "row7_state": 7,
-        "row8_scale": 8,
-        "row9_reserved": 9,
-        "row10_reserved": 10,
-        "row11_reserved": 11,
-        "row12_origin_crs": 12,
-        "row13_area": 13
-      },
-      "sample_values": {
-        "buyer_name": "MR. NDUPECHI BARTHOLOMEW CHIBUZO",
-        "location": "{\\fVerdana|b0|i0|c0|p34;ELIJIJI AVENUE NO. 4 FRIENDS OF JESUS CLOSE \\P}RUMUROLU",
-        "origin": "{\\fVerdana|b0|i0|c0|p34;\\C5;ORIGIN:- UTM ZONE 32N}",
-        "area": "{\\fVerdana|b0|i0|c0|p34;\\C1;AREA:- 441.637 SQ. MTRS.}"
-      }
+      "handle": "1171"
     },
     "plan_number": {
-      "handle": "1151",
-      "layer": "CADA_PLANNUMBER",
-      "rows_0_based": {
-        "header": 0,
-        "value": 1
-      },
-      "rows_human": {
-        "header": 1,
-        "value": 2
-      },
-      "sample_value": "{\\H0.68751x;\\C256;RV/2026/6215/001}"
+      "handle": "1151"
     },
     "surveyor": {
-      "handle": "1144",
-      "layer": "CADA_SURVEYOR",
-      "rows_0_based": {
-        "name": 0,
-        "address": 1
-      },
-      "rows_human": {
-        "name": 1,
-        "address": 2
-      },
-      "sample": {
-        "name": "{\\C256;SURV. OKEKE UZOCHUKWU MICHAEL}",
-        "address": "{\\C256;CARDINAL GEO-NET SERVICES LTD.\\fVerdana|b0|i0|c0|p34;\\PRUMUOKWURUSI CIVIC CENTRE, \\PRUMUOKWURUSI ROAD,\\PPORT HARCOURT. RIVERS STATE}"
-      }
+      "handle": "1144"
     },
     "certification": {
-      "handle": "112F",
-      "layer": "CADA_CERTIFICATION",
-      "rows_0_based": {
-        "value": 0
-      },
-      "rows_human": {
-        "value": 1
-      },
-      "sample_value": "{\\fVerdana|b0|i0|c0|p34;\\H0.77778x;\\C256;CERTIFIED TRUE COPY OF ORIGINAL PLAN \\PMADE BY ME ON 09-01-2026}"
+      "handle": "112F"
     },
     "coordinates": {
-      "layer": "CADA_COORDINATES",
       "easting_table_handle": "1204",
-      "northing_table_handle": "120E",
-      "row_0_based": 0,
-      "col_0_based": 0,
-      "samples": {
-        "easting": "{\\fVerdana|b0|i0|c0|p34;\\H0.77778x;\\C256;283849.736m.E}",
-        "northing": "{\\fVerdana|b0|i0|c0|p34;\\H0.77778x;\\C256;534971.236m.N}"
-      }
+      "northing_table_handle": "120E"
     },
     "pillar_numbers": {
-      "layer": "CADA_PILLARNUMBERS",
       "tables": [
         {
           "handle": "115D",
@@ -169,10 +120,7 @@
           "insertion_point": {
             "x": 283865.141043953,
             "y": 534977.8802795024
-          },
-          "row0_raw": "{\\fVerdana|b0|i0|c0|p34;\\C256;SC/RV}",
-          "row1_raw": "{\\fVerdana|b0|i0|c0|p34;\\C256;1001}",
-          "parsed_code": null
+          }
         },
         {
           "handle": "1242",
@@ -182,10 +130,7 @@
           "insertion_point": {
             "x": 283839.5202465003,
             "y": 534973.5219720372
-          },
-          "row0_raw": "{\\fVerdana|b0|i0|c0|p34;\\C256;SC/RV}",
-          "row1_raw": "{\\fVerdana|b0|i0|c0|p34;\\C256;1000}",
-          "parsed_code": null
+          }
         },
         {
           "handle": "1257",
@@ -195,10 +140,7 @@
           "insertion_point": {
             "x": 283873.9962608832,
             "y": 534958.2290679272
-          },
-          "row0_raw": "{\\fVerdana|b0|i0|c0|p34;\\C256;SC/RV}",
-          "row1_raw": "{\\fVerdana|b0|i0|c0|p34;\\C256;1002}",
-          "parsed_code": null
+          }
         },
         {
           "handle": "1263",
@@ -208,89 +150,24 @@
           "insertion_point": {
             "x": 283851.3887882033,
             "y": 534943.0561358385
-          },
-          "row0_raw": "{\\fVerdana|b0|i0|c0|p34;\\C256;SC/RV}",
-          "row1_raw": "{\\fVerdana|b0|i0|c0|p34;\\C256;1003}",
-          "parsed_code": null
-        }
-      ],
-      "row_0_based": {
-        "prefix": 0,
-        "number": 1
-      }
-    }
-  },
-  "blocks": {
-    "pillars": {
-      "layer": "CADA_PILLARS",
-      "inserts": [
-        {
-          "handle": "123E",
-          "layer": "CADA_PILLARS",
-          "type": "INSERT",
-          "block_name": "PEG_SYMBOL",
-          "insertion_point": {
-            "x": 283849.73600000003,
-            "y": 534971.236
           }
         },
         {
-          "handle": "123F",
-          "layer": "CADA_PILLARS",
-          "type": "INSERT",
-          "block_name": "PEG_SYMBOL",
+          "handle": "150F",
+          "layer": "CADA_PILLARNUMBERS",
+          "rows": 2,
+          "cols": 1,
           "insertion_point": {
-            "x": 283863.4785350009,
-            "y": 534975.8612277512
-          }
-        },
-        {
-          "handle": "1240",
-          "layer": "CADA_PILLARS",
-          "type": "INSERT",
-          "block_name": "PEG_SYMBOL",
-          "insertion_point": {
-            "x": 283873.5764766733,
-            "y": 534952.7728849354
-          }
-        },
-        {
-          "handle": "1241",
-          "layer": "CADA_PILLARS",
-          "type": "INSERT",
-          "block_name": "PEG_SYMBOL",
-          "insertion_point": {
-            "x": 283855.6329692924,
-            "y": 534944.8878358674
-          }
-        }
-      ],
-      "primary_pillar_by_min_x": {
-        "handle": "123E",
-        "layer": "CADA_PILLARS",
-        "type": "INSERT",
-        "block_name": "PEG_SYMBOL",
-        "insertion_point": {
-          "x": 283849.73600000003,
-          "y": 534971.236
-        }
-      }
-    },
-    "scalebar": {
-      "layer": "CADA_SCALEBAR",
-      "inserts": [
-        {
-          "handle": "1429",
-          "layer": "CADA_SCALEBAR",
-          "type": "INSERT",
-          "block_name": "BORDER_BLOCK",
-          "insertion_point": {
-            "x": 0.0,
-            "y": 0.0
+            "x": 283865.141043953,
+            "y": 534977.8802795024
           }
         }
       ]
     }
   },
-  "excel_reference": {}
+  "blocks": {
+    "pillars": {
+      "block_name": "PEG_SYMBOL"
+    }
+  }
 }

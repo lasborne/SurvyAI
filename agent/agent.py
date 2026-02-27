@@ -702,53 +702,123 @@ class SurvyAIAgent:
         pillars = ", ".join(pillar_list)
         coords_blob = _pick([r"coordinates\s+for\s+the\s+points\s*=\s*(.+)$"]) or q
         
-        # New: Parse access road instruction
-        # 1) Named form: access road = '...' or "..."
-        access_road = _pick([r"access\s+road\s*=\s*'([^']+)'", r"access\s+road\s*=\s*\"([^\"]+)\""])
-        # 2) Free-form sentences
-        if not access_road:
-            # "An access road of 7m width should be on the boundary line connecting SC/CK 4324 - 4325"
-            m_ar = re.search(
-                r"access\s+road\s+of\s+(\d+(?:\.\d+)?)\s*m\s+width\s+(?:should\s+be\s+)?(?:on|along)\s+(?:the\s+)?(?:boundary\s+line\s+)?connecting\s+(.+?)(?:\.|$)",
-                q,
-                flags=re.IGNORECASE | re.DOTALL,
-            )
-            if m_ar:
-                w, ref = m_ar.group(1), m_ar.group(2).strip()
-                access_road = f"{w}m width on the boundary line connecting {ref}"
-                m_offset_q = re.search(r"offset\s+of\s+(\d+(?:\.\d+)?)\s*m|offset\s+(\d+(?:\.\d+)?)\s*m", q, re.IGNORECASE)
-                if m_offset_q:
-                    off_val = m_offset_q.group(1) or m_offset_q.group(2)
-                    access_road += f" offset {off_val}m"
-            else:
-                # "add an access road of width 7m (and an offset of 3m) on the side joining pillars SC/CK 4324 and SC/CK 4325"
+        # Parse access road(s): support one or multiple roads (e.g. "6m on side of A and B; 4m on side of C and D")
+        access_roads: List[str] = []
+        # 1) Named form: access road = '...' or "..." (may contain multiple specs separated by ; or " and ")
+        access_road_quoted = _pick([r"access\s+road\s*=\s*'([^']+)'", r"access\s+road\s*=\s*\"([^\"]+)\""])
+        if access_road_quoted:
+            for part in re.split(r"\s*;\s*|\s+and\s+an?\s+access\s+|\s+,\s*and\s+an?\s+access\s+", access_road_quoted, flags=re.IGNORECASE):
+                part = (part or "").strip()
+                if part and (re.search(r"\d+(?:\.\d+)?\s*m", part) or "width" in part.lower()):
+                    access_roads.append(part)
+        # 2) Free-form: collect all road specs from the prompt (split by sentence or "and add ..." then match each)
+        if not access_roads:
+            segments = re.split(r"(?<=[.;])\s+|\s+and\s+add\s+an?\s+access\s+|\s+also\s+add\s+an?\s+access\s+|\s+,?\s+and\s+an?\s+access\s+", q, flags=re.IGNORECASE)
+            for seg in segments:
+                seg = (seg or "").strip()
+                if not seg or not re.search(r"access|road|width|side\s+of|connecting|joining", seg, re.IGNORECASE):
+                    continue
+                m_ar = re.search(
+                    r"access\s+road\s+of\s+(\d+(?:\.\d+)?)\s*m\s+width\s+(?:should\s+be\s+)?(?:on|along)\s+(?:the\s+)?(?:boundary\s+line\s+)?connecting\s+(.+?)(?:\.|$)",
+                    seg,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                if m_ar:
+                    w, ref = m_ar.group(1), m_ar.group(2).strip()
+                    spec = f"{w}m width on the boundary line connecting {ref}"
+                    m_o = re.search(r"offset\s+of\s+(\d+(?:\.\d+)?)\s*m|offset\s+(\d+(?:\.\d+)?)\s*m", seg, re.IGNORECASE)
+                    if m_o:
+                        spec += f" offset {(m_o.group(1) or m_o.group(2))}m"
+                    access_roads.append(spec)
+                    continue
                 m_ar2 = re.search(
                     r"(?:add\s+)?an?\s+access\s+road\s+of\s+width\s+(\d+(?:\.\d+)?)\s*m\s+.*?joining\s+pillars\s+(.+?)(?:\.|$)",
-                    q,
+                    seg,
                     flags=re.IGNORECASE | re.DOTALL,
                 )
                 if m_ar2:
                     w, ref = m_ar2.group(1), m_ar2.group(2).strip()
-                    access_road = f"{w}m width on the side joining pillars {ref}"
-                    # Preserve offset from prompt if present (e.g. "(and an offset of 3m)") so road block can parse it
+                    spec = f"{w}m width on the side joining pillars {ref}"
+                    m_o = re.search(r"offset\s+of\s+(\d+(?:\.\d+)?)\s*m|offset\s+(\d+(?:\.\d+)?)\s*m", seg, re.IGNORECASE)
+                    if m_o:
+                        spec += f" offset {(m_o.group(1) or m_o.group(2))}m"
+                    access_roads.append(spec)
+                    continue
+                m_ar3 = re.search(
+                    r"(?:add\s+)?an?\s+access\s+(?:road\s+)?of\s+width\s+(\d+(?:\.\d+)?)\s*m\s+.*?on\s+the\s+side\s+of\s+(.+?)(?:\.|$)",
+                    seg,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                if m_ar3:
+                    w, ref = m_ar3.group(1), m_ar3.group(2).strip()
+                    spec = f"{w}m width on the side of {ref}"
+                    m_o = re.search(r"offset\s+of\s+(\d+(?:\.\d+)?)\s*m|offset\s+(\d+(?:\.\d+)?)\s*m", seg, re.IGNORECASE)
+                    if m_o:
+                        spec += f" offset {(m_o.group(1) or m_o.group(2))}m"
+                    access_roads.append(spec)
+            # Backward compat: if we still have nothing, run original single-road logic on full q
+            if not access_roads:
+                m_ar = re.search(
+                    r"access\s+road\s+of\s+(\d+(?:\.\d+)?)\s*m\s+width\s+(?:should\s+be\s+)?(?:on|along)\s+(?:the\s+)?(?:boundary\s+line\s+)?connecting\s+(.+?)(?:\.|$)",
+                    q,
+                    flags=re.IGNORECASE | re.DOTALL,
+                )
+                if m_ar:
+                    w, ref = m_ar.group(1), m_ar.group(2).strip()
+                    access_road = f"{w}m width on the boundary line connecting {ref}"
                     m_offset_q = re.search(r"offset\s+of\s+(\d+(?:\.\d+)?)\s*m|offset\s+(\d+(?:\.\d+)?)\s*m", q, re.IGNORECASE)
                     if m_offset_q:
-                        off_val = m_offset_q.group(1) or m_offset_q.group(2)
-                        access_road += f" offset {off_val}m"
+                        access_road += f" offset {(m_offset_q.group(1) or m_offset_q.group(2))}m"
+                    access_roads.append(access_road)
                 else:
-                    # "Add an access of width 5m on the side of SC/CK 7330 and SC/CK 7331"
-                    m_ar3 = re.search(
-                        r"(?:add\s+)?an?\s+access\s+(?:road\s+)?of\s+width\s+(\d+(?:\.\d+)?)\s*m\s+.*?on\s+the\s+side\s+of\s+(.+?)(?:\.|$)",
+                    m_ar2 = re.search(
+                        r"(?:add\s+)?an?\s+access\s+road\s+of\s+width\s+(\d+(?:\.\d+)?)\s*m\s+.*?joining\s+pillars\s+(.+?)(?:\.|$)",
                         q,
                         flags=re.IGNORECASE | re.DOTALL,
                     )
-                    if m_ar3:
-                        w, ref = m_ar3.group(1), m_ar3.group(2).strip()
-                        access_road = f"{w}m width on the side of {ref}"
+                    if m_ar2:
+                        w, ref = m_ar2.group(1), m_ar2.group(2).strip()
+                        access_road = f"{w}m width on the side joining pillars {ref}"
                         m_offset_q = re.search(r"offset\s+of\s+(\d+(?:\.\d+)?)\s*m|offset\s+(\d+(?:\.\d+)?)\s*m", q, re.IGNORECASE)
                         if m_offset_q:
-                            off_val = m_offset_q.group(1) or m_offset_q.group(2)
-                            access_road += f" offset {off_val}m"
+                            access_road += f" offset {(m_offset_q.group(1) or m_offset_q.group(2))}m"
+                        access_roads.append(access_road)
+                    else:
+                        m_ar3 = re.search(
+                            r"(?:add\s+)?an?\s+access\s+(?:road\s+)?of\s+width\s+(\d+(?:\.\d+)?)\s*m\s+.*?on\s+the\s+side\s+of\s+(.+?)(?:\.|$)",
+                            q,
+                            flags=re.IGNORECASE | re.DOTALL,
+                        )
+                        if m_ar3:
+                            w, ref = m_ar3.group(1), m_ar3.group(2).strip()
+                            access_road = f"{w}m width on the side of {ref}"
+                            m_offset_q = re.search(r"offset\s+of\s+(\d+(?:\.\d+)?)\s*m|offset\s+(\d+(?:\.\d+)?)\s*m", q, re.IGNORECASE)
+                            if m_offset_q:
+                                access_road += f" offset {(m_offset_q.group(1) or m_offset_q.group(2))}m"
+                            access_roads.append(access_road)
+
+        # Parse Concrete Wall Fence / Dwarf Concrete Wall Fence requests (C.W.F / D.C.W.F)
+        # Supports multiple fences across different traverse legs, but max 1 fence per leg.
+        fences: List[Dict[str, str]] = []
+        fence_segments = re.split(r"(?<=[.;])\s+|\s+and\s+add\s+|\s+also\s+add\s+|\s+,\s*and\s+", q, flags=re.IGNORECASE)
+        for seg in fence_segments:
+            seg = (seg or "").strip()
+            if not seg:
+                continue
+            seg_l = seg.lower()
+            if not re.search(r"\bfence\b|c\.w\.f|d\.c\.w\.f|concrete\s+wall\s+fence|dwarf\s+concrete\s+wall\s+fence|short\s+wall\s+fence|wall\s+fence", seg_l, re.IGNORECASE):
+                continue
+            kind = None
+            if re.search(r"d\.c\.w\.f|dwarf\s+concrete\s+wall\s+fence|short\s+wall\s+fence|dwarf\s+wall\s+fence", seg_l, re.IGNORECASE):
+                kind = "DCWF"
+            elif re.search(r"c\.w\.f|concrete\s+wall\s+fence|wall\s+fence|\bfence\b", seg_l, re.IGNORECASE):
+                kind = "CWF"
+            if not kind:
+                continue
+            # Only keep segments that reference a traverse leg (side of / joining / connecting / along / between)
+            if not re.search(r"side\s+of|joining|connecting|along|between|linking", seg_l, re.IGNORECASE):
+                continue
+            fences.append({"kind": kind, "spec": seg})
 
         # Parse user-requested plot scale (e.g. "Plot using scale 1:250", "scale 1:250")
         user_scale_denom = None
@@ -760,9 +830,9 @@ class SurvyAIAgent:
             if scale_m:
                 user_scale_denom = int(scale_m.group(1))
 
-        # Parse optional road title override (e.g. "title as 'UMUAKURU-UMUALILI ROAD'", "give it the title 'X'")
+        # Parse optional road title override for first road (e.g. "title as 'UMUAKURU-UMUALILI ROAD'")
         access_road_title = None
-        if access_road:
+        if access_roads:
             access_road_title = _pick([
                 r"(?:road\s+)?title\s+as\s+['\"]([^'\"]+)['\"]",
                 r"(?:give\s+it\s+the\s+)?title\s+as\s+['\"]([^'\"]+)['\"]",
@@ -779,6 +849,8 @@ class SurvyAIAgent:
         template_p = Path(template)
         if not template_p.is_absolute():
             template_p = (Path.cwd() / template_p).resolve()
+        if not template_p.exists():
+            return {"success": False, "error": f"Template DWG not found: {str(template_p)}"}
         out_p = Path(output)
         if not out_p.is_absolute():
             out_p = (Path.cwd() / out_p.name).resolve()
@@ -786,13 +858,39 @@ class SurvyAIAgent:
         profile_dir = Path("template_profiles").resolve()
         profile_dir.mkdir(parents=True, exist_ok=True)
         profile_path = (profile_dir / f"{template_p.stem}.json").resolve()
-        if not profile_path.exists():
+        # (Re)learn profile when missing OR when template file changed (mtime/size) OR when profile points to a different template path.
+        need_learn = not profile_path.exists()
+        if not need_learn:
+            try:
+                import json as _json
+
+                data = _json.loads(profile_path.read_text(encoding="utf-8"))
+                prof_tp = str((data.get("template") or {}).get("path") or "")
+                try:
+                    prof_tp_res = str(Path(prof_tp).resolve()) if prof_tp else ""
+                except Exception:
+                    prof_tp_res = prof_tp
+                cur_tp_res = str(template_p.resolve())
+                sig = (data.get("template") or {}).get("signature") or {}
+                cur_stat = template_p.stat()
+                if prof_tp_res and prof_tp_res != cur_tp_res:
+                    need_learn = True
+                elif int(sig.get("size_bytes") or -1) != int(cur_stat.st_size):
+                    need_learn = True
+                elif int(sig.get("mtime_ns") or -1) != int(getattr(cur_stat, "st_mtime_ns", int(cur_stat.st_mtime * 1e9))):
+                    need_learn = True
+            except Exception:
+                # If profile is corrupt/unreadable, re-learn safely.
+                need_learn = True
+
+        if need_learn:
             learned = self._learn_cadastral_template_profile(str(template_p), profile_output=str(profile_path))
             if not learned.get("success"):
                 return learned
 
         return self._apply_cadastral_template(
             profile_path=str(profile_path),
+            template_override_path=str(template_p),
             output_dwg_path=str(out_p),
             buyer_name=buyer or "",
             location=location or "",
@@ -805,7 +903,8 @@ class SurvyAIAgent:
             pillar_numbers=pillars or "",
             coordinates=coords_blob,
             certification_date=cert_date,
-            access_road=access_road,
+            access_roads=access_roads,
+            fences=fences,
             access_road_title=access_road_title,
             user_scale_denom=user_scale_denom,
         )
@@ -880,6 +979,7 @@ class SurvyAIAgent:
         # "Sheet" layers that should move together as one unit when recentring the plan.
         # This must include the border/boxes and any sheet text so tables stay inside their boxes.
         # Geometry layers (boundary/bearing/pegs) are intentionally excluded.
+        # CADA_SCALEBAR: scale bar (and any hatching/hashing in it, e.g. survey_plan_template2.dwg) is taken from the template and scaled with the sheet.
         layers_in_template = [str(x) for x in (drawing_info.get("layers") or []) if str(x)]
         sheet_layers_default = [
             "CADA_BORDER",
@@ -915,7 +1015,15 @@ class SurvyAIAgent:
 
         profile = {
             "success": True,
-            "template": {"path": str(tp), "name": tp.name, "learned_at": time.strftime("%Y-%m-%d %H:%M:%S")},
+            "template": {
+                "path": str(tp),
+                "name": tp.name,
+                "learned_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "signature": {
+                    "size_bytes": int(tp.stat().st_size),
+                    "mtime_ns": int(getattr(tp.stat(), "st_mtime_ns", int(tp.stat().st_mtime * 1e9))),
+                },
+            },
             "drawing_info": drawing_info,
             "layers_expected": layers_expected,
             "sheet_layers": sheet_layers,
@@ -948,12 +1056,18 @@ class SurvyAIAgent:
         surveyor_name: str,
         surveyor_company_address: str,
         pillar_numbers: str,
+        template_override_path: Optional[str] = None,
         coordinates: Optional[str] = None,
         certification_date: Optional[str] = None,
         access_road: Optional[str] = None,
+        access_roads: Optional[List[str]] = None,
+        fences: Optional[List[Dict[str, str]]] = None,
         access_road_title: Optional[str] = None,
         user_scale_denom: Optional[int] = None,
     ) -> Dict[str, Any]:
+        # Normalize to list: support legacy single access_road
+        roads_to_draw = access_roads if access_roads is not None else ([access_road] if access_road else [])
+        fences_to_draw = fences or []
         import json as _json
         import math
         import re
@@ -965,7 +1079,8 @@ class SurvyAIAgent:
         if not prof.exists():
             return {"success": False, "error": f"Profile not found: {str(prof)}"}
         profile = _json.loads(prof.read_text(encoding="utf-8"))
-        template = Path(profile.get("template", {}).get("path", "")).resolve()
+        template_src = template_override_path or profile.get("template", {}).get("path", "")
+        template = Path(str(template_src or "")).resolve()
         if not template.exists():
             return {"success": False, "error": f"Template not found: {str(template)}"}
 
@@ -976,7 +1091,8 @@ class SurvyAIAgent:
         if not outp.is_absolute():
             outp = (Path.cwd() / outp).resolve()
 
-        # Copy template to output (overwrite); template file itself is never written to
+        # Copy template to output (overwrite); template file itself is never written to.
+        # The full template (including scale bar and any scale bar hashing/hatching, e.g. survey_plan_template2.dwg) is preserved and then scaled if plan scale changes.
         try:
             outp.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(template), str(outp))
@@ -1225,6 +1341,7 @@ class SurvyAIAgent:
             # (e.g. template labeled 1:500 → treat output as 1:1000) BEFORE plotting/aligning,
             # so the result stays neat like the template.
             scale_k = 1.0
+            chosen_denom = 500  # plan scale 1:chosen_denom; used for road min-length check and title
             try:
                 allowed_denoms = [250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 25000]
 
@@ -1266,6 +1383,7 @@ class SurvyAIAgent:
                         template_denom = 500
                 if template_denom not in allowed_denoms:
                     template_denom = 500
+                chosen_denom = template_denom  # plan scale denominator (1:chosen_denom); may be updated below
 
                 # Interior border bbox (template coords)
                 interior_bb = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBORDER"])
@@ -1376,6 +1494,18 @@ class SurvyAIAgent:
                             except Exception:
                                 pass
 
+                            # Scale bar hashing: scaling is applied once. The scale bar is a block insert on
+                            # CADA_SCALEBAR; scale_modelspace_by_layers above already scales that insert by scale_k,
+                            # so the block (and the hatch inside it) is scaled once. We do NOT also call
+                            # scale_hatch_pattern_scale_by_layers(scale_k), or the hatch would be scaled twice
+                            # (insert scale_k × PatternScale scale_k = scale_k²).
+
+                            # Force hatch regen so the scalebar hashing updates immediately
+                            try:
+                                self.autocad.execute_command("REGEN")
+                            except Exception:
+                                pass
+
                             # Ensure new bearing/road text is created at the correct size
                             try:
                                 bearing_road_height = float(bearing_road_height) * float(scale_k)
@@ -1449,6 +1579,7 @@ class SurvyAIAgent:
             self.autocad.delete_entities("CADA_BOUNDARY")
             self.autocad.delete_entities("CADA_PILLARS")
             self.autocad.delete_entities("CADA_ROAD")
+            self.autocad.delete_entities("CADA_CWF")
             self.autocad.delete_entities("CADA_TEXT")
             time.sleep(0.2)
             # IMPORTANT: Do NOT delete generic sheet/title layers; they are part of the template
@@ -1780,7 +1911,7 @@ class SurvyAIAgent:
                 pass
             # Use scaled bearing/road height (no max cap so e.g. 1:500→1:10000 gives height 24)
             _bd_height = max(0.5, float(bearing_road_height))
-            def _bearing_ddmm(az_deg: float) -> str:
+            def _bearing_ddmm(az_deg: float, hard_spaces: int = 1) -> str:
                 az_deg = az_deg % 360.0
                 d = int(az_deg)
                 m = int(round((az_deg - d) * 60.0))
@@ -1789,7 +1920,8 @@ class SurvyAIAgent:
                     m = 0
                 # Use AutoCAD MTEXT "hard space" (\\~) so the bearing never wraps mid-token.
                 # Example: 143°~05'
-                return f"{d:03d}°\\~{m:02d}'"
+                hs = max(1, int(hard_spaces or 1))
+                return f"{d:03d}°" + ("\\~" * hs) + f"{m:02d}'"
             for i in range(len(local_pts)):
                 p1 = local_pts[i]
                 p2 = local_pts[(i + 1) % len(local_pts)]
@@ -1827,7 +1959,17 @@ class SurvyAIAgent:
                     inx, iny = n2x, n2y
                 outx, outy = -inx, -iny
 
-                bearing_str = _bearing_ddmm(az)
+                # Bearing should span ~60% of the traverse length by inserting extra spaces between degrees and minutes.
+                # Never reduce spacing below the current default (1 hard space).
+                target_span = 0.6 * L
+                # Heuristic width estimates (drawing units): Verdana digit width ~0.6*height, hard space ~0.6*height.
+                base_span_est = 4.6 * _bd_height  # approximate bearing with 1 hard space
+                space_span_est = 0.6 * _bd_height
+                hs = 1
+                if target_span > base_span_est and space_span_est > 1e-9:
+                    hs = 1 + int(math.ceil((target_span - base_span_est) / space_span_est))
+                    hs = max(1, min(hs, 60))
+                bearing_str = _bearing_ddmm(az, hard_spaces=hs)
                 dist_str = f"{L:.2f}m"
                 # Stack order: bearing outside, distance inside. MTEXT first line (before \\P) is in
                 # direction (-sin(rot), cos(rot)) from center. Choose order so bearing points outward.
@@ -1857,10 +1999,117 @@ class SurvyAIAgent:
                 pass
             time.sleep(0.2)
 
-            # Draw Access Road if requested
-            if access_road:
+            # Draw Concrete Wall Fence(s) if requested (C.W.F / D.C.W.F) on CADA_CWF
+            # - Single line parallel to traverse leg(s)
+            # - Sits outside the traverse (outward normal)
+            # - Offset scales with plan scale: 0.3 @ 1:500, 0.15 @ 1:250, 0.6 @ 1:1000, etc.
+            used_fence_edges: set[int] = set()
+            try:
+                fence_offset = 0.3 * (float(chosen_denom) / 500.0)
+            except Exception:
+                fence_offset = 0.3
+
+            for f in fences_to_draw:
                 try:
-                    ar_lower = access_road.lower()
+                    kind = str((f or {}).get("kind") or "").upper().strip()
+                    spec = str((f or {}).get("spec") or "")
+                    if kind not in ("CWF", "DCWF") or not spec:
+                        continue
+
+                    spec_lower = spec.lower()
+                    ref_match = re.search(
+                        r"(?:linking|between|connecting|on|along|joining)\s+(?:the\s+)?(?:side\s+)?(?:of\s+)?(?:boundary\s+)?(?:line\s+)?(?:pillars\s+)?(.*)$",
+                        spec_lower,
+                    )
+                    target_idx = -1
+                    if ref_match and pn_list:
+                        ref_str = ref_match.group(1).strip()
+                        ref_str_norm = re.sub(r"\s+", " ", ref_str)
+                        matched_indices: List[int] = []
+                        for idx, p_info in enumerate(pn_list):
+                            num = str(p_info.get("number", "")).strip()
+                            prefix = str(p_info.get("prefix", "")).strip()
+                            if not num:
+                                continue
+                            full_label = (prefix + " " + num).lower()
+                            num_lower = num.lower()
+                            if full_label in ref_str_norm.lower():
+                                matched_indices.append(idx)
+                            elif re.search(r"\b" + re.escape(num_lower) + r"\b", ref_str_norm.lower()):
+                                matched_indices.append(idx)
+                        if len(matched_indices) >= 2:
+                            n_pts = len(local_pts)
+                            for i in range(n_pts):
+                                j = (i + 1) % n_pts
+                                if i in matched_indices and j in matched_indices:
+                                    target_idx = i
+                                    break
+
+                    if target_idx == -1 and len(local_pts) >= 2:
+                        target_idx = 0
+                    if target_idx == -1:
+                        continue
+                    if target_idx in used_fence_edges:
+                        continue
+                    used_fence_edges.add(target_idx)
+
+                    p1 = local_pts[target_idx]
+                    p2 = local_pts[(target_idx + 1) % len(local_pts)]
+                    dx = p2["x"] - p1["x"]
+                    dy = p2["y"] - p1["y"]
+                    L_bound = math.hypot(dx, dy)
+                    if L_bound <= 1e-6:
+                        continue
+
+                    ux, uy = dx / L_bound, dy / L_bound
+
+                    # Outward normal using centroid
+                    midx = (p1["x"] + p2["x"]) / 2.0
+                    midy = (p1["y"] + p2["y"]) / 2.0
+                    poly_cx = sum(p["x"] for p in local_pts) / len(local_pts)
+                    poly_cy = sum(p["y"] for p in local_pts) / len(local_pts)
+                    vx = poly_cx - midx
+                    vy = poly_cy - midy
+                    n1x, n1y = uy, -ux
+                    n2x, n2y = -uy, ux
+                    if (n1x * vx + n1y * vy) >= (n2x * vx + n2y * vy):
+                        outx, outy = -n1x, -n1y
+                    else:
+                        outx, outy = -n2x, -n2y
+
+                    f_s = {"x": p1["x"] + fence_offset * outx, "y": p1["y"] + fence_offset * outy}
+                    f_e = {"x": p2["x"] + fence_offset * outx, "y": p2["y"] + fence_offset * outy}
+                    self.autocad.create_lwpolyline([f_s, f_e], layer="CADA_CWF", closed=False, linetype_scale=3.0)
+
+                    label = "C.W.F" if kind == "CWF" else "D.C.W.F"
+                    # Fence label height is half of bearing/distances text height
+                    fence_text_h = max(0.25, 0.5 * float(bearing_road_height))
+                    # Center label above fence line (slightly outward to avoid overlap)
+                    tx = (f_s["x"] + f_e["x"]) / 2.0 + (fence_text_h * 1.2) * outx
+                    ty = (f_s["y"] + f_e["y"]) / 2.0 + (fence_text_h * 1.2) * outy
+                    rot_rad = math.atan2(uy, ux)
+                    deg = math.degrees(rot_rad) % 360
+                    if 90 < deg <= 270:
+                        rot_rad += math.pi
+                    fence_fmt = f"{{\\fVerdana|b0|i0|c0|p34;{label}}}"
+                    txt_width = max(10.0, L_bound)
+                    self.autocad.add_mtext(
+                        fence_fmt,
+                        tx,
+                        ty,
+                        layer="CADA_CWF",
+                        rotation_rad=rot_rad,
+                        height=float(fence_text_h),
+                        width=txt_width,
+                        attachment_point=5,
+                    )
+                except Exception:
+                    continue
+
+            # Draw Access Road(s) if requested (supports multiple roads, each beside a traverse leg)
+            for road_idx, road_spec in enumerate(roads_to_draw):
+                try:
+                    ar_lower = road_spec.lower()
                     # 1. Parse Width (support "7m width", "7m road", "width 7m")
                     width = 6.0  # fallback default
                     m_w = (
@@ -1925,14 +2174,22 @@ class SurvyAIAgent:
                         L_bound = math.hypot(dx, dy)
                         
                         if L_bound > 1e-6:
-                            # Calculate Road Length
-                            # Condition: if (L_road_single - L_bound) > 20 => L_bound > 20 (since L_road_single=2*L_bound)
-                            # "else keep at default of 14m" -> assume extension is 14m
-                            if L_bound <= 20.0:
-                                extension_total = L_bound # L_road = 2*L_bound
+                            # Road length = 1.4 × traverse leg length (e.g. 100m leg → 140m road)
+                            L_road = 1.4 * L_bound
+                            # Minimum plotted length: (L_road / scale_denom) must be >= 0.064 so the road is visible.
+                            # If (L_road / chosen_denom) < 0.064, extend road so (new_L_road / chosen_denom) = 0.064
+                            # => new_L_road = 0.064 * chosen_denom (e.g. 1:500 → 32m).
+                            try:
+                                scale_denom = float(chosen_denom) if chosen_denom and float(chosen_denom) > 1e-6 else 500.0
+                            except Exception:
+                                scale_denom = 500.0
+                            min_plotted_ratio = 0.064
+                            ratio = L_road / scale_denom
+                            if ratio < min_plotted_ratio:
+                                L_road = min_plotted_ratio * scale_denom
+                                extension_total = max(0.0, L_road - L_bound)
                             else:
-                                extension_total = 14.0 # L_road = L_bound + 14
-                                
+                                extension_total = 0.4 * L_bound
                             ext_side = extension_total / 2.0
                             
                             # Unit vector along edge
@@ -1983,9 +2240,11 @@ class SurvyAIAgent:
                             l2_e = {"x": rex + (offset + width) * outx, "y": rey + (offset + width) * outy}
                             self.autocad.create_lwpolyline([l2_s, l2_e], layer="CADA_ROAD", closed=False, linetype_scale=3.0)
 
-                            # Road title: default "ACCESS    ROAD" (centered in road); override from user if specified
-                            road_title = (access_road_title or "ACCESS    ROAD").strip() or "ACCESS    ROAD"
-                            geometry["access_road_title"] = road_title
+                            # Road title: first road uses access_road_title if set, else "ACCESS    ROAD"; others use "ACCESS    ROAD"
+                            road_title = (access_road_title if road_idx == 0 else None) or "ACCESS    ROAD"
+                            road_title = road_title.strip() or "ACCESS    ROAD"
+                            if road_idx == 0:
+                                geometry["access_road_title"] = road_title
 
                             # Position text perfectly centered (vertically and horizontally) within the road
                             # cx, cy = geometric center of road (midpoint between l1 and l2, offset by width/2 outward)
@@ -2061,7 +2320,7 @@ class SurvyAIAgent:
                     arrow_layers = ["CADA_NORTHARROW", "CADA_EASTARROW", "CADA_COORDINATES", "CADA_NORTHCOORDINATES", "CADA_EASTCOORDINATES"]
                     movable_layers = [L for L in movable_layers if L not in arrow_layers]
                     # Never move survey geometry: boundary, bearings/distances, pillars, road (prevents displacement)
-                    survey_geometry_layers = ["CADA_BOUNDARY", "CADA_BEARING_DIST", "CADA_PILLARS", "CADA_PILLARNUMBERS", "CADA_ROAD"]
+                    survey_geometry_layers = ["CADA_BOUNDARY", "CADA_BEARING_DIST", "CADA_PILLARS", "CADA_PILLARNUMBERS", "CADA_ROAD", "CADA_CWF"]
                     movable_layers = [L for L in movable_layers if L not in survey_geometry_layers]
 
                     # Apply the move and then do a quick correction pass (AutoCAD bbox can shift slightly).
@@ -2555,7 +2814,8 @@ class SurvyAIAgent:
                 dy = p2["y"] - p1["y"]
                 L_bound = math.hypot(dx, dy)
                 if L_bound > 1e-6:
-                    extension_total = L_bound if L_bound <= 20.0 else 14.0
+                    # Road length = 1.4 × traverse leg length
+                    extension_total = 0.4 * L_bound
                     ext_side = extension_total / 2.0
                     ux, uy = dx / L_bound, dy / L_bound
                     midx = (p1["x"] + p2["x"]) / 2.0
