@@ -207,6 +207,83 @@ class AutoCADProcessor:
         # Optionally connect immediately
         if auto_connect:
             self.connect()
+
+    def _autocad_version_catalog(self) -> List[Tuple[int, List[str]]]:
+        """
+        Return supported AutoCAD COM ProgID aliases by release year.
+
+        Notes:
+        - AutoCAD COM ProgIDs vary by release and can appear with or without a
+          trailing ".0" style minor version.
+        - We support versions down to AutoCAD 2007 as requested.
+        """
+        catalog: List[Tuple[int, List[str]]] = [
+            (2025, ["AutoCAD.Application.24.4", "AutoCAD.Application.25"]),
+            (2024, ["AutoCAD.Application.24.3", "AutoCAD.Application.24"]),
+            (2023, ["AutoCAD.Application.24.2"]),
+            (2022, ["AutoCAD.Application.24.1", "AutoCAD.Application.23"]),
+            (2021, ["AutoCAD.Application.24.0", "AutoCAD.Application.22"]),
+            (2020, ["AutoCAD.Application.23.1", "AutoCAD.Application.21"]),
+            (2019, ["AutoCAD.Application.23.0", "AutoCAD.Application.20"]),
+            (2018, ["AutoCAD.Application.22.0", "AutoCAD.Application.19"]),
+            (2017, ["AutoCAD.Application.21.0", "AutoCAD.Application.18"]),
+            (2016, ["AutoCAD.Application.20.1"]),
+            (2015, ["AutoCAD.Application.20.0"]),
+            (2014, ["AutoCAD.Application.19.1"]),
+            (2013, ["AutoCAD.Application.19.0"]),
+            (2012, ["AutoCAD.Application.18.2"]),
+            (2011, ["AutoCAD.Application.18.1"]),
+            (2010, ["AutoCAD.Application.18.0"]),
+            (2009, ["AutoCAD.Application.17.2"]),
+            (2008, ["AutoCAD.Application.17.1"]),
+            (2007, ["AutoCAD.Application.17.0"]),
+        ]
+        return catalog
+
+    def _unique_progids(self, progids: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for progid in progids:
+            key = str(progid).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(str(progid))
+        return out
+
+    def _active_autocad_progids(self) -> List[str]:
+        """
+        Order for attaching to an already-open AutoCAD instance.
+        If any supported version is already open, prefer using it.
+        """
+        progids: List[str] = []
+        for _year, aliases in sorted(self._autocad_version_catalog(), key=lambda x: x[0], reverse=True):
+            progids.extend(aliases)
+        progids.append("AutoCAD.Application")  # generic as last resort
+        return self._unique_progids(progids)
+
+    def _startup_autocad_progids(self) -> List[str]:
+        """
+        Order for starting AutoCAD when none is currently open.
+        Preference:
+        1. AutoCAD 2021 if installed
+        2. Latest installed version available
+        3. Generic AutoCAD ProgID as final fallback
+        """
+        catalog = {year: aliases for year, aliases in self._autocad_version_catalog()}
+        progids: List[str] = []
+
+        # Default preferred release
+        progids.extend(catalog.get(2021, []))
+
+        # Then newest -> oldest, excluding the already-preferred 2021
+        for year, aliases in sorted(self._autocad_version_catalog(), key=lambda x: x[0], reverse=True):
+            if year == 2021:
+                continue
+            progids.extend(aliases)
+
+        progids.append("AutoCAD.Application")
+        return self._unique_progids(progids)
     
     # ==========================================================================
     # CONNECTION MANAGEMENT
@@ -246,63 +323,53 @@ class AutoCADProcessor:
         # ------------------------------------------------------------------
         try:
             import win32com.client
-            
-            # List of AutoCAD ProgIDs to try (different versions)
-            # Order: Generic first, then specific versions (newer to older)
-            autocad_progids = [
-                "AutoCAD.Application",           # Generic - uses default version
-                "AutoCAD.Application.25",        # AutoCAD 2025
-                "AutoCAD.Application.24",        # AutoCAD 2024
-                "AutoCAD.Application.23",        # AutoCAD 2022/2023
-                "AutoCAD.Application.22",        # AutoCAD 2021
-                "AutoCAD.Application.21",        # AutoCAD 2020
-                "AutoCAD.Application.20",        # AutoCAD 2019
-                "AutoCAD.Application.19",        # AutoCAD 2018
-                "AutoCAD.Application.18",        # AutoCAD 2017
-            ]
-            
-            # First, try to connect to an already running instance
-            # GetActiveObject finds a running COM server
+
+            active_progids = self._active_autocad_progids()
+            startup_progids = self._startup_autocad_progids()
+
+            # First, attach to any already running supported AutoCAD instance.
             connected = False
-            for progid in autocad_progids:
+            for progid in active_progids:
                 try:
                     self.acad = win32com.client.GetActiveObject(progid)
-                    logger.info(f"Connected to running AutoCAD instance via {progid}")
+                    ver = None
+                    try:
+                        ver = str(getattr(self.acad, "Version", "") or "")
+                    except Exception:
+                        ver = None
+                    logger.info(f"Connected to running AutoCAD instance via {progid}" + (f" (Version: {ver})" if ver else ""))
                     connected = True
                     break
                 except Exception:
                     continue
-            
+
             if not connected:
-                # No running instance - try to start one
-                logger.info("No running AutoCAD instance found. Attempting to start...")
-                
-                for progid in autocad_progids:
+                # No running instance - start one using the preferred order:
+                # 2021 first, then the newest installed version that responds.
+                logger.info("No running AutoCAD instance found. Attempting to start preferred AutoCAD version...")
+
+                for progid in startup_progids:
                     try:
-                        # Try DispatchEx first (creates new instance)
                         try:
                             self.acad = win32com.client.DispatchEx(progid)
                             logger.info(f"Started new AutoCAD instance via DispatchEx ({progid})")
                         except Exception:
                             self.acad = win32com.client.Dispatch(progid)
                             logger.info(f"Started new AutoCAD instance via Dispatch ({progid})")
-                            
-                        # Make AutoCAD visible
+
                         self.acad.Visible = True
-                        
-                        # Give AutoCAD time to initialize
+
                         logger.info("Waiting for AutoCAD to initialize...")
                         time.sleep(3)
-                        
+
                         connected = True
                         break
-                        
+
                     except Exception as e:
                         logger.debug(f"Could not connect via {progid}: {e}")
                         continue
-                
+
                 if not connected:
-                    # Provide detailed troubleshooting info
                     logger.error("=" * 60)
                     logger.error("AUTOCAD CONNECTION FAILED")
                     logger.error("=" * 60)
@@ -2005,6 +2072,115 @@ class AutoCADProcessor:
                     return {"success": True, "handle": handle, "moved_via": "Move(tuple)", "dx": dx, "dy": dy}
                 except Exception as e2:
                     return {"success": False, "error": str(e2)}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def copy_entity_by_handle(self, handle: str, dx: float = 0.0, dy: float = 0.0, layer: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Copy a single ModelSpace entity by handle and optionally move it by (dx, dy).
+        Useful for cloning template-driven TABLE entities (e.g., CADA_PILLARNUMBERS).
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        try:
+            import pythoncom
+            import win32com.client
+
+            ms = self.doc.ModelSpace
+            src = None
+            for i in range(ms.Count):
+                try:
+                    e = ms.Item(i)
+                    if str(getattr(e, "Handle", "")).upper() == str(handle).upper():
+                        src = e
+                        break
+                except Exception:
+                    continue
+            if src is None:
+                return {"success": False, "error": f"Entity with handle {handle} not found"}
+
+            new_ent = None
+            last_err = None
+            for attempt in range(6):
+                try:
+                    new_ent = src.Copy()
+                    break
+                except Exception as ex:
+                    last_err = ex
+                    time.sleep(0.2 * (attempt + 1))
+            if new_ent is None:
+                return {"success": False, "error": str(last_err) if last_err else "Copy failed"}
+
+            if layer:
+                try:
+                    new_ent.Layer = str(layer)
+                except Exception:
+                    pass
+
+            dx_f = float(dx)
+            dy_f = float(dy)
+            if abs(dx_f) > 1e-12 or abs(dy_f) > 1e-12:
+                try:
+                    p_from = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (0.0, 0.0, 0.0))
+                    p_to = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (dx_f, dy_f, 0.0))
+                    new_ent.Move(p_from, p_to)
+                except Exception:
+                    try:
+                        new_ent.Move((0.0, 0.0, 0.0), (dx_f, dy_f, 0.0))
+                    except Exception:
+                        pass
+
+            out = {"success": True, "source_handle": str(handle), "handle": getattr(new_ent, "Handle", None), "layer": getattr(new_ent, "Layer", None)}
+            try:
+                for attr in ("InsertionPoint", "Position"):
+                    pt = getattr(new_ent, attr, None)
+                    if pt is not None:
+                        out["insertion_point"] = {"x": float(pt[0]), "y": float(pt[1])}
+                        break
+            except Exception:
+                pass
+            return out
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def list_entity_bboxes(self, layers: Optional[List[str]] = None, object_names: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        List axis-aligned bounding boxes for matching ModelSpace entities.
+        Returns individual bboxes (not union), best-effort.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        want_layers = {str(l).upper() for l in (layers or []) if str(l).strip()}
+        want_objs = {str(o) for o in (object_names or []) if str(o).strip()}
+        try:
+            ms = self.doc.ModelSpace
+            out = []
+            for i in range(ms.Count):
+                try:
+                    e = ms.Item(i)
+                    lyr = str(getattr(e, "Layer", "")).upper()
+                    obj = str(getattr(e, "ObjectName", ""))
+                    if want_layers and lyr not in want_layers:
+                        continue
+                    if want_objs and obj not in want_objs:
+                        continue
+                    try:
+                        bb = e.GetBoundingBox()
+                        pmin, pmax = bb[0], bb[1]
+                        out.append(
+                            {
+                                "handle": getattr(e, "Handle", None),
+                                "layer": getattr(e, "Layer", None),
+                                "object_name": obj,
+                                "min": {"x": float(pmin[0]), "y": float(pmin[1])},
+                                "max": {"x": float(pmax[0]), "y": float(pmax[1])},
+                            }
+                        )
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+            return {"success": True, "count": len(out), "bboxes": out}
         except Exception as e:
             return {"success": False, "error": str(e)}
 

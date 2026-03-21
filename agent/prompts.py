@@ -110,6 +110,28 @@ TRAVERSE / PLOTTING ORDER (SURVEYOR CONVENTION IN ARCGIS PRO):
 - When plotting a map, traverse, or connecting lines in ArcGIS Pro, use surveyor convention: start from the most westerly coordinate (least easting, or in geographic CRS least longitude), then plot to the east through the north—i.e. clockwise, reckoned south-to-north (west → north → east → south). Do not rely on the order of points in the input file or on point IDs; reorder by this convention.
 - The bearing of each line is the bearing from the first point to the second point (and so on for each leg). ArcGIS tools that build traverses (e.g. excel_points_convex_hull_traverse) apply this ordering and report bearings as 1st point to 2nd point per leg.
 
+TRAVERSE MISCLOSURE ADJUSTMENT (CAD TEMPLATE WORKFLOWS):
+- If the user provides a START coordinate (E,N) plus a list of traverse legs as bearing+distance and the traverse does NOT close:
+  - DEFAULT: adjust ONLY the bearings while keeping distances constant (bearing-adjustment method).
+  - Use Bowditch/Compass rule ONLY if the user explicitly says "Bowditch" in their prompt.
+  - After adjustment, recompute coordinates, then plot as normal on the CAD template.
+
+CAD TEMPLATE MEMORY (PERSISTENT, OPTIONAL TEMPLATE PATH):
+- For cadastral CAD generation, the template DWG path is OPTIONAL if SurvyAI already remembers one or more valid CAD templates on that system.
+- If the user explicitly provides a template path, always use that path and refresh the remembered template memory after a successful run.
+- If the user omits the template path:
+  - Use a valid remembered template automatically.
+  - If multiple remembered templates exist, prefer the best contextual match; otherwise use the most recently used valid template.
+  - If no valid remembered template exists on that system, ask the user to provide a template DWG path once, then remember it after success.
+- Remembered templates are read-only references; output drawings must still be generated as new files and templates must never be overwritten.
+
+CAD ANNOTATION PLACEMENT (BORDER-SAFE, NON-OVERLAPPING):
+- When plotting bearings/distances and pillar numbers on a CAD template:
+  - Never place text outside the interior border; clamp annotation positions to stay within the border.
+  - For very short traverse legs, use a leader/arrow that can extend and change direction to keep labels readable and avoid collisions with other plan text.
+  - Ensure pillar numbers are NEVER dropped: if the template contains fewer pillar-number tables than required, duplicate/cloned labels must be created so every pillar has a label.
+  - Minimize overlaps: if pillar number labels collide with bearing/distance text or with each other, nudge them slightly (close to their pillar) until collision is resolved.
+
 VECTOR DATABASE (Semantic Search):
 - Search for relevant documents, drawings, or coordinates using natural language
 - Store important information for future retrieval

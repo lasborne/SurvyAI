@@ -359,6 +359,10 @@ class SurvyAIAgent:
         # Populated from template_profiles/*.json and when learning a template.
         self._protected_template_paths: set = set()
 
+        # Persistent cadastral CAD template memory (multi-template registry).
+        # This lets users omit the template path after successful prior runs.
+        self._cad_template_memory_file: Optional[str] = None
+
         # Internet permission (interactive, user-controlled)
         # Default: False (must ask user before searching the internet)
         self._internet_permission_granted: bool = False
@@ -648,14 +652,252 @@ class SurvyAIAgent:
     # FAST-PATH: CAD CADASTRAL PLAN (Template DWG -> Output DWG)
     # ==========================================================================
 
+    def _cad_template_profiles_dir(self):
+        from pathlib import Path
+        # Anchor template memory/profiles to the project root, not the caller's cwd.
+        # This prevents prompts from "losing" remembered templates when the CLI is launched
+        # from a different working directory.
+        d = (Path(__file__).resolve().parent.parent / "template_profiles").resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _cad_template_memory_path(self):
+        from pathlib import Path
+        if self._cad_template_memory_file:
+            return Path(self._cad_template_memory_file).resolve()
+        p = (self._cad_template_profiles_dir() / "template_memory.json").resolve()
+        self._cad_template_memory_file = str(p)
+        return p
+
+    def _load_cad_template_memory(self) -> Dict[str, Any]:
+        import json as _json
+        mem_path = self._cad_template_memory_path()
+        data: Dict[str, Any] = {"templates": []}
+        if not mem_path.exists():
+            return self._bootstrap_cad_template_memory_from_profiles(data)
+        try:
+            raw = _json.loads(mem_path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and isinstance(raw.get("templates"), list):
+                data = raw
+        except Exception:
+            data = {"templates": []}
+        if not (data.get("templates") or []):
+            data = self._bootstrap_cad_template_memory_from_profiles(data)
+        return data
+
+    def _save_cad_template_memory(self, data: Dict[str, Any]) -> None:
+        import json as _json
+        mem_path = self._cad_template_memory_path()
+        mem_path.parent.mkdir(parents=True, exist_ok=True)
+        mem_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+
+    def _bootstrap_cad_template_memory_from_profiles(self, data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """
+        Seed template memory from existing learned template profiles.
+        This supports older installations that already have template_profiles/*.json
+        but were created before template_memory.json existed.
+        """
+        import json as _json
+        from pathlib import Path
+
+        data = dict(data or {"templates": []})
+        entries = list(data.get("templates") or [])
+        by_path: Dict[str, Dict[str, Any]] = {}
+
+        for ent in entries:
+            try:
+                p = str(Path(str(ent.get("path") or "")).resolve())
+                if p:
+                    by_path[p] = ent
+            except Exception:
+                continue
+
+        profile_dir = self._cad_template_profiles_dir()
+        dirty = False
+        for prof_path in profile_dir.glob("*.json"):
+            try:
+                if prof_path.name.lower() == "template_memory.json":
+                    continue
+                raw = _json.loads(prof_path.read_text(encoding="utf-8"))
+                template_meta = raw.get("template") or {}
+                tp_raw = str(template_meta.get("path") or "").strip()
+                if not tp_raw:
+                    continue
+                tp = Path(tp_raw).resolve()
+                tp_res = str(tp)
+                learned_at = str(template_meta.get("learned_at") or "")
+                sig = template_meta.get("signature") or {}
+                stat = tp.stat() if tp.exists() else None
+                entry = by_path.get(tp_res) or {
+                    "id": tp.stem,
+                    "path": tp_res,
+                    "name": tp.name,
+                    "aliases": self._candidate_template_aliases(tp_res),
+                    "use_count": 0,
+                }
+                entry["profile_path"] = str(prof_path.resolve())
+                entry["last_used_at"] = str(entry.get("last_used_at") or learned_at or "")
+                entry["is_available"] = bool(tp.exists())
+                entry["signature"] = {
+                    "size_bytes": int(sig.get("size_bytes") or (stat.st_size if stat else -1)),
+                    "mtime_ns": int(sig.get("mtime_ns") or (getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)) if stat else -1)),
+                }
+                by_path[tp_res] = entry
+                dirty = True
+            except Exception:
+                continue
+
+        if dirty:
+            data["templates"] = list(by_path.values())
+            try:
+                self._save_cad_template_memory(data)
+            except Exception:
+                pass
+        else:
+            data["templates"] = list(by_path.values()) if by_path else list(entries)
+        return data
+
+    def _candidate_template_aliases(self, template_path: str) -> List[str]:
+        import re
+        from pathlib import Path
+        tp = Path(template_path)
+        stem = tp.stem.strip()
+        name = tp.name.strip()
+        aliases = [stem, name]
+        # Split common separators so prompts like "template 3" or "1000 template" can still match.
+        parts = re.split(r"[_\-\s]+", stem)
+        aliases.extend([p for p in parts if p])
+        out: List[str] = []
+        seen: set[str] = set()
+        for a in aliases:
+            key = str(a).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(str(a))
+        return out
+
+    def _register_cad_template_memory(self, template_path: str, profile_path: str) -> None:
+        import time
+        from pathlib import Path
+
+        try:
+            tp = Path(template_path).resolve()
+            prof = Path(profile_path).resolve()
+            stat = tp.stat()
+            data = self._load_cad_template_memory()
+            entries = list(data.get("templates") or [])
+            tp_res = str(tp)
+            prof_res = str(prof)
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            idx_hit = -1
+            for idx, ent in enumerate(entries):
+                try:
+                    if str(Path(str(ent.get("path") or "")).resolve()) == tp_res:
+                        idx_hit = idx
+                        break
+                except Exception:
+                    continue
+            new_entry = {
+                "id": tp.stem,
+                "path": tp_res,
+                "name": tp.name,
+                "aliases": self._candidate_template_aliases(tp_res),
+                "last_used_at": now,
+                "use_count": 1,
+                "profile_path": prof_res,
+                "signature": {
+                    "size_bytes": int(stat.st_size),
+                    "mtime_ns": int(getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9))),
+                },
+                "is_available": True,
+            }
+            if idx_hit >= 0:
+                cur = dict(entries[idx_hit] or {})
+                new_entry["use_count"] = int(cur.get("use_count") or 0) + 1
+                aliases = list(cur.get("aliases") or []) + new_entry["aliases"]
+                seen: set[str] = set()
+                dedup_aliases: List[str] = []
+                for a in aliases:
+                    key = str(a).strip().lower()
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    dedup_aliases.append(str(a))
+                new_entry["aliases"] = dedup_aliases
+                entries[idx_hit] = new_entry
+            else:
+                entries.append(new_entry)
+            data["templates"] = entries
+            self._save_cad_template_memory(data)
+        except Exception:
+            pass
+
+    def _resolve_cadastral_template_from_memory(self, query: str) -> Optional[Dict[str, str]]:
+        import time
+        from pathlib import Path
+
+        q = (query or "").lower()
+        data = self._load_cad_template_memory()
+        entries = list(data.get("templates") or [])
+        valid_entries: List[Dict[str, Any]] = []
+        dirty = False
+
+        for ent in entries:
+            try:
+                tp = Path(str(ent.get("path") or "")).resolve()
+                exists = tp.exists()
+                if bool(ent.get("is_available")) != bool(exists):
+                    ent["is_available"] = bool(exists)
+                    dirty = True
+                if exists:
+                    valid_entries.append(ent)
+            except Exception:
+                ent["is_available"] = False
+                dirty = True
+
+        if dirty:
+            data["templates"] = entries
+            try:
+                self._save_cad_template_memory(data)
+            except Exception:
+                pass
+
+        if not valid_entries:
+            return None
+
+        def _score(ent: Dict[str, Any]) -> Tuple[int, str]:
+            score = 0
+            aliases = [str(a).lower() for a in (ent.get("aliases") or []) if str(a).strip()]
+            name = str(ent.get("name") or "").lower()
+            stem = str(ent.get("id") or "").lower()
+            for token in aliases + [name, stem]:
+                if token and token in q:
+                    score += max(5, len(token))
+            # Most recent valid template wins when there is no clear semantic match.
+            last_used = str(ent.get("last_used_at") or "")
+            return (score, last_used)
+
+        best = sorted(valid_entries, key=_score, reverse=True)[0]
+        try:
+            best["last_used_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            data["templates"] = entries
+            self._save_cad_template_memory(data)
+        except Exception:
+            pass
+        return {
+            "template_path": str(Path(str(best.get("path") or "")).resolve()),
+            "profile_path": str(Path(str(best.get("profile_path") or "")).resolve()) if best.get("profile_path") else "",
+            "template_name": str(best.get("name") or ""),
+        }
+
     def _should_fastpath_cadastral_cad(self, query: str) -> bool:
         q = (query or "").lower()
         if ".dwg" not in q:
             return False
-        has_template = "template" in q and ".dwg" in q
         has_generate = any(k in q for k in ["generate", "create", "produce", "save"]) and ".dwg" in q
         has_coords = "coordinates" in q and ("mE" in q or "mn" in q or "(" in q)
-        return bool(has_template and has_generate and has_coords)
+        return bool(has_generate and has_coords)
 
     def _run_cadastral_cad_prompt_pipeline(self, query: str) -> Dict[str, Any]:
         """
@@ -843,8 +1085,22 @@ class SurvyAIAgent:
             if access_road_title:
                 access_road_title = access_road_title.strip()
 
-        if not template or not output:
-            return {"success": False, "error": "Could not parse template/output DWG from prompt."}
+        resolved_from_memory = None
+        if not template:
+            resolved_from_memory = self._resolve_cadastral_template_from_memory(q)
+            if resolved_from_memory:
+                template = resolved_from_memory.get("template_path")
+
+        if not output:
+            return {"success": False, "error": "Could not parse output DWG from prompt."}
+        if not template:
+            return {
+                "success": False,
+                "error": (
+                    "No CAD template was provided and no valid remembered cadastral template is available on this system. "
+                    "Please provide a template DWG path once so SurvyAI can learn and remember it."
+                ),
+            }
 
         template_p = Path(template)
         if not template_p.is_absolute():
@@ -855,9 +1111,18 @@ class SurvyAIAgent:
         if not out_p.is_absolute():
             out_p = (Path.cwd() / out_p.name).resolve()
 
-        profile_dir = Path("template_profiles").resolve()
+        profile_dir = self._cad_template_profiles_dir()
         profile_dir.mkdir(parents=True, exist_ok=True)
-        profile_path = (profile_dir / f"{template_p.stem}.json").resolve()
+        profile_path = None
+        if resolved_from_memory:
+            try:
+                p_mem = Path(str(resolved_from_memory.get("profile_path") or "")).resolve()
+                if p_mem.exists():
+                    profile_path = p_mem
+            except Exception:
+                profile_path = None
+        if profile_path is None:
+            profile_path = (profile_dir / f"{template_p.stem}.json").resolve()
         # (Re)learn profile when missing OR when template file changed (mtime/size) OR when profile points to a different template path.
         need_learn = not profile_path.exists()
         if not need_learn:
@@ -888,7 +1153,7 @@ class SurvyAIAgent:
             if not learned.get("success"):
                 return learned
 
-        return self._apply_cadastral_template(
+        result = self._apply_cadastral_template(
             profile_path=str(profile_path),
             template_override_path=str(template_p),
             output_dwg_path=str(out_p),
@@ -908,6 +1173,9 @@ class SurvyAIAgent:
             access_road_title=access_road_title,
             user_scale_denom=user_scale_denom,
         )
+        if isinstance(result, dict) and result.get("success"):
+            self._register_cad_template_memory(str(template_p), str(profile_path))
+        return result
 
     def _learn_cadastral_template_profile(
         self,
@@ -1096,6 +1364,20 @@ class SurvyAIAgent:
         try:
             outp.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(str(template), str(outp))
+        except PermissionError as e:
+            # If the target DWG is open/locked (common during iterative edits), write to a unique filename
+            # in the same folder rather than failing the entire workflow.
+            try:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                alt = outp.with_name(f"{outp.stem}_{ts}{outp.suffix}")
+                shutil.copy2(str(template), str(alt))
+                outp = alt
+                output_dwg_path = str(outp)
+            except Exception as e2:
+                return {
+                    "success": False,
+                    "error": f"Failed to copy template to output (permission denied; also failed alternate name): {e2}",
+                }
         except Exception as e:
             return {"success": False, "error": f"Failed to copy template to output: {e}"}
 
@@ -1309,6 +1591,8 @@ class SurvyAIAgent:
 
         # Parse coordinate pairs from prompt
         coord_pairs = []
+        bowditch_info = None
+        bearing_distance_legs: Optional[List[Dict[str, float]]] = None
         if coordinates:
             pairs = re.findall(
                 r"\(\s*([0-9]+(?:\.[0-9]+)?)\s*(?:m)?\s*[eE]\s*,\s*([0-9]+(?:\.[0-9]+)?)\s*(?:m)?\s*[nN]\s*\)",
@@ -1317,7 +1601,168 @@ class SurvyAIAgent:
             for e_s, n_s in pairs:
                 coord_pairs.append({"e": float(e_s), "n": float(n_s)})
 
+            # Fallback: single coordinate + bearings/distances traverse legs
+            # Example inputs:
+            # - "plot using coordinate 286638.060mE, 544692.450mN then bearing 17deg 49' and distance 16.14m ..."
+            # - "use coordinate 286638.060mE, 544692.450mN; bearing = 17 degrees 49 min, distance = 16.14m ..."
+            if len(coord_pairs) < 3:
+                try:
+                    # 1) Start coordinate (E,N)
+                    m0 = re.search(
+                        r"([0-9]+(?:\.[0-9]+)?)\s*(?:m)?\s*[eE]\s*[,; ]+\s*([0-9]+(?:\.[0-9]+)?)\s*(?:m)?\s*[nN]\b",
+                        coordinates,
+                        flags=re.IGNORECASE,
+                    )
+                    if m0:
+                        e0 = float(m0.group(1))
+                        n0 = float(m0.group(2))
+
+                        # 2) Traverse legs: bearing + distance (flexible phrasing)
+                        leg_re = re.compile(
+                            r"\bbearing\b\s*(?:=|is|:)?\s*"
+                            r"(\d{1,3})\s*(?:deg|degree|degrees|°|d)\s*"
+                            r"([0-5]?\d)\s*(?:min|mins|minute|minutes|['’])"
+                            r"(?:[^0-9]{0,80}?)"
+                            r"(?:distance|dist\.?|measured\s+distance)\s*(?:=|is|:)?\s*"
+                            r"([0-9]+(?:\.[0-9]+)?)\s*(?:m)?\b",
+                            flags=re.IGNORECASE | re.DOTALL,
+                        )
+                        legs = []
+                        for mm in leg_re.finditer(coordinates):
+                            d = int(mm.group(1))
+                            m = int(mm.group(2))
+                            dist = float(mm.group(3))
+                            # Normalize bearing to decimal degrees (from North, clockwise)
+                            bdeg = (float(d) % 360.0) + (float(m) / 60.0)
+                            legs.append((bdeg, dist))
+
+                        if legs:
+                            # Build unadjusted deltas + vertices
+                            deltas = []
+                            tmp_unadj = [{"e": float(e0), "n": float(n0)}]
+                            ce, cn = float(e0), float(n0)
+                            total_len = 0.0
+                            for (bdeg, dist) in legs:
+                                br = math.radians(float(bdeg))
+                                de = float(dist) * math.sin(br)
+                                dn = float(dist) * math.cos(br)
+                                deltas.append((de, dn, float(dist)))
+                                total_len += float(dist)
+                                ce += de
+                                cn += dn
+                                tmp_unadj.append({"e": float(ce), "n": float(cn)})
+
+                            mis_e = float(tmp_unadj[-1]["e"] - tmp_unadj[0]["e"])
+                            mis_n = float(tmp_unadj[-1]["n"] - tmp_unadj[0]["n"])
+                            mis = float(math.hypot(mis_e, mis_n))
+                            threshold = 0.01  # 1 cm
+
+                            tmp = tmp_unadj
+                            applied = False
+                            max_shift = 0.0
+                            method_used = None
+                            db_deg = None
+                            bearing_distance_legs = [{"bearing_deg": float(bd), "distance": float(di)} for (bd, di) in legs]
+
+                            # Default: bearing-adjustment (keep distances fixed).
+                            # Bowditch is ONLY used when the user explicitly mentions it.
+                            wants_bowditch = bool(re.search(r"\bbowditch\b", coordinates or "", flags=re.IGNORECASE))
+
+                            if mis > threshold and total_len > 1e-9:
+                                if wants_bowditch:
+                                    method_used = "bowditch"
+                                    applied = True
+                                    tmp_adj = [{"e": float(e0), "n": float(n0)}]
+                                    ce2, cn2 = float(e0), float(n0)
+                                    for (de, dn, Li) in deltas:
+                                        # distribute misclosure proportional to line length
+                                        cde = (-mis_e) * (float(Li) / float(total_len))
+                                        cdn = (-mis_n) * (float(Li) / float(total_len))
+                                        ce2 += float(de + cde)
+                                        cn2 += float(dn + cdn)
+                                        tmp_adj.append({"e": float(ce2), "n": float(cn2)})
+                                    tmp = tmp_adj
+
+                                    # compute max point shift (excluding start)
+                                    for k in range(1, min(len(tmp_unadj), len(tmp_adj))):
+                                        sh = math.hypot(tmp_adj[k]["e"] - tmp_unadj[k]["e"], tmp_adj[k]["n"] - tmp_unadj[k]["n"])
+                                        if sh > max_shift:
+                                            max_shift = float(sh)
+                                else:
+                                    method_used = "bearing_adjustment"
+                                    try:
+                                        from tools import traverse_bearing_adjustment as _tba
+                                        import numpy as _np
+
+                                        b_list = [float(bd) for (bd, _di) in legs]
+                                        d_list = [float(_di) for (_bd, _di) in legs]
+                                        trv = _tba.traverse_from_agent(e0, n0, b_list, d_list, bearings_in_degrees=True)
+                                        ba = _tba.form_matrices(trv)  # adjusted bearings in radians
+                                        db = ba - _np.deg2rad(_np.asarray(b_list, dtype=float))
+                                        db_deg = (_np.rad2deg(db)).tolist()
+                                        bearing_distance_legs = [
+                                            {"bearing_deg": float(_np.rad2deg(ba[i])), "distance": float(d_list[i])}
+                                            for i in range(len(d_list))
+                                        ]
+
+                                        D_adj = _np.asarray(d_list, dtype=float) * _np.sin(ba)
+                                        L_adj = _np.asarray(d_list, dtype=float) * _np.cos(ba)
+
+                                        tmp_adj = [{"e": float(e0), "n": float(n0)}]
+                                        ce2, cn2 = float(e0), float(n0)
+                                        for i in range(len(d_list)):
+                                            ce2 += float(D_adj[i])
+                                            cn2 += float(L_adj[i])
+                                            tmp_adj.append({"e": float(ce2), "n": float(cn2)})
+                                        tmp = tmp_adj
+
+                                        for k in range(1, min(len(tmp_unadj), len(tmp_adj))):
+                                            sh = math.hypot(tmp_adj[k]["e"] - tmp_unadj[k]["e"], tmp_adj[k]["n"] - tmp_unadj[k]["n"])
+                                            if sh > max_shift:
+                                                max_shift = float(sh)
+                                        applied = True
+                                    except Exception:
+                                        # If bearing-adjustment fails for any reason, keep unadjusted points
+                                        method_used = "bearing_adjustment_failed"
+                                        applied = False
+
+                            # For start-coordinate + bearing/distance parcel traverses, the final computed point
+                            # is the closure back to the start and must NOT be treated as an extra pillar.
+                            # Keep only the unique parcel vertices; boundary polyline closure is handled separately.
+                            if len(legs) >= 3 and len(tmp) == len(legs) + 1:
+                                tmp = tmp[:-1]
+                            # Safety fallback for any other near-duplicate closure point
+                            elif len(tmp) >= 4:
+                                dx0 = tmp[-1]["e"] - tmp[0]["e"]
+                                dy0 = tmp[-1]["n"] - tmp[0]["n"]
+                                if math.hypot(dx0, dy0) <= 0.25:
+                                    tmp = tmp[:-1]
+
+                            if len(tmp) >= 3:
+                                coord_pairs = tmp
+                                bowditch_info = {
+                                    "mode": "bearing_distance",
+                                    "method": method_used or ("bowditch" if wants_bowditch else "bearing_adjustment"),
+                                    "applied": bool(applied),
+                                    "threshold_m": float(threshold),
+                                    "misclosure_m": float(mis),
+                                    "misclosure_e_m": float(mis_e),
+                                    "misclosure_n_m": float(mis_n),
+                                    "perimeter_m": float(total_len),
+                                    "max_point_shift_m": float(max_shift),
+                                    "db_deg": db_deg,
+                                    # Keep preview small (most jobs are 4-10 legs)
+                                    "adjusted_points_preview": [
+                                        {"idx": i, "e": float(p["e"]), "n": float(p["n"])}
+                                        for i, p in enumerate(coord_pairs[: min(6, len(coord_pairs))])
+                                    ],
+                                }
+                except Exception:
+                    pass
+
         geometry = {"pillars_moved": 0, "boundary_redrawn": False, "bearing_mtext": 0, "access_road_title": None}
+        if bowditch_info:
+            geometry["bowditch"] = bowditch_info
 
         if coord_pairs and len(coord_pairs) >= 3:
             # Preserve user input order: pillar i is assigned to coordinate i (first pillar to first coord, etc.)
@@ -1717,6 +2162,24 @@ class SurvyAIAgent:
                 return out
 
             pn_list = _parse_pillar_numbers(pillar_numbers)
+            # If the agent extracted fewer pillar numbers than vertices (often due to punctuation/quoting),
+            # auto-extend sequentially using the last known prefix/number so we never drop pillar labels.
+            try:
+                need_n = len(local_pts) if isinstance(local_pts, list) else 0
+                if need_n and pn_list and len(pn_list) < need_n:
+                    last = pn_list[-1]
+                    prefix = str(last.get("prefix") or "").strip() or "SP"
+                    try:
+                        start_num = int(str(last.get("number") or "0").strip())
+                    except Exception:
+                        start_num = 0
+                    k = start_num
+                    while len(pn_list) < need_n and k < start_num + 2000:
+                        k += 1
+                        pn_list.append({"prefix": prefix, "number": f"{k:04d}"})
+            except Exception:
+                pass
+            pn_meta: List[Dict[str, Any]] = []
             if pn_list:
                 # Compute a "template-typical" offset distance between a peg and its pillar-number table.
                 # This makes the placement look like the template: close to the peg, but not on it.
@@ -1773,19 +2236,77 @@ class SurvyAIAgent:
                 t_res = self.autocad.list_tables(layer="CADA_PILLARNUMBERS")
                 pn_tables = (t_res.get("tables") or []) if isinstance(t_res, dict) else []
                 used_handles: set[str] = set()
+                pn_meta: List[Dict[str, Any]] = []
                 cxp = sum(p["x"] for p in local_pts) / len(local_pts)
                 cyp = sum(p["y"] for p in local_pts) / len(local_pts)
+                pillar_box_bbs: List[Dict[str, Any]] = []
+                try:
+                    pbb = self.autocad.list_entity_bboxes(
+                        layers=["CADA_PILLARS"],
+                        object_names=["AcDbBlockReference"],
+                    )
+                    if (pbb or {}).get("success"):
+                        pillar_box_bbs = list(pbb.get("bboxes") or [])
+                except Exception:
+                    pillar_box_bbs = []
 
                 def _dist2(t, vx, vy):
                     ip = (t.get("insertion_point") or {})
                     tx, ty = float(ip.get("x", 0.0)), float(ip.get("y", 0.0))
                     return (tx - vx) ** 2 + (ty - vy) ** 2
 
+                def _nearest_pillar_bb(vx: float, vy: float) -> Optional[Dict[str, Any]]:
+                    if not pillar_box_bbs:
+                        return None
+                    def _bb_d2(b: Dict[str, Any]) -> float:
+                        mn = b.get("min") or {}
+                        mx = b.get("max") or {}
+                        cx = (float(mn.get("x", 0.0)) + float(mx.get("x", 0.0))) / 2.0
+                        cy = (float(mn.get("y", 0.0)) + float(mx.get("y", 0.0))) / 2.0
+                        return (cx - vx) ** 2 + (cy - vy) ** 2
+                    return min(pillar_box_bbs, key=_bb_d2)
+
                 for i_v, v in enumerate(local_pts[: len(pn_list)]):
                     vx, vy = float(v["x"]), float(v["y"])
                     cand = [t for t in pn_tables if t.get("handle") and str(t.get("handle")) not in used_handles]
                     if not cand:
-                        break
+                        # Template may contain fewer pillar-number tables than parcel vertices.
+                        # Clone an existing table so all pillar numbers are preserved.
+                        try:
+                            seed = None
+                            if pn_tables:
+                                # Prefer the last used handle as it matches styling/scale in this drawing.
+                                for hh in reversed(list(used_handles)):
+                                    if hh:
+                                        seed = hh
+                                        break
+                                if seed is None:
+                                    seed = str((pn_tables[0] or {}).get("handle") or "")
+                            if seed:
+                                c = self.autocad.copy_entity_by_handle(seed, dx=0.0, dy=0.0, layer="CADA_PILLARNUMBERS")
+                                if (c or {}).get("success") and c.get("handle"):
+                                    new_h = str(c.get("handle"))
+                                    pn_tables.append({"handle": new_h, "layer": "CADA_PILLARNUMBERS", "insertion_point": c.get("insertion_point") or {}})
+                                    cand = [t for t in pn_tables if t.get("handle") and str(t.get("handle")) not in used_handles]
+                        except Exception:
+                            cand = cand
+                        if not cand:
+                            # Hard fallback: create an MTEXT-based pillar-number label so we never drop a pillar number.
+                            try:
+                                lbl = f"{pn_list[i_v]['prefix']}\\P{pn_list[i_v]['number']}"
+                                self.autocad.add_mtext(
+                                    f"{{\\fVerdana|b0|i0|c0|p34;{lbl}}}",
+                                    vx + 2.0,
+                                    vy + 2.0,
+                                    layer="CADA_PILLARNUMBERS",
+                                    rotation_rad=0.0,
+                                    height=max(0.5, float(bearing_road_height) * 0.9),
+                                    width=12.0,
+                                    attachment_point=1,  # top-left
+                                )
+                            except Exception:
+                                pass
+                            continue
                     best = min(cand, key=lambda t: _dist2(t, vx, vy))
                     h = str(best.get("handle"))
                     used_handles.add(h)
@@ -1800,6 +2321,10 @@ class SurvyAIAgent:
                     dxv, dyv = vx - cxp, vy - cyp
                     Lvv = math.hypot(dxv, dyv) or 1.0
                     ux, uy = dxv / Lvv, dyv / Lvv  # outward from centroid
+                    try:
+                        pn_meta.append({"handle": h, "vx": vx, "vy": vy, "ux": ux, "uy": uy, "off": float(off)})
+                    except Exception:
+                        pass
                     # Gap target (survey drafting): ~1.0 unit from peg, except primary peg ~1.5 units.
                     gap = 1.5 if i_v == 0 else 1.0
                     try:
@@ -1811,19 +2336,6 @@ class SurvyAIAgent:
                                 ent = e
                                 break
                         if ent is not None:
-                            def _dist_point_to_bbox(px: float, py: float, minx: float, miny: float, maxx: float, maxy: float) -> float:
-                                dxp = 0.0
-                                if px < minx:
-                                    dxp = minx - px
-                                elif px > maxx:
-                                    dxp = px - maxx
-                                dyp = 0.0
-                                if py < miny:
-                                    dyp = miny - py
-                                elif py > maxy:
-                                    dyp = py - maxy
-                                return math.hypot(dxp, dyp)
-
                             # insertion point
                             ip = None
                             for attr in ("InsertionPoint", "Position"):
@@ -1842,54 +2354,165 @@ class SurvyAIAgent:
                             cx, cy = (minx + maxx) / 2.0, (miny + maxy) / 2.0
                             # center offset relative to insertion
                             dcx, dcy = cx - ix, cy - iy
-                            # extent along outward direction
+
+                            def _aabb(minx0: float, miny0: float, maxx0: float, maxy0: float) -> Dict[str, Dict[str, float]]:
+                                return {"min": {"x": minx0, "y": miny0}, "max": {"x": maxx0, "y": maxy0}}
+
+                            def _shift_bbox(bb0: Dict[str, Dict[str, float]], dx0: float, dy0: float) -> Dict[str, Dict[str, float]]:
+                                mn = bb0.get("min") or {}
+                                mx = bb0.get("max") or {}
+                                return _aabb(
+                                    float(mn.get("x", 0.0)) + dx0,
+                                    float(mn.get("y", 0.0)) + dy0,
+                                    float(mx.get("x", 0.0)) + dx0,
+                                    float(mx.get("y", 0.0)) + dy0,
+                                )
+
+                            def _aabb_overlaps_local(a: Dict[str, Dict[str, float]], b: Dict[str, Dict[str, float]], pad0: float = 0.0) -> bool:
+                                amin, amax = a.get("min") or {}, a.get("max") or {}
+                                bmin, bmax = b.get("min") or {}, b.get("max") or {}
+                                return not (
+                                    float(amax.get("x", 0.0)) + pad0 < float(bmin.get("x", 0.0)) - pad0
+                                    or float(amin.get("x", 0.0)) - pad0 > float(bmax.get("x", 0.0)) + pad0
+                                    or float(amax.get("y", 0.0)) + pad0 < float(bmin.get("y", 0.0)) - pad0
+                                    or float(amin.get("y", 0.0)) - pad0 > float(bmax.get("y", 0.0)) + pad0
+                                )
+
+                            def _point_in_poly(px0: float, py0: float) -> bool:
+                                inside0 = False
+                                n0 = len(local_pts)
+                                j0 = n0 - 1
+                                for i0 in range(n0):
+                                    xi0, yi0 = float(local_pts[i0]["x"]), float(local_pts[i0]["y"])
+                                    xj0, yj0 = float(local_pts[j0]["x"]), float(local_pts[j0]["y"])
+                                    hit0 = ((yi0 > py0) != (yj0 > py0)) and (
+                                        px0 < (xj0 - xi0) * (py0 - yi0) / ((yj0 - yi0) or 1e-12) + xi0
+                                    )
+                                    if hit0:
+                                        inside0 = not inside0
+                                    j0 = i0
+                                return inside0
+
+                            def _seg_int(ax: float, ay: float, bx: float, by: float, cx0: float, cy0: float, dx0: float, dy0: float) -> bool:
+                                def _orient(px1: float, py1: float, px2: float, py2: float, px3: float, py3: float) -> float:
+                                    return (px2 - px1) * (py3 - py1) - (py2 - py1) * (px3 - px1)
+                                o1 = _orient(ax, ay, bx, by, cx0, cy0)
+                                o2 = _orient(ax, ay, bx, by, dx0, dy0)
+                                o3 = _orient(cx0, cy0, dx0, dy0, ax, ay)
+                                o4 = _orient(cx0, cy0, dx0, dy0, bx, by)
+                                return (o1 > 0) != (o2 > 0) and (o3 > 0) != (o4 > 0)
+
+                            def _crosses_traverse(bb0: Dict[str, Dict[str, float]]) -> bool:
+                                mn = bb0.get("min") or {}
+                                mx = bb0.get("max") or {}
+                                minx0, miny0 = float(mn.get("x", 0.0)), float(mn.get("y", 0.0))
+                                maxx0, maxy0 = float(mx.get("x", 0.0)), float(mx.get("y", 0.0))
+                                corners0 = [(minx0, miny0), (minx0, maxy0), (maxx0, miny0), (maxx0, maxy0)]
+                                if any(_point_in_poly(px0, py0) for (px0, py0) in corners0):
+                                    return True
+                                redges = [
+                                    (minx0, miny0, minx0, maxy0),
+                                    (minx0, maxy0, maxx0, maxy0),
+                                    (maxx0, maxy0, maxx0, miny0),
+                                    (maxx0, miny0, minx0, miny0),
+                                ]
+                                for kk in range(len(local_pts)):
+                                    p_a = local_pts[kk]
+                                    p_b = local_pts[(kk + 1) % len(local_pts)]
+                                    ax0, ay0 = float(p_a["x"]), float(p_a["y"])
+                                    bx0, by0 = float(p_b["x"]), float(p_b["y"])
+                                    for (rx1, ry1, rx2, ry2) in redges:
+                                        if _seg_int(ax0, ay0, bx0, by0, rx1, ry1, rx2, ry2):
+                                            return True
+                                return False
+
+                            cur_bb = _aabb(minx, miny, maxx, maxy)
+                            # extent along preferred direction for the current table box
                             corners = [(minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy)]
                             ext = 0.0
                             for (qx, qy) in corners:
                                 proj = abs((qx - cx) * ux + (qy - cy) * uy)
                                 if proj > ext:
                                     ext = proj
-                            # desired center so nearest edge is at gap from pillar
-                            tcx = vx + ux * (gap + ext)
-                            tcy = vy + uy * (gap + ext)
-                            # convert desired center back to insertion point
+
+                            # desired center should clear the pillar box edge, not the pillar point.
+                            pillar_bb = _nearest_pillar_bb(vx, vy)
+                            p_cx, p_cy = vx, vy
+                            p_ext = 0.0
+                            own_pillar_bb = pillar_bb
+                            if pillar_bb is not None:
+                                pb_min = pillar_bb.get("min") or {}
+                                pb_max = pillar_bb.get("max") or {}
+                                pminx, pminy = float(pb_min.get("x", vx)), float(pb_min.get("y", vy))
+                                pmaxx, pmaxy = float(pb_max.get("x", vx)), float(pb_max.get("y", vy))
+                                p_cx = (pminx + pmaxx) / 2.0
+                                p_cy = (pminy + pmaxy) / 2.0
+                                for (qx, qy) in [(pminx, pminy), (pminx, pmaxy), (pmaxx, pminy), (pmaxx, pmaxy)]:
+                                    proj = abs((qx - p_cx) * ux + (qy - p_cy) * uy)
+                                    if proj > p_ext:
+                                        p_ext = proj
+
+                            # Candidate search: stay near the peg, prefer outside the parcel, and never cross the peg box.
+                            placed_bbs: List[Dict[str, Any]] = []
+                            for uu in used_handles:
+                                if str(uu).upper() == str(h).upper():
+                                    continue
+                                for jj in range(ms.Count):
+                                    ee = ms.Item(jj)
+                                    if str(getattr(ee, "Handle", "")).upper() != str(uu).upper():
+                                        continue
+                                    try:
+                                        bb_u = ee.GetBoundingBox()
+                                        pmn, pmx = bb_u[0], bb_u[1]
+                                        placed_bbs.append(_aabb(float(pmn[0]), float(pmn[1]), float(pmx[0]), float(pmx[1])))
+                                    except Exception:
+                                        pass
+                                    break
+
+                            base_r = p_ext + gap + ext
+                            perp_x, perp_y = -uy, ux
+                            best_pos = None
+                            best_cost = 1e18
+                            for r_mult in (1.0, 1.15, 1.35, 1.6):
+                                rr = base_r * r_mult
+                                for ang_deg in (0, 20, -20, 40, -40, 60, -60, 85, -85, 110, -110, 145, -145, 180):
+                                    th = math.radians(float(ang_deg))
+                                    dux = ux * math.cos(th) + perp_x * math.sin(th)
+                                    duy = uy * math.cos(th) + perp_y * math.sin(th)
+                                    tcx = p_cx + dux * rr
+                                    tcy = p_cy + duy * rr
+                                    cand_bb = _shift_bbox(cur_bb, tcx - cx, tcy - cy)
+                                    cost = 0.0
+                                    if own_pillar_bb is not None and _aabb_overlaps_local(cand_bb, own_pillar_bb, pad0=0.05):
+                                        cost += 10000.0
+                                    for other_pb in pillar_box_bbs:
+                                        if own_pillar_bb is not None and other_pb is own_pillar_bb:
+                                            continue
+                                        if _aabb_overlaps_local(cand_bb, other_pb, pad0=0.05):
+                                            cost += 5000.0
+                                    if _crosses_traverse(cand_bb):
+                                        cost += 10000.0
+                                    for pb in placed_bbs:
+                                        if _aabb_overlaps_local(cand_bb, pb, pad0=0.1):
+                                            cost += 2500.0
+                                    # prefer outward / shortest move
+                                    cost += abs(float(ang_deg)) * 2.0
+                                    cost += (r_mult - 1.0) * 200.0
+                                    if cost < best_cost:
+                                        best_cost = cost
+                                        best_pos = (tcx, tcy)
+                                    if cost <= 1e-6:
+                                        break
+                                if best_cost <= 1e-6:
+                                    break
+
+                            if best_pos is None:
+                                best_pos = (p_cx + ux * base_r, p_cy + uy * base_r)
+
+                            tcx, tcy = best_pos
                             tx = tcx - dcx
                             ty = tcy - dcy
                             self.autocad.move_entity_to_xy(h, tx, ty)
-
-                            # Refinement: because TABLE insertion points are corners and tables can be rotated,
-                            # iterate a few times to converge to the desired point->bbox gap.
-                            for _ in range(4):
-                                ent2 = None
-                                for jj in range(ms.Count):
-                                    ee = ms.Item(jj)
-                                    if getattr(ee, "Handle", None) == h:
-                                        ent2 = ee
-                                        break
-                                if ent2 is None:
-                                    break
-                                bb2 = ent2.GetBoundingBox()
-                                pmin2, pmax2 = bb2[0], bb2[1]
-                                minx2, miny2 = float(pmin2[0]), float(pmin2[1])
-                                maxx2, maxy2 = float(pmax2[0]), float(pmax2[1])
-                                g_now = _dist_point_to_bbox(vx, vy, minx2, miny2, maxx2, maxy2)
-                                delta = g_now - gap
-                                if abs(delta) <= 0.15:
-                                    break
-                                # Move toward pillar if too far, away if too close.
-                                ip2 = None
-                                for attr in ("InsertionPoint", "Position"):
-                                    try:
-                                        ip2 = getattr(ent2, attr, None)
-                                        if ip2 is not None:
-                                            break
-                                    except Exception:
-                                        pass
-                                if ip2 is None:
-                                    break
-                                nx = float(ip2[0]) - ux * delta
-                                ny = float(ip2[1]) - uy * delta
-                                self.autocad.move_entity_to_xy(h, nx, ny)
                         else:
                             # fallback: simple outward offset
                             self.autocad.move_entity_to_xy(h, vx + ux * 4.0, vy + uy * 4.0)
@@ -1922,76 +2545,624 @@ class SurvyAIAgent:
                 # Example: 143°~05'
                 hs = max(1, int(hard_spaces or 1))
                 return f"{d:03d}°" + ("\\~" * hs) + f"{m:02d}'"
+            # Fetch interior border bbox once for clamping projecting-arrow text inside the drawing area.
+            _interior_bb = None
+            try:
+                _ibb = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBORDER"])
+                if not (_ibb or {}).get("success"):
+                    _ibb = self.autocad.get_modelspace_bbox(layers=["CADA_BORDER"], prefer_largest=True)
+                if (_ibb or {}).get("success"):
+                    _interior_bb = _ibb
+            except Exception:
+                pass
+
+            # Minimum leg length (in drawing units) below which a projecting arrow is used.
+            # Threshold: the bearing string "DDD° MM'" at 1 hard-space is roughly 8 chars wide;
+            # stacked with distance, estimate ~9 char-widths at 0.6*height per char.
+            _min_text_span = 9.0 * 0.6 * _bd_height
+
+            # Smarter placement: avoid mixing with other plan contents by checking AABB collisions
+            # against existing annotation (pillar-number tables, coordinate tables) and already-placed labels.
+            _occupied_bboxes: List[Dict[str, Any]] = []
+            try:
+                bb = self.autocad.list_entity_bboxes(
+                    layers=[
+                        "CADA_PILLARNUMBERS",
+                        "CADA_COORDINATES",
+                        "CADA_NORTHCOORDINATES",
+                        "CADA_EASTCOORDINATES",
+                        "CADA_ROAD",
+                        "CADA_TITLEBLOCK",
+                    ],
+                    object_names=["AcDbTable", "AcDbText", "AcDbMText"],
+                )
+                if (bb or {}).get("success"):
+                    _occupied_bboxes = list(bb.get("bboxes") or [])
+            except Exception:
+                _occupied_bboxes = []
+            _placed_label_bboxes: List[Dict[str, Dict[str, float]]] = []
+
+            def _aabb_overlaps(a: Dict[str, Dict[str, float]], b: Dict[str, Dict[str, float]], pad: float = 0.0) -> bool:
+                amin, amax = a.get("min") or {}, a.get("max") or {}
+                bmin, bmax = b.get("min") or {}, b.get("max") or {}
+                return not (
+                    float(amax.get("x", 0.0)) + pad < float(bmin.get("x", 0.0)) - pad
+                    or float(amin.get("x", 0.0)) - pad > float(bmax.get("x", 0.0)) + pad
+                    or float(amax.get("y", 0.0)) + pad < float(bmin.get("y", 0.0)) - pad
+                    or float(amin.get("y", 0.0)) - pad > float(bmax.get("y", 0.0)) + pad
+                )
+
+            def _aabb_for_centered_rect(cx: float, cy: float, w: float, h: float, rot_rad: float) -> Dict[str, Dict[str, float]]:
+                hw, hh = 0.5 * float(w), 0.5 * float(h)
+                c, s = math.cos(float(rot_rad)), math.sin(float(rot_rad))
+                # Four corners around origin
+                pts = [(-hw, -hh), (-hw, hh), (hw, -hh), (hw, hh)]
+                xs = []
+                ys = []
+                for (px, py) in pts:
+                    rx = cx + px * c - py * s
+                    ry = cy + px * s + py * c
+                    xs.append(rx)
+                    ys.append(ry)
+                return {"min": {"x": min(xs), "y": min(ys)}, "max": {"x": max(xs), "y": max(ys)}}
+
+            def _aabb_inside_interior(a: Dict[str, Dict[str, float]], margin: float) -> bool:
+                if _interior_bb is None:
+                    return True
+                ib_min = _interior_bb.get("min") or {}
+                ib_max = _interior_bb.get("max") or {}
+                xmin = float(ib_min.get("x", -1e18)) + margin
+                ymin = float(ib_min.get("y", -1e18)) + margin
+                xmax = float(ib_max.get("x", 1e18)) - margin
+                ymax = float(ib_max.get("y", 1e18)) - margin
+                amin, amax = a.get("min") or {}, a.get("max") or {}
+                return (
+                    float(amin.get("x", 0.0)) >= xmin
+                    and float(amax.get("x", 0.0)) <= xmax
+                    and float(amin.get("y", 0.0)) >= ymin
+                    and float(amax.get("y", 0.0)) <= ymax
+                )
+
+            def _point_in_polygon(px: float, py: float, poly: List[Dict[str, float]]) -> bool:
+                inside = False
+                n = len(poly)
+                if n < 3:
+                    return False
+                j = n - 1
+                for i in range(n):
+                    xi, yi = float(poly[i]["x"]), float(poly[i]["y"])
+                    xj, yj = float(poly[j]["x"]), float(poly[j]["y"])
+                    try:
+                        hit = ((yi > py) != (yj > py)) and (
+                            px < (xj - xi) * (py - yi) / ((yj - yi) or 1e-12) + xi
+                        )
+                    except Exception:
+                        hit = False
+                    if hit:
+                        inside = not inside
+                    j = i
+                return inside
+
+            def _segments_intersect(ax: float, ay: float, bx: float, by: float, cx: float, cy: float, dx: float, dy: float) -> bool:
+                def _orient(px1: float, py1: float, px2: float, py2: float, px3: float, py3: float) -> float:
+                    return (px2 - px1) * (py3 - py1) - (py2 - py1) * (px3 - px1)
+
+                def _on_segment(px1: float, py1: float, px2: float, py2: float, qx: float, qy: float) -> bool:
+                    return (
+                        min(px1, px2) - 1e-9 <= qx <= max(px1, px2) + 1e-9
+                        and min(py1, py2) - 1e-9 <= qy <= max(py1, py2) + 1e-9
+                    )
+
+                o1 = _orient(ax, ay, bx, by, cx, cy)
+                o2 = _orient(ax, ay, bx, by, dx, dy)
+                o3 = _orient(cx, cy, dx, dy, ax, ay)
+                o4 = _orient(cx, cy, dx, dy, bx, by)
+
+                if (o1 > 0) != (o2 > 0) and (o3 > 0) != (o4 > 0):
+                    return True
+                if abs(o1) <= 1e-9 and _on_segment(ax, ay, bx, by, cx, cy):
+                    return True
+                if abs(o2) <= 1e-9 and _on_segment(ax, ay, bx, by, dx, dy):
+                    return True
+                if abs(o3) <= 1e-9 and _on_segment(cx, cy, dx, dy, ax, ay):
+                    return True
+                if abs(o4) <= 1e-9 and _on_segment(cx, cy, dx, dy, bx, by):
+                    return True
+                return False
+
+            def _aabb_crosses_traverse(a: Dict[str, Dict[str, float]], poly: List[Dict[str, float]]) -> bool:
+                amin, amax = a.get("min") or {}, a.get("max") or {}
+                minx, miny = float(amin.get("x", 0.0)), float(amin.get("y", 0.0))
+                maxx, maxy = float(amax.get("x", 0.0)), float(amax.get("y", 0.0))
+                corners = [(minx, miny), (minx, maxy), (maxx, miny), (maxx, maxy)]
+                if any(_point_in_polygon(cx, cy, poly) for (cx, cy) in corners):
+                    return True
+                rect_edges = [
+                    (minx, miny, minx, maxy),
+                    (minx, maxy, maxx, maxy),
+                    (maxx, maxy, maxx, miny),
+                    (maxx, miny, minx, miny),
+                ]
+                n = len(poly)
+                for i in range(n):
+                    p1 = poly[i]
+                    p2 = poly[(i + 1) % n]
+                    x1, y1 = float(p1["x"]), float(p1["y"])
+                    x2, y2 = float(p2["x"]), float(p2["y"])
+                    for (rx1, ry1, rx2, ry2) in rect_edges:
+                        if _segments_intersect(x1, y1, x2, y2, rx1, ry1, rx2, ry2):
+                            return True
+                return False
+
             for i in range(len(local_pts)):
                 p1 = local_pts[i]
                 p2 = local_pts[(i + 1) % len(local_pts)]
                 dx = p2["x"] - p1["x"]
                 dy = p2["y"] - p1["y"]
-                L = math.hypot(dx, dy)
-                if L <= 1e-6:
+                L_geom = math.hypot(dx, dy)
+                if L_geom <= 1e-6:
                     continue
-                az = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
-                # Text rotation/orientation RULE (user requirement):
-                # - Bearing text content stays as the true computed bearing (0..360).
-                # - If bearing > 180, the text ORIENTATION becomes (bearing - 180) so it reads upright.
-                #
-                # AutoCAD MTEXT Rotation is angle from +X axis CCW.
-                # Convert a bearing (from North, clockwise) to rotation via: rot_deg = (90 - bearing) mod 360.
+                # For start-coordinate + bearing/distance traverses, preserve the adjusted leg
+                # bearings/distances for annotation even after the duplicate closure vertex is removed.
+                if bearing_distance_legs and len(bearing_distance_legs) == len(local_pts):
+                    leg_meta = bearing_distance_legs[i]
+                    az = float(leg_meta.get("bearing_deg", (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0)) % 360.0
+                    L_disp = float(leg_meta.get("distance", L_geom))
+                else:
+                    az = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+                    L_disp = L_geom
                 az_orient = az if az <= 180.0 else (az - 180.0)
                 rot_deg = (90.0 - az_orient) % 360.0
                 rot = math.radians(rot_deg)
-                # Center point on the boundary leg (insertion point must stay on the line).
                 midx = (p1["x"] + p2["x"]) / 2.0
                 midy = (p1["y"] + p2["y"]) / 2.0
 
-                # Decide which side is "outside" vs "inside" using polygon centroid.
                 poly_cx = sum(p["x"] for p in local_pts) / len(local_pts)
                 poly_cy = sum(p["y"] for p in local_pts) / len(local_pts)
                 vx = poly_cx - midx
                 vy = poly_cy - midy
-                # candidate normals (unit)
-                n1x, n1y = dy / L, -dx / L
-                n2x, n2y = -dy / L, dx / L
-                # interior normal points toward centroid
+                n1x, n1y = dy / L_geom, -dx / L_geom
+                n2x, n2y = -dy / L_geom, dx / L_geom
                 if (n1x * vx + n1y * vy) >= (n2x * vx + n2y * vy):
                     inx, iny = n1x, n1y
                 else:
                     inx, iny = n2x, n2y
                 outx, outy = -inx, -iny
 
-                # Bearing should span ~60% of the traverse length by inserting extra spaces between degrees and minutes.
-                # Never reduce spacing below the current default (1 hard space).
-                target_span = 0.6 * L
-                # Heuristic width estimates (drawing units): Verdana digit width ~0.6*height, hard space ~0.6*height.
-                base_span_est = 4.6 * _bd_height  # approximate bearing with 1 hard space
-                space_span_est = 0.6 * _bd_height
-                hs = 1
-                if target_span > base_span_est and space_span_est > 1e-9:
-                    hs = 1 + int(math.ceil((target_span - base_span_est) / space_span_est))
-                    hs = max(1, min(hs, 60))
-                bearing_str = _bearing_ddmm(az, hard_spaces=hs)
-                dist_str = f"{L:.2f}m"
-                # Stack order: bearing outside, distance inside. MTEXT first line (before \\P) is in
-                # direction (-sin(rot), cos(rot)) from center. Choose order so bearing points outward.
-                first_line_out = -math.sin(rot) * outx + math.cos(rot) * outy
-                if first_line_out > 0:
-                    stacked_text = f"{{\\fVerdana|b0|i0|c0|p34;{bearing_str}\\P{dist_str}}}"
+                use_projecting_arrow = L_geom < _min_text_span
+
+                if not use_projecting_arrow:
+                    # --- Normal on-leg placement (unchanged logic) ---
+                    target_span = 0.6 * L_geom
+                    base_span_est = 4.6 * _bd_height
+                    space_span_est = 0.6 * _bd_height
+                    hs = 1
+                    if target_span > base_span_est and space_span_est > 1e-9:
+                        hs = 1 + int(math.ceil((target_span - base_span_est) / space_span_est))
+                        hs = max(1, min(hs, 60))
+                    bearing_str = _bearing_ddmm(az, hard_spaces=hs)
+                    dist_str = f"{L_disp:.2f}m"
+                    first_line_out = -math.sin(rot) * outx + math.cos(rot) * outy
+                    if first_line_out > 0:
+                        stacked_text = f"{{\\fVerdana|b0|i0|c0|p34;{bearing_str}\\P{dist_str}}}"
+                    else:
+                        stacked_text = f"{{\\fVerdana|b0|i0|c0|p34;{dist_str}\\P{bearing_str}}}"
+                    w = min(max(2.0, 0.75 * L_geom), 0.95 * L_geom)
+                    self.autocad.add_mtext(
+                        stacked_text,
+                        midx,
+                        midy,
+                        layer="CADA_BEARING_DIST",
+                        rotation_rad=rot,
+                        height=_bd_height,
+                        width=w,
+                        attachment_point=5,
+                    )
+                    try:
+                        _placed_label_bboxes.append(_aabb_for_centered_rect(midx, midy, w, 2.2 * _bd_height, rot))
+                    except Exception:
+                        pass
                 else:
-                    stacked_text = f"{{\\fVerdana|b0|i0|c0|p34;{dist_str}\\P{bearing_str}}}"
-                # Width should be small enough to keep centered but readable
-                w = min(max(2.0, 0.75 * L), 0.95 * L)
-                self.autocad.add_mtext(
-                    stacked_text,
-                    midx,
-                    midy,
-                    layer="CADA_BEARING_DIST",
-                    rotation_rad=rot,
-                    height=_bd_height,
-                    width=w,
-                    attachment_point=5,  # middle-center so it stays centered on the leg
-                )
+                    # --- Smart leader for short legs ---
+                    # Prefer an L-shaped leader with a horizontal (90/270) branch; if that collides or
+                    # approaches the border, progressively extend and try alternative orientations.
+
+                    bearing_str = _bearing_ddmm(az, hard_spaces=1)
+                    dist_str = f"{L_disp:.2f}m"
+                    stacked_text = f"{{\\fVerdana|b0|i0|c0|p34;{bearing_str}\\P{dist_str}}}"
+
+                    def _clamp_xy(x: float, y: float, margin: float) -> Tuple[float, float]:
+                        if _interior_bb is None:
+                            return x, y
+                        ib_min = _interior_bb.get("min") or {}
+                        ib_max = _interior_bb.get("max") or {}
+                        xmin = float(ib_min.get("x", -1e18)) + margin
+                        ymin = float(ib_min.get("y", -1e18)) + margin
+                        xmax = float(ib_max.get("x", 1e18)) - margin
+                        ymax = float(ib_max.get("y", 1e18)) - margin
+                        return max(xmin, min(xmax, x)), max(ymin, min(ymax, y))
+
+                    stem_base = max(_min_text_span * 0.9, 6.0 * _bd_height)
+                    branch_base = max(_min_text_span * 1.35, 10.0 * _bd_height)
+                    pad = 1.25 * _bd_height
+                    margin = 2.0 * _bd_height
+
+                    # Unit directions
+                    t_ux, t_uy = dx / L, dy / L  # along leg in XY
+                    stem_dirs = [
+                        (outx, outy),            # outward normal
+                        (-outx, -outy),          # inward normal
+                        (t_ux, t_uy),            # along the leg
+                        (-t_ux, -t_uy),          # reverse along the leg
+                    ]
+                    # Branch options in preference order: horizontal (E/W), vertical (N/S), then along-leg.
+                    branch_opts = [
+                        (1.0, 0.0, 0.0),     # East, rotation 0
+                        (-1.0, 0.0, 0.0),    # West, rotation 0
+                        (0.0, 1.0, math.pi / 2.0),   # North, rotation 90°
+                        (0.0, -1.0, math.pi / 2.0),  # South, rotation 90°
+                        (t_ux, t_uy, rot),   # along leg
+                        (-t_ux, -t_uy, rot), # reverse along leg (rotation kept readable via rot)
+                    ]
+
+                    chosen = None
+                    for (sdx, sdy) in stem_dirs:
+                        for sm in (1.0, 1.6, 2.4, 3.4):
+                            stem_len = stem_base * sm
+                            ex = midx + sdx * stem_len
+                            ey = midy + sdy * stem_len
+                            ex, ey = _clamp_xy(ex, ey, margin)
+                            for (bdx, bdy, text_rot) in branch_opts:
+                                for bm in (1.0, 1.35, 1.8):
+                                    bl = branch_base * bm
+                                    bx = ex + bdx * bl
+                                    by = ey + bdy * bl
+                                    bx2, by2 = _clamp_xy(bx, by, margin)
+                                    actual_bl = math.hypot(bx2 - ex, by2 - ey)
+                                    if actual_bl < 0.55 * bl:
+                                        continue
+
+                                    tcx = (ex + bx2) / 2.0
+                                    tcy = (ey + by2) / 2.0
+                                    tw = max(2.0, actual_bl * 0.95)
+                                    th = 2.2 * _bd_height
+                                    aabb = _aabb_for_centered_rect(tcx, tcy, tw, th, text_rot)
+                                    if not _aabb_inside_interior(aabb, margin):
+                                        continue
+                                    bad = False
+                                    for ob in _occupied_bboxes:
+                                        if _aabb_overlaps(aabb, ob, pad=pad):
+                                            bad = True
+                                            break
+                                    if not bad:
+                                        for pb in _placed_label_bboxes:
+                                            if _aabb_overlaps(aabb, pb, pad=pad):
+                                                bad = True
+                                                break
+                                    if bad:
+                                        continue
+
+                                    chosen = {
+                                        "elbow": (ex, ey),
+                                        "end": (bx2, by2),
+                                        "text": (tcx, tcy),
+                                        "text_rot": float(text_rot),
+                                        "text_w": float(tw),
+                                        "aabb": aabb,
+                                    }
+                                    break
+                                if chosen:
+                                    break
+                            if chosen:
+                                break
+                        if chosen:
+                            break
+                    if not chosen:
+                        # Fallback that should always succeed: long outward stem + horizontal branch with clamping.
+                        ex = midx + outx * (stem_base * 3.4)
+                        ey = midy + outy * (stem_base * 3.4)
+                        ex, ey = _clamp_xy(ex, ey, margin)
+                        bx = ex + (1.0 if outx >= 0 else -1.0) * (branch_base * 1.8)
+                        by = ey
+                        bx, by = _clamp_xy(bx, by, margin)
+                        tcx = (ex + bx) / 2.0
+                        tcy = (ey + by) / 2.0
+                        tw = max(2.0, math.hypot(bx - ex, by - ey) * 0.95)
+                        th = 2.2 * _bd_height
+                        aabb = _aabb_for_centered_rect(tcx, tcy, tw, th, 0.0)
+                        chosen = {"elbow": (ex, ey), "end": (bx, by), "text": (tcx, tcy), "text_rot": 0.0, "text_w": tw, "aabb": aabb}
+
+                    elbow_x, elbow_y = chosen["elbow"]
+                    branch_end_x, branch_end_y = chosen["end"]
+                    text_cx, text_cy = chosen["text"]
+                    text_rot = chosen["text_rot"]
+                    text_w = chosen["text_w"]
+
+                    # Draw leader polyline: midpoint → elbow → end.
+                    try:
+                        self.autocad.create_lwpolyline(
+                            [
+                                {"x": midx, "y": midy},
+                                {"x": elbow_x, "y": elbow_y},
+                                {"x": branch_end_x, "y": branch_end_y},
+                            ],
+                            layer="CADA_BEARING_DIST",
+                            closed=False,
+                        )
+                    except Exception:
+                        pass
+
+                    # Arrowhead at the boundary midpoint, pointing along the first leader segment.
+                    try:
+                        arrow_size = _bd_height * 0.6
+                        stem_dx = elbow_x - midx
+                        stem_dy = elbow_y - midy
+                        stem_L = math.hypot(stem_dx, stem_dy) or 1.0
+                        su, sv = stem_dx / stem_L, stem_dy / stem_L
+                        sp, sq = -sv, su
+                        arrow_pts = [
+                            {"x": midx, "y": midy},
+                            {"x": midx + su * arrow_size + sp * arrow_size * 0.35, "y": midy + sv * arrow_size + sq * arrow_size * 0.35},
+                            {"x": midx + su * arrow_size - sp * arrow_size * 0.35, "y": midy + sv * arrow_size - sq * arrow_size * 0.35},
+                        ]
+                        self.autocad.create_lwpolyline(arrow_pts, layer="CADA_BEARING_DIST", closed=True)
+                    except Exception:
+                        pass
+
+                    # Place MTEXT on the second segment, oriented to that segment's bearing.
+                    try:
+                        self.autocad.add_mtext(
+                            stacked_text,
+                            text_cx,
+                            text_cy,
+                            layer="CADA_BEARING_DIST",
+                            rotation_rad=float(text_rot),
+                            height=_bd_height,
+                            width=float(text_w),
+                            attachment_point=5,
+                        )
+                    except Exception:
+                        # Last-resort: try horizontal at elbow
+                        try:
+                            self.autocad.add_mtext(
+                                stacked_text,
+                                elbow_x,
+                                elbow_y,
+                                layer="CADA_BEARING_DIST",
+                                rotation_rad=0.0,
+                                height=_bd_height,
+                                width=max(2.0, branch_base),
+                                attachment_point=5,
+                            )
+                        except Exception:
+                            pass
+                    try:
+                        _placed_label_bboxes.append(chosen["aabb"])
+                    except Exception:
+                        pass
+
                 geometry["bearing_mtext"] += 1
-                time.sleep(0.05)  # Brief pause between COM calls to reduce glitches when connection is under load
+                time.sleep(0.05)
+
+            # Second pass (cartographic cleanup): nudge pillar-number labels away from overlaps.
+            # This addresses very short legs where pegs and annotations cluster tightly.
+            try:
+                if pn_meta:
+                    t_res2 = self.autocad.list_tables(layer="CADA_PILLARNUMBERS")
+                    tbs = (t_res2.get("tables") or []) if isinstance(t_res2, dict) else []
+                    ins_map = {}
+                    for t in tbs:
+                        hh = str(t.get("handle") or "").upper()
+                        ip = t.get("insertion_point") or {}
+                        if hh and ("x" in ip) and ("y" in ip):
+                            ins_map[hh] = (float(ip.get("x", 0.0)), float(ip.get("y", 0.0)))
+
+                    bb2 = self.autocad.list_entity_bboxes(
+                        layers=["CADA_BEARING_DIST", "CADA_PILLARNUMBERS", "CADA_PILLARS"],
+                        object_names=["AcDbTable", "AcDbText", "AcDbMText", "AcDbBlockReference"],
+                    )
+                    bbs = list((bb2 or {}).get("bboxes") or []) if (bb2 or {}).get("success") else []
+                    bb_by_handle = {str((b.get("handle") or "")).upper(): b for b in bbs if b.get("handle")}
+
+                    bearing_bbs = [b for b in bbs if str(b.get("layer") or "").upper() == "CADA_BEARING_DIST"]
+                    pillar_bbs = {str((b.get("handle") or "")).upper(): b for b in bbs if str(b.get("layer") or "").upper() == "CADA_PILLARNUMBERS" and b.get("handle")}
+                    pillar_obj_bbs = [b for b in bbs if str(b.get("layer") or "").upper() == "CADA_PILLARS"]
+
+                    def _shift_aabb(a: Dict[str, Dict[str, float]], dx0: float, dy0: float) -> Dict[str, Dict[str, float]]:
+                        amin, amax = a.get("min") or {}, a.get("max") or {}
+                        return {
+                            "min": {"x": float(amin.get("x", 0.0)) + dx0, "y": float(amin.get("y", 0.0)) + dy0},
+                            "max": {"x": float(amax.get("x", 0.0)) + dx0, "y": float(amax.get("y", 0.0)) + dy0},
+                        }
+
+                    # Keep post-placement nudges local so pillar-number labels remain close to their pegs.
+                    step = max(0.35, min(0.7, 0.18 * _bd_height))
+                    pad = 1.15 * _bd_height
+                    margin = 2.0 * _bd_height
+
+                    # Iterate a few passes so clustered labels can settle without leaving residual overlaps.
+                    for _pass in range(3):
+                        moved = 0
+                        for meta in pn_meta:
+                            h_raw = str(meta.get("handle") or "")
+                            hh = h_raw.upper()
+                            if not hh or hh not in ins_map or hh not in pillar_bbs:
+                                continue
+                            cur_ip = ins_map[hh]
+                            cur_bb = pillar_bbs[hh]
+
+                            def _overlap_count(test_bb: Dict[str, Dict[str, float]]) -> int:
+                                c = 0
+                                # against bearing/distance texts
+                                for ob in bearing_bbs:
+                                    if _aabb_overlaps(test_bb, ob, pad=pad):
+                                        c += 1
+                                # against already-placed bearing labels (local estimates)
+                                for ob in (_placed_label_bboxes or []):
+                                    if _aabb_overlaps(test_bb, ob, pad=pad):
+                                        c += 1
+                                # against other sheet annotations we sampled earlier (exclude self layer to avoid double-counting)
+                                for ob in (_occupied_bboxes or []):
+                                    lyr = str(ob.get("layer") or "").upper()
+                                    if lyr == "CADA_PILLARNUMBERS":
+                                        continue
+                                    if _aabb_overlaps(test_bb, ob, pad=pad):
+                                        c += 1
+                                # against other pillar numbers
+                                for oh, ob in pillar_bbs.items():
+                                    if oh == hh:
+                                        continue
+                                    if _aabb_overlaps(test_bb, ob, pad=pad):
+                                        c += 1
+                                # hard drafting penalties: don't cross peg symbols or intrude into traverse unless unavoidable
+                                for ob in pillar_obj_bbs:
+                                    if _aabb_overlaps(test_bb, ob, pad=0.05):
+                                        c += 50
+                                if _aabb_crosses_traverse(test_bb, local_pts):
+                                    c += 50
+                                return c
+
+                            base_overlaps = _overlap_count(cur_bb)
+                            if base_overlaps <= 0:
+                                continue
+
+                            ux0 = float(meta.get("ux", 0.0))
+                            uy0 = float(meta.get("uy", 0.0))
+                            L0 = math.hypot(ux0, uy0) or 1.0
+                            ux0, uy0 = ux0 / L0, uy0 / L0
+                            vx0, vy0 = -uy0, ux0
+
+                            # Hard cap the search radius to preserve survey drafting style:
+                            # labels should stay close to their corresponding pillar.
+                            off0 = float(meta.get("off", 4.0) or 4.0)
+                            max_r = max(1.0, min(2.2 * off0, 4.5))
+                            angles_deg = [0, 20, -20, 40, -40, 60, -60, 80, -80, 100, -100, 120, -120, 150, -150, 180]
+                            best = {"score": base_overlaps, "cost": float(base_overlaps) * 1000.0, "r": 0.0, "dx": 0.0, "dy": 0.0, "bb": cur_bb}
+
+                            r = step
+                            while r <= max_r + 1e-9:
+                                for ad in angles_deg:
+                                    th = math.radians(float(ad))
+                                    dx0 = (ux0 * math.cos(th) + vx0 * math.sin(th)) * r
+                                    dy0 = (uy0 * math.cos(th) + vy0 * math.sin(th)) * r
+                                    test_bb = _shift_aabb(cur_bb, dx0, dy0)
+                                    if not _aabb_inside_interior(test_bb, margin):
+                                        continue
+                                    score = _overlap_count(test_bb)
+                                    # Prefer fewer overlaps, then shorter moves (cost function).
+                                    cost = float(score) * 1000.0 + float(r)
+                                    if (score < best["score"]) or (score == best["score"] and cost < best["cost"]):
+                                        best = {"score": score, "cost": cost, "r": r, "dx": dx0, "dy": dy0, "bb": test_bb}
+                                        if score == 0:
+                                            break
+                                if best["score"] == 0:
+                                    break
+                                r += step
+
+                            # Only move if we strictly improve overlap score (prevents oscillation).
+                            if best["r"] > 0.0 and best["score"] < base_overlaps and (best["dx"] != 0.0 or best["dy"] != 0.0):
+                                try:
+                                    self.autocad.move_entity_to_xy(h_raw, cur_ip[0] + float(best["dx"]), cur_ip[1] + float(best["dy"]))
+                                    ins_map[hh] = (cur_ip[0] + float(best["dx"]), cur_ip[1] + float(best["dy"]))
+                                    pillar_bbs[hh] = best["bb"]
+                                    moved += 1
+                                except Exception:
+                                    pass
+                        if moved == 0:
+                            break
+
+                    # Final proximity normalization: keep each pillar-number table close to its own pillar.
+                    # This prevents any residual "too far" appearance after overlap reduction.
+                    bb3 = self.autocad.list_entity_bboxes(
+                        layers=["CADA_PILLARNUMBERS"],
+                        object_names=["AcDbTable"],
+                    )
+                    bbs3 = list((bb3 or {}).get("bboxes") or []) if (bb3 or {}).get("success") else []
+                    bb3_by_h = {str((b.get("handle") or "")).upper(): b for b in bbs3 if b.get("handle")}
+
+                    def _dist_point_to_bbox(px: float, py: float, b: Dict[str, Any]) -> float:
+                        mn = b.get("min") or {}
+                        mx = b.get("max") or {}
+                        minx, miny = float(mn.get("x", 0.0)), float(mn.get("y", 0.0))
+                        maxx, maxy = float(mx.get("x", 0.0)), float(mx.get("y", 0.0))
+                        dx0 = 0.0 if (minx <= px <= maxx) else (minx - px if px < minx else px - maxx)
+                        dy0 = 0.0 if (miny <= py <= maxy) else (miny - py if py < miny else py - maxy)
+                        return math.hypot(dx0, dy0)
+
+                    target_min_gap = 0.8
+                    target_max_gap = 2.0
+                    for meta in pn_meta:
+                        h_raw = str(meta.get("handle") or "")
+                        hh = h_raw.upper()
+                        if not hh or hh not in ins_map or hh not in bb3_by_h:
+                            continue
+                        vx = float(meta.get("vx", 0.0))
+                        vy = float(meta.get("vy", 0.0))
+                        cur_ip = ins_map[hh]
+                        cur_bb = bb3_by_h[hh]
+                        g = _dist_point_to_bbox(vx, vy, cur_bb)
+                        # Move only when clearly outside desired proximity band.
+                        if (g >= target_min_gap - 0.05) and (g <= target_max_gap + 0.05):
+                            continue
+
+                        vec_x = float(cur_ip[0]) - vx
+                        vec_y = float(cur_ip[1]) - vy
+                        vec_L = math.hypot(vec_x, vec_y)
+                        if vec_L <= 1e-9:
+                            vec_x = float(meta.get("ux", 1.0))
+                            vec_y = float(meta.get("uy", 0.0))
+                            vec_L = math.hypot(vec_x, vec_y) or 1.0
+                        ux1, uy1 = vec_x / vec_L, vec_y / vec_L
+
+                        if g < target_min_gap:
+                            delta = target_min_gap - g
+                        else:
+                            delta = -(g - target_max_gap)
+
+                        nx = float(cur_ip[0]) + ux1 * delta
+                        ny = float(cur_ip[1]) + uy1 * delta
+                        # Guardrail: do not worsen annotation collisions while enforcing proximity.
+                        cur_score = 0
+                        for ob in bearing_bbs:
+                            if _aabb_overlaps(cur_bb, ob, pad=pad):
+                                cur_score += 1
+                        for oh, ob in bb3_by_h.items():
+                            if oh == hh:
+                                continue
+                            if _aabb_overlaps(cur_bb, ob, pad=pad):
+                                cur_score += 1
+                        for ob in pillar_obj_bbs:
+                            if _aabb_overlaps(cur_bb, ob, pad=0.05):
+                                cur_score += 50
+                        if _aabb_crosses_traverse(cur_bb, local_pts):
+                            cur_score += 50
+                        test_bb = _shift_aabb(cur_bb, nx - float(cur_ip[0]), ny - float(cur_ip[1]))
+                        if not _aabb_inside_interior(test_bb, margin):
+                            continue
+                        new_score = 0
+                        for ob in bearing_bbs:
+                            if _aabb_overlaps(test_bb, ob, pad=pad):
+                                new_score += 1
+                        for oh, ob in bb3_by_h.items():
+                            if oh == hh:
+                                continue
+                            if _aabb_overlaps(test_bb, ob, pad=pad):
+                                new_score += 1
+                        for ob in pillar_obj_bbs:
+                            if _aabb_overlaps(test_bb, ob, pad=0.05):
+                                new_score += 50
+                        if _aabb_crosses_traverse(test_bb, local_pts):
+                            new_score += 50
+                        if new_score > cur_score:
+                            continue
+                        try:
+                            self.autocad.move_entity_to_xy(h_raw, nx, ny)
+                            ins_map[hh] = (nx, ny)
+                            bb3_by_h[hh] = test_bb
+                        except Exception:
+                            pass
+            except Exception:
+                pass
 
             try:
                 self.autocad.execute_command("REGEN")
@@ -2021,11 +3192,11 @@ class SurvyAIAgent:
                         r"(?:linking|between|connecting|on|along|joining)\s+(?:the\s+)?(?:side\s+)?(?:of\s+)?(?:boundary\s+)?(?:line\s+)?(?:pillars\s+)?(.*)$",
                         spec_lower,
                     )
-                    target_idx = -1
+                    target_indices: List[int] = []
                     if ref_match and pn_list:
                         ref_str = ref_match.group(1).strip()
                         ref_str_norm = re.sub(r"\s+", " ", ref_str)
-                        matched_indices: List[int] = []
+                        matched_ordered: List[Tuple[int, int]] = []
                         for idx, p_info in enumerate(pn_list):
                             num = str(p_info.get("number", "")).strip()
                             prefix = str(p_info.get("prefix", "")).strip()
@@ -2033,76 +3204,90 @@ class SurvyAIAgent:
                                 continue
                             full_label = (prefix + " " + num).lower()
                             num_lower = num.lower()
-                            if full_label in ref_str_norm.lower():
-                                matched_indices.append(idx)
-                            elif re.search(r"\b" + re.escape(num_lower) + r"\b", ref_str_norm.lower()):
-                                matched_indices.append(idx)
-                        if len(matched_indices) >= 2:
+                            ref_lower = ref_str_norm.lower()
+                            pos = ref_lower.find(full_label)
+                            if pos >= 0:
+                                matched_ordered.append((pos, idx))
+                                continue
+                            m_num = re.search(r"\b" + re.escape(num_lower) + r"\b", ref_lower)
+                            if m_num:
+                                matched_ordered.append((m_num.start(), idx))
+                        if len(matched_ordered) >= 2:
+                            matched_ordered.sort(key=lambda x: x[0])
+                            ordered_indices: List[int] = []
+                            seen_idx: set[int] = set()
+                            for _, idx in matched_ordered:
+                                if idx not in seen_idx:
+                                    ordered_indices.append(idx)
+                                    seen_idx.add(idx)
                             n_pts = len(local_pts)
-                            for i in range(n_pts):
-                                j = (i + 1) % n_pts
-                                if i in matched_indices and j in matched_indices:
-                                    target_idx = i
-                                    break
+                            # Chain support: "A to B to C to D" means fences on AB, BC, and CD.
+                            for kk in range(len(ordered_indices) - 1):
+                                a_idx = ordered_indices[kk]
+                                b_idx = ordered_indices[kk + 1]
+                                for i in range(n_pts):
+                                    j = (i + 1) % n_pts
+                                    if (i == a_idx and j == b_idx) or (i == b_idx and j == a_idx):
+                                        target_indices.append(i)
+                                        break
 
-                    if target_idx == -1 and len(local_pts) >= 2:
-                        target_idx = 0
-                    if target_idx == -1:
+                    if not target_indices and len(local_pts) >= 2:
+                        target_indices = [0]
+                    if not target_indices:
                         continue
-                    if target_idx in used_fence_edges:
-                        continue
-                    used_fence_edges.add(target_idx)
+                    for target_idx in target_indices:
+                        if target_idx in used_fence_edges:
+                            continue
+                        used_fence_edges.add(target_idx)
 
-                    p1 = local_pts[target_idx]
-                    p2 = local_pts[(target_idx + 1) % len(local_pts)]
-                    dx = p2["x"] - p1["x"]
-                    dy = p2["y"] - p1["y"]
-                    L_bound = math.hypot(dx, dy)
-                    if L_bound <= 1e-6:
-                        continue
+                        p1 = local_pts[target_idx]
+                        p2 = local_pts[(target_idx + 1) % len(local_pts)]
+                        dx = p2["x"] - p1["x"]
+                        dy = p2["y"] - p1["y"]
+                        L_bound = math.hypot(dx, dy)
+                        if L_bound <= 1e-6:
+                            continue
 
-                    ux, uy = dx / L_bound, dy / L_bound
+                        ux, uy = dx / L_bound, dy / L_bound
 
-                    # Outward normal using centroid
-                    midx = (p1["x"] + p2["x"]) / 2.0
-                    midy = (p1["y"] + p2["y"]) / 2.0
-                    poly_cx = sum(p["x"] for p in local_pts) / len(local_pts)
-                    poly_cy = sum(p["y"] for p in local_pts) / len(local_pts)
-                    vx = poly_cx - midx
-                    vy = poly_cy - midy
-                    n1x, n1y = uy, -ux
-                    n2x, n2y = -uy, ux
-                    if (n1x * vx + n1y * vy) >= (n2x * vx + n2y * vy):
-                        outx, outy = -n1x, -n1y
-                    else:
-                        outx, outy = -n2x, -n2y
+                        # Outward normal using centroid
+                        midx = (p1["x"] + p2["x"]) / 2.0
+                        midy = (p1["y"] + p2["y"]) / 2.0
+                        poly_cx = sum(p["x"] for p in local_pts) / len(local_pts)
+                        poly_cy = sum(p["y"] for p in local_pts) / len(local_pts)
+                        vx = poly_cx - midx
+                        vy = poly_cy - midy
+                        n1x, n1y = uy, -ux
+                        n2x, n2y = -uy, ux
+                        if (n1x * vx + n1y * vy) >= (n2x * vx + n2y * vy):
+                            outx, outy = -n1x, -n1y
+                        else:
+                            outx, outy = -n2x, -n2y
 
-                    f_s = {"x": p1["x"] + fence_offset * outx, "y": p1["y"] + fence_offset * outy}
-                    f_e = {"x": p2["x"] + fence_offset * outx, "y": p2["y"] + fence_offset * outy}
-                    self.autocad.create_lwpolyline([f_s, f_e], layer="CADA_CWF", closed=False, linetype_scale=3.0)
+                        f_s = {"x": p1["x"] + fence_offset * outx, "y": p1["y"] + fence_offset * outy}
+                        f_e = {"x": p2["x"] + fence_offset * outx, "y": p2["y"] + fence_offset * outy}
+                        self.autocad.create_lwpolyline([f_s, f_e], layer="CADA_CWF", closed=False, linetype_scale=3.0)
 
-                    label = "C.W.F" if kind == "CWF" else "D.C.W.F"
-                    # Fence label height is half of bearing/distances text height
-                    fence_text_h = max(0.25, 0.5 * float(bearing_road_height))
-                    # Center label above fence line (slightly outward to avoid overlap)
-                    tx = (f_s["x"] + f_e["x"]) / 2.0 + (fence_text_h * 1.2) * outx
-                    ty = (f_s["y"] + f_e["y"]) / 2.0 + (fence_text_h * 1.2) * outy
-                    rot_rad = math.atan2(uy, ux)
-                    deg = math.degrees(rot_rad) % 360
-                    if 90 < deg <= 270:
-                        rot_rad += math.pi
-                    fence_fmt = f"{{\\fVerdana|b0|i0|c0|p34;{label}}}"
-                    txt_width = max(10.0, L_bound)
-                    self.autocad.add_mtext(
-                        fence_fmt,
-                        tx,
-                        ty,
-                        layer="CADA_CWF",
-                        rotation_rad=rot_rad,
-                        height=float(fence_text_h),
-                        width=txt_width,
-                        attachment_point=5,
-                    )
+                        label = "C.W.F" if kind == "CWF" else "D.C.W.F"
+                        fence_text_h = max(0.25, 0.5 * float(bearing_road_height))
+                        tx = (f_s["x"] + f_e["x"]) / 2.0 + (fence_text_h * 1.2) * outx
+                        ty = (f_s["y"] + f_e["y"]) / 2.0 + (fence_text_h * 1.2) * outy
+                        rot_rad = math.atan2(uy, ux)
+                        deg = math.degrees(rot_rad) % 360
+                        if 90 < deg <= 270:
+                            rot_rad += math.pi
+                        fence_fmt = f"{{\\fVerdana|b0|i0|c0|p34;{label}}}"
+                        txt_width = max(10.0, L_bound)
+                        self.autocad.add_mtext(
+                            fence_fmt,
+                            tx,
+                            ty,
+                            layer="CADA_CWF",
+                            rotation_rad=rot_rad,
+                            height=float(fence_text_h),
+                            width=txt_width,
+                            attachment_point=5,
+                        )
                 except Exception:
                     continue
 
@@ -2618,12 +3803,18 @@ class SurvyAIAgent:
         """Load all known survey plan template paths from template_profiles so they are never written."""
         from pathlib import Path
         import json as _json
-        profile_dir = Path("template_profiles").resolve()
+        profile_dir = self._cad_template_profiles_dir()
         if not profile_dir.exists():
             return
         for prof_path in profile_dir.glob("*.json"):
             try:
                 data = _json.loads(prof_path.read_text(encoding="utf-8"))
+                if isinstance(data.get("templates"), list):
+                    for ent in data.get("templates") or []:
+                        tp = str((ent or {}).get("path") or "")
+                        if tp:
+                            self._protected_template_paths.add(str(Path(tp).resolve()))
+                    continue
                 tp = (data.get("template") or {}).get("path") or ""
                 if tp:
                     self._protected_template_paths.add(str(Path(tp).resolve()))
@@ -6962,6 +8153,26 @@ class SurvyAIAgent:
                     ]
                     if fast.get("access_road_title"):
                         resp_lines.append(f"- Access road title (as plotted): {fast.get('access_road_title')!r}")
+                    try:
+                        bow = (fast.get("geometry") or {}).get("bowditch") if isinstance(fast, dict) else None
+                        if isinstance(bow, dict) and bow.get("mode") == "bearing_distance":
+                            if bow.get("applied"):
+                                resp_lines.append(
+                                    "- Bowditch adjustment applied (misclosure > 1cm): "
+                                    f"misclosure={bow.get('misclosure_m'):.3f}m "
+                                    f"(E={bow.get('misclosure_e_m'):.3f}m, N={bow.get('misclosure_n_m'):.3f}m), "
+                                    f"max point shift={bow.get('max_point_shift_m'):.3f}m."
+                                )
+                                prev = bow.get("adjusted_points_preview") or []
+                                if prev:
+                                    resp_lines.append(f"- Adjusted points preview (first {len(prev)}): {prev}")
+                            else:
+                                resp_lines.append(
+                                    "- Bowditch adjustment not applied: "
+                                    f"misclosure={bow.get('misclosure_m'):.3f}m (<= 0.010m threshold)."
+                                )
+                    except Exception:
+                        pass
                     resp_lines.append("\nYou can request modifications in this session (e.g. add another road, change the title) without closing or re-prompting.")
                     return {
                         "query": query,

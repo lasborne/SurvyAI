@@ -1,0 +1,64 @@
+{
+  "templates": [
+    {
+      "id": "survey_plan_template1000",
+      "path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\survey_plan_template1000.dwg",
+      "name": "survey_plan_template1000.dwg",
+      "aliases": [
+        "survey_plan_template1000",
+        "survey_plan_template1000.dwg",
+        "survey",
+        "plan",
+        "template1000"
+      ],
+      "use_count": 0,
+      "profile_path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\template_profiles\\survey_plan_template1000.json",
+      "last_used_at": "2026-02-05 10:56:13",
+      "is_available": false,
+      "signature": {
+        "size_bytes": -1,
+        "mtime_ns": -1
+      }
+    },
+    {
+      "id": "survey_plan_template2",
+      "path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\survey_plan_template2.dwg",
+      "name": "survey_plan_template2.dwg",
+      "aliases": [
+        "survey_plan_template2",
+        "survey_plan_template2.dwg",
+        "survey",
+        "plan",
+        "template2"
+      ],
+      "use_count": 0,
+      "profile_path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\template_profiles\\survey_plan_template2.json",
+      "last_used_at": "2026-02-26 07:44:14",
+      "is_available": true,
+      "signature": {
+        "size_bytes": 83534,
+        "mtime_ns": 1772001578000000000
+      }
+    },
+    {
+      "id": "survey_plan_template3",
+      "path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\survey_plan_template3.dwg",
+      "name": "survey_plan_template3.dwg",
+      "aliases": [
+        "survey_plan_template3",
+        "survey_plan_template3.dwg",
+        "survey",
+        "plan",
+        "template3"
+      ],
+      "last_used_at": "2026-03-20T12:09:30Z",
+      "use_count": 4,
+      "profile_path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\template_profiles\\survey_plan_template3.json",
+      "signature": {
+        "size_bytes": 102208,
+        "mtime_ns": 1773997936000000000
+      },
+      "is_available": true
+    }
+  ]
+}
