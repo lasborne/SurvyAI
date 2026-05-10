@@ -207,6 +207,109 @@ class AutoCADProcessor:
         # Optionally connect immediately
         if auto_connect:
             self.connect()
+
+    def _autocad_version_catalog(self) -> List[Tuple[int, List[str]]]:
+        """
+        Return supported AutoCAD COM ProgID aliases by release year.
+
+        Notes:
+        - AutoCAD COM ProgIDs vary by release and can appear with or without a
+          trailing ".0" style minor version.
+        - We support versions down to AutoCAD 2007 as requested.
+        """
+        catalog: List[Tuple[int, List[str]]] = [
+            (2025, ["AutoCAD.Application.24.4", "AutoCAD.Application.25"]),
+            (2024, ["AutoCAD.Application.24.3", "AutoCAD.Application.24"]),
+            (2023, ["AutoCAD.Application.24.2"]),
+            (2022, ["AutoCAD.Application.24.1", "AutoCAD.Application.23"]),
+            (2021, ["AutoCAD.Application.24.0", "AutoCAD.Application.22"]),
+            (2020, ["AutoCAD.Application.23.1", "AutoCAD.Application.21"]),
+            (2019, ["AutoCAD.Application.23.0", "AutoCAD.Application.20"]),
+            (2018, ["AutoCAD.Application.22.0", "AutoCAD.Application.19"]),
+            (2017, ["AutoCAD.Application.21.0", "AutoCAD.Application.18"]),
+            (2016, ["AutoCAD.Application.20.1"]),
+            (2015, ["AutoCAD.Application.20.0"]),
+            (2014, ["AutoCAD.Application.19.1"]),
+            (2013, ["AutoCAD.Application.19.0"]),
+            (2012, ["AutoCAD.Application.18.2"]),
+            (2011, ["AutoCAD.Application.18.1"]),
+            (2010, ["AutoCAD.Application.18.0"]),
+            (2009, ["AutoCAD.Application.17.2"]),
+            (2008, ["AutoCAD.Application.17.1"]),
+            (2007, ["AutoCAD.Application.17.0"]),
+        ]
+        return catalog
+
+    def _unique_progids(self, progids: List[str]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for progid in progids:
+            key = str(progid).strip().lower()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(str(progid))
+        return out
+
+    def _versioned_autocad_progids_newest_first(self) -> List[str]:
+        """
+        Version-specific ProgIDs only, newest → oldest (2007…recent).
+        Used after ``AutoCAD.Application`` when attaching to a running session.
+        """
+        progids: List[str] = []
+        for _year, aliases in sorted(self._autocad_version_catalog(), key=lambda x: x[0], reverse=True):
+            progids.extend(aliases)
+        return self._unique_progids(progids)
+
+    def _attach_running_autocad(self):
+        """
+        Connect to an **already running** AutoCAD.
+
+        Order:
+        1) ``GetActiveObject("AutoCAD.Application")`` — usually the automation
+           server for whichever session the user actually opened (avoids picking
+           2021-specific ProgID when e.g. 2019 is the running window).
+        2) Version-specific ProgIDs, newest → … → 2007 — for installs that do
+           not register the generic ProgID.
+        """
+        import win32com.client
+
+        for progid in ("AutoCAD.Application",):
+            try:
+                acad = win32com.client.GetActiveObject(progid)
+                return acad, progid
+            except Exception:
+                continue
+        for progid in self._versioned_autocad_progids_newest_first():
+            try:
+                acad = win32com.client.GetActiveObject(progid)
+                return acad, progid
+            except Exception:
+                continue
+        return None, None
+
+    def _startup_autocad_progids(self) -> List[str]:
+        """
+        Order for starting AutoCAD when none is currently open.
+        Preference:
+        1. AutoCAD 2021 if installed
+        2. Latest installed version available
+        3. Generic AutoCAD ProgID as final fallback
+        """
+        catalog = {year: aliases for year, aliases in self._autocad_version_catalog()}
+        progids: List[str] = []
+
+        # Default preferred release
+        progids.extend(catalog.get(2021, []))
+
+        # Then newest -> oldest, excluding the already-preferred 2021
+        for year, aliases in sorted(self._autocad_version_catalog(), key=lambda x: x[0], reverse=True):
+            if year == 2021:
+                continue
+            progids.extend(aliases)
+
+        progids.append("AutoCAD.Application")
+        return self._unique_progids(progids)
     
     # ==========================================================================
     # CONNECTION MANAGEMENT
@@ -246,63 +349,51 @@ class AutoCADProcessor:
         # ------------------------------------------------------------------
         try:
             import win32com.client
-            
-            # List of AutoCAD ProgIDs to try (different versions)
-            # Order: Generic first, then specific versions (newer to older)
-            autocad_progids = [
-                "AutoCAD.Application",           # Generic - uses default version
-                "AutoCAD.Application.25",        # AutoCAD 2025
-                "AutoCAD.Application.24",        # AutoCAD 2024
-                "AutoCAD.Application.23",        # AutoCAD 2022/2023
-                "AutoCAD.Application.22",        # AutoCAD 2021
-                "AutoCAD.Application.21",        # AutoCAD 2020
-                "AutoCAD.Application.20",        # AutoCAD 2019
-                "AutoCAD.Application.19",        # AutoCAD 2018
-                "AutoCAD.Application.18",        # AutoCAD 2017
-            ]
-            
-            # First, try to connect to an already running instance
-            # GetActiveObject finds a running COM server
+
+            startup_progids = self._startup_autocad_progids()
+
+            # First, attach to any already running AutoCAD (prefer user's open session).
             connected = False
-            for progid in autocad_progids:
+            self.acad, progid_used = self._attach_running_autocad()
+            if self.acad is not None:
+                ver = None
                 try:
-                    self.acad = win32com.client.GetActiveObject(progid)
-                    logger.info(f"Connected to running AutoCAD instance via {progid}")
-                    connected = True
-                    break
+                    ver = str(getattr(self.acad, "Version", "") or "")
                 except Exception:
-                    continue
-            
+                    ver = None
+                logger.info(
+                    f"Connected to running AutoCAD via {progid_used}"
+                    + (f" (Version: {ver})" if ver else "")
+                )
+                connected = True
+
             if not connected:
-                # No running instance - try to start one
-                logger.info("No running AutoCAD instance found. Attempting to start...")
-                
-                for progid in autocad_progids:
+                # No running instance - start one using the preferred order:
+                # 2021 first, then the newest installed version that responds.
+                logger.info("No running AutoCAD instance found. Attempting to start preferred AutoCAD version...")
+
+                for progid in startup_progids:
                     try:
-                        # Try DispatchEx first (creates new instance)
                         try:
                             self.acad = win32com.client.DispatchEx(progid)
                             logger.info(f"Started new AutoCAD instance via DispatchEx ({progid})")
                         except Exception:
                             self.acad = win32com.client.Dispatch(progid)
                             logger.info(f"Started new AutoCAD instance via Dispatch ({progid})")
-                            
-                        # Make AutoCAD visible
+
                         self.acad.Visible = True
-                        
-                        # Give AutoCAD time to initialize
+
                         logger.info("Waiting for AutoCAD to initialize...")
                         time.sleep(3)
-                        
+
                         connected = True
                         break
-                        
+
                     except Exception as e:
                         logger.debug(f"Could not connect via {progid}: {e}")
                         continue
-                
+
                 if not connected:
-                    # Provide detailed troubleshooting info
                     logger.error("=" * 60)
                     logger.error("AUTOCAD CONNECTION FAILED")
                     logger.error("=" * 60)
@@ -371,6 +462,104 @@ class AutoCADProcessor:
     # ==========================================================================
     # DRAWING MANAGEMENT
     # ==========================================================================
+    
+    def close_drawing_if_open(self, file_path: str, *, save_changes: bool = False) -> Dict[str, Any]:
+        """
+        Close a drawing if it is currently open in AutoCAD.
+
+        This is used to avoid creating unintended extra files when regenerating an
+        output DWG that is already open in the UI.
+        """
+        # Ensure we're connected
+        if not self.is_connected:
+            if not self.connect():
+                return {"success": False, "error": "Not connected to AutoCAD"}
+
+        from pathlib import Path
+        import time
+
+        target = Path(file_path).resolve()
+        target_name = target.name.lower()
+
+        try:
+            docs = self.acad.Documents
+        except Exception as e:
+            return {"success": False, "error": f"AutoCAD Documents unavailable: {e}"}
+
+        closed_any = False
+        last_err = None
+        try:
+            n = int(getattr(docs, "Count", 0))
+        except Exception:
+            n = 0
+
+        for i in range(n):
+            try:
+                d = getattr(docs, "Item")(i)
+            except Exception as e:
+                last_err = e
+                continue
+            try:
+                full = str(getattr(d, "FullName", "") or "")
+                nm = str(getattr(d, "Name", "") or "").lower()
+                match = False
+                try:
+                    if full and Path(full).resolve() == target:
+                        match = True
+                except Exception:
+                    pass
+                if not match and nm == target_name:
+                    match = True
+                if not match:
+                    continue
+                try:
+                    d.Close(bool(save_changes))
+                    closed_any = True
+                    time.sleep(0.2)
+                except Exception as e:
+                    last_err = e
+                    continue
+            except Exception as e:
+                last_err = e
+                continue
+
+        return {"success": True, "closed": closed_any, "error": str(last_err) if last_err else None}
+
+    def is_drawing_open(self, file_path: str) -> bool:
+        """
+        True if AutoCAD already has this drawing open as a saved document (FullName matches resolved path).
+
+        Used to avoid closing the user's tab or failing to overwrite the DWG on disk: automation can
+        activate the open document and edit in place instead.
+        """
+        if not self.is_connected:
+            if not self.connect():
+                return False
+        from pathlib import Path
+
+        try:
+            target = Path(file_path).resolve()
+        except Exception:
+            return False
+        try:
+            docs = self.acad.Documents
+            n = int(getattr(docs, "Count", 0))
+        except Exception:
+            return False
+        for i in range(n):
+            try:
+                d = getattr(docs, "Item")(i)
+                full = str(getattr(d, "FullName", "") or "").strip()
+                if not full:
+                    continue
+                try:
+                    if Path(full).resolve() == target:
+                        return True
+                except Exception:
+                    continue
+            except Exception:
+                continue
+        return False
     
     def open_drawing(self, file_path: str, read_only: bool = False) -> Dict[str, Any]:
         """
@@ -2008,6 +2197,115 @@ class AutoCADProcessor:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def copy_entity_by_handle(self, handle: str, dx: float = 0.0, dy: float = 0.0, layer: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Copy a single ModelSpace entity by handle and optionally move it by (dx, dy).
+        Useful for cloning template-driven TABLE entities (e.g., CADA_PILLARNUMBERS).
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        try:
+            import pythoncom
+            import win32com.client
+
+            ms = self.doc.ModelSpace
+            src = None
+            for i in range(ms.Count):
+                try:
+                    e = ms.Item(i)
+                    if str(getattr(e, "Handle", "")).upper() == str(handle).upper():
+                        src = e
+                        break
+                except Exception:
+                    continue
+            if src is None:
+                return {"success": False, "error": f"Entity with handle {handle} not found"}
+
+            new_ent = None
+            last_err = None
+            for attempt in range(6):
+                try:
+                    new_ent = src.Copy()
+                    break
+                except Exception as ex:
+                    last_err = ex
+                    time.sleep(0.2 * (attempt + 1))
+            if new_ent is None:
+                return {"success": False, "error": str(last_err) if last_err else "Copy failed"}
+
+            if layer:
+                try:
+                    new_ent.Layer = str(layer)
+                except Exception:
+                    pass
+
+            dx_f = float(dx)
+            dy_f = float(dy)
+            if abs(dx_f) > 1e-12 or abs(dy_f) > 1e-12:
+                try:
+                    p_from = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (0.0, 0.0, 0.0))
+                    p_to = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (dx_f, dy_f, 0.0))
+                    new_ent.Move(p_from, p_to)
+                except Exception:
+                    try:
+                        new_ent.Move((0.0, 0.0, 0.0), (dx_f, dy_f, 0.0))
+                    except Exception:
+                        pass
+
+            out = {"success": True, "source_handle": str(handle), "handle": getattr(new_ent, "Handle", None), "layer": getattr(new_ent, "Layer", None)}
+            try:
+                for attr in ("InsertionPoint", "Position"):
+                    pt = getattr(new_ent, attr, None)
+                    if pt is not None:
+                        out["insertion_point"] = {"x": float(pt[0]), "y": float(pt[1])}
+                        break
+            except Exception:
+                pass
+            return out
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def list_entity_bboxes(self, layers: Optional[List[str]] = None, object_names: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        List axis-aligned bounding boxes for matching ModelSpace entities.
+        Returns individual bboxes (not union), best-effort.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        want_layers = {str(l).upper() for l in (layers or []) if str(l).strip()}
+        want_objs = {str(o) for o in (object_names or []) if str(o).strip()}
+        try:
+            ms = self.doc.ModelSpace
+            out = []
+            for i in range(ms.Count):
+                try:
+                    e = ms.Item(i)
+                    lyr = str(getattr(e, "Layer", "")).upper()
+                    obj = str(getattr(e, "ObjectName", ""))
+                    if want_layers and lyr not in want_layers:
+                        continue
+                    if want_objs and obj not in want_objs:
+                        continue
+                    try:
+                        bb = e.GetBoundingBox()
+                        pmin, pmax = bb[0], bb[1]
+                        out.append(
+                            {
+                                "handle": getattr(e, "Handle", None),
+                                "layer": getattr(e, "Layer", None),
+                                "object_name": obj,
+                                "min": {"x": float(pmin[0]), "y": float(pmin[1])},
+                                "max": {"x": float(pmax[0]), "y": float(pmax[1])},
+                            }
+                        )
+                    except Exception:
+                        continue
+                except Exception:
+                    continue
+            return {"success": True, "count": len(out), "bboxes": out}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def set_layer_color(self, layer: str, color_code: int) -> Dict[str, Any]:
         """Set a layer's color (ACI). Example: color_code=1 for red."""
         if not self._ensure_active_document():
@@ -2283,6 +2581,433 @@ class AutoCADProcessor:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def scale_modelspace_by_layers(
+        self,
+        base_x: float,
+        base_y: float,
+        scale_factor: float,
+        layers: List[str],
+    ) -> Dict[str, Any]:
+        """
+        Scale all ModelSpace entities on the given layers by scale_factor about (base_x, base_y).
+        Uses AutoCAD COM ScaleEntity; best-effort across entity types.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        if not layers or float(scale_factor) <= 0.0:
+            return {"success": False, "error": "layers must be non-empty and scale_factor must be positive"}
+        try:
+            import pythoncom
+            import win32com.client
+
+            ms = self.doc.ModelSpace
+            want = {str(l).upper() for l in layers}
+            base_pt = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (float(base_x), float(base_y), 0.0))
+            sf = float(scale_factor)
+            scaled = 0
+            for i in range(ms.Count):
+                try:
+                    e = ms.Item(i)
+                    if str(getattr(e, "Layer", "")).upper() not in want:
+                        continue
+                    try:
+                        e.ScaleEntity(base_pt, sf)
+                        scaled += 1
+                    except Exception:
+                        try:
+                            e.ScaleEntity((float(base_x), float(base_y), 0.0), sf)
+                            scaled += 1
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+            return {
+                "success": True,
+                "base_x": float(base_x),
+                "base_y": float(base_y),
+                "scale_factor": sf,
+                "layers": list(want),
+                "scaled_entities": scaled,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def scale_scalebar_text_values(
+        self,
+        scale_factor: float,
+        layers: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Multiply numeric values in TEXT/MTEXT entities on scalebar layers by scale_factor.
+
+        This is used to keep scale bar labels correct when a template sheet is scaled up/down.
+        Example: template 1:500 -> output 1:250 => factor = 250/500 = 0.5, so "10m" becomes "5m".
+
+        Notes:
+        - Only modifies entities whose Layer matches provided layers (case-insensitive).
+        - Attempts to update both ModelSpace entities and entities inside Block definitions.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        try:
+            import re
+
+            sf = float(scale_factor)
+            if sf <= 0:
+                return {"success": False, "error": "scale_factor must be positive"}
+
+            want = {str(l).upper() for l in (layers or ["SCALEBAR", "CADA_SCALEBAR"])}
+
+            num_re = re.compile(r"-?\d+(?:\.\d+)?")
+
+            def _fmt(x: float) -> str:
+                # Avoid -0, keep clean numeric formatting
+                if abs(x) < 5e-10:
+                    x = 0.0
+                xr = round(x, 6)
+                if abs(xr - round(xr)) < 1e-9:
+                    return str(int(round(xr)))
+                s = ("{:.6f}".format(xr)).rstrip("0").rstrip(".")
+                return s if s else "0"
+
+            def _should_update(text: str) -> bool:
+                # On scalebar layers, *all* numeric labels should scale (e.g. "10m" and "5").
+                # Only skip scale-ratio patterns if they ever appear (e.g. "1:250").
+                t = (text or "")
+                if re.search(r"\b1\s*:\s*\d+\b", t):
+                    return False
+                return bool(num_re.search(t))
+
+            def _scale_numbers(text: str) -> str:
+                if not text:
+                    return text
+                if not _should_update(text):
+                    return text
+
+                def repl(m: re.Match) -> str:
+                    try:
+                        v = float(m.group(0))
+                    except Exception:
+                        return m.group(0)
+                    return _fmt(v * sf)
+
+                return num_re.sub(repl, text)
+
+            def _get_text(ent) -> Optional[str]:
+                for prop in ("TextString", "Contents", "Text"):
+                    try:
+                        v = getattr(ent, prop, None)
+                        if v is not None:
+                            return str(v)
+                    except Exception:
+                        continue
+                return None
+
+            def _set_text(ent, new_text: str) -> bool:
+                for prop in ("TextString", "Contents", "Text"):
+                    try:
+                        if hasattr(ent, prop):
+                            setattr(ent, prop, str(new_text))
+                            return True
+                    except Exception:
+                        continue
+                return False
+
+            def _is_text_entity(ent) -> bool:
+                try:
+                    obj = str(getattr(ent, "ObjectName", "") or "")
+                except Exception:
+                    obj = ""
+                if obj in ("AcDbText", "AcDbMText"):
+                    return True
+                # Some AutoCAD variants expose attribute references as text-like
+                if "AcDbAttribute" in obj:
+                    return True
+                return False
+
+            def _layer_ok(ent) -> bool:
+                try:
+                    lyr = str(getattr(ent, "Layer", "") or "").upper()
+                    return lyr in want
+                except Exception:
+                    return False
+
+            updated = 0
+            scanned = 0
+
+            # 1) ModelSpace
+            ms = self.doc.ModelSpace
+            for i in range(ms.Count):
+                try:
+                    e = ms.Item(i)
+                    if not _is_text_entity(e) or not _layer_ok(e):
+                        continue
+                    scanned += 1
+                    old = _get_text(e)
+                    if old is None:
+                        continue
+                    new = _scale_numbers(old)
+                    if new != old and _set_text(e, new):
+                        updated += 1
+                except Exception:
+                    continue
+
+            # 2) Block definitions (covers scalebar text nested in blocks)
+            blocks_updated = 0
+            blocks_scanned = 0
+            blocks = getattr(self.doc, "Blocks", None)
+            if blocks is not None:
+                # Try index-based access first; if it fails, fallback to enumeration.
+                try:
+                    bcount = int(blocks.Count)
+                    block_iter = (blocks.Item(i) for i in range(bcount))
+                except Exception:
+                    try:
+                        block_iter = iter(blocks)
+                    except Exception:
+                        block_iter = []
+
+                for b in block_iter:
+                    try:
+                        # IMPORTANT: Blocks collection includes special blocks like "*Model_Space" and "*Paper_Space"
+                        # that reference the live contents of ModelSpace/PaperSpace. We already processed ModelSpace above,
+                        # so skipping these prevents applying the scale factor twice (e.g. 0.5 -> 0.25).
+                        try:
+                            bname = str(getattr(b, "Name", "") or "").upper()
+                            if bname in ("*MODEL_SPACE", "*PAPER_SPACE"):
+                                continue
+                        except Exception:
+                            pass
+                        blocks_scanned += 1
+                        try:
+                            ec = int(getattr(b, "Count", 0))
+                        except Exception:
+                            ec = 0
+                        for j in range(ec):
+                            try:
+                                e = b.Item(j)
+                                if not _is_text_entity(e) or not _layer_ok(e):
+                                    continue
+                                scanned += 1
+                                old = _get_text(e)
+                                if old is None:
+                                    continue
+                                new = _scale_numbers(old)
+                                if new != old and _set_text(e, new):
+                                    updated += 1
+                                    blocks_updated += 1
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+
+            return {
+                "success": True,
+                "scale_factor": sf,
+                "layers": list(want),
+                "text_entities_scanned": scanned,
+                "text_entities_updated": updated,
+                "blocks_scanned": blocks_scanned,
+                "block_text_entities_updated": blocks_updated,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def scale_hatch_pattern_scale_by_layers(
+        self,
+        scale_factor: float,
+        layers: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Multiply Hatch PatternScale for hatches on the specified layers by scale_factor.
+
+        Used so the scale bar hatching scales with the plan: e.g. template at 1:500 with
+        hatch PatternScale 4, output at 1:1000 → pass factor 2 so hatch becomes 8.
+
+        Notes:
+        - In ModelSpace, modifies hatch entities whose Layer matches provided layers (case-insensitive).
+        - In Block definitions, also modifies hatch entities in any block that is INSERTed on the provided
+          layers (even if the hatch's internal layer is "0"/ByBlock), since scalebars are often block-based.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        try:
+            sf = float(scale_factor)
+            if sf <= 0:
+                return {"success": False, "error": "scale_factor must be positive"}
+
+            want = {str(l).upper() for l in (layers or ["SCALEBAR", "CADA_SCALEBAR"])}
+
+            def _layer_ok(ent) -> bool:
+                try:
+                    lyr = str(getattr(ent, "Layer", "") or "").upper()
+                    return lyr in want
+                except Exception:
+                    return False
+
+            def _is_hatch_like(ent) -> bool:
+                try:
+                    obj = str(getattr(ent, "ObjectName", "") or "")
+                except Exception:
+                    obj = ""
+                if obj == "AcDbHatch":
+                    return True
+                # Best-effort: some variants expose hatch-like entities with PatternScale
+                try:
+                    return hasattr(ent, "PatternScale")
+                except Exception:
+                    return False
+
+            def _is_insert(ent) -> bool:
+                try:
+                    obj = str(getattr(ent, "ObjectName", "") or "")
+                except Exception:
+                    obj = ""
+                return obj in ("AcDbBlockReference", "AcDbMInsertBlock") or "BlockReference" in obj
+
+            def _get_block_name(ent) -> Optional[str]:
+                for prop in ("EffectiveName", "Name", "BlockName"):
+                    try:
+                        v = getattr(ent, prop, None)
+                        if v:
+                            return str(v)
+                    except Exception:
+                        continue
+                return None
+
+            updated = 0
+            scanned = 0
+            blocks_updated = 0
+            blocks_scanned = 0
+            blocks_targeted = 0
+            targeted_block_names: set[str] = set()
+
+            def _adjust(ent, *, ignore_layer: bool = False) -> bool:
+                try:
+                    if (not ignore_layer) and (not _layer_ok(ent)):
+                        return False
+                    if not _is_hatch_like(ent):
+                        return False
+                    if not hasattr(ent, "PatternScale"):
+                        return False
+                    old = getattr(ent, "PatternScale", None)
+                    if old is None:
+                        return False
+                    new = float(old) * sf
+                    if new <= 0:
+                        return False
+                    setattr(ent, "PatternScale", new)
+                    return True
+                except Exception:
+                    return False
+
+            def _scan_space_for_targets(space) -> None:
+                nonlocal targeted_block_names
+                try:
+                    for i in range(space.Count):
+                        try:
+                            e = space.Item(i)
+                            if not _is_insert(e) or not _layer_ok(e):
+                                continue
+                            bn = _get_block_name(e)
+                            if bn:
+                                targeted_block_names.add(str(bn).upper())
+                        except Exception:
+                            continue
+                except Exception:
+                    return
+
+            def _scale_space_hatches(space) -> None:
+                nonlocal scanned, updated
+                try:
+                    for i in range(space.Count):
+                        try:
+                            e = space.Item(i)
+                            if not _layer_ok(e) or not _is_hatch_like(e):
+                                continue
+                            scanned += 1
+                            if _adjust(e, ignore_layer=False):
+                                updated += 1
+                        except Exception:
+                            continue
+                except Exception:
+                    return
+
+            # 1) ModelSpace (+ PaperSpace if available)
+            ms = self.doc.ModelSpace
+            _scan_space_for_targets(ms)
+            _scale_space_hatches(ms)
+            try:
+                ps = getattr(self.doc, "PaperSpace", None)
+                if ps is not None:
+                    _scan_space_for_targets(ps)
+                    _scale_space_hatches(ps)
+            except Exception:
+                pass
+
+            # 2) Block definitions (covers scalebar hatch nested in blocks)
+            blocks = getattr(self.doc, "Blocks", None)
+            if blocks is not None:
+                try:
+                    bcount = int(blocks.Count)
+                    block_iter = (blocks.Item(i) for i in range(bcount))
+                except Exception:
+                    try:
+                        block_iter = iter(blocks)
+                    except Exception:
+                        block_iter = []
+
+                for b in block_iter:
+                    try:
+                        try:
+                            bname = str(getattr(b, "Name", "") or "").upper()
+                            if bname in ("*MODEL_SPACE", "*PAPER_SPACE"):
+                                continue
+                        except Exception:
+                            pass
+                        blocks_scanned += 1
+                        is_target_block = False
+                        try:
+                            is_target_block = bool(bname) and (bname in targeted_block_names)
+                        except Exception:
+                            is_target_block = False
+                        if is_target_block:
+                            blocks_targeted += 1
+                        try:
+                            ec = int(getattr(b, "Count", 0))
+                        except Exception:
+                            ec = 0
+                        for j in range(ec):
+                            try:
+                                e = b.Item(j)
+                                # In target blocks, allow hatch entities on layer "0"/ByBlock, etc.
+                                if (not is_target_block) and (not _layer_ok(e)):
+                                    continue
+                                if not _is_hatch_like(e):
+                                    continue
+                                scanned += 1
+                                if _adjust(e, ignore_layer=is_target_block):
+                                    updated += 1
+                                    blocks_updated += 1
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+
+            return {
+                "success": True,
+                "scale_factor": sf,
+                "layers": list(want),
+                "target_block_names": sorted(list(targeted_block_names))[:25],
+                "target_blocks_count": int(blocks_targeted),
+                "hatches_scanned": scanned,
+                "hatches_updated": updated,
+                "blocks_scanned": blocks_scanned,
+                "block_hatches_updated": blocks_updated,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def get_entity_insertion_xy(self, handle: str) -> Dict[str, Any]:
         """Get an entity's (x,y) from InsertionPoint/Position by handle (best-effort)."""
         if not self._ensure_active_document():
@@ -2349,6 +3074,15 @@ class AutoCADProcessor:
                     mt.Layer = str(layer)
                 except Exception:
                     pass
+            # Set height FIRST so the entity is never left at AutoCAD's default (often huge) if COM glitches.
+            req_height = float(height) if height is not None else None
+            if req_height is not None:
+                for prop in ("Height", "TextHeight"):
+                    try:
+                        setattr(mt, prop, req_height)
+                        break
+                    except Exception:
+                        continue
             # Middle-center by default for segment-centered labels
             try:
                 mt.AttachmentPoint = int(attachment_point)
@@ -2358,13 +3092,21 @@ class AutoCADProcessor:
                 mt.Rotation = float(rotation_rad)
             except Exception:
                 pass
-            if height is not None:
-                for prop in ("Height", "TextHeight"):
-                    try:
-                        setattr(mt, prop, float(height))
-                        break
-                    except Exception:
-                        continue
+            # Verify/correct height after AttachmentPoint/Rotation (COM can sometimes drop or wrong-foot height)
+            if req_height is not None:
+                try:
+                    actual = getattr(mt, "Height", None) or getattr(mt, "TextHeight", None)
+                    if actual is not None:
+                        actual = float(actual)
+                        if actual < 0.25 * req_height or actual > 4.0 * req_height:
+                            for prop in ("Height", "TextHeight"):
+                                try:
+                                    setattr(mt, prop, req_height)
+                                    break
+                                except Exception:
+                                    continue
+                except Exception:
+                    pass
 
             # IMPORTANT: AutoCAD can shift the InsertionPoint when AttachmentPoint/Rotation are set.
             # Re-anchor the MTEXT so its InsertionPoint ends up exactly at (x, y).
@@ -2433,6 +3175,239 @@ class AutoCADProcessor:
         except Exception as e:
             return {"success": False, "error": str(e)}
     
+    # ------------------------------------------------------------------
+    # TABLE READING UTILITIES
+    # ------------------------------------------------------------------
+
+    def read_full_table(self, handle: str) -> Dict[str, Any]:
+        """
+        Read all cell content from an AutoCAD TABLE object identified by handle.
+
+        Iterates every row and column and returns the text found in each cell.
+        Returns a 2-D list of strings (rows × cols).
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document."}
+        try:
+            ms = self.doc.ModelSpace
+            target = None
+            for i in range(ms.Count):
+                e = ms.Item(i)
+                if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                    target = e
+                    break
+            if target is None:
+                return {"success": False, "error": f"TABLE with handle {handle} not found"}
+
+            rows = int(target.Rows)
+            cols = int(target.Columns)
+            grid: list = []
+            for r in range(rows):
+                row_data: list = []
+                for c in range(cols):
+                    try:
+                        text = target.GetText(r, c)
+                    except Exception:
+                        text = ""
+                    row_data.append(str(text).strip())
+                grid.append(row_data)
+            return {
+                "success": True,
+                "handle": handle,
+                "rows": rows,
+                "cols": cols,
+                "grid": grid,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def dump_all_tables(self) -> Dict[str, Any]:
+        """
+        Read every TABLE object in ModelSpace and return all cell text.
+
+        Returns a list of table dicts, each with:
+          - handle, layer, rows, cols, insertion_point, grid (2-D list of cell strings)
+
+        This is the primary tool for reading title-block metadata (owner name,
+        plan number, surveyor, certification date, CRS, etc.) stored as TABLE objects.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document."}
+        try:
+            ms = self.doc.ModelSpace
+            tables = []
+            for i in range(ms.Count):
+                try:
+                    e = ms.Item(i)
+                    if getattr(e, "ObjectName", "") != "AcDbTable":
+                        continue
+                    handle = getattr(e, "Handle", None)
+                    layer = getattr(e, "Layer", "")
+                    rows = int(e.Rows)
+                    cols = int(e.Columns)
+                    ins = {}
+                    for attr in ("InsertionPoint", "Position"):
+                        try:
+                            pt = getattr(e, attr, None)
+                            if pt is not None:
+                                ins = {"x": float(pt[0]), "y": float(pt[1])}
+                                break
+                        except Exception:
+                            continue
+                    grid: list = []
+                    for r in range(rows):
+                        row_data: list = []
+                        for c in range(cols):
+                            try:
+                                text = e.GetText(r, c)
+                            except Exception:
+                                text = ""
+                            row_data.append(str(text).strip())
+                        grid.append(row_data)
+                    tables.append({
+                        "handle": handle,
+                        "layer": layer,
+                        "rows": rows,
+                        "cols": cols,
+                        "insertion_point": ins,
+                        "grid": grid,
+                    })
+                except Exception:
+                    continue
+            return {"success": True, "count": len(tables), "tables": tables}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    # ------------------------------------------------------------------
+    # SMART BOUNDARY AREA (avoids mistaking border frames for plot area)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_axis_aligned_rect(pts: list, tol: float = 0.01) -> bool:
+        """Return True if the point list approximates an axis-aligned rectangle."""
+        if len(pts) < 4:
+            return False
+        cleaned = [p for p in pts if len(p) >= 2]
+        # Remove duplicate closing point
+        if len(cleaned) >= 2 and abs(cleaned[0][0] - cleaned[-1][0]) < tol and abs(cleaned[0][1] - cleaned[-1][1]) < tol:
+            cleaned = cleaned[:-1]
+        if len(cleaned) != 4:
+            return False
+        xs = sorted(set(round(p[0], 3) for p in cleaned))
+        ys = sorted(set(round(p[1], 3) for p in cleaned))
+        return len(xs) == 2 and len(ys) == 2
+
+    def calculate_boundary_area(self) -> Dict[str, Any]:
+        """
+        Intelligently identify and calculate the actual survey plot boundary area.
+
+        Strategy (in order of preference):
+        1. If a closed polyline exists on a layer whose name contains 'BOUNDARY'
+           (case-insensitive), use that — it is almost certainly the plot outline.
+        2. Otherwise look for the closed polyline coloured red (ACI colour 1),
+           which is the surveying convention for a boundary 'verged in red'.
+        3. Otherwise, from all remaining closed polylines, exclude those that
+           form axis-aligned rectangles (those are sheet borders / interior borders)
+           and pick the one with the SMALLEST area among the irregular shapes,
+           which is almost always the actual land parcel on a cadastral plan.
+
+        Returns the area and which strategy was used, so the agent can report
+        the reasoning transparently.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document."}
+
+        result = self.get_all_entities()
+        if not result.get("success"):
+            return result
+
+        entities = result.get("entities", [])
+        candidates = []
+
+        for ent in entities:
+            etype = ent.get("type", "")
+            if etype not in ("LWPOLYLINE", "POLYLINE"):
+                continue
+            if not ent.get("closed", False):
+                continue
+            area = ent.get("area")
+            if not area or area <= 0:
+                continue
+            candidates.append(ent)
+
+        if not candidates:
+            return {"success": False, "error": "No closed polylines found in the drawing."}
+
+        units = self._get_units()
+
+        # Strategy 1 – layer name contains 'boundary'
+        boundary_layer = [
+            c for c in candidates
+            if "boundary" in str(c.get("layer", "")).lower()
+            and "interior" not in str(c.get("layer", "")).lower()
+            and "border" not in str(c.get("layer", "")).lower()
+        ]
+        if boundary_layer:
+            chosen = min(boundary_layer, key=lambda c: c.get("area", float("inf")))
+            strategy = "layer-name contains 'BOUNDARY'"
+            return self._boundary_area_result(chosen, strategy, units)
+
+        # Strategy 2 – red polyline (colour 1 / 'red')
+        red_polys = [c for c in candidates if str(c.get("color", "")).lower() in ("red", "1")]
+        if red_polys:
+            chosen = min(red_polys, key=lambda c: c.get("area", float("inf")))
+            strategy = "red polyline (survey convention: boundary verged in red)"
+            return self._boundary_area_result(chosen, strategy, units)
+
+        # Strategy 3 – smallest non-rectangular closed polyline
+        # Fetch coordinate data to test rectangularity
+        non_rect = []
+        for ent in candidates:
+            # Exclude obvious border layers
+            lyr = str(ent.get("layer", "")).upper()
+            if any(kw in lyr for kw in ("BORDER", "FRAME", "INTERIOR", "SHEET", "TITLEBLOCK")):
+                continue
+            # Try to get coordinates for rectangularity check
+            coords = ent.get("coordinates") or ent.get("vertices") or []
+            is_rect = self._is_axis_aligned_rect(coords) if coords else False
+            if not is_rect:
+                non_rect.append(ent)
+
+        pool = non_rect if non_rect else candidates
+        # Exclude very large entities that are likely border frames
+        areas = [c.get("area", 0) for c in pool]
+        if areas:
+            median_area = sorted(areas)[len(areas) // 2]
+            pool_filtered = [c for c in pool if c.get("area", 0) <= median_area * 10]
+            if pool_filtered:
+                pool = pool_filtered
+
+        chosen = min(pool, key=lambda c: c.get("area", float("inf")))
+        strategy = "smallest non-rectangular closed polyline (border layers excluded)"
+        return self._boundary_area_result(chosen, strategy, units)
+
+    def _boundary_area_result(self, ent: dict, strategy: str, units: str) -> Dict[str, Any]:
+        area = ent.get("area", 0.0)
+        conversions = self._calculate_area_conversions(area, units)
+        return {
+            "success": True,
+            "strategy_used": strategy,
+            "layer": ent.get("layer"),
+            "color": ent.get("color"),
+            "handle": ent.get("handle"),
+            "area_sq_units": area,
+            "drawing_units": units,
+            "area_sq_meters": conversions.get("sq_meters", area),
+            "area_hectares": conversions.get("hectares"),
+            "area_acres": conversions.get("acres"),
+            "area_sq_feet": conversions.get("sq_feet"),
+            "note": (
+                f"Boundary identified by: {strategy}. "
+                "If this is incorrect, call autocad_calculate_area(layer='<layer_name>') "
+                "with the specific layer that contains the plot outline."
+            ),
+        }
+
     def _calculate_area_conversions(self, area: float, units: str) -> Dict[str, float]:
         """
         Convert area to various units.

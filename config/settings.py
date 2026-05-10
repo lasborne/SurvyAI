@@ -236,13 +236,15 @@ class Settings(BaseSettings):
     )
     
     agent_max_tokens: int = Field(
-        default=4000,
+        default=16384,
         env="AGENT_MAX_TOKENS",
         description=(
-            "Maximum tokens in LLM response.\n"
-            "1 token ≈ 4 characters or 0.75 words.\n"
-            "4000 tokens ≈ 3000 words, enough for detailed responses.\n"
-            "Note: This is capped per model (e.g., GPT-4o-mini max is 16384)."
+            "Maximum tokens in LLM response (output token budget per completion).\n"
+            "This value is automatically clamped to each model's real API limit before every call,\n"
+            "so setting it higher than a model supports causes a harmless INFO-level log, not a warning.\n"
+            "16384 is the practical ceiling for GPT-4o / GPT-5-mini; GPT-5.1 supports up to 128000.\n"
+            "Typical useful range: 4000–16384 for most tasks; the 'complex' tier model (gpt-5.1) will\n"
+            "automatically use its own higher limit without needing to raise this value."
         )
     )
     
@@ -267,7 +269,7 @@ class Settings(BaseSettings):
         )
     )
     
-    primary_llm: Literal["deepseek", "gemini", "claude", "openai"] = Field(
+    primary_llm: Literal["deepseek", "gemini", "claude", "openai", "ollama"] = Field(
         default="openai",
         env="PRIMARY_LLM",
         description=(
@@ -275,14 +277,76 @@ class Settings(BaseSettings):
             "  - openai: Use OpenAI (GPT-4/4o/5) - Default\n"
             "  - claude: Use Anthropic Claude (Opus/Sonnet/Haiku)\n"
             "  - gemini: Use Google Gemini\n"
-            "  - deepseek: Use DeepSeek"
+            "  - deepseek: Use DeepSeek\n"
+            "  - ollama: Use local Ollama models (offline-capable; requires Ollama installed)"
         )
     )
     
-    fallback_llm: Literal["deepseek", "gemini", "claude", "openai"] = Field(
+    fallback_llm: Literal["deepseek", "gemini", "claude", "openai", "ollama"] = Field(
         default="gemini",
         env="FALLBACK_LLM",
         description="Which LLM to use if primary fails. Same options as PRIMARY_LLM."
+    )
+
+    # ==========================================================================
+    # Ollama (local models) Configuration
+    # ==========================================================================
+    # Ollama runs models locally (no internet required once models are pulled).
+    # Default daemon listens on http://localhost:11434
+
+    ollama_base_url: str = Field(
+        default="http://localhost:11434",
+        env="OLLAMA_BASE_URL",
+        description="Base URL for a running Ollama server (default: http://localhost:11434).",
+    )
+
+    ollama_model: str = Field(
+        default="llama3.2:1b",
+        env="OLLAMA_MODEL",
+        description=(
+            "Default local Ollama model to use (e.g. llama3.2:1b, qwen2.5:7b). "
+            "You must pull the model in Ollama at least once."
+        ),
+    )
+
+    # ==========================================================================
+    # Performance controls (desktop UX toggles can inject these)
+    # ==========================================================================
+
+    fast_mode_non_file_prompts: bool = Field(
+        default=False,
+        env="FAST_MODE_NON_FILE_PROMPTS",
+        description=(
+            "If True, generic non-file prompts bypass the full agent graph/tool planning and run a single LLM call. "
+            "File/tool workflows (CAD, documents, ArcGIS, etc.) are unaffected."
+        ),
+    )
+
+    store_generic_conversations: bool = Field(
+        default=False,
+        env="STORE_GENERIC_CONVERSATIONS",
+        description=(
+            "If True, store generic Q&A into the local vector store. "
+            "If False (recommended), only store file/tool workflows and explicitly memory-referencing prompts."
+        ),
+    )
+
+    ollama_num_predict: int = Field(
+        default=512,
+        env="OLLAMA_NUM_PREDICT",
+        description=(
+            "For Ollama: cap the maximum predicted tokens per response. "
+            "Lower values are faster and reduce runaway latency on CPU machines."
+        ),
+    )
+
+    fast_mode_max_tokens: int = Field(
+        default=700,
+        env="FAST_MODE_MAX_TOKENS",
+        description=(
+            "Output token cap used in Fast mode across providers. "
+            "Lower values respond faster; increase for longer answers."
+        ),
     )
     
     disable_gemini_fallback: bool = Field(
@@ -327,6 +391,72 @@ class Settings(BaseSettings):
             "Default coordinate system for new projects.\n"
             "Examples: WGS84, UTM Zone 32N, EPSG:4326, 32632"
         )
+    )
+
+    arcgis_ui_execution_timeout: int = Field(
+        default=1800,
+        env="ARCGIS_UI_EXECUTION_TIMEOUT",
+        description=(
+            "Maximum time (in seconds) to wait for a live ArcGIS Pro UI script run to finish.\n"
+            "Default: 1800 seconds (30 minutes).\n"
+            "Used for visible ArcGIS workflows such as IDW, CutFill, raster generation, and exports."
+        )
+    )
+
+    arcgis_ui_bootstrap_timeout_seconds: int = Field(
+        default=55,
+        env="ARCGIS_UI_BOOTSTRAP_TIMEOUT_SECONDS",
+        description=(
+            "Seconds allowed for ArcGIS Pro Python Window automation (SendKeys) to show a 'running' status.\n"
+            "Increase on slow PCs if logs often show UI runner did not start (before propy fallback)."
+        ),
+    )
+
+    arcgis_generated_execution_mode: Literal["auto", "live_ui_only", "propy_only"] = Field(
+        default="auto",
+        env="ARCGIS_GENERATED_EXECUTION_MODE",
+        description=(
+            "How SurvyAI runs dynamically generated arcpy when execute_automatically is True.\n"
+            "- auto (default): run deterministically via propy.bat, then open/finalize ArcGIS Pro after outputs are ready.\n"
+            "- live_ui_only: require ArcGIS Pro's live Python Window (uses UI automation; least reliable, only for explicit live execution needs).\n"
+            "- propy_only: always use propy.bat (same execution style as auto, but explicitly forbids live UI execution)."
+        ),
+    )
+
+    arcgis_generated_code_live_ui_only: bool = Field(
+        default=False,
+        env="ARCGIS_GENERATED_CODE_LIVE_UI_ONLY",
+        description=(
+            "Legacy flag: if True, forces execution mode to live_ui_only (same as ARCGIS_GENERATED_EXECUTION_MODE=live_ui_only).\n"
+            "Prefer arcgis_generated_execution_mode instead."
+        ),
+    )
+
+    arcgis_propy_timeout_seconds: int = Field(
+        default=1800,
+        env="ARCGIS_PROPY_TIMEOUT_SECONDS",
+        description=(
+            "Subprocess timeout (seconds) for propy.bat runs of generated scripts.\n"
+            "Default matches arcgis_ui_execution_timeout (30 minutes) for IDW/CutFill-scale work."
+        ),
+    )
+
+    arcgis_launch_verify_seconds: int = Field(
+        default=8,
+        env="ARCGIS_LAUNCH_VERIFY_SECONDS",
+        description=(
+            "Seconds to watch a freshly launched ArcGIS Pro process for immediate exit/crash.\n"
+            "If ArcGIS Pro dies during this startup window, SurvyAI treats the launch as unstable and can retry more safely."
+        ),
+    )
+
+    arcgis_launch_retry_without_project: bool = Field(
+        default=True,
+        env="ARCGIS_LAUNCH_RETRY_WITHOUT_PROJECT",
+        description=(
+            "If opening a specific ArcGIS Pro project appears to crash immediately, retry by launching ArcGIS Pro without that project.\n"
+            "This keeps ArcGIS Pro usable for review while preserving the finished outputs on disk."
+        ),
     )
     
     # ==========================================================================
@@ -469,6 +599,67 @@ class Settings(BaseSettings):
     )
     
     # ==========================================================================
+    # SurvyAI Desktop / Cloud (Phase 1 placeholders)
+    # ==========================================================================
+    # Used by the packaged Windows app when billing/licensing calls your backend.
+    # Empty values keep current behavior: local .env + direct LLM provider keys.
+    
+    survyai_access_token: str = Field(
+        default="",
+        env="SURVYAI_ACCESS_TOKEN",
+        description=(
+            "Optional bearer token for SurvyAI cloud API (desktop commercial builds). "
+            "When set, a future gateway can authenticate requests; Phase 1 only stores the value."
+        ),
+    )
+    
+    survyai_api_base_url: str = Field(
+        default="",
+        env="SURVYAI_API_BASE_URL",
+        description=(
+            "Optional base URL for SurvyAI cloud API (e.g. https://api.example.com). "
+            "Phase 1: reserved for upcoming proxy; not yet used by the agent."
+        ),
+    )
+
+    # ==========================================================================
+    # Plan policy scaffolding (NOT ENFORCED by default)
+    # ==========================================================================
+    # These fields define commercial rules for Free/Pro builds, but are intentionally
+    # dormant while you continue development on the free build. When you are ready,
+    # flip `ENFORCE_PLAN_POLICIES=true` in the packaged app environment.
+
+    enforce_plan_policies: bool = Field(
+        default=False,
+        env="ENFORCE_PLAN_POLICIES",
+        description=(
+            "If True, apply plan policy constraints (Free=Ollama-only + CAD quotas; "
+            "Pro=model switching + higher quotas). Default False (development mode)."
+        ),
+    )
+
+    free_plan_cad_success_30d_cap: int = Field(
+        default=10,
+        env="FREE_PLAN_CAD_SUCCESS_30D_CAP",
+        description="Free plan cap: successful CAD jobs allowed in a rolling 30 days (dormant unless enforced).",
+        ge=0,
+    )
+
+    pro_plan_cad_success_30d_cap: int = Field(
+        default=100,
+        env="PRO_PLAN_CAD_SUCCESS_30D_CAP",
+        description="Pro plan cap: successful CAD jobs allowed in a rolling 30 days (dormant unless enforced).",
+        ge=0,
+    )
+
+    pro_plan_cad_success_365d_cap: int = Field(
+        default=1300,
+        env="PRO_PLAN_CAD_SUCCESS_365D_CAP",
+        description="Pro plan cap: successful CAD jobs allowed in a rolling 365 days (dormant unless enforced).",
+        ge=0,
+    )
+    
+    # ==========================================================================
     # Pydantic Configuration
     # ==========================================================================
     
@@ -480,6 +671,9 @@ class Settings(BaseSettings):
         - env_file: Path to .env file for loading defaults
         - env_file_encoding: Character encoding for the .env file
         - case_sensitive: Whether env var names are case-sensitive
+        - extra: Ignore unknown env vars / fields rather than raising ValidationError.
+          This prevents crashes when .env contains experimental keys
+          (e.g. CLOUD_ADMIN_API_KEY) that have not yet been promoted to named fields.
         """
         
         # Load settings from .env file if it exists
@@ -491,6 +685,11 @@ class Settings(BaseSettings):
         # Environment variables are not case-sensitive
         # (GOOGLE_API_KEY = google_api_key = Google_Api_Key)
         case_sensitive = False
+
+        # Silently ignore .env keys that don't map to a declared field.
+        # Prevents ValidationError when new/experimental env vars are added to .env
+        # before the corresponding Settings field is defined.
+        extra = "ignore"
 
 
 # ==============================================================================

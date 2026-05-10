@@ -40,6 +40,30 @@ cp .env.example .env
 
 ## Usage
 
+### Desktop GUI (Windows)
+
+Requires `PySide6` (see `requirements.txt`). From the project root:
+
+```bash
+python -m survyai.gui
+# or
+python -m survyai.cli gui
+# or (legacy entry)
+python -m cli gui
+```
+
+Desktop features now include:
+- onboarding wizard
+- local sign-in/profile section
+- license/status card
+- workspace selector
+- output history
+- settings page
+- diagnostics export
+- safe mode for troubleshooting
+
+See [`docs/PHASE2_DESKTOP_GUI.md`](docs/PHASE2_DESKTOP_GUI.md) for architecture notes and current limitations.
+
 ### Command Line
 
 ```bash
@@ -54,6 +78,22 @@ python -m cli query "Search for 'property of' in the drawing and tell me the own
 ```
 
 ### Python API
+
+**Recommended for apps and GUI (Phase 1 service layer):**
+
+```python
+from survyai import SurvyAIAgentService, merge_settings
+
+# Optional: inject keys from your login / secure store instead of only .env
+# settings = merge_settings(openai_api_key="...")
+# service = SurvyAIAgentService(settings=settings, eager_init=True)
+
+service = SurvyAIAgentService(eager_init=True)
+result = service.run_task("What is the history of surveying?")
+print(result.response)
+```
+
+**Low-level agent (same as before):**
 
 ```python
 from agent import SurvyAIAgent
@@ -70,6 +110,8 @@ result = agent.process_query("""
 
 print(result["response"])
 ```
+
+You can also pass explicit settings: `SurvyAIAgent(settings=merge_settings(...))` for desktop builds.
 
 ## How It Works
 
@@ -105,14 +147,28 @@ SurvyAI supports interactive permission requests for file operations. See [docs/
 ```
 SurvyAI/
 ├── agent/agent.py          # Main AI agent with LLM integration
+├── survyai/                # Product/service layer (GUI-ready API, Phase 1)
+│   ├── agent_service.py    # SurvyAIAgentService façade
+│   ├── capabilities.py     # Windows integration detection
+│   ├── feature_flags.py    # Plan / feature toggles
+│   └── ...
 ├── tools/
 │   ├── autocad_processor.py  # AutoCAD COM automation
 │   ├── excel_processor.py    # Excel file handling
 │   └── ...
 ├── config/settings.py      # Configuration management
-├── cli.py                  # Command-line interface
+├── cli.py                  # Command-line entry (delegates to survyai.cli)
 └── requirements.txt
 ```
+
+See [docs/PHASE1_SERVICE_LAYER.md](docs/PHASE1_SERVICE_LAYER.md) for Phase 1–2 architecture (service layer + license tool filtering).
+
+### License mode (Phase 2)
+
+- **`SURVYAI_LICENSE_MODE=builder`** (default): full AutoCAD / ArcGIS / internet / vector tools for development — **free for building and testing**.
+- **`SURVYAI_LICENSE_MODE=pro`**: shipped commercial app; optional `SURVYAI_FEATURE_*=0` removes tool families (see docs).
+
+There is **one paid product (Pro)**; billing is integrated with **Paystack** (plans + webhooks + desktop checkout).
 
 ## License
 

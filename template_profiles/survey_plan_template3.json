@@ -1,0 +1,173 @@
+{
+  "success": true,
+  "template": {
+    "path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\survey_plan_template3.dwg",
+    "name": "survey_plan_template3.dwg",
+    "learned_at": "2026-03-20 10:17:10",
+    "signature": {
+      "size_bytes": 102208,
+      "mtime_ns": 1773997936000000000
+    }
+  },
+  "drawing_info": {
+    "success": true,
+    "name": "survey_plan_template3.dwg",
+    "path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\survey_plan_template3.dwg",
+    "units": "Unitless",
+    "layers": [
+      "0",
+      "Defpoints",
+      "55",
+      "text",
+      "TITLE",
+      "CADA_BOUNDARY",
+      "CADA_PEGS",
+      "CADA_TEXT",
+      "CADA_TITLEBLOCK",
+      "CADA_PILLARNUMBERS",
+      "CADA_PILLARS",
+      "CADA_PLANNUMBER",
+      "CADA_CERTIFICATION",
+      "CADA_SURVEYOR",
+      "CADA_NORTHCOORDINATES",
+      "CADA_ROAD",
+      "CADA_BEARING_DIST",
+      "CADA_NORTHARROW",
+      "CADA_SCALEBAR",
+      "CADA_BORDER",
+      "CADA_PRIMARYPILLAR_ARROWS",
+      "CADA_INTERIORBORDER",
+      "CADA_EASTARROW",
+      "CADA_EASTCOORDINATES",
+      "CADA_CWF"
+    ],
+    "entity_counts": {
+      "TABLE": 12,
+      "MTEXT": 18,
+      "LWPOLYLINE": 3,
+      "LINE": 21,
+      "ARC": 5,
+      "INSERT": 5,
+      "HATCH": 2
+    }
+  },
+  "layers_expected": [
+    "text",
+    "TITLE",
+    "CADA_BOUNDARY",
+    "CADA_PEGS",
+    "CADA_TEXT",
+    "CADA_TITLEBLOCK",
+    "CADA_PILLARNUMBERS",
+    "CADA_PILLARS",
+    "CADA_PLANNUMBER",
+    "CADA_CERTIFICATION",
+    "CADA_SURVEYOR",
+    "CADA_NORTHCOORDINATES",
+    "CADA_ROAD",
+    "CADA_BEARING_DIST",
+    "CADA_NORTHARROW",
+    "CADA_SCALEBAR",
+    "CADA_BORDER",
+    "CADA_PRIMARYPILLAR_ARROWS",
+    "CADA_INTERIORBORDER",
+    "CADA_EASTARROW",
+    "CADA_EASTCOORDINATES",
+    "CADA_CWF"
+  ],
+  "sheet_layers": [
+    "CADA_BORDER",
+    "CADA_INTERIORBORDER",
+    "CADA_SCALEBAR",
+    "CADA_NORTHARROW",
+    "CADA_EASTARROW",
+    "CADA_TITLEBLOCK",
+    "CADA_PLANNUMBER",
+    "CADA_CERTIFICATION",
+    "CADA_SURVEYOR",
+    "CADA_NORTHCOORDINATES",
+    "CADA_EASTCOORDINATES",
+    "TITLE",
+    "text"
+  ],
+  "text_heights": {
+    "bearing_dist_road": 1.1999999999999997
+  },
+  "tables": {
+    "title_block": {
+      "handle": "1171"
+    },
+    "plan_number": {
+      "handle": "1151"
+    },
+    "surveyor": {
+      "handle": "1144"
+    },
+    "certification": {
+      "handle": "112F"
+    },
+    "coordinates": {
+      "easting_table_handle": "1204",
+      "northing_table_handle": "120E"
+    },
+    "pillar_numbers": {
+      "tables": [
+        {
+          "handle": "115D",
+          "layer": "CADA_PILLARNUMBERS",
+          "rows": 2,
+          "cols": 1,
+          "insertion_point": {
+            "x": 283865.141043953,
+            "y": 534977.8802795024
+          }
+        },
+        {
+          "handle": "1242",
+          "layer": "CADA_PILLARNUMBERS",
+          "rows": 2,
+          "cols": 1,
+          "insertion_point": {
+            "x": 283839.5202465003,
+            "y": 534973.5219720372
+          }
+        },
+        {
+          "handle": "1257",
+          "layer": "CADA_PILLARNUMBERS",
+          "rows": 2,
+          "cols": 1,
+          "insertion_point": {
+            "x": 283873.9962608832,
+            "y": 534958.2290679272
+          }
+        },
+        {
+          "handle": "1263",
+          "layer": "CADA_PILLARNUMBERS",
+          "rows": 2,
+          "cols": 1,
+          "insertion_point": {
+            "x": 283851.3887882033,
+            "y": 534943.0561358385
+          }
+        },
+        {
+          "handle": "150F",
+          "layer": "CADA_PILLARNUMBERS",
+          "rows": 2,
+          "cols": 1,
+          "insertion_point": {
+            "x": 283865.141043953,
+            "y": 534977.8802795024
+          }
+        }
+      ]
+    }
+  },
+  "blocks": {
+    "pillars": {
+      "block_name": "PEG_SYMBOL"
+    }
+  }
+}

@@ -1,0 +1,11 @@
+Metric,Value,Unit
+FillVolume,0.0,cubic_meters
+CutVolume,0.0,cubic_meters
+NetVolume,0.0,cubic_meters
+PrePointsInserted,58,count
+PostPointsInserted,50,count
+CRS,Nigeria_West_Belt,
+BoundaryFeature,C:\Users\UZOR\PycharmProjects\untitled\venv\SurvyAI\scripts\Iseni_Volume.gdb\analysis_boundary_single,
+PreRaster,C:\Users\UZOR\PycharmProjects\untitled\venv\SurvyAI\scripts\Iseni_Volume.gdb\pre_idw_aligned_clp,
+PostRaster,C:\Users\UZOR\PycharmProjects\untitled\venv\SurvyAI\scripts\Iseni_Volume.gdb\post_idw_aligned_clp,
+CutFillRaster,C:\Users\UZOR\PycharmProjects\untitled\venv\SurvyAI\scripts\Iseni_Volume.gdb\cutfill,

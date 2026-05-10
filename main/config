@@ -8,3 +8,9 @@
 [user]
 	name = lasborne
 	email = okeke.michael1995@gmail.com
+[remote "origin"]
+	url = https://github.com/lasborne/SurvyAI.git
+	fetch = +refs/heads/*:refs/remotes/origin/*
+[branch "master"]
+	remote = origin
+	merge = refs/heads/master

@@ -44,6 +44,7 @@ import json
 import tempfile
 import time
 import datetime
+import shutil
 from config import get_settings
 from utils.logger import get_logger
 
@@ -361,6 +362,45 @@ class ArcGISProcessor:
     # ==========================================================================
     # PROJECT MANAGEMENT METHODS
     # ==========================================================================
+
+    def _spawn_arcgis_pro_process(
+        self,
+        cmd: List[str],
+        exe_path: Path,
+    ) -> subprocess.Popen:
+        """
+        Launch ArcGIS Pro with an explicit working directory instead of inheriting
+        SurvyAI's current workspace folder.
+
+        ArcGIS Pro is more stable when started from its own install directory.
+        """
+        popen_kwargs: Dict[str, Any] = {
+            "shell": False,
+            "cwd": str(exe_path.parent),
+        }
+        if os.name == "nt":
+            popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        return subprocess.Popen(cmd, **popen_kwargs)
+
+    def _wait_for_arcgis_stable_start(
+        self,
+        proc: subprocess.Popen,
+        verify_seconds: int,
+    ) -> Tuple[bool, Optional[int]]:
+        """
+        Watch the new ArcGIS Pro process briefly and detect immediate exit/crash.
+        """
+        verify_seconds = max(0, min(int(verify_seconds or 0), 30))
+        if verify_seconds <= 0:
+            return True, None
+
+        deadline = time.time() + verify_seconds
+        while time.time() < deadline:
+            exit_code = proc.poll()
+            if exit_code is not None:
+                return False, exit_code
+            time.sleep(0.5)
+        return True, None
     
     def launch_arcgis_pro(self, project_path: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -505,34 +545,102 @@ class ArcGISProcessor:
             else:
                 logger.info(f"Launching ArcGIS Pro from: {exe_path}")
             
-            # Launch ArcGIS Pro
-            subprocess.Popen(cmd, shell=False)
+            # Launch ArcGIS Pro from its own install directory to avoid inheriting
+            # SurvyAI's working directory, which can destabilize Pro startup.
+            proc = self._spawn_arcgis_pro_process(cmd, exe_path)
+
+            verify_seconds = int(getattr(self.settings, "arcgis_launch_verify_seconds", 8) or 8)
+            stable_start, exit_code = self._wait_for_arcgis_stable_start(proc, verify_seconds)
+
+            launch_note = None
+            launch_mode = "project" if resolved_project_path else "blank"
+            project_opened = bool(resolved_project_path)
+
+            if not stable_start:
+                logger.warning(
+                    "ArcGIS Pro exited during startup (exit_code=%s, project=%s).",
+                    exit_code,
+                    resolved_project_path,
+                )
+                retry_without_project = bool(
+                    getattr(self.settings, "arcgis_launch_retry_without_project", True)
+                )
+                if resolved_project_path and retry_without_project:
+                    blank_cmd = [str(exe_path)]
+                    retry_proc = self._spawn_arcgis_pro_process(blank_cmd, exe_path)
+                    retry_stable, retry_exit = self._wait_for_arcgis_stable_start(
+                        retry_proc,
+                        verify_seconds,
+                    )
+                    if retry_stable:
+                        proc = retry_proc
+                        launch_mode = "blank_retry"
+                        project_opened = False
+                        launch_note = (
+                            "ArcGIS Pro opened successfully, but automatic opening of the specific project "
+                            f"appeared unstable. SurvyAI retried with a blank ArcGIS Pro session instead. "
+                            f"Project remains on disk: {resolved_project_path}"
+                        )
+                        resolved_project_path_for_state = None
+                    else:
+                        return {
+                            "success": False,
+                            "error": (
+                                "ArcGIS Pro exited during startup when opening the project, "
+                                "and a blank-session retry also failed."
+                            ),
+                            "path": str(exe_path),
+                            "project_path": str(resolved_project_path),
+                            "returncode": retry_exit if retry_exit is not None else exit_code,
+                        }
+                else:
+                    return {
+                        "success": False,
+                        "error": "ArcGIS Pro exited during startup.",
+                        "path": str(exe_path),
+                        "project_path": str(resolved_project_path) if resolved_project_path else None,
+                        "returncode": exit_code,
+                    }
+            else:
+                resolved_project_path_for_state = resolved_project_path
+
             try:
                 import time as _time
                 self._last_launch_ts = _time.time()
-                self._last_launch_project = str(Path(resolved_project_path).resolve()) if resolved_project_path else (str(Path(project_path).resolve()) if project_path else None)
+                self._last_launch_project = (
+                    str(Path(resolved_project_path_for_state).resolve())
+                    if resolved_project_path_for_state
+                    else (str(Path(project_path).resolve()) if project_path and not project_opened else None)
+                )
             except Exception:
                 pass
             
-            # Give it a moment to start
-            time.sleep(2)
+            # Give it a short final moment to settle after startup verification.
+            time.sleep(1)
             
             message = "ArcGIS Pro launched successfully"
-            if resolved_project_path:
+            if project_opened and resolved_project_path:
                 message += f" with project: {resolved_project_path.name}"
                 # Update current_project if we found and opened one
                 self.current_project = str(resolved_project_path)
             elif project_path:
-                message += " (project file not found - launched without opening project)"
+                if launch_mode == "blank_retry":
+                    message += " (blank session fallback after unstable project open)"
+                else:
+                    message += " (project file not found - launched without opening project)"
             
             return {
                 "success": True,
                 "message": message,
                 "path": str(exe_path),
-                "project_path": str(resolved_project_path) if resolved_project_path else None,
+                "pid": getattr(proc, "pid", None),
+                "project_path": str(resolved_project_path) if project_opened and resolved_project_path else None,
                 "auto_created": auto_created,
+                "project_opened": project_opened,
+                "launch_mode": launch_mode,
                 "note": (
-                    "Project was missing; SurvyAI auto-created it before launching"
+                    launch_note
+                    or "Project was missing; SurvyAI auto-created it before launching"
                     if auto_created
                     else ("Project not found - launched without opening project" if project_path and not resolved_project_path else None)
                 ),
@@ -1200,15 +1308,16 @@ Since direct ArcGIS Pro control is not available, please follow these steps manu
         # Fall back to launching ArcGIS Pro with the project
         if self.arcgis_pro_path:
             try:
-                exe_path = self.arcgis_pro_path / "bin" / "ArcGISPro.exe"
-                subprocess.Popen([str(exe_path), str(project_file)], shell=False)
-                self.current_project = str(project_file)
-                
-                return {
-                    "success": True,
-                    "message": f"Opening project in ArcGIS Pro: {project_file.name}",
-                    "project_path": str(project_file)
-                }
+                launch = self.launch_arcgis_pro(project_path=str(project_file))
+                if launch.get("success") and launch.get("project_opened"):
+                    self.current_project = str(project_file)
+                    return {
+                        "success": True,
+                        "message": f"Opening project in ArcGIS Pro: {project_file.name}",
+                        "project_path": str(project_file),
+                        "launch_details": launch,
+                    }
+                return launch
             except Exception as e:
                 return {"success": False, "error": str(e)}
         
@@ -1667,6 +1776,10 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
         launch_arcgis_pro: bool = True,
         prelaunch_arcgis_pro: bool = False,
         skip_finalization: bool = False,
+        # When project_path is omitted, create a fresh .aprx in workspace (same pattern as verified workflows)
+        workspace_folder: Optional[str] = None,
+        auto_project_name: Optional[str] = None,
+        coordinate_system: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Execute dynamically generated Python/arcpy code.
@@ -1679,6 +1792,9 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
             project_path: Optional path to .aprx project (used to determine script save location)
             script_name: Optional script filename (default: auto-generated timestamp-based name)
             execute_automatically: If True, execute via propy.bat. If False, save and provide instructions.
+            workspace_folder: When project_path is omitted, create the auto-project under this folder (default: cwd).
+            auto_project_name: Optional stem for auto-created project when project_path is omitted.
+            coordinate_system: Optional CRS for auto-created project (e.g. user-specified projected CRS).
             
         Returns:
             Dictionary with execution results, script path, and instructions if applicable
@@ -1688,6 +1804,67 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
                 "success": False,
                 "error": "ArcGIS Pro installation not found. Please install ArcGIS Pro.",
             }
+
+        exec_mode = getattr(self.settings, "arcgis_generated_execution_mode", "auto")
+        if not isinstance(exec_mode, str):
+            exec_mode = "auto"
+        exec_mode = exec_mode.strip().lower()
+        if exec_mode not in ("auto", "live_ui_only", "propy_only"):
+            exec_mode = "auto"
+        if bool(getattr(self.settings, "arcgis_generated_code_live_ui_only", False)):
+            exec_mode = "live_ui_only"
+        live_ui_only = exec_mode == "live_ui_only"
+
+        # ------------------------------------------------------------------
+        # Resolve project path (auto-create when omitted — matches verified workflows)
+        # ------------------------------------------------------------------
+        auto_created_project = False
+        raw_pp = (project_path or "").strip()
+        effective_project_path: Optional[str] = None
+        if raw_pp:
+            try:
+                pf = Path(raw_pp).resolve()
+                if pf.exists() and pf.suffix.lower() == ".aprx":
+                    effective_project_path = str(pf)
+                else:
+                    effective_project_path = raw_pp
+            except Exception:
+                effective_project_path = raw_pp
+        else:
+            wf = Path(workspace_folder).resolve() if workspace_folder else Path.cwd().resolve()
+            try:
+                wf.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                return {
+                    "success": False,
+                    "error": f"Cannot create workspace folder for dynamic ArcGIS project: {e}",
+                    "workspace_folder": str(wf),
+                }
+            stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            pname = (auto_project_name or f"SurvyAI_Dynamic_{stamp}").strip()
+            pname = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in pname).strip("_")
+            if not pname:
+                pname = f"SurvyAI_Dynamic_{stamp}"
+            pname = pname[:80]
+            crs = coordinate_system or getattr(self.settings, "arcgis_default_coordinate_system", None)
+            cr = self.create_project(
+                project_name=pname,
+                project_path=str(wf),
+                coordinate_system=crs,
+                template="MAP",
+                clean_layers=True,
+            )
+            if not cr.get("success") or not cr.get("project_path"):
+                return {
+                    "success": False,
+                    "error": cr.get("error", "Failed to auto-create ArcGIS project for dynamic workflow."),
+                    "details": cr,
+                    "workspace_folder": str(wf),
+                }
+            effective_project_path = str(Path(cr["project_path"]).resolve())
+            auto_created_project = True
+
+        project_path = effective_project_path
 
         # ------------------------------------------------------------------
         # Headless safety rewrites
@@ -1712,8 +1889,13 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
                 import re
                 # Replace arcpy.mp.ArcGISProject("CURRENT") (any quoting) with explicit path
                 pattern = r"arcpy\.mp\.ArcGISProject\(\s*['\"]CURRENT['\"]\s*\)"
-                replacement = f"arcpy.mp.ArcGISProject(r\"{aprx_path}\")"
-                return re.sub(pattern, replacement, code, flags=re.IGNORECASE)
+                replacement = f'arcpy.mp.ArcGISProject(r"{aprx_path}")'
+                return re.sub(
+                    pattern,
+                    lambda _m: replacement,
+                    code,
+                    flags=re.IGNORECASE,
+                )
             except Exception:
                 return code
 
@@ -1802,6 +1984,13 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
             working_dir = Path.cwd() / "scripts"
             working_dir.mkdir(parents=True, exist_ok=True)
 
+        # Generated ArcGIS workflows are most reliable when executed deterministically via
+        # propy.bat and only opened in ArcGIS Pro after outputs have been written.
+        # Keep the live Python Window path available only for explicit live_ui_only mode.
+        interactive_ui_mode = bool(
+            execute_automatically and launch_arcgis_pro and exec_mode == "live_ui_only"
+        )
+
         # Apply rewrite using the best available aprx path
         aprx_for_rewrite = None
         if project_path:
@@ -1813,7 +2002,11 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
                     aprx_for_rewrite = cp
             except Exception:
                 pass
-        python_code = _rewrite_current_aprx(python_code, aprx_for_rewrite)
+
+        # For live ArcGIS Pro execution, keep CURRENT semantics available.
+        # For headless/propy execution, CURRENT must be rewritten/removed.
+        if not interactive_ui_mode:
+            python_code = _rewrite_current_aprx(python_code, aprx_for_rewrite)
         python_code = _rewrite_layer_getextent(python_code)
         python_code = _rewrite_xy_field_literals(python_code)
         
@@ -1830,7 +2023,12 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
         script_content = f"""# Generated by SurvyAI
 # This script was dynamically generated based on user request
 # Generated: {datetime.datetime.now().isoformat()}
-# 
+#
+# REQUIRED checklist for analyst workflows (IDW, Cut Fill, borrow pits):
+# - Use a projected CRS with known linear units for volume; log EPSG/WKID.
+# - Add every output feature class/raster to the active map (addDataFromPath / layer objects).
+# - project.save() after writes so the open Pro window shows new layers.
+#
 # Execute this script in ArcGIS Pro's Python Window if needed:
 # exec(open(r'{script_path}').read())
 
@@ -1843,6 +2041,181 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
         
         # Execute automatically if requested
         if execute_automatically:
+            if interactive_ui_mode:
+                run_result = self._run_script_in_arcgis_pro_ui(
+                    script_path=script_path,
+                    project_path=project_path,
+                    completion_timeout_s=getattr(
+                        self.settings,
+                        "arcgis_ui_execution_timeout",
+                        getattr(self.settings, "agent_query_timeout", 900),
+                    ),
+                )
+
+                if run_result.get("success"):
+                    stdout = run_result.get("stdout", "") or ""
+                    results = self._parse_arcgis_results(stdout)
+                    return {
+                        "success": True,
+                        "message": "ArcGIS workflow executed successfully inside ArcGIS Pro.",
+                        "script_path": str(script_path),
+                        "stdout": stdout,
+                        "stderr": run_result.get("stderr", ""),
+                        "returncode": run_result.get("returncode", 0),
+                        "arcgis_launched": True,
+                        "project_path": run_result.get("project_path"),
+                        "results": results,
+                        "visualization_finalized": None,
+                        "visualization_details": None,
+                        "ui_status_path": run_result.get("ui_status_path"),
+                        "ui_log_path": run_result.get("ui_log_path"),
+                        "note": "Complete workflow executed inside ArcGIS Pro's Python Window. No manual steps required.",
+                    }
+
+                ui_bootstrap_failed = bool(run_result.get("ui_bootstrap_failed"))
+                if ui_bootstrap_failed:
+                    if live_ui_only:
+                        return {
+                            "success": False,
+                            "error": (
+                                "ArcGIS Pro interactive runner could not be activated, and this generated workflow is "
+                                "configured to run in ArcGIS Pro's live Python Window only."
+                            ),
+                            "script_path": str(script_path),
+                            "stdout": run_result.get("stdout", ""),
+                            "stderr": run_result.get("stderr", ""),
+                            "returncode": run_result.get("returncode", -1),
+                            "project_path": run_result.get("project_path"),
+                            "ui_status_path": run_result.get("ui_status_path"),
+                            "ui_log_path": run_result.get("ui_log_path"),
+                            "note": (
+                                "Headless propy fallback was intentionally skipped because generated ArcGIS workflows "
+                                "are configured to execute in ArcGIS Pro's live Python Window."
+                            ),
+                            "instructions": (
+                                f"SurvyAI saved the generated ArcGIS script and kept the workflow on the live ArcGIS Pro path.\n"
+                                f"Run it in ArcGIS Pro's Python Window if needed:\n"
+                                f"exec(open(r'{script_path}', encoding='utf-8').read())"
+                            ),
+                        }
+
+                    fallback_project_path = run_result.get("project_path") or project_path
+                    fallback_code = python_code
+                    if fallback_project_path:
+                        fallback_code = _rewrite_current_aprx(
+                            fallback_code,
+                            str(Path(fallback_project_path).resolve()),
+                        )
+
+                    fallback_name = script_name.replace(".py", "_fallback.py")
+                    fallback_path = (working_dir / fallback_name).resolve()
+                    fallback_content = f"""# Generated by SurvyAI
+# Automatic fallback after ArcGIS Pro UI bootstrap failed
+# Generated: {datetime.datetime.now().isoformat()}
+# 
+# Original interactive script: {script_path}
+
+{fallback_code}
+"""
+                    fallback_path.write_text(fallback_content, encoding="utf-8")
+                    logger.warning(
+                        "ArcGIS Pro UI runner did not start; falling back to deterministic ArcGIS execution: %s",
+                        fallback_path,
+                    )
+
+                    fallback_run = self._run_propy_script(
+                        script_content=fallback_content,
+                        working_dir=working_dir,
+                        script_name=fallback_name,
+                    )
+                    if fallback_run.get("success"):
+                        stdout = fallback_run.get("stdout", "") or ""
+                        results = self._parse_arcgis_results(stdout)
+                        finalize_result = None
+                        if fallback_project_path and (not skip_finalization):
+                            try:
+                                finalize_result = self.finalize_project_visualization(
+                                    project_path=str(fallback_project_path),
+                                    load_basemap=True,
+                                    basemap_name="Imagery Hybrid",
+                                    load_geodatabase=True,
+                                    launch_arcgis_pro=False,
+                                )
+                            except Exception as e:
+                                logger.warning("Failed to finalize project visualization after UI fallback: %s", e)
+                                finalize_result = {"success": False, "error": str(e)}
+
+                        launch_result = None
+                        if launch_arcgis_pro:
+                            try:
+                                if fallback_project_path:
+                                    launch_result = self.launch_arcgis_pro(project_path=str(fallback_project_path))
+                                else:
+                                    launch_result = self.launch_arcgis_pro()
+                            except Exception as e:
+                                logger.warning("Failed to relaunch ArcGIS Pro after UI fallback: %s", e)
+
+                        return {
+                            "success": True,
+                            "message": "ArcGIS workflow executed successfully after automatic UI fallback.",
+                            "script_path": str(fallback_path),
+                            "stdout": stdout,
+                            "stderr": fallback_run.get("stderr", ""),
+                            "returncode": fallback_run.get("returncode", 0),
+                            "arcgis_launched": launch_result.get("success", False) if isinstance(launch_result, dict) else True,
+                            "project_path": str(fallback_project_path) if fallback_project_path else None,
+                            "results": results,
+                            "visualization_finalized": finalize_result.get("success", False) if finalize_result else None,
+                            "visualization_details": finalize_result,
+                            "auto_created_project": auto_created_project,
+                            "ui_status_path": run_result.get("ui_status_path"),
+                            "ui_log_path": run_result.get("ui_log_path"),
+                            "note": (
+                                "ArcGIS Pro opened, but the live Python Window runner did not start. "
+                                "SurvyAI automatically switched to a deterministic ArcGIS Python fallback, "
+                                "completed the workflow, and kept ArcGIS Pro available for review."
+                            ),
+                        }
+
+                    return {
+                        "success": False,
+                        "error": (
+                            "ArcGIS Pro UI runner did not start, and the automatic fallback execution also failed: "
+                            f"{fallback_run.get('error', 'Unknown error')}"
+                        ),
+                        "script_path": str(fallback_path),
+                        "stdout": fallback_run.get("stdout", ""),
+                        "stderr": fallback_run.get("stderr", ""),
+                        "returncode": fallback_run.get("returncode", -1),
+                        "project_path": str(fallback_project_path) if fallback_project_path else None,
+                        "ui_status_path": run_result.get("ui_status_path"),
+                        "ui_log_path": run_result.get("ui_log_path"),
+                        "instructions": (
+                            f"SurvyAI could not start the live ArcGIS Pro Python Window runner automatically.\n"
+                            f"It then attempted a deterministic fallback script.\n"
+                            f"If needed, you can run the saved fallback script manually in ArcGIS Pro:\n"
+                            f"exec(open(r'{fallback_path}', encoding='utf-8').read())"
+                        ),
+                    }
+
+                return {
+                    "success": False,
+                    "error": f"Interactive ArcGIS Pro execution failed: {run_result.get('error', 'Unknown error')}",
+                    "script_path": str(script_path),
+                    "stdout": run_result.get("stdout", ""),
+                    "stderr": run_result.get("stderr", ""),
+                    "returncode": run_result.get("returncode", -1),
+                    "project_path": run_result.get("project_path"),
+                    "ui_status_path": run_result.get("ui_status_path"),
+                    "ui_log_path": run_result.get("ui_log_path"),
+                    "instructions": (
+                        f"SurvyAI attempted to run the script automatically inside ArcGIS Pro but it did not finish successfully.\n"
+                        f"ArcGIS Pro should already be open.\n"
+                        f"If needed, you can re-run the saved script in ArcGIS Pro's Python Window:\n"
+                        f"exec(open(r'{script_path}', encoding='utf-8').read())"
+                    ),
+                }
+
             # Optional: prelaunch ArcGIS Pro before headless execution (off by default).
             prelaunch = None
             if prelaunch_arcgis_pro and launch_arcgis_pro:
@@ -1902,9 +2275,11 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
                     "stderr": run_result.get("stderr", ""),
                     "returncode": run_result.get("returncode", 0),
                     "arcgis_launched": launch_result.get("success", False) if isinstance(launch_result, dict) else False,
+                    "project_path": project_path,
                     "results": results,
                     "visualization_finalized": finalize_result.get("success", False) if finalize_result else None,
                     "visualization_details": finalize_result,
+                    "auto_created_project": auto_created_project,
                     "note": "Complete workflow executed automatically. Results parsed from output. No manual steps required.",
                 }
             else:
@@ -1950,6 +2325,30 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
                             if retry_result.get("success"):
                                 retry_stdout = retry_result.get("stdout", "") or ""
                                 results = self._parse_arcgis_results(retry_stdout)
+                                finalize_result = None
+                                if project_path and (not skip_finalization):
+                                    try:
+                                        finalize_result = self.finalize_project_visualization(
+                                            project_path=project_path,
+                                            load_basemap=True,
+                                            basemap_name="Imagery Hybrid",
+                                            load_geodatabase=True,
+                                            launch_arcgis_pro=False,
+                                        )
+                                    except Exception as e:
+                                        logger.warning(
+                                            "Failed to finalize project visualization after MBG retry: %s", e
+                                        )
+                                        finalize_result = {"success": False, "error": str(e)}
+                                launch_result = None
+                                if launch_arcgis_pro:
+                                    if prelaunch is not None:
+                                        launch_result = prelaunch
+                                    else:
+                                        if project_path:
+                                            launch_result = self.launch_arcgis_pro(project_path=project_path)
+                                        else:
+                                            launch_result = self.launch_arcgis_pro()
                                 return {
                                     "success": True,
                                     "message": "ArcGIS workflow succeeded after auto-fix (MBG group_option NONE->ALL)",
@@ -1957,8 +2356,16 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
                                     "stdout": retry_stdout,
                                     "stderr": retry_result.get("stderr", ""),
                                     "returncode": retry_result.get("returncode", 0),
-                                    "arcgis_launched": (prelaunch or {}).get("success", False),
+                                    "arcgis_launched": launch_result.get("success", False)
+                                    if isinstance(launch_result, dict)
+                                    else (prelaunch or {}).get("success", False),
+                                    "project_path": project_path,
                                     "results": results,
+                                    "visualization_finalized": finalize_result.get("success", False)
+                                    if finalize_result
+                                    else None,
+                                    "visualization_details": finalize_result,
+                                    "auto_created_project": auto_created_project,
                                     "note": "Initial run failed with ERROR 001017; auto-rewritten and retried successfully.",
                                 }
                     except Exception as e:
@@ -1967,7 +2374,12 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
                 # Execution failed - return error but still provide script location
                 return {
                     "success": False,
-                    "error": f"Script execution failed: {run_result.get('error', 'Unknown error')}",
+                    "error": (
+                        run_result.get("error")
+                        or run_result.get("stderr")
+                        or run_result.get("stdout")
+                        or f"Script execution failed with return code {run_result.get('returncode', 'unknown')}"
+                    ),
                     "script_path": str(script_path),
                     "stdout": stdout,
                     "stderr": stderr,
@@ -2060,7 +2472,12 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
 
         # Build robust arcpy workflow as code string to run via propy.bat
         # NOTE: keep it generic; avoid relying on map UI-only methods.
-        sheet_clause = f", sheet_name={json.dumps(sheet_name)}" if sheet_name else ""
+        # ArcGIS Pro ExcelToTable uses THIRD POSITIONAL for sheet (not keyword sheet_name).
+        excel_to_table_call = (
+            f'arcpy.conversion.ExcelToTable(excel_path, excel_table, {json.dumps(sheet_name)})'
+            if sheet_name
+            else "arcpy.conversion.ExcelToTable(excel_path, excel_table)"
+        )
         code = f"""
 import os, math, csv
 import arcpy
@@ -2086,11 +2503,11 @@ gdb_path = os.path.join(project_dir, os.path.splitext(os.path.basename(project_p
 if not arcpy.Exists(gdb_path):
     arcpy.management.CreateFileGDB(project_dir, os.path.basename(gdb_path))
 
-# Excel -> table
+# Excel -> table (sheet as 3rd positional; arcpy does not use sheet_name keyword)
 excel_table = os.path.join(gdb_path, "points_table")
 if arcpy.Exists(excel_table):
     arcpy.management.Delete(excel_table)
-arcpy.conversion.ExcelToTable(excel_path, excel_table{sheet_clause})
+{excel_to_table_call}
 
 fields = [f.name for f in arcpy.ListFields(excel_table)]
 
@@ -2167,6 +2584,9 @@ if mp:
     except Exception:
         pass
 
+# Geographic vs projected: use geodesic measurements when coordinates are lat/lon (degrees)
+is_geographic = (sr is not None and getattr(sr, "type", "") == "Geographic")
+
 # Convex hull & area (requires 3+ points)
 area_m2 = None
 polygon_fc = os.path.join(gdb_path, "points_hull")
@@ -2179,12 +2599,19 @@ if inserted >= 3:
         for (geom,) in cur:
             if geom:
                 try:
-                    area_m2 = geom.getArea("PLANAR", "SQUAREMETERS")
+                    if is_geographic:
+                        area_m2 = geom.getArea("GEODESIC", "SQUAREMETERS")
+                    else:
+                        area_m2 = geom.getArea("PLANAR", "SQUAREMETERS")
                 except Exception:
-                    area_m2 = geom.area
+                    try:
+                        area_m2 = geom.getArea("GEODESIC", "SQUAREMETERS") if is_geographic else geom.area
+                    except Exception:
+                        area_m2 = geom.area
             break
 
 print("RESULT_AREA_M2:", area_m2 if area_m2 is not None else "NA")
+print("RESULT_MEASUREMENT_TYPE:", "GEODESIC" if is_geographic else "PLANAR")
 print("RESULT_HULL_FC:", polygon_fc if arcpy.Exists(polygon_fc) else "NA")
 
 # Add hull layer to map (best-effort)
@@ -2194,7 +2621,8 @@ if mp and arcpy.Exists(polygon_fc):
     except Exception:
         pass
 
-# Traverse legs
+# Traverse legs: surveyor convention = start at most westerly, then west-to-east through the north (clockwise)
+# Bearing of each leg = bearing from 1st point to 2nd point (and so on). Ignore file/point ID order.
 order_field = "SrcOID" if any(f.name == "SrcOID" for f in arcpy.ListFields(points_fc)) else "OBJECTID"
 pts = []
 _sql = (None, "ORDER BY " + str(order_field))
@@ -2204,6 +2632,19 @@ with arcpy.da.SearchCursor(points_fc, [order_field, "SHAPE@XY"], sql_clause=_sql
             continue
         pts.append((int(oid), float(xy[0]), float(xy[1])))
 
+# Reorder: most westerly first, then clockwise (west -> north -> east -> south, south-to-north reckoning)
+if len(pts) >= 2:
+    idx_west = min(range(len(pts)), key=lambda i: pts[i][1])  # min X = least easting / least longitude
+    start_pt = pts[idx_west]
+    rest = [p for j, p in enumerate(pts) if j != idx_west]
+    x0, y0 = start_pt[1], start_pt[2]
+    def _angle_from_north(p):
+        dx, dy = p[1] - x0, p[2] - y0
+        a = math.degrees(math.atan2(dx, dy))
+        return (a + 360.0) % 360.0
+    rest_clockwise = sorted(rest, key=_angle_from_north, reverse=False)  # ascending: N(0) -> E(90) -> S(180) -> W(270) = clockwise
+    pts = [start_pt] + rest_clockwise
+
 rows = []
 if len(pts) >= 2:
     n = len(pts)
@@ -2211,10 +2652,20 @@ if len(pts) >= 2:
     for i in range(last_index):
         oid1, x1, y1 = pts[i]
         oid2, x2, y2 = pts[(i + 1) % n]
-        dx = x2 - x1
-        dy = y2 - y1
-        dist = math.hypot(dx, dy)
-        bearing = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+        if is_geographic:
+            # Geodesic distance and bearing (lat/lon in degrees -> meters and degrees)
+            p1_geom = arcpy.PointGeometry(arcpy.Point(x1, y1), sr)
+            p2_geom = arcpy.PointGeometry(arcpy.Point(x2, y2), sr)
+            line = arcpy.Polyline(arcpy.Array([p1_geom.firstPoint, p2_geom.firstPoint]), sr)
+            dist = line.getLength("GEODESIC", "METERS")
+            dx = x2 - x1
+            dy = y2 - y1
+            bearing = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+        else:
+            dx = x2 - x1
+            dy = y2 - y1
+            dist = math.hypot(dx, dy)
+            bearing = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
         rows.append((i + 1, oid1, oid2, dist, bearing, area_m2))
 
 # Create a traverse polyline feature class for visualization (best-effort)
@@ -2297,7 +2748,386 @@ aprx.save()
             "arcgis_launch_details": launch_result,
             "note": "Workflow executed and outputs were verified on disk." if csv_exists else "ArcGIS run succeeded but CSV was not found or empty.",
         }
-    
+
+    def compute_fill_volume_idw_cutfill(
+        self,
+        excel_path: str,
+        sheet_name: str,
+        x_field: str,
+        y_field: str,
+        post_z_field: str,
+        pre_z_field: str,
+        coordinate_system: str = "Minna / Nigeria Mid Belt",
+        output_excel_path: Optional[str] = None,
+        cell_size: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Hardened workflow: Excel (one sheet with pre/post Z columns) -> IDW rasters -> Cut Fill -> fill volume (m³) -> results_fill.xlsx.
+        Uses NO ArcGISProject (headless-safe). ExcelToTable uses 3rd positional for sheet.
+        Call this for known "fill volume from Pre-fill/Post-fill" requests to avoid LLM-generated script failures.
+        """
+        from pathlib import Path
+        excel_file = Path(excel_path).resolve()
+        if not excel_file.exists():
+            return {"success": False, "error": f"Excel file not found: {excel_path}"}
+        workspace = excel_file.parent
+        out_xlsx = Path(output_excel_path).resolve() if output_excel_path else (workspace / "results_fill.xlsx")
+        sr_info = parse_coordinate_system(coordinate_system)
+        wkid = sr_info.get("wkid") or 26392
+        sr_name = sr_info.get("name") or "Minna / Nigeria Mid Belt"
+        # ArcGIS expects sheet as 3rd positional (no keyword sheet_name)
+        excel_to_table_call = f'arcpy.conversion.ExcelToTable(r"{excel_file}", excel_table, {json.dumps(sheet_name)})'
+        code = f'''
+import arcpy, os
+arcpy.env.overwriteOutput = True
+workspace = r"{workspace}"
+gdb_name = "FillVolume_analysis"
+gdb_path = os.path.join(workspace, gdb_name + ".gdb")
+if not arcpy.Exists(gdb_path):
+    arcpy.management.CreateFileGDB(workspace, gdb_name + ".gdb")
+arcpy.env.workspace = gdb_path
+
+excel_table = os.path.join(gdb_path, "data_table")
+if arcpy.Exists(excel_table):
+    arcpy.management.Delete(excel_table)
+{excel_to_table_call}
+
+# Resolve actual field names (ArcGIS may alter names: spaces->underscores, case, etc.)
+fields = [f.name for f in arcpy.ListFields(excel_table) if f.type not in ("OID", "Geometry")]
+def _norm(s): return (s or "").lower().replace(" ", "_").replace("-", "_").strip("_")
+def _pick(hints, exclude):
+    for h in hints:
+        hn = _norm(h)
+        for f in fields:
+            if f in exclude: continue
+            if _norm(f) == hn or hn in _norm(f) or _norm(f) in hn:
+                return f
+    return None
+x_f = _pick([{json.dumps(x_field)}, "easting", "east", "x", "longitude"], [])
+y_f = _pick([{json.dumps(y_field)}, "northing", "north", "y", "latitude"], [])
+post_f = _pick([{json.dumps(post_z_field)}, "post_fill", "postfill", "post fill", "post"], [x_f, y_f])
+pre_f = _pick([{json.dumps(pre_z_field)}, "pre_fill", "prefill", "pre fill", "pre"], [x_f, y_f, post_f] if post_f else [x_f, y_f])
+if not all([x_f, y_f, post_f, pre_f]):
+    raise RuntimeError("Resolved fields: " + str({{"x": x_f, "y": y_f, "post_z": post_f, "pre_z": pre_f}}) + "; available: " + ",".join(fields))
+
+sr = arcpy.SpatialReference({wkid})
+points_fc = os.path.join(gdb_path, "points")
+if arcpy.Exists(points_fc):
+    arcpy.management.Delete(points_fc)
+arcpy.management.CreateFeatureclass(gdb_path, "points", "POINT", spatial_reference=sr)
+arcpy.management.AddField(points_fc, "Post", "DOUBLE")
+arcpy.management.AddField(points_fc, "Pre", "DOUBLE")
+with arcpy.da.SearchCursor(excel_table, [x_f, y_f, post_f, pre_f]) as sc, \\
+     arcpy.da.InsertCursor(points_fc, ["SHAPE@XY", "Post", "Pre"]) as ic:
+    for x_raw, y_raw, pz, prz in sc:
+        try:
+            x = float(str(x_raw).replace(",", ""))
+            y = float(str(y_raw).replace(",", ""))
+            post_z = float(str(pz).replace(",", "")) if pz not in (None, "") else None
+            pre_z = float(str(prz).replace(",", "")) if prz not in (None, "") else None
+        except Exception:
+            continue
+        ic.insertRow(((x, y), post_z, pre_z))
+
+post_pts = os.path.join(gdb_path, "post_points")
+if arcpy.Exists(post_pts):
+    arcpy.management.Delete(post_pts)
+arcpy.analysis.Select(points_fc, post_pts, "Post IS NOT NULL")
+hull_fc = os.path.join(gdb_path, "post_hull")
+if arcpy.Exists(hull_fc):
+    arcpy.management.Delete(hull_fc)
+arcpy.management.MinimumBoundingGeometry(post_pts, hull_fc, "CONVEX_HULL", group_option="ALL")
+
+cell_size = {cell_size}
+arcpy.env.mask = hull_fc
+extent_hull = arcpy.Describe(hull_fc).extent
+arcpy.env.extent = extent_hull
+post_raster = os.path.join(gdb_path, "post_idw")
+pre_raster = os.path.join(gdb_path, "pre_idw")
+for r in [post_raster, pre_raster]:
+    if arcpy.Exists(r):
+        arcpy.management.Delete(r)
+arcpy.sa.Idw(post_pts, "Post", cell_size=cell_size).save(post_raster)
+arcpy.env.extent = extent_hull
+arcpy.env.snapRaster = post_raster
+pre_pts = os.path.join(gdb_path, "pre_points")
+if arcpy.Exists(pre_pts):
+    arcpy.management.Delete(pre_pts)
+arcpy.analysis.Select(points_fc, pre_pts, "Pre IS NOT NULL")
+arcpy.sa.Idw(pre_pts, "Pre", cell_size=cell_size).save(pre_raster)
+
+cutfill_raster = os.path.join(gdb_path, "cutfill")
+if arcpy.Exists(cutfill_raster):
+    arcpy.management.Delete(cutfill_raster)
+# CutFill(before, after): before=pre-fill, after=post-fill. Negative Volume = fill (material added).
+arcpy.sa.CutFill(pre_raster, post_raster).save(cutfill_raster)
+
+# IMPORTANT:
+# - The CutFill output raster itself may store REGION IDs in its VALUE field (not per-cell height deltas),
+#   so attempting to compute volume from its VALUE/COUNT alone can be wrong (it can collapse to a single zone).
+# - To match manual ArcGIS Pro behavior, compute dz = (post_idw - pre_idw) within the post boundary mask,
+#   and then create a "CutFill table" with a true Volume column derived from dz and cell area.
+fill_volume = 0.0
+cut_volume = 0.0
+
+# Force CutFill to be clipped to the actual area of work (post boundary).
+cutfill_masked = os.path.join(gdb_path, "cutfill_masked")
+if arcpy.Exists(cutfill_masked):
+    arcpy.management.Delete(cutfill_masked)
+arcpy.sa.ExtractByMask(cutfill_raster, hull_fc).save(cutfill_masked)
+
+# Difference raster (meters): positive=fill (post>pre), negative=cut (post<pre)
+dz_raster = os.path.join(gdb_path, "dz_post_minus_pre")
+if arcpy.Exists(dz_raster):
+    arcpy.management.Delete(dz_raster)
+dz = arcpy.sa.Minus(arcpy.sa.Raster(post_raster), arcpy.sa.Raster(pre_raster))
+arcpy.sa.ExtractByMask(dz, hull_fc).save(dz_raster)
+del dz
+
+# Cell area from output raster (m²)
+dz_desc = arcpy.Describe(dz_raster)
+try:
+    cell_area = float(dz_desc.meanCellWidth) * float(dz_desc.meanCellHeight)
+except Exception:
+    cell_area = float(cell_size) * float(cell_size)
+
+# Compute TOTAL fill/cut volumes from dz using zonal SUM (robust in headless ProPy).
+# dz = (post - pre) in meters; Volume = SUM(dz_pos) * cell_area in m³, and SUM(-dz_neg) * cell_area in m³.
+fill_volume = 0.0
+cut_volume = 0.0
+oid_field = arcpy.Describe(hull_fc).OIDFieldName
+fill_depth = arcpy.sa.Con(arcpy.sa.Raster(dz_raster) > 0, arcpy.sa.Raster(dz_raster), 0)
+cut_depth = arcpy.sa.Con(arcpy.sa.Raster(dz_raster) < 0, -arcpy.sa.Raster(dz_raster), 0)
+fill_tbl = os.path.join(gdb_path, "fill_depth_sum")
+cut_tbl = os.path.join(gdb_path, "cut_depth_sum")
+for t in [fill_tbl, cut_tbl]:
+    if arcpy.Exists(t):
+        arcpy.management.Delete(t)
+arcpy.sa.ZonalStatisticsAsTable(hull_fc, oid_field, fill_depth, fill_tbl, "DATA", "SUM")
+arcpy.sa.ZonalStatisticsAsTable(hull_fc, oid_field, cut_depth, cut_tbl, "DATA", "SUM")
+del fill_depth
+del cut_depth
+
+def _sum_from(tbl):
+    flds = [f.name for f in arcpy.ListFields(tbl)]
+    sf = next((f for f in flds if (f or "").strip().lower() == "sum"), None) or next((f for f in flds if "sum" in (f or "").strip().lower()), None)
+    if not sf:
+        return 0.0
+    with arcpy.da.SearchCursor(tbl, [sf]) as c:
+        for (v,) in c:
+            return float(v) if v is not None else 0.0
+    return 0.0
+
+fill_volume = _sum_from(fill_tbl) * cell_area
+cut_volume = _sum_from(cut_tbl) * cell_area
+
+# Create CutFill table with Volume column from dz sums per CutFill zone.
+# (This mimics the Volume column ArcGIS often provides automatically.)
+cutfill_table = os.path.join(gdb_path, "cutfill_table")
+if arcpy.Exists(cutfill_table):
+    arcpy.management.Delete(cutfill_table)
+
+# Ensure the zone raster has an attribute table (for the Value zone field)
+try:
+    arcpy.management.BuildRasterAttributeTable(cutfill_masked, "Overwrite")
+except Exception:
+    pass
+
+zone_field = "Value"
+# Zonal statistics: sum of dz values per zone (units: meters). Multiply by cell_area => m³.
+arcpy.sa.ZonalStatisticsAsTable(cutfill_masked, zone_field, dz_raster, cutfill_table, "DATA", "SUM")
+
+# Add Volume (m³) and compute it from SUM(dz) * cell_area
+tbl_fields = [f.name for f in arcpy.ListFields(cutfill_table)]
+sum_f = next((f for f in tbl_fields if (f or "").strip().lower() == "sum"), None)
+if not sum_f:
+    # Sometimes SUM is named SUM_ or similar depending on store; pick first field containing 'sum'
+    sum_f = next((f for f in tbl_fields if "sum" in (f or "").strip().lower()), None)
+if not sum_f:
+    raise RuntimeError("Zonal stats table missing SUM field. Fields: " + ", ".join(tbl_fields))
+
+if "Volume" not in tbl_fields and "VOLUME" not in [f.upper() for f in tbl_fields]:
+    arcpy.management.AddField(cutfill_table, "Volume", "DOUBLE")
+# Populate Volume using an UpdateCursor (avoids CalculateField expression quirks in some Pro headless runs)
+tbl_fields2 = [f.name for f in arcpy.ListFields(cutfill_table)]
+vol_f = next((f for f in tbl_fields2 if (f or "").strip().lower() == "volume"), "Volume")
+with arcpy.da.UpdateCursor(cutfill_table, [sum_f, vol_f]) as ucur:
+    for s, v in ucur:
+        try:
+            sv = float(s) if s is not None else 0.0
+        except Exception:
+            sv = 0.0
+        ucur.updateRow((s, sv * cell_area))
+
+# Note: `cutfill_table.Volume` is the NET dz volume per CutFill zone.
+# We keep the per-cell `fill_volume` / `cut_volume` computed above as the authoritative totals.
+
+# Area of post_hull polygon (sq m)
+hull_area = 0.0
+with arcpy.da.SearchCursor(hull_fc, ["SHAPE@AREA"]) as cur:
+    for row in cur:
+        if row[0] is not None:
+            hull_area += float(row[0])
+            break
+
+# Create summary table with Area and Volume (not zonal stats, which can confuse area vs volume)
+out_excel = r"{out_xlsx}"
+if arcpy.Exists(out_excel):
+    arcpy.management.Delete(out_excel)
+summary_tbl = os.path.join(gdb_path, "fill_volume_summary")
+if arcpy.Exists(summary_tbl):
+    arcpy.management.Delete(summary_tbl)
+arcpy.management.CreateTable(gdb_path, "fill_volume_summary")
+arcpy.management.AddField(summary_tbl, "Metric", "TEXT", field_length=64)
+arcpy.management.AddField(summary_tbl, "Value", "DOUBLE")
+with arcpy.da.InsertCursor(summary_tbl, ["Metric", "Value"]) as ic:
+    ic.insertRow(["Area_sq_m", hull_area])
+    ic.insertRow(["Fill_Volume_m3", fill_volume])
+    ic.insertRow(["Cut_Volume_m3", cut_volume])
+arcpy.conversion.TableToExcel(summary_tbl, out_excel)
+print("RESULT_AREA_SQ_M:", hull_area)
+print("RESULT_FILL_VOLUME_CUBIC_METERS:", fill_volume)
+print("RESULT_CUT_VOLUME_CUBIC_METERS:", cut_volume)
+print("RESULT_EXCEL_PATH:", out_excel)
+'''
+        working_dir = workspace / "scripts"
+        working_dir.mkdir(parents=True, exist_ok=True)
+        script_name = "fill_volume_idw_cutfill.py"
+        run_result = self._run_propy_script(code, working_dir, script_name)
+        if not run_result.get("success"):
+            stdout_txt = run_result.get("stdout", "") or ""
+            stderr_txt = run_result.get("stderr", "") or ""
+            combined = f"{stdout_txt}\n{stderr_txt}"
+            invalid_extent = "ERROR 010092" in combined or "Invalid output extent" in combined
+            return {
+                "success": False,
+                "error": run_result.get("error", "Script execution failed"),
+                "stdout": stdout_txt,
+                "stderr": stderr_txt,
+                "analysis": (
+                    "ArcGIS IDW failed with invalid output extent. "
+                    "This usually means the raster environment must be rebuilt from an explicit polygon mask/extent. "
+                    "For separate PRE/POST source files or DWG boundary workflows, escalate to arcgis_execute_python_code "
+                    "with a custom script that imports both files, imports/probes the DWG polygon, sets env.extent/env.mask "
+                    "from that polygon, and retries IDW/CutFill."
+                    if invalid_extent else None
+                ),
+                "suggested_next_tool": "arcgis_execute_python_code" if invalid_extent else None,
+            }
+        stdout = run_result.get("stdout", "") or ""
+        results = self._parse_arcgis_results(stdout)
+        fv = results.get("fill_volume_cubic_meters") or {}
+        fill_vol = fv.get("value") if isinstance(fv, dict) else fv
+        ex = results.get("excel_path") or results.get("result_excel_path") or {}
+        excel_out = (ex.get("text") or ex.get("formatted")) if isinstance(ex, dict) else str(out_xlsx)
+        if not excel_out:
+            excel_out = str(out_xlsx)
+
+        # Create ArcGIS project and show layers (run as a normal GIS analyst would: project + map + layers + open Pro)
+        project_path_for_map: Optional[str] = None
+        gdb_path = workspace / "FillVolume_analysis.gdb"
+        create_result = self.create_project(
+            project_name="FillVolume_Results",
+            project_path=str(workspace),
+            coordinate_system=coordinate_system,
+            template="MAP",
+            clean_layers=True,
+        )
+        if create_result.get("success"):
+            project_path_for_map = create_result.get("project_path")
+        if project_path_for_map and gdb_path.exists():
+            # Add analysis layers to the project map so user sees shapefiles/rasters and steps
+            layer_order = ["post_hull", "points", "post_points", "pre_idw", "post_idw", "dz_post_minus_pre", "cutfill_masked"]
+            _p = str(project_path_for_map).replace("\\", "\\\\")
+            _g = str(gdb_path).replace("\\", "\\\\")
+            _w = str(workspace).replace("\\", "\\\\")
+            add_layers_code = f'''
+import arcpy, os
+project_path = r"{_p}"
+gdb_path = r"{_g}"
+workspace_dir = r"{_w}"
+aprx = arcpy.mp.ArcGISProject(project_path)
+aprx.defaultGeodatabase = gdb_path
+try:
+    aprx.addFolderConnection(workspace_dir)
+except Exception:
+    pass
+maps = aprx.listMaps()
+if maps:
+    m = aprx.activeMap if aprx.activeMap else maps[0]
+    try:
+        if m.spatialReference is None:
+            m.spatialReference = arcpy.SpatialReference(26392)
+    except Exception:
+        pass
+    layer_order = {json.dumps(layer_order)}
+    for name in layer_order:
+        path = os.path.join(gdb_path, name)
+        if arcpy.Exists(path):
+            try:
+                lyr = m.addDataFromPath(path)
+                try:
+                    # Ensure visibility matches "manual add" behavior.
+                    lyr.visible = True
+                except Exception:
+                    pass
+            except Exception as e:
+                print("RESULT_LAYER_WARN:", name, str(e))
+    try:
+        m.addBasemap("Imagery Hybrid")
+    except Exception:
+        pass
+    zoom_ext = None
+    hull_path = os.path.join(gdb_path, "post_hull")
+    if arcpy.Exists(hull_path):
+        zoom_ext = arcpy.Describe(hull_path).extent
+    if zoom_ext is None and arcpy.Exists(os.path.join(gdb_path, "cutfill")):
+        zoom_ext = arcpy.Describe(os.path.join(gdb_path, "cutfill")).extent
+    if zoom_ext:
+        try:
+            m.defaultCamera.setExtent(zoom_ext)
+        except Exception:
+            pass
+    aprx.save()
+    print("RESULT_PROJECT_READY:", project_path)
+aprx = None
+'''
+            add_result = self._run_propy_script(add_layers_code, working_dir, "fill_volume_add_layers.py")
+            if add_result.get("success"):
+                try:
+                    self.launch_arcgis_pro(project_path=project_path_for_map)
+                except Exception as e:
+                    logger.warning("Launch ArcGIS Pro after fill-volume: %s", e)
+
+        area_sq_m = None
+        ar = results.get("area_sq_m") or {}
+        if isinstance(ar, dict) and "value" in ar:
+            area_sq_m = ar.get("value")
+        layers_shown = (
+            "post_hull (post-fill area boundary), points (all with Pre/Post Z), post_points, "
+            "pre_idw (pre-fill IDW raster), post_idw (post-fill IDW raster), cutfill (cut/fill raster)"
+        )
+        return {
+            "success": True,
+            "fill_volume_cubic_meters": fill_vol,
+            "area_sq_m": area_sq_m,
+            "results_excel_path": excel_out,
+            "script_path": str(working_dir / script_name),
+            "stdout": stdout,
+            "results": results,
+            "project_path": project_path_for_map,
+            "arcgis_pro_launched": bool(project_path_for_map and gdb_path.exists()),
+            "layers_in_map": layers_shown,
+            "note": (
+                f"Report Area (sq m) and Fill Volume (m³) separately—Area is the post-fill footprint, Volume is cubic meters. "
+                f"ArcGIS Pro opened with project at {project_path_for_map or 'N/A'}, layers zoomed to extent. "
+                f"Layers in map: {layers_shown}. results_fill.xlsx contains Area_sq_m and Fill_Volume_m3 columns."
+            ) if project_path_for_map else (
+                "Report Area (sq m) and Fill Volume (m³) separately. Geoprocessing completed; ArcGIS Pro project/layers may have been skipped. "
+                "results_excel_path contains Area_sq_m and Fill_Volume_m3 columns."
+            ),
+        }
+
     def _run_propy_script(self, script_content: str, working_dir: Path, script_name: str) -> Dict[str, Any]:
         """
         Run a small arcpy script using ArcGIS Pro's propy.bat (headless geoprocessing).
@@ -2330,13 +3160,22 @@ aprx.save()
                 "-Command",
                 f"& '{str(propy_bat)}' '{str(script_path)}'",
             ]
+            timeout_s = int(
+                getattr(
+                    self.settings,
+                    "arcgis_propy_timeout_seconds",
+                    getattr(self.settings, "arcgis_ui_execution_timeout", 1800),
+                )
+            )
+            if timeout_s < 60:
+                timeout_s = 600
             result = subprocess.run(
                 cmd,
                 shell=False,
                 cwd=str(working_dir),
                 capture_output=True,
                 text=True,
-                timeout=600,  # 10 minute timeout for complex operations
+                timeout=timeout_s,
             )
             ok = result.returncode == 0
             return {
@@ -2346,56 +3185,1021 @@ aprx.save()
                 "stderr": result.stderr,
                 "script": str(script_path),
             }
-        except subprocess.TimeoutExpired:
+        except subprocess.TimeoutExpired as te:
+            to = getattr(te, "timeout", None)
             return {
                 "success": False,
-                "error": "Script execution timed out after 10 minutes",
+                "error": f"Script execution timed out after {to} seconds",
                 "script": str(working_dir / script_name),
             }
         except Exception as e:
             return {"success": False, "error": str(e)}
-    
-    def _parse_arcgis_results(self, stdout: str) -> Dict[str, Any]:
+
+    def compute_pre_post_csv_dwg_cutfill(
+        self,
+        pre_csv_path: str,
+        post_csv_path: str,
+        boundary_dwg_path: str,
+        workspace_folder: Optional[str] = None,
+        output_csv_path: Optional[str] = None,
+        project_name: str = "Adibawa_BorrowPit_Volume",
+        coordinate_system: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
-        Parse computational results from ArcGIS script stdout.
-        Looks for lines starting with 'RESULT_' and extracts structured data.
+        Deterministic ArcGIS workflow for:
+        separate PRE/POST tabular files (.csv or .xlsx) + DWG polygon boundary
+        -> IDW surfaces -> CutFill -> CSV result.
+
+        This follows the same stable pattern as the verified pullman workflow:
+        run geoprocessing headlessly via propy.bat with explicit paths, verify outputs on disk,
+        then open ArcGIS Pro with the finished project for review.
         """
-        results = {}
-        if not stdout:
-            return results
-        
-        lines = stdout.split('\n')
-        for line in lines:
-            line = line.strip()
-            if line.startswith('RESULT_'):
+        pre_src = Path(pre_csv_path).resolve()
+        post_src = Path(post_csv_path).resolve()
+        dwg_src = Path(boundary_dwg_path).resolve()
+        missing = [str(p) for p in (pre_src, post_src, dwg_src) if not p.exists()]
+        if missing:
+            return {
+                "success": False,
+                "error": "One or more required source files were not found.",
+                "missing_paths": missing,
+            }
+
+        workspace = Path(workspace_folder).resolve() if workspace_folder else Path.cwd().resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        def _csv_copy_name(src: Path, fallback_stem: str) -> str:
+            safe_stem = "".join(ch if ch.isalnum() else "_" for ch in src.stem).strip("_")
+            return f"{safe_stem or fallback_stem}.csv"
+
+        def _materialize_tabular_input(src: Path, fallback_stem: str) -> Path:
+            dest = (workspace / _csv_copy_name(src, fallback_stem)).resolve()
+            suffix = src.suffix.lower()
+            if suffix == ".csv":
+                shutil.copy2(src, dest)
+                return dest
+            if suffix not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+                raise ValueError(
+                    f"Unsupported PRE/POST tabular input type '{src.suffix}'. "
+                    "Use .csv or .xlsx files."
+                )
+
+            try:
+                import csv as _csv
+                from openpyxl import load_workbook
+            except Exception as exc:
+                raise RuntimeError(
+                    "Excel input was provided, but workbook conversion support is unavailable. "
+                    "Install openpyxl or provide CSV files."
+                ) from exc
+
+            wb = load_workbook(filename=str(src), data_only=True, read_only=True)
+            try:
+                ws = wb[wb.sheetnames[0]]
+                with dest.open("w", newline="", encoding="utf-8-sig") as fh:
+                    writer = _csv.writer(fh)
+                    for row in ws.iter_rows(values_only=True):
+                        writer.writerow(list(row) if row is not None else [])
+            finally:
                 try:
-                    # Expected format: RESULT_AREA: 12345.67 square_meters
-                    # or: RESULT_BEARING_P1_P2: 45.5 degrees
-                    parts = line.split(':', 1)
-                    if len(parts) == 2:
-                        key = parts[0].replace('RESULT_', '').lower()
-                        value_part = parts[1].strip()
-                        
-                        # Try to extract numeric value and unit
-                        value_tokens = value_part.split()
-                        if value_tokens:
-                            try:
-                                numeric_value = float(value_tokens[0])
-                                unit = value_tokens[1] if len(value_tokens) > 1 else ""
-                                results[key] = {
-                                    "value": numeric_value,
-                                    "unit": unit,
-                                    "formatted": value_part
-                                }
-                            except ValueError:
-                                # If not numeric, store as text
-                                results[key] = {"text": value_part}
-                except Exception as e:
-                    logger.debug(f"Error parsing result line '{line}': {e}")
+                    wb.close()
+                except Exception:
+                    pass
+            return dest
+
+        try:
+            pre_copy = _materialize_tabular_input(pre_src, "pre_data")
+            post_copy = _materialize_tabular_input(post_src, "post_data")
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "pre_source": str(pre_src),
+                "post_source": str(post_src),
+            }
+
+        out_csv = Path(output_csv_path).resolve() if output_csv_path else (workspace / "Adibawa_VolumeResult.csv")
+
+        create = self.create_project(
+            project_name=project_name,
+            project_path=str(workspace),
+            coordinate_system=coordinate_system,
+            template="MAP",
+            clean_layers=True,
+        )
+        if not create.get("success"):
+            return {
+                "success": False,
+                "error": create.get("error", "Failed to create ArcGIS project"),
+                "details": create,
+                "pre_copy": str(pre_copy),
+                "post_copy": str(post_copy),
+            }
+
+        project_path = create.get("project_path")
+        if not project_path:
+            return {
+                "success": False,
+                "error": "Project creation did not return a project_path.",
+                "details": create,
+            }
+
+        explicit_sr = parse_coordinate_system(coordinate_system) if coordinate_system else None
+        explicit_wkid = explicit_sr.get("wkid") if explicit_sr else None
+
+        code = f"""
+import os, csv, time, arcpy
+from arcpy.sa import Idw, CutFill, ExtractByMask
+
+arcpy.env.overwriteOutput = True
+
+project_path = r"{project_path}"
+workspace = r"{str(workspace)}"
+pre_csv = r"{str(pre_copy)}"
+post_csv = r"{str(post_copy)}"
+dwg_path = r"{str(dwg_src)}"
+out_csv = r"{str(out_csv)}"
+explicit_wkid = {repr(explicit_wkid)}
+
+project_dir = os.path.dirname(project_path)
+project_name = os.path.splitext(os.path.basename(project_path))[0]
+gdb_path = os.path.join(project_dir, project_name + ".gdb")
+if not arcpy.Exists(gdb_path):
+    arcpy.management.CreateFileGDB(project_dir, project_name + ".gdb")
+
+arcpy.env.workspace = gdb_path
+arcpy.env.scratchWorkspace = gdb_path
+
+if arcpy.CheckExtension("Spatial") != "Available":
+    raise RuntimeError("Spatial Analyst extension is not available")
+arcpy.CheckOutExtension("Spatial")
+
+aprx = arcpy.mp.ArcGISProject(project_path)
+maps = aprx.listMaps()
+try:
+    aprx.defaultGeodatabase = gdb_path
+except Exception:
+    pass
+try:
+    aprx.addFolderConnection(project_dir)
+except Exception:
+    pass
+
+run_tag = "r" + str(int(time.time()))
+cad_name = "cad_import_" + run_tag
+cad_result = arcpy.conversion.CADToGeodatabase(dwg_path, gdb_path, cad_name, "1000")
+try:
+    cad_path = cad_result[0]
+except Exception:
+    cad_path = os.path.join(gdb_path, cad_name)
+
+polygon_fc = None
+polyline_fc = None
+candidate_roots = [cad_path, gdb_path]
+for root in candidate_roots:
+    try:
+        for dirpath, dirnames, filenames in arcpy.da.Walk(root, datatype="FeatureClass"):
+            for filename in filenames:
+                full = os.path.join(dirpath, filename)
+                nm = str(filename).strip().lower()
+                if polygon_fc is None and nm == "polygon":
+                    polygon_fc = full
+                elif polyline_fc is None and nm == "polyline":
+                    polyline_fc = full
+    except Exception:
+        pass
+    if polygon_fc or polyline_fc:
+        break
+
+temp_poly = os.path.join(gdb_path, "cad_polygonized_" + run_tag)
+boundary_fc = os.path.join(gdb_path, "analysis_boundary_" + run_tag)
+
+def _largest_geom(fc):
+    best_geom = None
+    best_area = -1.0
+    with arcpy.da.SearchCursor(fc, ["SHAPE@"]) as cur:
+        for (geom,) in cur:
+            if geom and float(getattr(geom, "area", 0.0) or 0.0) > best_area:
+                best_area = float(getattr(geom, "area", 0.0) or 0.0)
+                best_geom = geom
+    return best_geom
+
+boundary_geom = None
+boundary_sr = None
+if polygon_fc and arcpy.Exists(polygon_fc) and int(arcpy.management.GetCount(polygon_fc)[0]) > 0:
+    boundary_geom = _largest_geom(polygon_fc)
+    boundary_sr = arcpy.Describe(polygon_fc).spatialReference
+
+if boundary_geom is None:
+    if (not polyline_fc) or (not arcpy.Exists(polyline_fc)) or int(arcpy.management.GetCount(polyline_fc)[0]) == 0:
+        raise RuntimeError("No polygon or polyline boundary found in DWG import")
+    arcpy.management.FeatureToPolygon(polyline_fc, temp_poly)
+    if not arcpy.Exists(temp_poly) or int(arcpy.management.GetCount(temp_poly)[0]) == 0:
+        raise RuntimeError("Could not derive polygon boundary from DWG polylines")
+    boundary_geom = _largest_geom(temp_poly)
+    boundary_sr = arcpy.Describe(temp_poly).spatialReference
+
+if boundary_geom is None:
+    raise RuntimeError("Could not resolve a usable DWG boundary geometry")
+
+sr = arcpy.SpatialReference(int(explicit_wkid)) if explicit_wkid else boundary_sr
+if sr:
+    arcpy.management.CreateFeatureclass(gdb_path, os.path.basename(boundary_fc), "POLYGON", spatial_reference=sr)
+else:
+    arcpy.management.CreateFeatureclass(gdb_path, os.path.basename(boundary_fc), "POLYGON")
+
+geom_to_write = boundary_geom
+try:
+    if sr and boundary_sr and getattr(boundary_sr, "name", "") not in ("", "Unknown") and getattr(sr, "factoryCode", 0) != getattr(boundary_sr, "factoryCode", 0):
+        geom_to_write = boundary_geom.projectAs(sr)
+except Exception:
+    geom_to_write = boundary_geom
+
+with arcpy.da.InsertCursor(boundary_fc, ["SHAPE@"]) as ic:
+    ic.insertRow([geom_to_write])
+
+desc = arcpy.Describe(boundary_fc)
+ext = desc.extent
+if not ext:
+    raise RuntimeError("Boundary feature class has no usable extent")
+
+width = max(float(ext.XMax - ext.XMin), 0.0)
+height = max(float(ext.YMax - ext.YMin), 0.0)
+cell_size = max(min(width if width > 0 else 1.0, height if height > 0 else 1.0) / 100.0, 0.5)
+xpad = max(width * 0.02, cell_size * 2.0, 1.0)
+ypad = max(height * 0.02, cell_size * 2.0, 1.0)
+
+def _set_env(mult):
+    arcpy.env.extent = arcpy.Extent(ext.XMin - xpad * mult, ext.YMin - ypad * mult, ext.XMax + xpad * mult, ext.YMax + ypad * mult)
+    arcpy.env.mask = boundary_fc
+    if sr and getattr(sr, "name", "") not in ("", "Unknown"):
+        arcpy.env.outputCoordinateSystem = sr
+    arcpy.env.cellSize = cell_size
+
+def _pick_field(fieldnames, exact_names, contains_names):
+    lower_map = {{str(f).strip().lower(): f for f in (fieldnames or [])}}
+    for name in exact_names:
+        if name in lower_map:
+            return lower_map[name]
+    for name in contains_names:
+        for key, original in lower_map.items():
+            if name in key:
+                return original
+    return None
+
+def _detect_xyz_fields(csv_path):
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+    xf = _pick_field(fields, ["e", "x"], ["east", "easting", "lon", "long"])
+    yf = _pick_field(fields, ["n", "y"], ["north", "northing", "lat"])
+    zf = _pick_field(fields, ["z"], ["elev", "elevation", "rl", "level"])
+    return fields, xf, yf, zf
+
+def _csv_to_points(csv_path, fc_name):
+    fields, xf, yf, zf = _detect_xyz_fields(csv_path)
+    if not xf or not yf or not zf:
+        raise RuntimeError("Missing usable E/N/Z fields in {{}}. Fields found: {{}}".format(csv_path, fields))
+    out_fc = os.path.join(gdb_path, fc_name + "_" + run_tag)
+    if sr:
+        arcpy.management.CreateFeatureclass(gdb_path, os.path.basename(out_fc), "POINT", spatial_reference=sr)
+    else:
+        arcpy.management.CreateFeatureclass(gdb_path, os.path.basename(out_fc), "POINT")
+    arcpy.management.AddField(out_fc, "ZVAL", "DOUBLE")
+    inserted = 0
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        with arcpy.da.InsertCursor(out_fc, ["SHAPE@XY", "ZVAL"]) as ic:
+            for row in reader:
+                try:
+                    x = float(str(row[xf]).replace(",", "").strip())
+                    y = float(str(row[yf]).replace(",", "").strip())
+                    z = float(str(row[zf]).replace(",", "").strip())
+                except Exception:
                     continue
-        
-        return results
-    
+                ic.insertRow([(x, y), z])
+                inserted += 1
+    if inserted == 0:
+        raise RuntimeError("No usable rows inserted from {{}}".format(csv_path))
+    return out_fc, inserted
+
+pre_fc, pre_count = _csv_to_points(pre_csv, "pre_points")
+post_fc, post_count = _csv_to_points(post_csv, "post_points")
+
+pre_idw_raw = os.path.join(gdb_path, "pre_idw_raw_" + run_tag)
+post_idw_raw = os.path.join(gdb_path, "post_idw_raw_" + run_tag)
+pre_idw = os.path.join(gdb_path, "pre_idw_" + run_tag)
+post_idw = os.path.join(gdb_path, "post_idw_" + run_tag)
+cutfill_raster = os.path.join(gdb_path, "cutfill_" + run_tag)
+cutfill_poly = os.path.join(gdb_path, "cutfill_poly_" + run_tag)
+
+idw_ok = False
+for mult in [1.0, 2.0, 4.0]:
+    try:
+        _set_env(mult)
+        Idw(pre_fc, "ZVAL", cell_size=cell_size).save(pre_idw_raw)
+        Idw(post_fc, "ZVAL", cell_size=cell_size).save(post_idw_raw)
+        ExtractByMask(pre_idw_raw, boundary_fc).save(pre_idw)
+        arcpy.env.snapRaster = pre_idw
+        ExtractByMask(post_idw_raw, boundary_fc).save(post_idw)
+        idw_ok = True
+        break
+    except Exception as e:
+        msg = arcpy.GetMessages(2) + " " + str(e)
+        if "010092" in msg or "Invalid output extent" in msg:
+            continue
+        raise
+if not idw_ok:
+    raise RuntimeError("IDW failed after automatic extent repair attempts")
+
+_set_env(4.0)
+arcpy.env.snapRaster = pre_idw
+CutFill(pre_idw, post_idw).save(cutfill_raster)
+
+try:
+    arcpy.management.BuildRasterAttributeTable(cutfill_raster, "Overwrite")
+except Exception:
+    pass
+
+fill_volume = 0.0
+cut_volume = 0.0
+net_volume = 0.0
+
+# Robust volume computation:
+# derive dz = post - pre inside the boundary and integrate depth over cell area.
+dz_raster = os.path.join(gdb_path, "dz_post_minus_pre_" + run_tag)
+fill_tbl = os.path.join(gdb_path, "fill_depth_sum_" + run_tag)
+cut_tbl = os.path.join(gdb_path, "cut_depth_sum_" + run_tag)
+
+ExtractByMask(arcpy.sa.Minus(arcpy.sa.Raster(post_idw), arcpy.sa.Raster(pre_idw)), boundary_fc).save(dz_raster)
+dz_desc = arcpy.Describe(dz_raster)
+try:
+    cell_area = float(dz_desc.meanCellWidth) * float(dz_desc.meanCellHeight)
+except Exception:
+    cell_area = float(cell_size) * float(cell_size)
+
+oid_field = arcpy.Describe(boundary_fc).OIDFieldName
+fill_depth = arcpy.sa.Con(arcpy.sa.Raster(dz_raster) > 0, arcpy.sa.Raster(dz_raster), 0)
+cut_depth = arcpy.sa.Con(arcpy.sa.Raster(dz_raster) < 0, -arcpy.sa.Raster(dz_raster), 0)
+arcpy.sa.ZonalStatisticsAsTable(boundary_fc, oid_field, fill_depth, fill_tbl, "DATA", "SUM")
+arcpy.sa.ZonalStatisticsAsTable(boundary_fc, oid_field, cut_depth, cut_tbl, "DATA", "SUM")
+del fill_depth
+del cut_depth
+
+def _sum_from(tbl):
+    flds = [f.name for f in arcpy.ListFields(tbl)]
+    sf = next((f for f in flds if (f or "").strip().lower() == "sum"), None) or next((f for f in flds if "sum" in (f or "").strip().lower()), None)
+    if not sf:
+        return 0.0
+    with arcpy.da.SearchCursor(tbl, [sf]) as c:
+        for (v,) in c:
+            return float(v) if v is not None else 0.0
+    return 0.0
+
+fill_volume = _sum_from(fill_tbl) * cell_area
+cut_volume = -(_sum_from(cut_tbl) * cell_area)
+net_volume = fill_volume + cut_volume
+
+boundary_area = 0.0
+with arcpy.da.SearchCursor(boundary_fc, ["SHAPE@AREA"]) as cur:
+    for (a,) in cur:
+        boundary_area += float(a or 0.0)
+
+with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow(["metric", "value", "unit"])
+    w.writerow(["pre_points_inserted", pre_count, "count"])
+    w.writerow(["post_points_inserted", post_count, "count"])
+    w.writerow(["boundary_area", boundary_area, "square_meters"])
+    w.writerow(["fill_volume", fill_volume, "cubic_meters"])
+    w.writerow(["cut_volume", cut_volume, "cubic_meters"])
+    w.writerow(["net_volume", net_volume, "cubic_meters"])
+    w.writerow(["pre_copy", pre_csv, "path"])
+    w.writerow(["post_copy", post_csv, "path"])
+    w.writerow(["project_path", project_path, "path"])
+
+mp = None
+try:
+    mp = aprx.activeMap
+except Exception:
+    mp = None
+if mp is None and maps:
+    mp = maps[0]
+
+def _add_layer_to_map(map_obj, ds_path, tag):
+    if not map_obj or not ds_path or not arcpy.Exists(ds_path):
+        print("RESULT_LAYER_SKIP:", tag)
+        return
+    try:
+        lyr = map_obj.addDataFromPath(ds_path)
+        try:
+            lyr.visible = True
+        except Exception:
+            pass
+        print("RESULT_LAYER_ADDED:", tag, ds_path)
+    except Exception as ex:
+        print("RESULT_LAYER_ERROR:", tag, str(ex))
+
+if mp:
+    for tag, ds in [
+        ("boundary", boundary_fc),
+        ("pre_points", pre_fc),
+        ("post_points", post_fc),
+        ("pre_idw", pre_idw),
+        ("post_idw", post_idw),
+        ("dz_post_minus_pre", dz_raster),
+        ("cutfill", cutfill_raster),
+    ]:
+        _add_layer_to_map(mp, ds, tag)
+    try:
+        mp.defaultCamera.setExtent(arcpy.Describe(boundary_fc).extent)
+    except Exception:
+        pass
+
+try:
+    aprx.save()
+except Exception:
+    pass
+
+print("RESULT_PRE_POINTS_INSERTED:", pre_count)
+print("RESULT_POST_POINTS_INSERTED:", post_count)
+print("RESULT_BOUNDARY_AREA:", boundary_area)
+print("RESULT_FILL_VOLUME:", fill_volume)
+print("RESULT_CUT_VOLUME:", cut_volume)
+print("RESULT_NET_VOLUME:", net_volume)
+print("RESULT_OUTPUT_CSV:", out_csv)
+print("RESULT_PRE_COPY:", pre_csv)
+print("RESULT_POST_COPY:", post_csv)
+print("RESULT_PROJECT_PATH:", project_path)
+"""
+
+        run = self.execute_python_code(
+            python_code=code,
+            project_path=str(project_path),
+            script_name=f"{project_name}_pre_post_cutfill.py",
+            execute_automatically=True,
+            launch_arcgis_pro=False,
+            prelaunch_arcgis_pro=False,
+            skip_finalization=True,
+        )
+        if not run.get("success"):
+            return {
+                "success": False,
+                "error": run.get("error", "ArcGIS execution failed"),
+                "details": run,
+                "pre_copy": str(pre_copy),
+                "post_copy": str(post_copy),
+                "project_path": str(project_path),
+            }
+
+        csv_exists = out_csv.exists() and out_csv.stat().st_size > 0
+        finalize_result = self.finalize_project_visualization(
+            project_path=str(project_path),
+            load_basemap=True,
+            basemap_name="Imagery Hybrid",
+            load_geodatabase=True,
+            launch_arcgis_pro=False,
+        )
+        launch_result = self.launch_arcgis_pro(project_path=str(project_path))
+
+        return {
+            "success": True,
+            "project_path": str(project_path),
+            "output_csv": str(out_csv),
+            "output_csv_exists": csv_exists,
+            "pre_copy": str(pre_copy),
+            "post_copy": str(post_copy),
+            "arcgis_results": run.get("results", {}),
+            "stdout": run.get("stdout", ""),
+            "visualization_finalized": finalize_result.get("success", False),
+            "visualization_details": finalize_result,
+            "arcgis_launched": launch_result.get("success", False),
+            "arcgis_launch_details": launch_result,
+            "note": "Workflow executed deterministically via ArcGIS Python and ArcGIS Pro was opened after output verification." if csv_exists else "ArcGIS execution finished but the result CSV was not found or is empty.",
+        }
+
+    def compute_pre_post_csv_dwg_tin_volume(
+        self,
+        pre_csv_path: str,
+        post_csv_path: str,
+        boundary_dwg_path: str,
+        workspace_folder: Optional[str] = None,
+        output_csv_path: Optional[str] = None,
+        project_name: str = "Adibawa_TIN_Volume",
+        coordinate_system: Optional[str] = "EPSG:26392",
+        cad_reference_scale: str = "1000",
+        fallback_to_idw_on_failure: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        PRE/POST CSV + DWG boundary -> 3D points -> CreateTin (3D Analyst) -> TinRaster -> dz volume CSV.
+
+        Handles common CreateTin failures (ERROR 999999) by retrying without hard clip, repairing
+        boundary geometry, then optionally falling back to :meth:`compute_pre_post_csv_dwg_cutfill`.
+        """
+        pre_src = Path(pre_csv_path).resolve()
+        post_src = Path(post_csv_path).resolve()
+        dwg_src = Path(boundary_dwg_path).resolve()
+        missing = [str(p) for p in (pre_src, post_src, dwg_src) if not p.exists()]
+        if missing:
+            return {
+                "success": False,
+                "error": "One or more required source files were not found.",
+                "missing_paths": missing,
+            }
+
+        workspace = Path(workspace_folder).resolve() if workspace_folder else Path.cwd().resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+
+        def _csv_copy_name(src: Path, fallback_stem: str) -> str:
+            safe_stem = "".join(ch if ch.isalnum() else "_" for ch in src.stem).strip("_")
+            return f"{safe_stem or fallback_stem}.csv"
+
+        def _materialize_tabular_input(src: Path, fallback_stem: str) -> Path:
+            dest = (workspace / _csv_copy_name(src, fallback_stem)).resolve()
+            suffix = src.suffix.lower()
+            if suffix == ".csv":
+                shutil.copy2(src, dest)
+                return dest
+            if suffix not in {".xlsx", ".xlsm", ".xltx", ".xltm"}:
+                raise ValueError(
+                    f"Unsupported PRE/POST tabular input type '{src.suffix}'. "
+                    "Use .csv or .xlsx files."
+                )
+            try:
+                import csv as _csv
+                from openpyxl import load_workbook
+            except Exception as exc:
+                raise RuntimeError(
+                    "Excel input was provided, but workbook conversion support is unavailable. "
+                    "Install openpyxl or provide CSV files."
+                ) from exc
+            wb = load_workbook(filename=str(src), data_only=True, read_only=True)
+            try:
+                ws = wb[wb.sheetnames[0]]
+                with dest.open("w", newline="", encoding="utf-8-sig") as fh:
+                    writer = _csv.writer(fh)
+                    for row in ws.iter_rows(values_only=True):
+                        writer.writerow(list(row) if row is not None else [])
+            finally:
+                try:
+                    wb.close()
+                except Exception:
+                    pass
+            return dest
+
+        try:
+            pre_copy = _materialize_tabular_input(pre_src, "pre_data")
+            post_copy = _materialize_tabular_input(post_src, "post_data")
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "pre_source": str(pre_src),
+                "post_source": str(post_src),
+            }
+
+        out_csv = Path(output_csv_path).resolve() if output_csv_path else (workspace / "Adibawa_VolumeResult2.csv")
+
+        create = self.create_project(
+            project_name=project_name,
+            project_path=str(workspace),
+            coordinate_system=coordinate_system,
+            template="MAP",
+            clean_layers=True,
+        )
+        if not create.get("success"):
+            return {
+                "success": False,
+                "error": create.get("error", "Failed to create ArcGIS project"),
+                "details": create,
+                "pre_copy": str(pre_copy),
+                "post_copy": str(post_copy),
+            }
+
+        project_path = create.get("project_path")
+        if not project_path:
+            return {
+                "success": False,
+                "error": "Project creation did not return a project_path.",
+                "details": create,
+            }
+
+        explicit_sr = parse_coordinate_system(coordinate_system) if coordinate_system else None
+        explicit_wkid = explicit_sr.get("wkid") if explicit_sr else None
+        cad_scale_repr = json.dumps(str(cad_reference_scale).strip())
+
+        tin_code = f"""
+import os, csv, time, arcpy
+from arcpy.sa import Minus, ExtractByMask, Con
+
+arcpy.env.overwriteOutput = True
+
+project_path = r"{project_path}"
+workspace = r"{str(workspace)}"
+pre_csv = r"{str(pre_copy)}"
+post_csv = r"{str(post_copy)}"
+dwg_path = r"{str(dwg_src)}"
+out_csv = r"{str(out_csv)}"
+explicit_wkid = {repr(explicit_wkid)}
+cad_ref_scale = {cad_scale_repr}
+
+project_dir = os.path.dirname(project_path)
+proj_base = os.path.splitext(os.path.basename(project_path))[0]
+gdb_path = os.path.join(project_dir, proj_base + ".gdb")
+if not arcpy.Exists(gdb_path):
+    arcpy.management.CreateFileGDB(project_dir, proj_base + ".gdb")
+
+arcpy.env.workspace = gdb_path
+arcpy.env.scratchWorkspace = gdb_path
+
+if arcpy.CheckExtension("3D") != "Available":
+    raise RuntimeError("3D Analyst extension is required for CreateTin / TinRaster")
+arcpy.CheckOutExtension("3D")
+if arcpy.CheckExtension("Spatial") != "Available":
+    raise RuntimeError("Spatial Analyst extension is required for volume rasters")
+arcpy.CheckOutExtension("Spatial")
+
+aprx = arcpy.mp.ArcGISProject(project_path)
+maps = aprx.listMaps()
+try:
+    aprx.defaultGeodatabase = gdb_path
+except Exception:
+    pass
+try:
+    aprx.addFolderConnection(project_dir)
+except Exception:
+    pass
+
+run_tag = "r" + str(int(time.time()))
+cad_name = "cad_import_" + run_tag
+
+def _cad_import():
+    # Reference scale + optional SR (matches interactive Pro CAD import fixes)
+    sr_proj = arcpy.SpatialReference(int(explicit_wkid)) if explicit_wkid else None
+    if sr_proj is not None:
+        return arcpy.conversion.CADToGeodatabase(dwg_path, gdb_path, cad_name, cad_ref_scale, sr_proj)
+    return arcpy.conversion.CADToGeodatabase(dwg_path, gdb_path, cad_name, cad_ref_scale)
+
+cad_result = _cad_import()
+try:
+    cad_path = cad_result[0]
+except Exception:
+    cad_path = os.path.join(gdb_path, cad_name)
+
+polygon_fc = None
+polyline_fc = None
+for root in [cad_path, gdb_path]:
+    try:
+        for dirpath, dirnames, filenames in arcpy.da.Walk(root, datatype="FeatureClass"):
+            for filename in filenames:
+                full = os.path.join(dirpath, filename)
+                nm = str(filename).strip().lower()
+                if polygon_fc is None and nm == "polygon":
+                    polygon_fc = full
+                elif polyline_fc is None and nm == "polyline":
+                    polyline_fc = full
+    except Exception:
+        pass
+    if polygon_fc or polyline_fc:
+        break
+
+temp_poly = os.path.join(gdb_path, "cad_polygonized_" + run_tag)
+boundary_fc = os.path.join(gdb_path, "analysis_boundary_" + run_tag)
+
+def _largest_geom(fc):
+    best_geom = None
+    best_area = -1.0
+    with arcpy.da.SearchCursor(fc, ["SHAPE@"]) as cur:
+        for (geom,) in cur:
+            if geom and float(getattr(geom, "area", 0.0) or 0.0) > best_area:
+                best_area = float(getattr(geom, "area", 0.0) or 0.0)
+                best_geom = geom
+    return best_geom
+
+boundary_geom = None
+boundary_sr = None
+if polygon_fc and arcpy.Exists(polygon_fc) and int(arcpy.management.GetCount(polygon_fc)[0]) > 0:
+    boundary_geom = _largest_geom(polygon_fc)
+    boundary_sr = arcpy.Describe(polygon_fc).spatialReference
+
+if boundary_geom is None:
+    if (not polyline_fc) or (not arcpy.Exists(polyline_fc)) or int(arcpy.management.GetCount(polyline_fc)[0]) == 0:
+        raise RuntimeError("No polygon or polyline boundary found in DWG import")
+    arcpy.management.FeatureToPolygon(polyline_fc, temp_poly)
+    if not arcpy.Exists(temp_poly) or int(arcpy.management.GetCount(temp_poly)[0]) == 0:
+        raise RuntimeError("Could not derive polygon boundary from DWG polylines")
+    boundary_geom = _largest_geom(temp_poly)
+    boundary_sr = arcpy.Describe(temp_poly).spatialReference
+
+if boundary_geom is None:
+    raise RuntimeError("Could not resolve a usable DWG boundary geometry")
+
+sr = arcpy.SpatialReference(int(explicit_wkid)) if explicit_wkid else boundary_sr
+if not sr:
+    raise RuntimeError("Could not determine spatial reference for TIN (set coordinate_system / EPSG)")
+
+if arcpy.Exists(boundary_fc):
+    arcpy.management.Delete(boundary_fc)
+if getattr(sr, "factoryCode", 0) and boundary_sr and getattr(boundary_sr, "factoryCode", 0) and sr.factoryCode != boundary_sr.factoryCode:
+    try:
+        boundary_geom = boundary_geom.projectAs(sr)
+    except Exception:
+        pass
+
+arcpy.management.CreateFeatureclass(gdb_path, os.path.basename(boundary_fc), "POLYGON", spatial_reference=sr)
+with arcpy.da.InsertCursor(boundary_fc, ["SHAPE@"]) as ic:
+    ic.insertRow([boundary_geom])
+
+boundary_single = os.path.join(gdb_path, "BOUNDARY_SINGLE_" + run_tag)
+if arcpy.Exists(boundary_single):
+    arcpy.management.Delete(boundary_single)
+arcpy.management.Dissolve(boundary_fc, boundary_single)
+try:
+    arcpy.management.RepairGeometry(boundary_single)
+except Exception:
+    pass
+
+def _pick_field(fieldnames, exact_names, contains_names):
+    lower_map = {{str(f).strip().lower(): f for f in (fieldnames or [])}}
+    for name in exact_names:
+        if name in lower_map:
+            return lower_map[name]
+    for name in contains_names:
+        for key, original in lower_map.items():
+            if name in key:
+                return original
+    return None
+
+def _detect_xyz(csv_path):
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+    xf = _pick_field(fields, ["e", "x"], ["east", "easting", "lon", "long"])
+    yf = _pick_field(fields, ["n", "y"], ["north", "northing", "lat"])
+    zf = _pick_field(fields, ["z"], ["elev", "elevation", "rl", "level"])
+    return fields, xf, yf, zf
+
+def _csv_to_points(csv_path, fc_name):
+    fields, xf, yf, zf = _detect_xyz(csv_path)
+    if not xf or not yf or not zf:
+        raise RuntimeError("Missing usable E/N/Z fields in " + str(csv_path))
+    out_fc = os.path.join(gdb_path, fc_name + "_" + run_tag)
+    if arcpy.Exists(out_fc):
+        arcpy.management.Delete(out_fc)
+    arcpy.management.CreateFeatureclass(gdb_path, os.path.basename(out_fc), "POINT", spatial_reference=sr)
+    arcpy.management.AddField(out_fc, "ZVAL", "DOUBLE")
+    inserted = 0
+    with open(csv_path, "r", newline="", encoding="utf-8-sig") as f:
+        reader = csv.DictReader(f)
+        with arcpy.da.InsertCursor(out_fc, ["SHAPE@XY", "ZVAL"]) as ic:
+            for row in reader:
+                try:
+                    x = float(str(row[xf]).replace(",", "").strip())
+                    y = float(str(row[yf]).replace(",", "").strip())
+                    z = float(str(row[zf]).replace(",", "").strip())
+                except Exception:
+                    continue
+                ic.insertRow([(x, y), z])
+                inserted += 1
+    if inserted == 0:
+        raise RuntimeError("No usable rows inserted from " + str(csv_path))
+    return out_fc, inserted
+
+pre_fc, pre_count = _csv_to_points(pre_csv, "PRE_POINTS")
+post_fc, post_count = _csv_to_points(post_csv, "POST_POINTS")
+
+pre_3d = os.path.join(gdb_path, "PRE_3D_" + run_tag)
+post_3d = os.path.join(gdb_path, "POST_3D_" + run_tag)
+for fc in [pre_3d, post_3d]:
+    if arcpy.Exists(fc):
+        arcpy.management.Delete(fc)
+
+arcpy.ddd.FeatureTo3DByAttribute(pre_fc, pre_3d, "ZVAL")
+arcpy.ddd.FeatureTo3DByAttribute(post_fc, post_3d, "ZVAL")
+
+pre_tin = os.path.join(project_dir, "pre_surface_" + run_tag)
+post_tin = os.path.join(project_dir, "post_surface_" + run_tag)
+
+def _createtin_robust(out_tin, pts_3d, clip_fc):
+    last_err = None
+    strategies = []
+    strategies.append([[pts_3d, "Shape.Z", "masspoints"], [clip_fc, "<None>", "hardclip"]])
+    strategies.append([[pts_3d, "Shape.Z", "masspoints"]])
+    for idx, spec in enumerate(strategies):
+        try:
+            if arcpy.Exists(out_tin):
+                try:
+                    arcpy.management.Delete(out_tin)
+                except Exception:
+                    pass
+            arcpy.ddd.CreateTin(out_tin, sr, spec, "DELAUNAY")
+            print("RESULT_CREATETIN_OK:", os.path.basename(out_tin), "strategy", idx)
+            return idx
+        except Exception as e:
+            last_err = e
+            msg = str(e) + " " + arcpy.GetMessages(2)
+            print("RESULT_CREATETIN_TRY_FAILED:", idx, msg)
+    raise RuntimeError("CreateTin failed after retries: " + str(last_err))
+
+_createtin_robust(pre_tin, pre_3d, boundary_single)
+_createtin_robust(post_tin, post_3d, boundary_single)
+
+desc_b = arcpy.Describe(boundary_single)
+ext = desc_b.extent
+_w = max(float(ext.XMax) - float(ext.XMin), 1.0)
+_h = max(float(ext.YMax) - float(ext.YMin), 1.0)
+cell = max(min(_w, _h) / 100.0, 0.5)
+arcpy.env.extent = boundary_single
+arcpy.env.mask = boundary_single
+arcpy.env.outputCoordinateSystem = sr
+
+pre_ras = os.path.join(gdb_path, "pre_tin_ras_" + run_tag)
+post_ras = os.path.join(gdb_path, "post_tin_ras_" + run_tag)
+for r in [pre_ras, post_ras]:
+    if arcpy.Exists(r):
+        arcpy.management.Delete(r)
+
+arcpy.ddd.TinRaster(pre_tin, pre_ras, "FLOAT", "LINEAR", "CELLSIZE", cell)
+arcpy.ddd.TinRaster(post_tin, post_ras, "FLOAT", "LINEAR", "CELLSIZE", cell)
+
+dz_raster = os.path.join(gdb_path, "dz_tin_" + run_tag)
+if arcpy.Exists(dz_raster):
+    arcpy.management.Delete(dz_raster)
+dz_tmp = Minus(arcpy.sa.Raster(post_ras), arcpy.sa.Raster(pre_ras))
+ExtractByMask(dz_tmp, boundary_single).save(dz_raster)
+
+dz_desc = arcpy.Describe(dz_raster)
+try:
+    cell_area = float(dz_desc.meanCellWidth) * float(dz_desc.meanCellHeight)
+except Exception:
+    cell_area = float(cell) * float(cell)
+
+oid_field = arcpy.Describe(boundary_single).OIDFieldName
+fill_tbl = os.path.join(gdb_path, "tin_fill_sum_" + run_tag)
+cut_tbl = os.path.join(gdb_path, "tin_cut_sum_" + run_tag)
+for t in [fill_tbl, cut_tbl]:
+    if arcpy.Exists(t):
+        arcpy.management.Delete(t)
+
+fill_depth = Con(arcpy.sa.Raster(dz_raster) > 0, arcpy.sa.Raster(dz_raster), 0)
+cut_depth = Con(arcpy.sa.Raster(dz_raster) < 0, -arcpy.sa.Raster(dz_raster), 0)
+arcpy.sa.ZonalStatisticsAsTable(boundary_single, oid_field, fill_depth, fill_tbl, "DATA", "SUM")
+arcpy.sa.ZonalStatisticsAsTable(boundary_single, oid_field, cut_depth, cut_tbl, "DATA", "SUM")
+del fill_depth
+del cut_depth
+
+def _sum_from(tbl):
+    flds = [f.name for f in arcpy.ListFields(tbl)]
+    sf = next((f for f in flds if (f or "").strip().lower() == "sum"), None) or next(
+        (f for f in flds if "sum" in (f or "").strip().lower()), None
+    )
+    if not sf:
+        return 0.0
+    with arcpy.da.SearchCursor(tbl, [sf]) as c:
+        for (v,) in c:
+            return float(v) if v is not None else 0.0
+    return 0.0
+
+fill_volume = _sum_from(fill_tbl) * cell_area
+cut_volume = -(_sum_from(cut_tbl) * cell_area)
+net_volume = fill_volume + cut_volume
+
+boundary_area = 0.0
+with arcpy.da.SearchCursor(boundary_fc, ["SHAPE@AREA"]) as cur:
+    for (a,) in cur:
+        boundary_area += float(a or 0.0)
+
+with open(out_csv, "w", newline="", encoding="utf-8") as f:
+    w = csv.writer(f)
+    w.writerow(["metric", "value", "unit"])
+    w.writerow(["method", "tin_surfaces", ""])
+    w.writerow(["pre_points_inserted", pre_count, "count"])
+    w.writerow(["post_points_inserted", post_count, "count"])
+    w.writerow(["boundary_area", boundary_area, "square_meters"])
+    w.writerow(["fill_volume", fill_volume, "cubic_meters"])
+    w.writerow(["cut_volume", cut_volume, "cubic_meters"])
+    w.writerow(["net_volume", net_volume, "cubic_meters"])
+    w.writerow(["pre_copy", pre_csv, "path"])
+    w.writerow(["post_copy", post_csv, "path"])
+    w.writerow(["project_path", project_path, "path"])
+
+mp = None
+try:
+    mp = aprx.activeMap
+except Exception:
+    mp = None
+if mp is None and maps:
+    mp = maps[0]
+
+def _add_layer_to_map(map_obj, ds_path, tag):
+    if not map_obj or not ds_path or not arcpy.Exists(ds_path):
+        print("RESULT_LAYER_SKIP:", tag)
+        return
+    try:
+        lyr = map_obj.addDataFromPath(ds_path)
+        try:
+            lyr.visible = True
+        except Exception:
+            pass
+        print("RESULT_LAYER_ADDED:", tag, ds_path)
+    except Exception as ex:
+        print("RESULT_LAYER_ERROR:", tag, str(ex))
+
+if mp:
+    for tag, ds in [
+        ("boundary", boundary_single),
+        ("pre_points", pre_fc),
+        ("post_points", post_fc),
+        ("pre_tin_raster", pre_ras),
+        ("post_tin_raster", post_ras),
+        ("dz_tin", dz_raster),
+    ]:
+        _add_layer_to_map(mp, ds, tag)
+
+try:
+    aprx.save()
+except Exception:
+    pass
+
+print("RESULT_PRE_POINTS_INSERTED:", pre_count)
+print("RESULT_POST_POINTS_INSERTED:", post_count)
+print("RESULT_BOUNDARY_AREA:", boundary_area)
+print("RESULT_FILL_VOLUME:", fill_volume)
+print("RESULT_CUT_VOLUME:", cut_volume)
+print("RESULT_NET_VOLUME:", net_volume)
+print("RESULT_OUTPUT_CSV:", out_csv)
+print("RESULT_PRE_COPY:", pre_csv)
+print("RESULT_POST_COPY:", post_csv)
+print("RESULT_PROJECT_PATH:", project_path)
+print("RESULT_PRE_TIN:", pre_tin)
+print("RESULT_POST_TIN:", post_tin)
+print("RESULT_VOLUME_METHOD:", "tin_plus_zonal")
+"""
+
+        run = self.execute_python_code(
+            python_code=tin_code,
+            project_path=str(project_path),
+            script_name=f"{project_name}_pre_post_tin_volume.py",
+            execute_automatically=True,
+            launch_arcgis_pro=False,
+            prelaunch_arcgis_pro=False,
+            skip_finalization=True,
+        )
+
+        if not run.get("success"):
+            if fallback_to_idw_on_failure:
+                fb = self.compute_pre_post_csv_dwg_cutfill(
+                    pre_csv_path=str(pre_src),
+                    post_csv_path=str(post_src),
+                    boundary_dwg_path=str(dwg_src),
+                    workspace_folder=str(workspace),
+                    output_csv_path=str(out_csv),
+                    project_name=f"{project_name}_IDW_Fallback",
+                    coordinate_system=coordinate_system,
+                )
+                fb["tin_attempt"] = {"success": False, "error": run.get("error"), "details": run}
+                fb["volume_method"] = "idw_fallback_after_tin_failure"
+                return fb
+            return {
+                "success": False,
+                "error": run.get("error", "ArcGIS TIN workflow failed"),
+                "details": run,
+                "pre_copy": str(pre_copy),
+                "post_copy": str(post_copy),
+                "project_path": str(project_path),
+            }
+
+        csv_exists = out_csv.exists() and out_csv.stat().st_size > 0
+        finalize_result = self.finalize_project_visualization(
+            project_path=str(project_path),
+            load_basemap=True,
+            basemap_name="Imagery Hybrid",
+            load_geodatabase=True,
+            launch_arcgis_pro=False,
+        )
+        launch_result = self.launch_arcgis_pro(project_path=str(project_path))
+
+        return {
+            "success": True,
+            "project_path": str(project_path),
+            "output_csv": str(out_csv),
+            "output_csv_exists": csv_exists,
+            "pre_copy": str(pre_copy),
+            "post_copy": str(post_copy),
+            "volume_method": "tin_surfaces",
+            "arcgis_results": run.get("results", {}),
+            "stdout": run.get("stdout", ""),
+            "visualization_finalized": finalize_result.get("success", False),
+            "visualization_details": finalize_result,
+            "arcgis_launched": launch_result.get("success", False),
+            "arcgis_launch_details": launch_result,
+            "note": (
+                "TIN-based volume workflow completed; ArcGIS Pro opened for review."
+                if csv_exists
+                else "TIN workflow finished but result CSV missing or empty."
+            ),
+        }
+
     def finalize_project_visualization(
         self,
         project_path: str,
@@ -2410,7 +4214,7 @@ aprx.save()
         This function is called AFTER all user-requested operations have been executed
         to ensure the project is visually ready for inspection:
         - Adds 'Imagery Hybrid' basemap to all maps
-        - Loads the native geodatabase (project_dir/project_name.gdb) and all its feature classes
+        - Loads the native geodatabase (project_dir/project_name.gdb): feature classes and raster datasets (IDW, CutFill, etc.)
         
         IMPORTANT: This should be called AFTER user operations complete, not during project creation,
         so users can visually verify that their instructions were properly carried out.
@@ -2509,34 +4313,87 @@ if {load_basemap_py}:
         except Exception as e:
             print("RESULT_BASEMAP_ERROR:", str(e))
 
-# Load native geodatabase and all feature classes
+# Load native geodatabase: feature classes AND rasters (IDW, CutFill, etc.)
 if {load_gdb_py} and os.path.exists(gdb_path):
     for m in maps:
         try:
-            # List all feature classes in the geodatabase
-            fcs = []
-            for dirpath, dirnames, filenames in arcpy.da.Walk(gdb_path, datatype="FeatureClass"):
-                for filename in filenames:
-                    fc_path = os.path.join(dirpath, filename)
-                    if arcpy.Exists(fc_path):
-                        fcs.append(fc_path)
-            
-            # Add each feature class to the map (if not already present)
-            for fc_path in fcs:
+            existing_paths = set()
+            try:
+                for lyr in m.listLayers():
+                    try:
+                        cp = getattr(lyr, "catalogPath", None) or getattr(lyr, "dataSource", None)
+                        if cp:
+                            existing_paths.add(os.path.normpath(str(cp)).lower())
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            datasets = []
+            for dtt in ("FeatureClass", "RasterDataset"):
                 try:
-                    # Check if layer already exists
-                    fc_name = os.path.basename(fc_path)
-                    existing = [lyr.name for lyr in m.listLayers() if lyr.name == fc_name]
-                    if not existing:
-                        m.addDataFromPath(fc_path)
-                        feature_classes_loaded.append(fc_name)
-                        print("RESULT_FC_LOADED:", fc_name, "on map:", m.name)
+                    for dirpath, dirnames, filenames in arcpy.da.Walk(gdb_path, datatype=dtt):
+                        for filename in filenames:
+                            ds_path = os.path.join(dirpath, filename)
+                            if arcpy.Exists(ds_path):
+                                datasets.append(ds_path)
+                except Exception:
+                    pass
+
+            def _viz_rank(p):
+                b = os.path.basename(p).lower()
+                if "analysis_boundary" in b or b.startswith("boundary"):
+                    return (0, b)
+                if "pre_point" in b or b.startswith("pre_points"):
+                    return (1, b)
+                if "post_point" in b or b.startswith("post_points"):
+                    return (2, b)
+                if "pre_idw" in b:
+                    return (3, b)
+                if "post_idw" in b:
+                    return (4, b)
+                if "dz_" in b or "dz_post" in b:
+                    return (5, b)
+                if "cutfill" in b:
+                    return (6, b)
+                return (9, b)
+
+            datasets.sort(key=_viz_rank)
+
+            for ds_path in datasets:
+                try:
+                    key = os.path.normpath(ds_path).lower()
+                    if key in existing_paths:
+                        continue
+                    lyr = m.addDataFromPath(ds_path)
+                    try:
+                        lyr.visible = True
+                    except Exception:
+                        pass
+                    existing_paths.add(key)
+                    ds_name = os.path.basename(ds_path)
+                    feature_classes_loaded.append(ds_name)
+                    print("RESULT_DS_LOADED:", ds_name, "on map:", m.name)
                 except Exception as e:
-                    print("RESULT_FC_WARNING:", fc_name, ":", str(e))
-            
-            if fcs:
+                    print("RESULT_DS_WARNING:", os.path.basename(ds_path), ":", str(e))
+
+            if datasets:
                 gdb_loaded = True
-                print("RESULT_GDB_LOADED:", gdb_path, "with", len(fcs), "feature classes")
+                print("RESULT_GDB_LOADED:", gdb_path, "with", len(datasets), "datasets")
+
+            try:
+                zoom_ext = None
+                for prefer in ("analysis_boundary", "boundary", "pre_idw", "post_idw", "cutfill"):
+                    for ds_path in datasets:
+                        if prefer in os.path.basename(ds_path).lower():
+                            zoom_ext = arcpy.Describe(ds_path).extent
+                            break
+                    if zoom_ext:
+                        break
+                if zoom_ext:
+                    m.defaultCamera.setExtent(zoom_ext)
+            except Exception:
+                pass
         except Exception as e:
             print("RESULT_GDB_ERROR:", str(e))
 
@@ -2568,16 +4425,18 @@ print("RESULT_FINALIZATION_COMPLETE")
         basemap_status = "loaded" if "RESULT_BASEMAP_LOADED" in stdout else "not loaded"
         gdb_status = "loaded" if "RESULT_GDB_LOADED" in stdout else "not found or empty"
         
-        # Extract feature class names
+        # Extract dataset names (feature classes + rasters)
         fc_names = []
         for line in stdout.split("\n"):
-            if "RESULT_FC_LOADED:" in line:
-                try:
-                    parts = line.split("RESULT_FC_LOADED:")[1].strip().split()
-                    if parts:
-                        fc_names.append(parts[0])
-                except Exception:
-                    pass
+            for marker in ("RESULT_DS_LOADED:", "RESULT_FC_LOADED:"):
+                if marker in line:
+                    try:
+                        parts = line.split(marker)[1].strip().split()
+                        if parts:
+                            fc_names.append(parts[0])
+                    except Exception:
+                        pass
+                    break
         
         return {
             "success": True,
@@ -2638,6 +4497,393 @@ print("RESULT_FINALIZATION_COMPLETE")
             
         except Exception as e:
             return {"success": False, "error": str(e)}
+
+    def _set_clipboard_text(self, text: str) -> None:
+        """Put text on the Windows clipboard."""
+        import win32clipboard  # type: ignore
+
+        win32clipboard.OpenClipboard()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardText(text)
+        finally:
+            win32clipboard.CloseClipboard()
+
+    def _co_initialize_for_thread(self) -> bool:
+        """
+        Initialize COM for the current thread when using win32com automation.
+
+        Returns True when this method successfully initialized COM and therefore
+        should later be paired with `pythoncom.CoUninitialize()`.
+        """
+        try:
+            import pythoncom  # type: ignore
+
+            pythoncom.CoInitialize()
+            return True
+        except Exception:
+            return False
+
+    def _co_uninitialize_for_thread(self, initialized_here: bool) -> None:
+        """Balance `_co_initialize_for_thread()` when we initialized COM here."""
+        if not initialized_here:
+            return
+        try:
+            import pythoncom  # type: ignore
+
+            pythoncom.CoUninitialize()
+        except Exception:
+            pass
+
+    def _activate_arcgis_pro_window(self, pid: Optional[int] = None, timeout_s: int = 60) -> bool:
+        """
+        Bring ArcGIS Pro to the foreground.
+
+        Uses PID when available; otherwise falls back to the window title.
+        """
+        import time as _time
+        import ctypes
+        import win32com.client  # type: ignore
+        import win32gui  # type: ignore
+        import win32process  # type: ignore
+
+        SW_RESTORE = 9
+
+        def _force_foreground_by_pid(target_pid: int) -> bool:
+            hwnds: List[int] = []
+
+            def _enum_handler(hwnd: int, _ctx: Any) -> bool:
+                try:
+                    if not win32gui.IsWindowVisible(hwnd):
+                        return True
+                    _, found_pid = win32process.GetWindowThreadProcessId(hwnd)
+                    if int(found_pid) != int(target_pid):
+                        return True
+                    title = (win32gui.GetWindowText(hwnd) or "").strip()
+                    if not title:
+                        return True
+                    hwnds.append(hwnd)
+                except Exception:
+                    pass
+                return True
+
+            try:
+                win32gui.EnumWindows(_enum_handler, None)
+            except Exception:
+                return False
+            if not hwnds:
+                return False
+            try:
+                hwnd = hwnds[0]
+                try:
+                    win32gui.ShowWindow(hwnd, SW_RESTORE)
+                except Exception:
+                    pass
+                # Windows often blocks SetForegroundWindow unless triggered by user input.
+                # Sending ALT first is a common safe workaround.
+                try:
+                    shell.SendKeys("%")
+                    _time.sleep(0.05)
+                except Exception:
+                    pass
+                try:
+                    win32gui.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+                try:
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                except Exception:
+                    pass
+                _time.sleep(0.2)
+                fg = win32gui.GetForegroundWindow()
+                return int(fg) == int(hwnd)
+            except Exception:
+                return False
+
+        com_initialized = self._co_initialize_for_thread()
+        try:
+            shell = win32com.client.Dispatch("WScript.Shell")
+            deadline = _time.time() + max(5, timeout_s)
+            while _time.time() < deadline:
+                if pid:
+                    try:
+                        if _force_foreground_by_pid(int(pid)):
+                            _time.sleep(0.6)
+                            return True
+                    except Exception:
+                        pass
+                try:
+                    if pid and shell.AppActivate(int(pid)):
+                        _time.sleep(0.8)
+                        return True
+                except Exception:
+                    pass
+                for title in ("ArcGIS Pro", "ArcGISPro", "ArcGIS"):
+                    try:
+                        if shell.AppActivate(title):
+                            _time.sleep(0.8)
+                            return True
+                    except Exception:
+                        pass
+                _time.sleep(1.0)
+            return False
+        finally:
+            self._co_uninitialize_for_thread(com_initialized)
+
+    def _run_script_in_arcgis_pro_ui(
+        self,
+        script_path: Path,
+        *,
+        project_path: Optional[str] = None,
+        completion_timeout_s: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Execute a saved Python script inside ArcGIS Pro's live Python Window.
+
+        This is the non-headless path used when the user wants to SEE the work happen
+        inside ArcGIS Pro itself rather than via propy.bat.
+        """
+        try:
+            if not script_path.exists():
+                return {
+                    "success": False,
+                    "error": f"Script file not found for UI execution: {script_path}",
+                }
+
+            # Ensure we have a real ArcGIS Pro project open so the Python Window is available.
+            host_project_path: Optional[str] = None
+            if project_path:
+                try:
+                    pp = Path(project_path).resolve()
+                    if pp.exists() and pp.suffix.lower() == ".aprx":
+                        host_project_path = str(pp)
+                except Exception:
+                    host_project_path = None
+
+            if host_project_path is None:
+                host_dir = script_path.parent / "_survyai_ui_host"
+                host_name = "SurvyAI_UI_Host"
+                create_res = self.create_project(
+                    project_name=host_name,
+                    project_path=str(host_dir),
+                    coordinate_system=getattr(self.settings, "arcgis_default_coordinate_system", None),
+                    template="MAP",
+                )
+                if not create_res.get("success") or not create_res.get("project_path"):
+                    return {
+                        "success": False,
+                        "error": "Failed to create a host ArcGIS Pro project for interactive execution.",
+                        "details": create_res,
+                    }
+                host_project_path = str(Path(create_res["project_path"]).resolve())
+
+            launch_res = self.launch_arcgis_pro(project_path=host_project_path)
+            if not launch_res.get("success"):
+                return {
+                    "success": False,
+                    "error": "Failed to launch ArcGIS Pro for interactive execution.",
+                    "details": launch_res,
+                }
+            pid = launch_res.get("pid")
+
+            startup_wait = int(getattr(self.settings, "arcgis_prelaunch_wait_seconds", 14) or 14)
+            startup_wait = max(8, min(startup_wait, 120))
+            time.sleep(startup_wait)
+
+            if not self._activate_arcgis_pro_window(pid=pid, timeout_s=60):
+                logger.warning(
+                    "ArcGIS Pro launched but window activation could not be confirmed. "
+                    "Continuing with resilient UI bootstrap strategies."
+                )
+
+            ui_log_path = script_path.with_name(f"{script_path.stem}_ui_log.txt")
+            ui_status_path = script_path.with_name(f"{script_path.stem}_ui_status.json")
+            ui_wrapper_path = script_path.with_name(f"{script_path.stem}_ui_runner.py")
+
+            for p in (ui_log_path, ui_status_path, ui_wrapper_path):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
+
+            wrapper_code = f'''# SurvyAI ArcGIS Pro UI runner
+import json, traceback
+from io import StringIO
+from contextlib import redirect_stdout, redirect_stderr
+
+_status_path = r"{ui_status_path}"
+_log_path = r"{ui_log_path}"
+_target_path = r"{script_path}"
+
+def _write_status(payload):
+    with open(_status_path, "w", encoding="utf-8") as _f:
+        json.dump(payload, _f, ensure_ascii=True, indent=2)
+
+_buf = StringIO()
+_write_status({{"state": "running", "target_script": _target_path}})
+
+try:
+    with redirect_stdout(_buf), redirect_stderr(_buf):
+        _g = {{"__name__": "__main__"}}
+        exec(compile(open(_target_path, "r", encoding="utf-8").read(), _target_path, "exec"), _g, _g)
+    _log = _buf.getvalue()
+    with open(_log_path, "w", encoding="utf-8") as _lf:
+        _lf.write(_log)
+    _write_status({{"state": "completed", "success": True, "log_path": _log_path}})
+except Exception:
+    _err = traceback.format_exc()
+    _log = _buf.getvalue()
+    with open(_log_path, "w", encoding="utf-8") as _lf:
+        _lf.write(_log)
+        if _log and not _log.endswith("\\n"):
+            _lf.write("\\n")
+        _lf.write(_err)
+    _write_status({{
+        "state": "completed",
+        "success": False,
+        "error": _err,
+        "log_path": _log_path
+    }})
+'''
+            ui_wrapper_path.write_text(wrapper_code, encoding="utf-8")
+
+            import win32com.client  # type: ignore
+
+            started = False
+            com_initialized = self._co_initialize_for_thread()
+            try:
+                shell = win32com.client.Dispatch("WScript.Shell")
+                runner_cmd = f'exec(open(r"{ui_wrapper_path}", encoding="utf-8").read(), globals())'
+
+                # SendKeys + Python Window startup can exceed 25s on slower machines or first cold start.
+                bootstrap_timeout_s = int(
+                    getattr(self.settings, "arcgis_ui_bootstrap_timeout_seconds", 55) or 55
+                )
+                bootstrap_timeout_s = max(25, min(bootstrap_timeout_s, 120))
+
+                def _status_started(wait_s: float = 8.0) -> bool:
+                    deadline2 = time.time() + max(2.0, wait_s)
+                    while time.time() < deadline2:
+                        if ui_status_path.exists():
+                            return True
+                        time.sleep(0.5)
+                    return False
+
+                def _inject_with_strategy(strategy: str) -> bool:
+                    if not self._activate_arcgis_pro_window(pid=pid, timeout_s=15):
+                        return False
+
+                    # Clear transient focus states before opening the Python Window.
+                    try:
+                        shell.SendKeys("{ESC}")
+                        time.sleep(0.2)
+                    except Exception:
+                        pass
+
+                    if strategy == "shortcut":
+                        # Preferred: ArcGIS Pro Python Window shortcut (faster, less brittle than command search).
+                        shell.SendKeys("^%p")
+                        time.sleep(2.0)
+                    else:
+                        # Fallback: open Command Search and launch the Python Window by name.
+                        shell.SendKeys("%q")
+                        time.sleep(1.2)
+                        self._set_clipboard_text("Python Window")
+                        shell.SendKeys("^v")
+                        time.sleep(0.3)
+                        shell.SendKeys("~")
+                        time.sleep(2.5)
+
+                    if not self._activate_arcgis_pro_window(pid=pid, timeout_s=10):
+                        return False
+
+                    self._set_clipboard_text(runner_cmd)
+                    shell.SendKeys("^v")
+                    time.sleep(0.5)
+                    shell.SendKeys("~")
+                    return _status_started(wait_s=6.0)
+
+                bootstrap_deadline = time.time() + bootstrap_timeout_s
+                for strategy in ("shortcut", "command_search"):
+                    if time.time() >= bootstrap_deadline:
+                        break
+                    if _inject_with_strategy(strategy):
+                        started = True
+                        break
+            finally:
+                self._co_uninitialize_for_thread(com_initialized)
+
+            if not started:
+                return {
+                    "success": False,
+                    "error": "ArcGIS Pro opened, but SurvyAI could not start the Python Window runner automatically.",
+                    "project_path": host_project_path,
+                    "ui_status_path": str(ui_status_path),
+                    "ui_log_path": str(ui_log_path),
+                    "ui_bootstrap_failed": True,
+                }
+
+            timeout_s = int(
+                completion_timeout_s
+                or getattr(self.settings, "agent_query_timeout", 900)
+                or 900
+            )
+            timeout_s = max(60, min(timeout_s, 7200))
+            deadline = time.time() + timeout_s
+
+            last_status = None
+            while time.time() < deadline:
+                if ui_status_path.exists():
+                    try:
+                        last_status = json.loads(ui_status_path.read_text(encoding="utf-8"))
+                    except Exception:
+                        last_status = None
+                    if isinstance(last_status, dict) and last_status.get("state") == "completed":
+                        stdout = ui_log_path.read_text(encoding="utf-8", errors="replace") if ui_log_path.exists() else ""
+                        if last_status.get("success"):
+                            return {
+                                "success": True,
+                                "message": "ArcGIS workflow executed inside ArcGIS Pro's Python Window.",
+                                "script_path": str(script_path),
+                                "stdout": stdout,
+                                "stderr": "",
+                                "returncode": 0,
+                                "arcgis_launched": True,
+                                "project_path": host_project_path,
+                                "ui_status_path": str(ui_status_path),
+                                "ui_log_path": str(ui_log_path),
+                                "note": "Executed interactively inside ArcGIS Pro (not propy.bat).",
+                            }
+                        return {
+                            "success": False,
+                            "error": "ArcGIS Pro UI execution failed.",
+                            "script_path": str(script_path),
+                            "stdout": stdout,
+                            "stderr": str(last_status.get("error", "")),
+                            "returncode": 1,
+                            "arcgis_launched": True,
+                            "project_path": host_project_path,
+                            "ui_status_path": str(ui_status_path),
+                            "ui_log_path": str(ui_log_path),
+                        }
+                time.sleep(2.0)
+
+            stdout = ui_log_path.read_text(encoding="utf-8", errors="replace") if ui_log_path.exists() else ""
+            return {
+                "success": False,
+                "error": "Timed out waiting for ArcGIS Pro UI script execution to finish.",
+                "script_path": str(script_path),
+                "stdout": stdout,
+                "stderr": "",
+                "returncode": 124,
+                "arcgis_launched": True,
+                "project_path": host_project_path,
+                "ui_status_path": str(ui_status_path),
+                "ui_log_path": str(ui_log_path),
+            }
+        except Exception as e:
+            return {"success": False, "error": f"Interactive ArcGIS Pro execution failed: {e}"}
     
     def _parse_arcgis_results(self, stdout: str) -> Dict[str, Any]:
         """
