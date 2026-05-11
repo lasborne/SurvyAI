@@ -2,32 +2,50 @@
 Professional Windows desktop shell for SurvyAI.
 
 This window wraps the existing service layer with the product surfaces expected
+<<<<<<< HEAD
 from a paid desktop application: onboarding, workspace picker, prompt console,
 output history, full-page settings and diagnostics (from the account menu),
 cloud sign-in, and safe mode.
+=======
+from a paid desktop application: onboarding, account section, license card,
+workspace picker, prompt console, history, settings, diagnostics, and safe mode.
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 """
 
 from __future__ import annotations
 
 import html
 import json
+<<<<<<< HEAD
 import os
 import re
 import time
 import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
+=======
+import time
+import uuid
+import zipfile
+from datetime import datetime, timezone
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QTextCursor
 from PySide6.QtWidgets import (
+<<<<<<< HEAD
     QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
+=======
+    QCheckBox,
+    QComboBox,
+    QDialog,
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -37,6 +55,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+<<<<<<< HEAD
     QMenu,
     QMessageBox,
     QInputDialog,
@@ -51,6 +70,15 @@ from PySide6.QtWidgets import (
     QTextBrowser,
     QTextEdit,
     QToolButton,
+=======
+    QMessageBox,
+    QPlainTextEdit,
+    QPushButton,
+    QSplitter,
+    QTabWidget,
+    QTextBrowser,
+    QTextEdit,
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     QVBoxLayout,
     QWidget,
 )
@@ -58,6 +86,7 @@ from PySide6.QtWidgets import (
 from survyai.agent_service import SurvyAIAgentService
 from survyai.app_config import merge_settings
 from survyai.capabilities import format_capabilities_summary, scan_machine_capabilities
+<<<<<<< HEAD
 from survyai.credit_gate import credit_limit_enforcement_enabled
 from survyai.feature_flags import FeatureFlags
 from survyai.gui.manage_pcs_dialog import ManagePcsDialog
@@ -80,6 +109,10 @@ from survyai.cloud_api import (
 )
 from survyai.device_identity import compute_machine_fingerprint
 from survyai.plan_policy import policy_for_plan
+=======
+from survyai.feature_flags import FeatureFlags
+from survyai.gui.onboarding import AccountDialog, OnboardingWizard, environment_validation_report
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 from survyai.gui.state import (
     AccountProfile,
     AppStateStore,
@@ -88,6 +121,7 @@ from survyai.gui.state import (
     TaskHistoryEntry,
 )
 from survyai.gui.worker import AgentRunThread
+<<<<<<< HEAD
 from survyai.ollama_support import (
     OLLAMA_DOWNLOAD_PAGE,
     install_ollama_with_winget,
@@ -307,6 +341,16 @@ class ChatInput(QPlainTextEdit):
             h_px = fm.lineSpacing() * lines + 28
         h_px = max(self._BASE_HEIGHT, min(self._MAX_HEIGHT, h_px))
         self.setFixedHeight(h_px)
+=======
+from survyai.types import AgentRunResult
+from survyai.version import __version__
+
+
+class ChatInput(QPlainTextEdit):
+    """Enter sends; Shift+Enter inserts a newline."""
+
+    sendRequested = Signal()
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     def keyPressEvent(self, event) -> None:  # noqa: N802
         if event.key() in (Qt.Key_Return, Qt.Key_Enter) and not (
@@ -317,6 +361,7 @@ class ChatInput(QPlainTextEdit):
         super().keyPressEvent(event)
 
 
+<<<<<<< HEAD
 class _OllamaSetupDialog(QDialog):
     def __init__(self, parent: QWidget, *, initial_base_url: str, initial_model: str) -> None:
         super().__init__(parent)
@@ -601,6 +646,8 @@ def _cloud_error_text_for_user(exc: BaseException) -> str:
     return user_facing_cloud_message(exc)
 
 
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 class MainWindow(QMainWindow):
     def __init__(
         self,
@@ -611,7 +658,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"SurvyAI Desktop — {__version__}")
         self.resize(1420, 900)
+<<<<<<< HEAD
         self.setMinimumSize(640, 450)
+=======
+        self.setMinimumSize(1120, 720)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
         self._state_store = AppStateStore()
         self._state: DesktopState = self._state_store.load()
@@ -637,6 +688,7 @@ class MainWindow(QMainWindow):
         self._startup_initial_query = (initial_query or "").strip()
         self._startup_auto_run = bool(auto_run_query and self._startup_initial_query)
 
+<<<<<<< HEAD
         self._console_content_panel: Optional[QWidget] = None
 
         self._build_ui()
@@ -646,11 +698,18 @@ class MainWindow(QMainWindow):
         self._install_status_indicators()
         self._refresh_all_views()
         self._refresh_active_llm_status()
+=======
+        self._build_ui()
+        self._build_menu()
+        self._apply_state_to_ui()
+        self._refresh_all_views()
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
         self._progress_timer = QTimer(self)
         self._progress_timer.setInterval(2500)
         self._progress_timer.timeout.connect(self._on_progress_tick)
 
+<<<<<<< HEAD
         self._desktop_state_save_timer = QTimer(self)
         self._desktop_state_save_timer.setSingleShot(True)
         self._desktop_state_save_timer.setInterval(200)
@@ -726,11 +785,15 @@ class MainWindow(QMainWindow):
             return
         enabled = bool(getattr(self._state, "fast_mode_non_file_prompts", False))
         self._fast_mode_indicator.setText(f"Fast mode: {'ON' if enabled else 'OFF'}")
+=======
+        QTimer.singleShot(0, self._finish_startup)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
 
+<<<<<<< HEAD
     def _apply_chrome(self) -> None:
         # Visual polish only; keep functional behavior unchanged.
         self.setStyleSheet(
@@ -933,10 +996,13 @@ QPushButton#statusChipButton:checked {
             """.strip()
         )
 
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     def _build_ui(self) -> None:
         central = QWidget()
         self.setCentralWidget(central)
         root = QVBoxLayout(central)
+<<<<<<< HEAD
         root.setContentsMargins(12, 6, 12, 10)
         root.setSpacing(6)
 
@@ -1019,10 +1085,67 @@ QPushButton#statusChipButton:checked {
         self._central_stack.addWidget(self._settings_page)
         self._central_stack.addWidget(self._diagnostics_page)
         self._central_stack.addWidget(self._credits_page)
+=======
+
+        top_bar = QHBoxLayout()
+        root.addLayout(top_bar)
+
+        title = QLabel("SurvyAI Desktop")
+        title.setObjectName("titleLabel")
+        title_font = QFont()
+        title_font.setPointSize(15)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        top_bar.addWidget(title)
+
+        self._safe_mode_toggle = QPushButton("Safe mode off")
+        self._safe_mode_toggle.setObjectName("statusChipButton")
+        self._safe_mode_toggle.setCheckable(True)
+        self._safe_mode_toggle.clicked.connect(self._toggle_safe_mode_from_button)
+        top_bar.addWidget(self._safe_mode_toggle)
+        top_bar.addStretch()
+
+        top_bar.addWidget(QLabel("Workspace"))
+        self._workspace_edit = QLineEdit()
+        self._workspace_edit.setPlaceholderText("Choose a workspace / project folder")
+        top_bar.addWidget(self._workspace_edit, 1)
+        browse_workspace = QPushButton("Browse…")
+        browse_workspace.setObjectName("secondaryButton")
+        browse_workspace.clicked.connect(self._choose_workspace)
+        top_bar.addWidget(browse_workspace)
+        open_workspace = QPushButton("Open")
+        open_workspace.setObjectName("secondaryButton")
+        open_workspace.clicked.connect(self._open_workspace_folder)
+        top_bar.addWidget(open_workspace)
+
+        self._tabs = QTabWidget()
+        root.addWidget(self._tabs, 1)
+
+        self._account_summary_btn = QPushButton("Account")
+        self._account_summary_btn.setObjectName("summaryButton")
+        self._account_summary_btn.clicked.connect(self._edit_account_profile)
+        top_bar.addWidget(self._account_summary_btn)
+
+        self._license_summary_btn = QPushButton("Plan")
+        self._license_summary_btn.setObjectName("summaryButton")
+        self._license_summary_btn.clicked.connect(lambda: self._tabs.setCurrentIndex(2))
+        top_bar.addWidget(self._license_summary_btn)
+
+        self._machine_summary_btn = QPushButton("Machine")
+        self._machine_summary_btn.setObjectName("summaryButton")
+        self._machine_summary_btn.clicked.connect(lambda: self._tabs.setCurrentIndex(3))
+        top_bar.addWidget(self._machine_summary_btn)
+
+        self._build_console_tab()
+        self._build_history_tab()
+        self._build_settings_tab()
+        self._build_diagnostics_tab()
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     def _build_console_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+<<<<<<< HEAD
         layout.setContentsMargins(10, 6, 10, 10)
         layout.setSpacing(6)
 
@@ -1030,12 +1153,20 @@ QPushButton#statusChipButton:checked {
             "Type in your prompt and click the Send button."
         )
         hint.setObjectName("consoleHintLabel")
+=======
+
+        hint = QLabel(
+            "Use the GUI as the primary product surface. The CLI remains available internally for support and testing."
+        )
+        hint.setObjectName("hintLabel")
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
         body_split = QSplitter(Qt.Horizontal)
 
         conversation_panel = QWidget()
+<<<<<<< HEAD
         conversation_panel.setObjectName("sidebarConversations")
         conversation_panel.setMinimumWidth(176)
         conversation_layout = QVBoxLayout(conversation_panel)
@@ -1049,6 +1180,12 @@ QPushButton#statusChipButton:checked {
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
         self._conversation_list.setTextElideMode(Qt.TextElideMode.ElideRight)
+=======
+        conversation_layout = QVBoxLayout(conversation_panel)
+        conversation_layout.setContentsMargins(0, 0, 0, 0)
+        conversation_layout.addWidget(QLabel("Conversations"))
+        self._conversation_list = QListWidget()
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._conversation_list.currentItemChanged.connect(self._on_conversation_changed)
         conversation_layout.addWidget(self._conversation_list, 1)
 
@@ -1065,13 +1202,17 @@ QPushButton#statusChipButton:checked {
         body_split.addWidget(conversation_panel)
 
         content_panel = QWidget()
+<<<<<<< HEAD
         self._console_content_panel = content_panel
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         content_layout = QVBoxLayout(content_panel)
         content_layout.setContentsMargins(0, 0, 0, 0)
 
         split = QSplitter(Qt.Horizontal)
         self._transcript = QTextEdit()
         self._transcript.setReadOnly(True)
+<<<<<<< HEAD
         self._transcript.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self._transcript.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._transcript.setPlaceholderText("Conversation will appear here…")
@@ -1088,6 +1229,15 @@ QPushButton#statusChipButton:checked {
         act_hdr = QLabel("Live activity")
         act_hdr.setObjectName("sectionHeader")
         activity_layout.addWidget(act_hdr)
+=======
+        self._transcript.setPlaceholderText("Conversation will appear here…")
+        split.addWidget(self._transcript)
+
+        activity_panel = QWidget()
+        activity_layout = QVBoxLayout(activity_panel)
+        activity_layout.setContentsMargins(0, 0, 0, 0)
+        activity_layout.addWidget(QLabel("Live activity"))
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._activity_log = QPlainTextEdit()
         self._activity_log.setReadOnly(True)
         self._activity_log.setPlaceholderText("Progress, long-run updates, and troubleshooting notes…")
@@ -1097,6 +1247,7 @@ QPushButton#statusChipButton:checked {
         activity_layout.addWidget(self._run_status_label)
         activity_layout.addWidget(self._elapsed_label)
         split.addWidget(activity_panel)
+<<<<<<< HEAD
         split.setSizes([780, 240])
         split.setChildrenCollapsible(True)
         # Favor transcript width (primary reading surface); activity stays secondary.
@@ -1112,10 +1263,20 @@ QPushButton#statusChipButton:checked {
         self._input.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
         )
+=======
+        split.setSizes([700, 280])
+        content_layout.addWidget(split, 1)
+
+        input_row = QHBoxLayout()
+        self._input = ChatInput()
+        self._input.setPlaceholderText("Describe your task… (Enter to send, Shift+Enter for newline)")
+        self._input.setFixedHeight(100)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._input.sendRequested.connect(self._on_send_clicked)
         input_row.addWidget(self._input, 1)
 
         controls = QVBoxLayout()
+<<<<<<< HEAD
         controls.setSpacing(4)
         self._send_btn = QPushButton("Send")
         self._send_btn.setDefault(True)
@@ -1124,29 +1285,41 @@ QPushButton#statusChipButton:checked {
         self._send_btn.setSizePolicy(
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
         )
+=======
+        self._send_btn = QPushButton("Send")
+        self._send_btn.setDefault(True)
+        self._send_btn.clicked.connect(self._on_send_clicked)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         controls.addWidget(self._send_btn)
 
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.setObjectName("secondaryButton")
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.clicked.connect(self._request_cancel_current_run)
+<<<<<<< HEAD
         self._cancel_btn.setToolTip("Stop the current run.")
         self._cancel_btn.setSizePolicy(
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
         )
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         controls.addWidget(self._cancel_btn)
 
         self._retry_btn = QPushButton("Retry last")
         self._retry_btn.setObjectName("secondaryButton")
         self._retry_btn.clicked.connect(self._retry_last_query)
+<<<<<<< HEAD
         self._retry_btn.setToolTip("Re-run the last prompt.")
         self._retry_btn.setSizePolicy(
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
         )
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         controls.addWidget(self._retry_btn)
 
         self._fallback_cb = QCheckBox("Use fallback LLM")
         self._fallback_cb.toggled.connect(self._on_fallback_toggled)
+<<<<<<< HEAD
         self._fallback_cb.setSizePolicy(
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
         )
@@ -1202,14 +1375,26 @@ QPushButton#statusChipButton:checked {
         body_split.setChildrenCollapsible(True)
         body_split.setStretchFactor(0, 0)
         body_split.setStretchFactor(1, 1)
+=======
+        controls.addWidget(self._fallback_cb)
+        controls.addStretch()
+        input_row.addLayout(controls)
+        content_layout.addLayout(input_row)
+
+        body_split.addWidget(content_panel)
+        body_split.setSizes([220, 980])
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         layout.addWidget(body_split, 1)
         self._tabs.addTab(tab, "Console")
 
     def _build_history_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
+<<<<<<< HEAD
         layout.setContentsMargins(14, 14, 14, 14)
         layout.setSpacing(10)
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         split = QSplitter(Qt.Horizontal)
 
         self._history_list = QListWidget()
@@ -1235,6 +1420,7 @@ QPushButton#statusChipButton:checked {
         layout.addLayout(actions)
         self._tabs.addTab(tab, "Output History")
 
+<<<<<<< HEAD
     def _build_settings_page(self) -> QWidget:
         """Full-page settings (opened from the account menu, not a main tab)."""
         tab = QWidget()
@@ -1360,21 +1546,68 @@ QPushButton#statusChipButton:checked {
         )
         self._safe_mode_note.setWordWrap(True)
         runtime_form.addRow("", self._safe_mode_note)
+=======
+    def _build_settings_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        account_group = QGroupBox("Account")
+        account_form = QFormLayout(account_group)
+        self._account_name_value = QLabel("—")
+        self._account_email_value = QLabel("—")
+        self._account_company_value = QLabel("—")
+        account_form.addRow("Name", self._account_name_value)
+        account_form.addRow("Email", self._account_email_value)
+        account_form.addRow("Company", self._account_company_value)
+        account_actions = QHBoxLayout()
+        account_edit = QPushButton("Sign in / edit")
+        account_edit.clicked.connect(self._edit_account_profile)
+        account_actions.addWidget(account_edit)
+        sign_out = QPushButton("Sign out")
+        sign_out.setObjectName("secondaryButton")
+        sign_out.clicked.connect(self._sign_out_account)
+        account_actions.addWidget(sign_out)
+        account_form.addRow("", self._wrap_layout(account_actions))
+        layout.addWidget(account_group)
+
+        runtime_group = QGroupBox("Runtime and safety")
+        runtime_form = QFormLayout(runtime_group)
+        self._primary_llm_combo = QComboBox()
+        self._primary_llm_combo.addItems(["openai", "gemini", "claude", "deepseek"])
+        self._fallback_llm_combo = QComboBox()
+        self._fallback_llm_combo.addItems(["gemini", "openai", "claude", "deepseek"])
+        self._settings_workspace = QLineEdit()
+        self._settings_data_folder = QLineEdit()
+        runtime_form.addRow("Primary LLM", self._primary_llm_combo)
+        runtime_form.addRow("Fallback LLM", self._fallback_llm_combo)
+        self._safe_mode_note = QLabel(
+            "Safe mode is controlled from the top toolbar beacon and disables external integrations for troubleshooting."
+        )
+        self._safe_mode_note.setWordWrap(True)
+        runtime_form.addRow("Safe mode", self._safe_mode_note)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
         browse_ws = QPushButton("Browse…")
         browse_ws.setObjectName("secondaryButton")
         browse_ws.clicked.connect(self._choose_workspace)
+<<<<<<< HEAD
         browse_ws.setToolTip("Pick the workspace folder.")
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         runtime_form.addRow("Workspace", self._pair_widget(self._settings_workspace, browse_ws))
 
         browse_data = QPushButton("Browse…")
         browse_data.setObjectName("secondaryButton")
         browse_data.clicked.connect(self._choose_data_folder)
+<<<<<<< HEAD
         browse_data.setToolTip("Pick the data folder.")
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         runtime_form.addRow("Data folder", self._pair_widget(self._settings_data_folder, browse_data))
 
         save_runtime = QPushButton("Apply settings")
         save_runtime.clicked.connect(self._apply_runtime_settings)
+<<<<<<< HEAD
         save_runtime.setToolTip("Apply changes for this desktop session.")
         runtime_form.addRow("", save_runtime)
         page_layout.addWidget(runtime_group)
@@ -1399,6 +1632,13 @@ QPushButton#statusChipButton:checked {
         desktop_form.setFormAlignment(Qt.AlignTop)
         desktop_form.setHorizontalSpacing(14)
         desktop_form.setVerticalSpacing(10)
+=======
+        runtime_form.addRow("", save_runtime)
+        layout.addWidget(runtime_group)
+
+        desktop_status = QGroupBox("Desktop status")
+        desktop_form = QFormLayout(desktop_status)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._license_settings_label = QLabel("")
         self._license_settings_label.setWordWrap(True)
         self._session_settings_label = QLabel("")
@@ -1408,6 +1648,7 @@ QPushButton#statusChipButton:checked {
         desktop_form.addRow("License", self._license_settings_label)
         desktop_form.addRow("Session", self._session_settings_label)
         desktop_form.addRow("Machine", self._machine_settings_label)
+<<<<<<< HEAD
         page_layout.addWidget(desktop_status)
 
         page_layout.addStretch()
@@ -1450,6 +1691,18 @@ QPushButton#statusChipButton:checked {
         footer_layout = QVBoxLayout(footer)
         footer_layout.setContentsMargins(14, 8, 14, 14)
         footer_layout.setSpacing(10)
+=======
+        layout.addWidget(desktop_status)
+        layout.addStretch()
+        self._tabs.addTab(tab, "Settings")
+
+    def _build_diagnostics_tab(self) -> None:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        self._diagnostics_text = QPlainTextEdit()
+        self._diagnostics_text.setReadOnly(True)
+        layout.addWidget(self._diagnostics_text, 1)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
         actions = QHBoxLayout()
         export_btn = QPushButton("Export diagnostics bundle")
@@ -1467,6 +1720,7 @@ QPushButton#statusChipButton:checked {
         actions.addWidget(refresh)
 
         actions.addStretch()
+<<<<<<< HEAD
         footer_layout.addLayout(actions)
         layout.addWidget(footer)
         return tab
@@ -1564,6 +1818,41 @@ QPushButton#statusChipButton:checked {
 
         page_layout.addStretch()
         return tab
+=======
+        layout.addLayout(actions)
+        self._tabs.addTab(tab, "Diagnostics")
+
+    def _build_account_card(self) -> QGroupBox:
+        group = QGroupBox("Account")
+        layout = QVBoxLayout(group)
+        self._account_card_title = QLabel("")
+        self._account_card_title.setWordWrap(True)
+        self._account_card_subtitle = QLabel("")
+        self._account_card_subtitle.setWordWrap(True)
+        self._account_card_subtitle.setObjectName("hintLabel")
+        layout.addWidget(self._account_card_title)
+        layout.addWidget(self._account_card_subtitle)
+
+        row = QHBoxLayout()
+        edit_btn = QPushButton("Sign in / edit")
+        edit_btn.clicked.connect(self._edit_account_profile)
+        row.addWidget(edit_btn)
+        run_onboarding = QPushButton("Run onboarding")
+        run_onboarding.setObjectName("secondaryButton")
+        run_onboarding.clicked.connect(self._run_onboarding)
+        row.addWidget(run_onboarding)
+        layout.addLayout(row)
+        return group
+
+    def _build_license_card(self) -> QGroupBox:
+        group = QGroupBox("License / subscription")
+        layout = QVBoxLayout(group)
+        self._license_card_label = QLabel("")
+        self._license_card_label.setWordWrap(True)
+        self._license_card_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        layout.addWidget(self._license_card_label)
+        return group
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     def _build_machine_card(self) -> QGroupBox:
         group = QGroupBox("Machine and environment")
@@ -1595,6 +1884,7 @@ QPushButton#statusChipButton:checked {
         layout.addWidget(new_conv)
         return group
 
+<<<<<<< HEAD
     @staticmethod
     def _describe_menu_action(action: QAction, help_text: str) -> None:
         """Status bar + hover text for menu items (novice-friendly)."""
@@ -1604,10 +1894,13 @@ QPushButton#statusChipButton:checked {
         action.setStatusTip(t)
         action.setToolTip(t)
 
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     def _build_menu(self) -> None:
         menubar = self.menuBar()
 
         file_menu = menubar.addMenu("&File")
+<<<<<<< HEAD
         file_menu.setToolTipsVisible(True)
         file_menu.menuAction().setToolTip(
             "Export files from SurvyAI and exit safely — hover each command below for details."
@@ -1776,6 +2069,36 @@ QPushButton#statusChipButton:checked {
             about,
             "App version, short credits, and legal notices — confirm you are on the build you expect.",
         )
+=======
+        export_transcript = QAction("Export transcript…", self)
+        export_transcript.triggered.connect(self._export_transcript)
+        file_menu.addAction(export_transcript)
+        export_diag = QAction("Export diagnostics bundle…", self)
+        export_diag.triggered.connect(self._export_diagnostics_bundle)
+        file_menu.addAction(export_diag)
+        file_menu.addSeparator()
+        exit_act = QAction("E&xit", self)
+        exit_act.triggered.connect(self.close)
+        file_menu.addAction(exit_act)
+
+        account_menu = menubar.addMenu("&Account")
+        sign_in = QAction("Sign in / edit profile", self)
+        sign_in.triggered.connect(self._edit_account_profile)
+        account_menu.addAction(sign_in)
+        onboarding = QAction("Run onboarding", self)
+        onboarding.triggered.connect(self._run_onboarding)
+        account_menu.addAction(onboarding)
+
+        help_menu = menubar.addMenu("&Help")
+        readme = QAction("Documentation (README)", self)
+        readme.triggered.connect(self._open_readme_docs)
+        help_menu.addAction(readme)
+        tutorial = QAction("First-run tutorial", self)
+        tutorial.triggered.connect(self._run_onboarding)
+        help_menu.addAction(tutorial)
+        about = QAction("&About SurvyAI", self)
+        about.triggered.connect(self._show_about)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         help_menu.addAction(about)
 
     # ------------------------------------------------------------------
@@ -1794,6 +2117,7 @@ QPushButton#statusChipButton:checked {
         row.addWidget(right)
         return self._wrap_layout(row)
 
+<<<<<<< HEAD
     @Slot()
     def _show_settings_page(self) -> None:
         self._central_stack.setCurrentIndex(_PAGE_SETTINGS)
@@ -1947,6 +2271,11 @@ QPushButton#statusChipButton:checked {
             self._run_onboarding()
         # Non-blocking post-start prompts (e.g. local models setup).
         QTimer.singleShot(650, self._maybe_prompt_ollama_install)
+=======
+    def _finish_startup(self) -> None:
+        if not self._state.onboarding_complete:
+            self._run_onboarding()
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         if self._startup_initial_query:
             self._input.setPlainText(self._startup_initial_query)
             if self._startup_auto_run:
@@ -1958,6 +2287,7 @@ QPushButton#statusChipButton:checked {
         else:
             self.statusBar().showMessage("Ready — choose a workspace and start a task.")
 
+<<<<<<< HEAD
     @Slot()
     def _open_ollama_setup(self) -> None:
         """
@@ -2032,6 +2362,8 @@ QPushButton#statusChipButton:checked {
         if box.clickedButton() == install_btn:
             self._open_ollama_setup()
 
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     def _effective_feature_flags(self) -> FeatureFlags:
         base = self._display_feature_flags
         if not self._state.safe_mode:
@@ -2058,6 +2390,7 @@ QPushButton#statusChipButton:checked {
         data_dir.mkdir(parents=True, exist_ok=True)
         overrides["vector_store_path"] = str(data_dir / "vectordb")
         overrides["log_file"] = str(data_dir / "survyai-desktop.log")
+<<<<<<< HEAD
         # Cloud overrides: token + base URL + injected platform keys/models from /v1/bootstrap.
         if self._state.cloud_api_base_url.strip() and self._state.cloud_access_token.strip():
             overrides["survyai_api_base_url"] = self._state.cloud_api_base_url.strip()
@@ -2087,10 +2420,13 @@ QPushButton#statusChipButton:checked {
                 ]:
                     if k_src in bs and bs.get(k_src) is not None:
                         overrides[k_dst] = bs.get(k_src)
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         if self._state.safe_mode:
             overrides["vector_store_enabled"] = False
             overrides["auto_context_retrieval"] = False
             overrides["auto_store_conversations"] = False
+<<<<<<< HEAD
         # Desktop-local Ollama settings (do not require editing .env).
         if getattr(self._state, "ollama_base_url", "").strip():
             overrides["ollama_base_url"] = self._state.ollama_base_url.strip()
@@ -2113,6 +2449,11 @@ QPushButton#statusChipButton:checked {
     def _rebuild_service(self, *, skip_cloud_refresh: bool = False) -> None:
         if not skip_cloud_refresh:
             self._ensure_cloud_token_valid(silent=True)
+=======
+        return merge_settings(**overrides)
+
+    def _rebuild_service(self) -> None:
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._settings = self._effective_settings()
         self._feature_flags = self._effective_feature_flags()
         self._service = SurvyAIAgentService(
@@ -2120,6 +2461,7 @@ QPushButton#statusChipButton:checked {
             feature_flags=self._feature_flags,
             eager_init=False,
         )
+<<<<<<< HEAD
         self._refresh_active_llm_status()
 
     def _ensure_cloud_token_valid(self, *, silent: bool = False) -> bool:
@@ -2248,6 +2590,8 @@ QPushButton#statusChipButton:checked {
         return self._register_cloud_device_with_credentials(
             base_url=base, access_token=token, silent=silent
         )
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     def _set_combo_value(self, combo: QComboBox, value: str) -> None:
         idx = combo.findText(value)
@@ -2259,9 +2603,13 @@ QPushButton#statusChipButton:checked {
         self._settings_workspace.setText(self._state.workspace_path)
         self._settings_data_folder.setText(self._state.data_folder)
         self._fallback_cb.setChecked(self._state.use_fallback_llm)
+<<<<<<< HEAD
         self._safe_mode_cb.setChecked(self._state.safe_mode)
         self._fast_mode_cb.setChecked(bool(getattr(self._state, "fast_mode_non_file_prompts", False)))
         self._refresh_fast_mode_indicator()
+=======
+        self._safe_mode_toggle.setChecked(self._state.safe_mode)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._set_combo_value(
             self._primary_llm_combo,
             self._state.preferred_primary_llm or self._settings.primary_llm,
@@ -2280,6 +2628,7 @@ QPushButton#statusChipButton:checked {
         self._refresh_conversation_list()
         self._render_active_conversation()
         self._refresh_diagnostics()
+<<<<<<< HEAD
         self._refresh_credits_page()
         self._session_settings_label.setText(f"{self._session_id}\nStatus: Ready")
 
@@ -2298,11 +2647,34 @@ QPushButton#statusChipButton:checked {
         self._account_email_value.setText(email_disp)
         self._account_company_value.setText(company_disp)
         self._refresh_user_menu()
+=======
+        self._session_settings_label.setText(f"{self._session_id}\nStatus: Ready")
+        self._update_safe_mode_chip()
+
+    def _refresh_account_views(self) -> None:
+        profile = self._state.profile
+        if profile.is_signed_in:
+            headline = profile.display_name or profile.email
+            sub = profile.email
+            if profile.company:
+                sub = f"{sub} | {profile.company}" if sub else profile.company
+            summary = profile.display_name or profile.email
+        else:
+            headline = "Not signed in"
+            sub = "Run onboarding or use Sign in / edit to set up the desktop profile."
+            summary = "Sign in"
+        self._account_summary_btn.setText(summary if len(summary) <= 18 else summary[:15] + "...")
+        self._account_summary_btn.setToolTip(f"{headline}\n{sub}")
+        self._account_name_value.setText(profile.display_name or "—")
+        self._account_email_value.setText(profile.email or "—")
+        self._account_company_value.setText(profile.company or "—")
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     def _refresh_license_card(self) -> None:
         runtime_flags = self._feature_flags
         display_flags = self._display_feature_flags
         plan = "Pro" if display_flags.license_mode == "pro" else "UserMode"
+<<<<<<< HEAD
         me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
         if me.get("plan_slug"):
             plan = str(me.get("plan_slug") or plan)
@@ -2310,6 +2682,11 @@ QPushButton#statusChipButton:checked {
             "Cloud session (API + bootstrap)"
             if getattr(self._settings, "survyai_access_token", "").strip()
             and self._state.cloud_api_base_url.strip()
+=======
+        source = (
+            "Cloud token configured"
+            if getattr(self._settings, "survyai_access_token", "").strip()
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             else "Local feature flags"
         )
         enabled = []
@@ -2324,18 +2701,22 @@ QPushButton#statusChipButton:checked {
         if runtime_flags.effective_allow_vector_store:
             enabled.append("Vector store")
         status = "Troubleshooting (safe mode)" if self._state.safe_mode else "Active"
+<<<<<<< HEAD
         sub_status = str(me.get("subscription_status") or "").strip()
         if sub_status:
             status = f"{status} | Cloud subscription: {sub_status}"
         period = me.get("subscription_current_period_end")
         if period:
             status = f"{status} | Renewal / period end: {period}"
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         license_text = (
             f"Plan: {plan}\n"
             f"Status: {status}\n"
             f"Source: {source}\n"
             f"Enabled integrations: {', '.join(enabled) if enabled else 'Core assistant only'}"
         )
+<<<<<<< HEAD
         cloud_ok = bool(self._state.cloud_api_base_url.strip() and self._state.cloud_access_token.strip())
         pro_like = {"active", "trialing", "non_renewing"}
         st_low = str(me.get("subscription_status") or "").lower()
@@ -2408,6 +2789,17 @@ QPushButton#statusChipButton:checked {
 
     def _refresh_capability_views(self) -> None:
         caps_text = format_capabilities_summary(self._caps)
+=======
+        self._license_summary_btn.setText(plan)
+        self._license_summary_btn.setToolTip(license_text)
+        self._license_settings_label.setText(license_text)
+
+    def _refresh_capability_views(self) -> None:
+        caps_text = format_capabilities_summary(self._caps)
+        short = "System Connections"
+        self._machine_summary_btn.setText(short)
+        self._machine_summary_btn.setToolTip(caps_text)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._machine_settings_label.setText(caps_text)
 
     def _refresh_history_list(self) -> None:
@@ -2441,7 +2833,11 @@ QPushButton#statusChipButton:checked {
             if conv.messages:
                 last = conv.messages[-1].content.strip().replace("\n", " ")
                 preview = f"\n{last[:60]}" if last else ""
+<<<<<<< HEAD
             item = QListWidgetItem(f"• {title}{preview}")
+=======
+            item = QListWidgetItem(f"{title}{preview}")
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             item.setData(Qt.ItemDataRole.UserRole, conv.conversation_id)
             item.setToolTip(f"{title}\nSession: {conv.session_id}")
             self._conversation_list.addItem(item)
@@ -2449,6 +2845,7 @@ QPushButton#statusChipButton:checked {
                 self._conversation_list.setCurrentItem(item)
         self._conversation_list_sync = False
 
+<<<<<<< HEAD
     def _message_html(self, role: str, text: str, *, error: bool = False) -> str:
         if role == "user":
             safe = html.escape(text)
@@ -2488,6 +2885,35 @@ QPushButton#statusChipButton:checked {
     @Slot()
     def _flush_desktop_state_save(self) -> None:
         self._state_store.save(self._state)
+=======
+    def _render_message(self, role: str, text: str, *, error: bool = False) -> None:
+        if role == "user":
+            safe = html.escape(text)
+            self._append_html(
+                f'<p style="margin:8px 0;"><b style="color:#1e40af;">You</b><br/>'
+                f'<span style="color:#0f172a;">{safe.replace(chr(10), "<br/>")}</span></p>'
+            )
+            return
+        if role == "assistant":
+            safe = html.escape(text)
+            color = "#b91c1c" if error else "#0f172a"
+            self._append_html(
+                f'<p style="margin:8px 0;"><b style="color:#047857;">SurvyAI</b><br/>'
+                f'<span style="color:{color};">{safe.replace(chr(10), "<br/>")}</span></p>'
+            )
+            return
+        safe = html.escape(text)
+        self._append_html(f'<p style="margin:4px 0;color:#64748b;font-size:9pt;">{safe}</p>')
+
+    def _render_active_conversation(self) -> None:
+        conv = self._active_conversation()
+        self._transcript.clear()
+        if not conv.messages:
+            self._transcript.setPlainText("")
+            return
+        for message in conv.messages:
+            self._render_message(message.role, message.content, error=message.error)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     def _store_conversation_message(self, role: str, text: str, *, error: bool = False) -> None:
         conv = self._active_conversation()
@@ -2533,6 +2959,7 @@ QPushButton#statusChipButton:checked {
             f"{state_report}\n"
         )
 
+<<<<<<< HEAD
     def _refresh_credits_page(self) -> None:
         budget = self._state.monthly_credits_usd
         used = self._state.monthly_credits_used_usd
@@ -2818,6 +3245,16 @@ QPushButton#statusChipButton:checked {
             self.statusBar().showMessage("Credits refreshed from cloud.", 4000)
         except CloudApiError as exc:
             QMessageBox.warning(self, "Credits sync failed", user_facing_cloud_message(exc))
+=======
+    def _update_safe_mode_chip(self) -> None:
+        self._safe_mode_toggle.setChecked(self._state.safe_mode)
+        self._safe_mode_toggle.setText("Safe mode on" if self._state.safe_mode else "Safe mode off")
+        self._safe_mode_toggle.setToolTip(
+            "Troubleshooting mode. Disables advanced external integrations."
+            if self._state.safe_mode
+            else "Normal mode. Click to enable safe mode for troubleshooting."
+        )
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     # ------------------------------------------------------------------
     # Console / history helpers
@@ -2854,7 +3291,10 @@ QPushButton#statusChipButton:checked {
             error=str(result.error or ""),
             llm_used=str(result.llm_used or ""),
             model_name=str(result.model_name or ""),
+<<<<<<< HEAD
             llm_cost_usd=float(result.llm_cost_usd or 0.0),
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             cancelled=False,
         )
         self._state_store.add_history_entry(self._state, entry=entry)
@@ -2877,6 +3317,7 @@ QPushButton#statusChipButton:checked {
         self._state_store.add_history_entry(self._state, entry=entry)
         self._refresh_history_list()
 
+<<<<<<< HEAD
     def _sync_credits_from_entitlements(self, ent: dict) -> None:
         """Pull credit balance fields from an /entitlements or /me response dict."""
         self._state.monthly_credits_usd = float(ent.get("monthly_credits_usd") or 0)
@@ -2937,6 +3378,8 @@ QPushButton#statusChipButton:checked {
         except Exception:
             pass
 
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     # ------------------------------------------------------------------
     # Slots / actions
     # ------------------------------------------------------------------
@@ -2947,6 +3390,7 @@ QPushButton#statusChipButton:checked {
         self._state_store.save(self._state)
 
     @Slot()
+<<<<<<< HEAD
     def _on_fast_mode_toggled(self, checked: bool) -> None:
         self._state.fast_mode_non_file_prompts = bool(checked)
         self._state_store.save(self._state)
@@ -2959,6 +3403,8 @@ QPushButton#statusChipButton:checked {
         self.statusBar().showMessage("Fast mode updated.", 2500)
 
     @Slot()
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     def _on_send_clicked(self) -> None:
         text = self._input.toPlainText().strip()
         if not text:
@@ -2969,6 +3415,7 @@ QPushButton#statusChipButton:checked {
         if not self._workspace_edit.text().strip():
             QMessageBox.warning(self, "Workspace required", "Choose a workspace before running tasks.")
             return
+<<<<<<< HEAD
         if self._state.cloud_api_base_url.strip() and self._state.cloud_refresh_token.strip():
             if not self._ensure_cloud_token_valid(silent=False):
                 QMessageBox.warning(
@@ -2989,12 +3436,15 @@ QPushButton#statusChipButton:checked {
             self._append_assistant_message(credit_msg, error=True)
             self.statusBar().showMessage("Hosted API credits exhausted for this period.", 8000)
             return
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
         self._pending_plain_query = text
         self._last_query = text
         self._input.clear()
         self._store_conversation_message("user", text)
         self._append_user_message(text)
+<<<<<<< HEAD
         enhanced = self._build_continuation_query(text)
         # Store the history-enriched version so _handle_internet_permission can
         # re-submit it (with full context) instead of the bare plain query.
@@ -3077,6 +3527,9 @@ QPushButton#statusChipButton:checked {
         )
         parts.append(raw_query)
         return "\n".join(parts)
+=======
+        self._run_agent_thread(text)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     def _run_agent_thread(self, query: str) -> None:
         self._state.workspace_path = self._workspace_edit.text().strip()
@@ -3094,6 +3547,7 @@ QPushButton#statusChipButton:checked {
         self._session_settings_label.setText(f"{self._session_id}\nStatus: Task in progress")
         self._append_activity("Task submitted.")
 
+<<<<<<< HEAD
         # "Use fallback LLM" is an explicit override (run fallback even when primary is healthy).
         # For Ollama-primary workflows, force this OFF so "offline/local" actually runs locally.
         use_fallback_override = bool(self._state.use_fallback_llm)
@@ -3105,6 +3559,12 @@ QPushButton#statusChipButton:checked {
             self._service,
             query,
             use_fallback_llm=use_fallback_override,
+=======
+        self._thread = AgentRunThread(
+            self._service,
+            query,
+            use_fallback_llm=bool(self._state.use_fallback_llm),
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             session_id=self._session_id,
             interactive=True,
             working_directory=self._state.workspace_path,
@@ -3144,6 +3604,7 @@ QPushButton#statusChipButton:checked {
             self._store_conversation_message("assistant", body, error=not result.success)
             self._append_assistant_message(body, error=not result.success)
         self._persist_history_from_result(result)
+<<<<<<< HEAD
         self._account_for_run_cost(result)
 
     def _handle_internet_permission(self, result: AgentRunResult) -> None:
@@ -3160,6 +3621,11 @@ QPushButton#statusChipButton:checked {
             or self._pending_plain_query
             or ""
         )
+=======
+
+    def _handle_internet_permission(self, result: AgentRunResult) -> None:
+        q = self._pending_plain_query or result.query or ""
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         box = QMessageBox(self)
         box.setWindowTitle("Internet search permission")
         box.setIcon(QMessageBox.Question)
@@ -3288,15 +3754,22 @@ QPushButton#statusChipButton:checked {
         if self._thread is not None and self._thread.isRunning():
             return
         conv_id = str(item.data(Qt.ItemDataRole.UserRole) or "")
+<<<<<<< HEAD
         conv = self._state_store.set_active_conversation(
             self._state, conv_id, persist=False
         )
+=======
+        conv = self._state_store.set_active_conversation(self._state, conv_id)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         if conv is None:
             return
         self._active_conversation_id = conv.conversation_id
         self._session_id = conv.session_id
         self._render_active_conversation()
+<<<<<<< HEAD
         self._schedule_desktop_state_save()
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._session_settings_label.setText(f"{self._session_id}\nStatus: Ready")
         self.statusBar().showMessage(f"Switched to conversation: {conv.title}", 3000)
 
@@ -3377,16 +3850,31 @@ QPushButton#statusChipButton:checked {
         checked = bool(checked)
         self._state.safe_mode = checked
 
+<<<<<<< HEAD
         if self._safe_mode_cb.isChecked() != checked:
             self._safe_mode_cb.blockSignals(True)
             self._safe_mode_cb.setChecked(checked)
             self._safe_mode_cb.blockSignals(False)
+=======
+        if self._safe_mode_toggle.isChecked() != checked:
+            self._safe_mode_toggle.blockSignals(True)
+            self._safe_mode_toggle.setChecked(checked)
+            self._safe_mode_toggle.blockSignals(False)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
         self._state_store.save(self._state)
         self._rebuild_service()
         self._refresh_license_card()
         self._refresh_diagnostics()
+<<<<<<< HEAD
         self.statusBar().showMessage("Safe mode updated.", 2500)
+=======
+        self._update_safe_mode_chip()
+
+    @Slot()
+    def _toggle_safe_mode_from_button(self) -> None:
+        self._on_safe_mode_toggled(self._safe_mode_toggle.isChecked())
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
     @Slot()
     def _apply_runtime_settings(self) -> None:
@@ -3395,6 +3883,7 @@ QPushButton#statusChipButton:checked {
             return
         self._state.preferred_primary_llm = self._primary_llm_combo.currentText().strip()
         self._state.preferred_fallback_llm = self._fallback_llm_combo.currentText().strip()
+<<<<<<< HEAD
         self._state.fast_mode_non_file_prompts = bool(self._fast_mode_cb.isChecked())
         # If user switches to Ollama from the dropdown, ensure we have a usable local model selected.
         wants_ollama = self._state.preferred_primary_llm == "ollama" or self._state.preferred_fallback_llm == "ollama"
@@ -3405,16 +3894,22 @@ QPushButton#statusChipButton:checked {
                 models = list_local_models()
                 if models:
                     self._state.ollama_model = models[0]
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._state.workspace_path = self._settings_workspace.text().strip() or self._state.workspace_path
         self._state.data_folder = self._settings_data_folder.text().strip() or self._state.data_folder
         self._workspace_edit.setText(self._state.workspace_path)
         self._state_store.save(self._state)
         self._rebuild_service()
+<<<<<<< HEAD
         self._refresh_active_llm_status()
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._refresh_license_card()
         self._refresh_diagnostics()
         self.statusBar().showMessage("Runtime settings applied.", 4000)
 
+<<<<<<< HEAD
         # UX guardrail: if the user chose Ollama as Primary, disable the explicit fallback override.
         if self._state.preferred_primary_llm == "ollama" and self._state.use_fallback_llm:
             self._state.use_fallback_llm = False
@@ -3917,18 +4412,43 @@ QPushButton#statusChipButton:checked {
     @Slot()
     def _sign_out_account(self) -> None:
         if not self._state.profile.is_signed_in and not self._state.cloud_access_token.strip():
+=======
+    @Slot()
+    def _edit_account_profile(self) -> None:
+        dlg = AccountDialog(self, profile=self._state.profile)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        profile = dlg.profile()
+        profile.signed_in_at = self._state.profile.signed_in_at or datetime.now(timezone.utc).isoformat()
+        self._state.profile = profile
+        self._state_store.save(self._state)
+        self._refresh_account_views()
+        self._refresh_diagnostics()
+
+    @Slot()
+    def _sign_out_account(self) -> None:
+        if not self._state.profile.is_signed_in:
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             return
         answer = QMessageBox.question(
             self,
             "Sign out",
+<<<<<<< HEAD
             "Clear the local desktop account profile and cloud session for this app?",
+=======
+            "Clear the local desktop account profile for this app?",
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if answer != QMessageBox.Yes:
             return
         self._state.profile = AccountProfile()
+<<<<<<< HEAD
         self._clear_cloud_session()
+=======
+        self._state_store.save(self._state)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         self._refresh_account_views()
         self._refresh_diagnostics()
 
@@ -4122,7 +4642,10 @@ QPushButton#statusChipButton:checked {
                 event.ignore()
                 return
             self._thread.request_cancel()
+<<<<<<< HEAD
         if self._desktop_state_save_timer.isActive():
             self._desktop_state_save_timer.stop()
             self._flush_desktop_state_save()
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         event.accept()

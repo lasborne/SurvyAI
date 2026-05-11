@@ -69,6 +69,7 @@ from __future__ import annotations
 
 import json
 import operator
+import re
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
@@ -111,6 +112,10 @@ from pydantic import BaseModel, Field
 # Local imports
 from config import get_settings
 from config.settings import Settings
+<<<<<<< HEAD
+=======
+from survyai.feature_flags import FeatureFlags
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 from utils.logger import get_logger
 from utils.token_limiter import (
     estimate_message_tokens,
@@ -144,7 +149,10 @@ from utils.internet import internet_search as _internet_search
 # Prompts and state live in separate modules for smaller, maintainable agent.py
 from agent.prompts import SYSTEM_PROMPT
 from agent.state import AgentState, RAGRouteDecision, looks_like_file_driven_task
+<<<<<<< HEAD
 from survyai.feature_flags import FeatureFlags
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
 # ==============================================================================
 # LOGGING SETUP
@@ -155,6 +163,7 @@ from survyai.feature_flags import FeatureFlags
 logger = get_logger(__name__)
 
 
+<<<<<<< HEAD
 # Cadastral DWG fast-path must not capture ArcGIS / volumetric workflows that only
 # reference a .dwg as a boundary (those prompts lack generate 'Out.dwg' cadastral output).
 _CADASTRAL_FASTPATH_EXCLUDE_MARKERS: Tuple[str, ...] = (
@@ -180,6 +189,8 @@ _CADASTRAL_FASTPATH_EXCLUDE_MARKERS: Tuple[str, ...] = (
 )
 
 
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 # ==============================================================================
 # MAIN AGENT CLASS
 # ==============================================================================
@@ -222,8 +233,13 @@ class SurvyAIAgent:
         Args:
             settings: Optional explicit `Settings` instance (e.g. from `merge_settings()`
                 in desktop builds). If omitted, uses `get_settings()` (.env / environment).
+<<<<<<< HEAD
             feature_flags: Desktop/service integration flags (`SurvyAIAgentService` passes this).
                 If omitted, loads from environment via `FeatureFlags.from_env()`.
+=======
+            feature_flags: Optional `FeatureFlags` (license_mode + integration toggles).
+                If omitted, uses `FeatureFlags.from_env()`. Phase 2: filters registered tools.
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         
         Initialization sequence:
         1. Load configuration settings
@@ -241,10 +257,21 @@ class SurvyAIAgent:
         # Settings come from environment variables and .env file, or are injected
         # (e.g. desktop app with merged cloud tokens) via `settings=`.
         self.settings = settings if settings is not None else get_settings()
+<<<<<<< HEAD
         self.feature_flags = (
             feature_flags if feature_flags is not None else FeatureFlags.from_env()
         )
 
+=======
+        self._feature_flags: FeatureFlags = (
+            feature_flags if feature_flags is not None else FeatureFlags.from_env()
+        )
+        logger.info(
+            "License mode: %s (builder=full tools for dev; pro=respect SURVYAI_FEATURE_*)",
+            self._feature_flags.license_mode,
+        )
+        
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         # Validate that primary LLM is set correctly
         logger.info(f"Configuration loaded - Primary LLM: {self.settings.primary_llm}, Fallback LLM: {self.settings.fallback_llm}")
         
@@ -442,6 +469,7 @@ class SurvyAIAgent:
         # Internet permission (interactive, user-controlled)
         # Default: False (must ask user before searching the internet)
         self._internet_permission_granted: bool = False
+        self._pending_permission_requests: Dict[str, Dict[str, Any]] = {}
     
     # ==========================================================================
     # CONTEXT RETRIEVAL AND STORAGE
@@ -913,6 +941,64 @@ class SurvyAIAgent:
         import time
         from pathlib import Path
 
+<<<<<<< HEAD
+=======
+        q = (query or "").lower()
+        data = self._load_cad_template_memory()
+        entries = list(data.get("templates") or [])
+        valid_entries: List[Dict[str, Any]] = []
+        dirty = False
+
+        for ent in entries:
+            try:
+                tp = Path(str(ent.get("path") or "")).resolve()
+                exists = tp.exists()
+                if bool(ent.get("is_available")) != bool(exists):
+                    ent["is_available"] = bool(exists)
+                    dirty = True
+                if exists:
+                    valid_entries.append(ent)
+            except Exception:
+                ent["is_available"] = False
+                dirty = True
+
+        if dirty:
+            data["templates"] = entries
+            try:
+                self._save_cad_template_memory(data)
+            except Exception:
+                pass
+
+        if not valid_entries:
+            return None
+
+        def _score(ent: Dict[str, Any]) -> Tuple[int, str]:
+            score = 0
+            aliases = [str(a).lower() for a in (ent.get("aliases") or []) if str(a).strip()]
+            name = str(ent.get("name") or "").lower()
+            stem = str(ent.get("id") or "").lower()
+            for token in aliases + [name, stem]:
+                if token and token in q:
+                    score += max(5, len(token))
+            # Most recent valid template wins when there is no clear semantic match.
+            last_used = str(ent.get("last_used_at") or "")
+            return (score, last_used)
+
+        best = sorted(valid_entries, key=_score, reverse=True)[0]
+        try:
+            best["last_used_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            data["templates"] = entries
+            self._save_cad_template_memory(data)
+        except Exception:
+            pass
+        return {
+            "template_path": str(Path(str(best.get("path") or "")).resolve()),
+            "profile_path": str(Path(str(best.get("profile_path") or "")).resolve()) if best.get("profile_path") else "",
+            "template_name": str(best.get("name") or ""),
+        }
+
+    def _should_fastpath_cadastral_cad(self, query: str) -> bool:
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         q = (query or "").lower()
         data = self._load_cad_template_memory()
         entries = list(data.get("templates") or [])
@@ -988,6 +1074,7 @@ class SurvyAIAgent:
         q = raw.lower()
         if ".dwg" not in q:
             return False
+<<<<<<< HEAD
         if any(m in q for m in _CADASTRAL_FASTPATH_EXCLUDE_MARKERS):
             return False
 
@@ -1169,6 +1256,365 @@ class SurvyAIAgent:
             "plans_success": ok,
             "plans_failed": len(subs) - ok,
             "results": results,
+=======
+        has_generate = any(k in q for k in ["generate", "create", "produce", "save"]) and ".dwg" in q
+        has_coords = "coordinates" in q and ("mE" in q or "mn" in q or "(" in q)
+        return bool(has_generate and has_coords)
+
+    def _should_fastpath_pre_post_csv_dwg_cutfill(self, query: str) -> bool:
+        q = query or ""
+        ql = q.lower()
+        tabulars = re.findall(r'["\']([^"\']+?\.(?:csv|xlsx|xlsm|xltx|xltm))["\']', q, flags=re.IGNORECASE)
+        dwgs = re.findall(r'["\']([^"\']+?\.dwg)["\']', q, flags=re.IGNORECASE)
+        has_volume_intent = any(k in ql for k in ["idw", "cutfill", "cut fill", "volume"])
+        has_pre_post = "pre" in ql and "post" in ql
+        return bool(len(tabulars) >= 2 and len(dwgs) >= 1 and has_volume_intent and has_pre_post)
+
+    def _run_pre_post_csv_dwg_cutfill_pipeline(self, query: str) -> Dict[str, Any]:
+        from pathlib import Path
+
+        q = query or ""
+        path_tokens = re.findall(r'["\']([^"\']+?\.(?:csv|xlsx|xlsm|xltx|xltm|dwg))["\']', q, flags=re.IGNORECASE)
+        tabulars = [
+            p for p in path_tokens
+            if p.lower().endswith((".csv", ".xlsx", ".xlsm", ".xltx", ".xltm"))
+        ]
+        dwgs = [p for p in path_tokens if p.lower().endswith(".dwg")]
+        if len(tabulars) < 2 or not dwgs:
+            return {
+                "success": False,
+                "error": "Could not extract the required PRE/POST tabular paths and DWG path from the prompt.",
+            }
+
+        pre_csv = tabulars[0]
+        post_csv = tabulars[1]
+        boundary_dwg = dwgs[0]
+
+        out_name = None
+        m_out = re.search(r"['\"]([^'\"]+VolumeResult\.csv)['\"]", q, flags=re.IGNORECASE)
+        if m_out:
+            out_name = m_out.group(1).strip()
+        if not out_name:
+            m_named = re.search(r"file\s+['\"]([^'\"]+\.csv)['\"]", q, flags=re.IGNORECASE)
+            if m_named:
+                out_name = m_named.group(1).strip()
+
+        coordinate_system = None
+        m_crs = re.search(
+            r"coordinate(?:\s+reference)?\s+system\s*(?:is|=|:)\s*([^.\n]+)",
+            q,
+            flags=re.IGNORECASE,
+        )
+        if m_crs:
+            coordinate_system = m_crs.group(1).strip(" '\"")
+        elif "nigerian west-belt" in q.lower() or "nigeria west belt" in q.lower():
+            coordinate_system = "Nigerian West-Belt Projected system"
+
+        workspace = Path.cwd().resolve()
+        output_csv_path = (
+            str(Path(out_name).resolve())
+            if out_name and Path(out_name).is_absolute()
+            else str((workspace / (out_name or "Adibawa_VolumeResult.csv")).resolve())
+        )
+        project_stem = Path(output_csv_path).stem or "SurvyAI_Volume_Result"
+        project_name = "".join(ch if ch.isalnum() else "_" for ch in project_stem).strip("_") or "SurvyAI_Volume_Result"
+
+        fast = self.arcgis_processor.compute_pre_post_csv_dwg_cutfill(
+            pre_csv_path=pre_csv,
+            post_csv_path=post_csv,
+            boundary_dwg_path=boundary_dwg,
+            workspace_folder=str(workspace),
+            output_csv_path=output_csv_path,
+            project_name=project_name,
+            coordinate_system=coordinate_system,
+        )
+
+        if fast.get("success"):
+            results = fast.get("arcgis_results", {}) or {}
+            net = results.get("net_volume") or {}
+            fill = results.get("fill_volume") or {}
+            cut = results.get("cut_volume") or {}
+            area = results.get("boundary_area") or {}
+            resp_lines = [
+                "ArcGIS volume workflow completed.",
+                f"- Output CSV: {fast.get('output_csv')}",
+                f"- Project: {fast.get('project_path')}",
+                f"- PRE copy: {fast.get('pre_copy')}",
+                f"- POST copy: {fast.get('post_copy')}",
+            ]
+            if isinstance(area, dict) and area.get("formatted"):
+                resp_lines.append(f"- Boundary area: {area.get('formatted')}")
+            if isinstance(fill, dict) and fill.get("formatted"):
+                resp_lines.append(f"- Fill volume: {fill.get('formatted')}")
+            if isinstance(cut, dict) and cut.get("formatted"):
+                resp_lines.append(f"- Cut volume: {cut.get('formatted')}")
+            if isinstance(net, dict) and net.get("formatted"):
+                resp_lines.append(f"- Net volume: {net.get('formatted')}")
+            return {
+                "success": True,
+                "response": "\n".join(resp_lines),
+                "output_csv": fast.get("output_csv"),
+                "project_path": fast.get("project_path"),
+            }
+
+        err = fast.get("error") or "ArcGIS workflow failed"
+        detail = fast.get("details") or {}
+        response = "\n".join(
+            [
+                "Task did not complete successfully.",
+                f"Error: {err}",
+                f"Project: {fast.get('project_path') or detail.get('project_path')}",
+                f"PRE copy: {fast.get('pre_copy')}",
+                f"POST copy: {fast.get('post_copy')}",
+                f"Script: {detail.get('script_path') or ''}".rstrip(),
+            ]
+        ).strip()
+        return {
+            "success": False,
+            "response": response,
+            "error": err,
+            "project_path": fast.get("project_path") or detail.get("project_path"),
+            "output_csv": fast.get("output_csv"),
+        }
+
+    def _should_fastpath_dynamic_arcgis_workflow(self, query: str) -> bool:
+        q = query or ""
+        ql = q.lower()
+        if "arcgis" not in ql:
+            return False
+        quoted_inputs = re.findall(
+            r'["\']([^"\']+?\.(?:xlsx|xlsm|xltx|xltm|csv|dwg|shp|geojson|json|kml|kmz))["\']',
+            q,
+            flags=re.IGNORECASE,
+        )
+        if not quoted_inputs:
+            return False
+        dynamic_ops = [
+            "buffer",
+            "buffers",
+            "intersect",
+            "intersection",
+            "cluster",
+            "spread",
+            "spatial join",
+            "statistics",
+            "standard deviation",
+            "variance",
+            "median",
+            "mean",
+            "mode",
+            "nearest neighbor",
+            "hot spot",
+            "kernel density",
+            "clip",
+            "erase",
+            "dissolve",
+            "union",
+            "thiessen",
+            "voronoi",
+        ]
+        return any(tok in ql for tok in dynamic_ops)
+
+    def _run_dynamic_arcgis_workflow_pipeline(
+        self,
+        query: str,
+        llm: BaseChatModel,
+        model_name_used: str,
+        max_attempts: int = 3,
+    ) -> Dict[str, Any]:
+        from pathlib import Path
+
+        q = query or ""
+        workspace = Path.cwd().resolve()
+        path_tokens = re.findall(
+            r'["\']([^"\']+?\.(?:xlsx|xlsm|xltx|xltm|csv|dwg|shp|geojson|json|kml|kmz))["\']',
+            q,
+            flags=re.IGNORECASE,
+        )
+        output_csv_name = None
+        m_named = re.search(r"file\s+['\"]([^'\"]+\.csv)['\"]", q, flags=re.IGNORECASE)
+        if m_named:
+            output_csv_name = m_named.group(1).strip()
+        if not output_csv_name:
+            m_any_csv = re.search(r"['\"]([^'\"]+\.csv)['\"]", q, flags=re.IGNORECASE)
+            if m_any_csv:
+                cand = m_any_csv.group(1).strip()
+                if "volumeresult" not in cand.lower():
+                    output_csv_name = cand
+        output_csv_path = (
+            str(Path(output_csv_name).resolve())
+            if output_csv_name and Path(output_csv_name).is_absolute()
+            else str((workspace / (output_csv_name or "ArcGIS_Result.csv")).resolve())
+        )
+
+        coordinate_system = None
+        m_crs = re.search(
+            r"coordinate(?:\s+reference)?\s+system\s*(?:is|=|:)\s*([^.\n]+)",
+            q,
+            flags=re.IGNORECASE,
+        )
+        if m_crs:
+            coordinate_system = m_crs.group(1).strip(" '\"")
+        elif "nigerian west-belt" in q.lower() or "nigeria west belt" in q.lower():
+            coordinate_system = "Nigerian West-Belt Projected system"
+
+        project_stem = Path(output_csv_path).stem or "SurvyAI_ArcGIS_Dynamic"
+        project_name = "".join(ch if ch.isalnum() else "_" for ch in project_stem).strip("_") or "SurvyAI_ArcGIS_Dynamic"
+
+        def _stringify_content(msg: Any) -> str:
+            content = getattr(msg, "content", msg)
+            if isinstance(content, str):
+                return content
+            if isinstance(content, list):
+                parts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        parts.append(str(item.get("text", "")))
+                    else:
+                        parts.append(str(item))
+                return "\n".join(parts)
+            return str(content)
+
+        def _extract_python(raw_text: str) -> str:
+            txt = (raw_text or "").strip()
+            m = re.search(r"```(?:python)?\s*(.*?)```", txt, flags=re.IGNORECASE | re.DOTALL)
+            if m:
+                txt = m.group(1).strip()
+            return txt
+
+        generation_instructions = (
+            "Return ONLY executable Python code, no markdown, no explanation.\n"
+            "You are writing ArcPy automation for SurvyAI.\n"
+            "The runtime will auto-create an ArcGIS Pro project and execute headlessly, then finalize/open ArcGIS Pro.\n"
+            "Script requirements:\n"
+            "- Use `import arcpy, os, csv, math, statistics` and other stdlib only when needed.\n"
+            "- Use `aprx = arcpy.mp.ArcGISProject('CURRENT')`; SurvyAI will rewrite CURRENT to the explicit .aprx path.\n"
+            "- Immediately derive the project-native geodatabase from `aprx.filePath` and use that for ALL outputs:\n"
+            "  `project_dir = os.path.dirname(aprx.filePath)`\n"
+            "  `project_name = os.path.splitext(os.path.basename(aprx.filePath))[0]`\n"
+            "  `gdb = os.path.join(project_dir, project_name + '.gdb')`\n"
+            "  `if not arcpy.Exists(gdb): arcpy.management.CreateFileGDB(project_dir, project_name + '.gdb')`\n"
+            "  Do NOT rely on `aprx.defaultGeodatabase` because it may point to an unrelated prior project.\n"
+            "- Use the current working directory as the SurvyAI workspace for output copies and final CSV.\n"
+            "- If the user asked for PRE/POST copies as CSV in the workspace, create them first.\n"
+            "- For Excel inputs, read workbook data robustly or use ArcGIS import carefully; avoid invalid output workspaces.\n"
+            "- For point creation, prefer `CreateFeatureclass` + cursors and cast numeric strings with `float(str(v).replace(',', ''))`.\n"
+            "- Store outputs in the project's native geodatabase.\n"
+            "- Print important outputs with `RESULT_*` lines so SurvyAI can parse them.\n"
+            f"- The expected final CSV path is: {output_csv_path}\n"
+            f"- The intended project name is: {project_name}\n"
+            f"- Use coordinate system: {coordinate_system or 'derive from user request / keep workflow consistent'}\n"
+            f"- Input paths detected: {path_tokens}\n"
+            "- If performing buffer/intersection/cluster/statistics work, export both computed feature classes and a CSV summary.\n"
+            "- End by saving the ArcGIS project.\n"
+        )
+
+        last_error_block = ""
+        last_script_path = None
+        last_project_path = None
+        last_run: Dict[str, Any] = {}
+
+        for attempt in range(1, max_attempts + 1):
+            if attempt == 1:
+                prompt = (
+                    f"{generation_instructions}\n"
+                    "Generate the complete ArcPy script for this user request:\n"
+                    f"{q}\n"
+                )
+            else:
+                prompt = (
+                    f"{generation_instructions}\n"
+                    "The previous ArcPy script failed. Fix it and return a full revised script only.\n"
+                    f"Original user request:\n{q}\n\n"
+                    f"Previous error/output:\n{last_error_block}\n"
+                )
+
+            llm_msg, err, timed_out = self._run_with_timeout(
+                240,
+                lambda: llm.invoke([HumanMessage(content=prompt)]),
+            )
+            if timed_out:
+                return {
+                    "success": False,
+                    "error": "Dynamic ArcGIS code generation timed out after 240 seconds.",
+                    "response": "Dynamic ArcGIS code generation timed out before a script could be produced.",
+                    "output_csv": output_csv_path,
+                }
+            if err:
+                return {
+                    "success": False,
+                    "error": str(err),
+                    "response": f"Dynamic ArcGIS code generation failed: {err}",
+                    "output_csv": output_csv_path,
+                }
+
+            python_code = _extract_python(_stringify_content(llm_msg))
+            if not python_code.strip():
+                return {
+                    "success": False,
+                    "error": "LLM did not return executable Python code.",
+                    "response": "The ArcGIS code generator did not produce a usable Python script.",
+                    "output_csv": output_csv_path,
+                }
+
+            run = self.arcgis_processor.execute_python_code(
+                python_code=python_code,
+                project_path=None,
+                workspace_folder=str(workspace),
+                auto_project_name=project_name,
+                coordinate_system=coordinate_system,
+                script_name=f"{project_name}_dynamic_arcgis_a{attempt}.py",
+                execute_automatically=True,
+            )
+            last_run = run
+            last_script_path = run.get("script_path")
+            last_project_path = run.get("project_path")
+
+            output_exists = Path(output_csv_path).exists() and Path(output_csv_path).stat().st_size > 0
+            if run.get("success") and (output_exists or output_csv_name is None):
+                results = run.get("results", {}) or {}
+                resp_lines = [
+                    "ArcGIS dynamic workflow completed.",
+                    f"- Output CSV: {output_csv_path}" if output_exists else f"- Script succeeded; no requested CSV was verified at: {output_csv_path}",
+                    f"- Project: {run.get('project_path')}",
+                    f"- Script: {run.get('script_path')}",
+                    f"- Model: {model_name_used}",
+                ]
+                if isinstance(results, dict):
+                    for key in ("mean", "median", "mode", "variance", "standard_deviation"):
+                        val = results.get(key)
+                        if val:
+                            resp_lines.append(f"- {key.replace('_', ' ').title()}: {val}")
+                return {
+                    "success": True,
+                    "response": "\n".join(resp_lines),
+                    "output_csv": output_csv_path if output_exists else None,
+                    "project_path": run.get("project_path"),
+                }
+
+            err_parts = [
+                str(run.get("error") or ""),
+                str(run.get("stderr") or ""),
+                str(run.get("stdout") or ""),
+            ]
+            last_error_block = "\n".join(part for part in err_parts if part).strip()[:12000]
+
+        response = "\n".join(
+            [
+                "Task did not complete successfully.",
+                f"Error: {last_run.get('error') or 'Dynamic ArcGIS workflow failed after retries.'}",
+                f"Project: {last_project_path or last_run.get('project_path')}",
+                f"Script: {last_script_path or last_run.get('script_path')}",
+                f"Output CSV: {output_csv_path}",
+            ]
+        )
+        return {
+            "success": False,
+            "response": response,
+            "error": last_run.get("error") or "Dynamic ArcGIS workflow failed after retries.",
+            "project_path": last_project_path or last_run.get("project_path"),
+            "output_csv": output_csv_path,
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         }
 
     def _run_cadastral_cad_prompt_pipeline(self, query: str) -> Dict[str, Any]:
@@ -1277,6 +1723,7 @@ class SurvyAIAgent:
             ]
         )
 
+<<<<<<< HEAD
         # Stop before "coordinates for the point" or "points" (users vary wording).
         # Support both quoted and unquoted pillar lists:
         # - pillar numbers = 'SC/BE 6060, SC/BG 1665, ...'
@@ -1310,6 +1757,11 @@ class SurvyAIAgent:
             )
             or q
         )
+=======
+        pillar_list = _quoted_list(r"pillar\s+numbers\s*=\s*(.*?)(?:coordinates\s+for\s+the\s+points|$)")
+        pillars = ", ".join(pillar_list)
+        coords_blob = _pick([r"coordinates\s+for\s+the\s+points\s*=\s*(.+)$"]) or q
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         
         # Parse access road(s): support one or multiple roads (e.g. "6m on side of A and B; 4m on side of C and D")
         access_roads: List[str] = []
@@ -1726,8 +2178,33 @@ class SurvyAIAgent:
         if not outp.is_absolute():
             outp = (Path.cwd() / outp).resolve()
 
+<<<<<<< HEAD
         # Connect early. Do NOT close the user's drawing: if the output DWG is already open in AutoCAD,
         # skip overwriting it from disk (locked file) and edit that session in place instead (better UX).
+=======
+        # Copy template to output (overwrite); template file itself is never written to.
+        # The full template (including scale bar and any scale bar hashing/hatching, e.g. survey_plan_template2.dwg) is preserved and then scaled if plan scale changes.
+        try:
+            outp.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(str(template), str(outp))
+        except PermissionError as e:
+            # If the target DWG is open/locked (common during iterative edits), write to a unique filename
+            # in the same folder rather than failing the entire workflow.
+            try:
+                ts = time.strftime("%Y%m%d_%H%M%S")
+                alt = outp.with_name(f"{outp.stem}_{ts}{outp.suffix}")
+                shutil.copy2(str(template), str(alt))
+                outp = alt
+                output_dwg_path = str(outp)
+            except Exception as e2:
+                return {
+                    "success": False,
+                    "error": f"Failed to copy template to output (permission denied; also failed alternate name): {e2}",
+                }
+        except Exception as e:
+            return {"success": False, "error": f"Failed to copy template to output: {e}"}
+
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         if not self.autocad.is_connected and not self.autocad.connect():
             return {"success": False, "error": "Could not connect to AutoCAD via COM"}
 
@@ -2001,8 +2478,12 @@ class SurvyAIAgent:
 
                         # 2) Traverse legs: bearing + distance (flexible phrasing)
                         leg_re = re.compile(
+<<<<<<< HEAD
                             # Accept "bearing-", "bearing:", "bearing=", and "bearing is"
                             r"\bbearing\b\s*(?:(?:=|:|-)|\bis\b)?\s*"
+=======
+                            r"\bbearing\b\s*(?:=|is|:)?\s*"
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                             r"(\d{1,3})\s*(?:deg|degree|degrees|°|d)\s*"
                             r"([0-5]?\d)\s*(?:min|mins|minute|minutes|['’])"
                             r"(?:[^0-9]{0,80}?)"
@@ -2148,9 +2629,40 @@ class SurvyAIAgent:
             geometry["bowditch"] = bowditch_info
 
         if coord_pairs and len(coord_pairs) >= 3:
+<<<<<<< HEAD
             # Preserve user input order: pillar i ↔ coordinate i (vertex order unchanged).
             # Primary peg / coordinate callout: most western (minimum E); tie-break southernmost (minimum N).
+=======
+            # Primary pillar rule: always use the most-western coordinate AFTER any traverse adjustments.
+            # Rotate the polygon so this primary becomes index 0, then downstream table/label logic
+            # (which already treats index 0 as primary) stays consistent.
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             pts = list(coord_pairs)
+            try:
+                # West-most = minimum Easting. Near-identical Easting (survey noise / adjustment):
+                # tie-break to lower Northing (south-west-most).
+                es = [float(pts[i].get("e", 0.0)) for i in range(len(pts))]
+                min_e = min(es)
+                spread = float(max(es) - min_e) if len(es) > 1 else 0.0
+                eps_e = max(0.01, spread * 1e-9)  # ≥1 cm, or ~0.1 ppm of parcel width
+                near_west = [
+                    i for i in range(len(pts)) if abs(float(pts[i].get("e", 0.0)) - min_e) <= eps_e
+                ]
+                primary_idx = int(
+                    min(near_west, key=lambda i: float(pts[i].get("n", 0.0)))
+                )
+                geometry["primary_easting_eps_m"] = float(eps_e)
+            except Exception:
+                primary_idx = 0
+            if primary_idx:
+                pts = pts[primary_idx:] + pts[:primary_idx]
+                if bearing_distance_legs and len(bearing_distance_legs) == len(pts):
+                    bearing_distance_legs = bearing_distance_legs[primary_idx:] + bearing_distance_legs[:primary_idx]
+            primary = pts[0]
+            e0, n0 = primary["e"], primary["n"]
+            geometry["primary_vertex_index_original"] = int(primary_idx)
+            geometry["primary_easting"] = float(e0)
+            geometry["primary_northing"] = float(n0)
 
             def _primary_survey_index(vertex_pts: List[Dict[str, Any]]) -> int:
                 best = 0
@@ -2253,6 +2765,7 @@ class SurvyAIAgent:
                 if interior_bb.get("success") and boundary_w > 1e-6 and boundary_h > 1e-6:
                     interior_w = float(interior_bb.get("maxx", 0.0)) - float(interior_bb.get("minx", 0.0))
                     interior_h = float(interior_bb.get("maxy", 0.0)) - float(interior_bb.get("miny", 0.0))
+<<<<<<< HEAD
                     iy0 = float(interior_bb.get("miny", 0.0))
                     iy1 = float(interior_bb.get("maxy", 0.0))
                     margin = 0.08
@@ -2292,11 +2805,17 @@ class SurvyAIAgent:
                     usable_w_plot = float(interior_usable_w)
                     if usable_h_plot < 1e-3:
                         usable_h_plot = float(interior_usable_h)
+=======
+                    margin = 0.08
+                    interior_usable_w = interior_w * (1.0 - 2.0 * margin)
+                    interior_usable_h = interior_h * (1.0 - 2.0 * margin)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                     geometry["scale_debug"].update({
                         "interior_w": float(interior_w),
                         "interior_h": float(interior_h),
                         "interior_usable_w": float(interior_usable_w),
                         "interior_usable_h": float(interior_usable_h),
+<<<<<<< HEAD
                         "usable_w_plot": float(usable_w_plot),
                         "usable_h_plot": float(usable_h_plot),
                         "road_pad_m": float(road_pad_m),
@@ -2311,6 +2830,12 @@ class SurvyAIAgent:
                             boundary_w_pad / usable_w_plot,
                             boundary_h_pad / usable_h_plot,
                         )
+=======
+                        "margin": float(margin),
+                    })
+                    if interior_usable_w > 1e-6 and interior_usable_h > 1e-6:
+                        required_k = max(boundary_w / interior_usable_w, boundary_h / interior_usable_h)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                         geometry["scale_debug"]["required_k"] = float(required_k)
                         chosen_denom = template_denom
                         # Prefer user-requested scale if it meets minimum standards and boundary fits
@@ -2612,6 +3137,12 @@ class SurvyAIAgent:
                         pn_list.append({"prefix": prefix, "number": f"{k:04d}"})
             except Exception:
                 pass
+<<<<<<< HEAD
+=======
+            # Keep pillar labels aligned with rotated vertices so the west-most pillar is primary.
+            if pn_list and isinstance(primary_idx, int) and primary_idx > 0 and len(pn_list) >= len(local_pts):
+                pn_list = pn_list[primary_idx:] + pn_list[:primary_idx]
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             pn_meta: List[Dict[str, Any]] = []
             if pn_list:
                 # Compute a "template-typical" offset distance between a peg and its pillar-number table.
@@ -2976,6 +3507,7 @@ class SurvyAIAgent:
                 if not (_ibb or {}).get("success"):
                     _ibb = self.autocad.get_modelspace_bbox(layers=["CADA_BORDER"], prefer_largest=True)
                 if (_ibb or {}).get("success"):
+<<<<<<< HEAD
                     # get_modelspace_bbox returns flat minx/miny/maxx/maxy; clamp helpers expect nested min/max.
                     _interior_bb = {
                         **dict(_ibb),
@@ -2988,6 +3520,9 @@ class SurvyAIAgent:
                             "y": float(_ibb.get("maxy", 0.0)),
                         },
                     }
+=======
+                    _interior_bb = _ibb
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             except Exception:
                 pass
 
@@ -3183,6 +3718,7 @@ class SurvyAIAgent:
                     else:
                         stacked_text = f"{{\\fVerdana|b0|i0|c0|p34;{dist_str}\\P{bearing_str}}}"
                     w = min(max(2.0, 0.75 * L_geom), 0.95 * L_geom)
+<<<<<<< HEAD
                     h_est = 2.2 * _bd_height
                     margin_bd = 2.0 * _bd_height
                     tcx, tcy = midx, midy
@@ -3218,6 +3754,20 @@ class SurvyAIAgent:
                     )
                     try:
                         _placed_label_bboxes.append(_aabb_for_centered_rect(tcx, tcy, tw, h_est, rot))
+=======
+                    self.autocad.add_mtext(
+                        stacked_text,
+                        midx,
+                        midy,
+                        layer="CADA_BEARING_DIST",
+                        rotation_rad=rot,
+                        height=_bd_height,
+                        width=w,
+                        attachment_point=5,
+                    )
+                    try:
+                        _placed_label_bboxes.append(_aabb_for_centered_rect(midx, midy, w, 2.2 * _bd_height, rot))
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                     except Exception:
                         pass
                 else:
@@ -3245,9 +3795,14 @@ class SurvyAIAgent:
                     pad = 1.25 * _bd_height
                     margin = 2.0 * _bd_height
 
+<<<<<<< HEAD
                     # Unit directions along the leg vector.
                     # NOTE: Use L_geom (the computed leg length) rather than an undefined `L`.
                     t_ux, t_uy = dx / L_geom, dy / L_geom
+=======
+                    # Unit directions
+                    t_ux, t_uy = dx / L, dy / L  # along leg in XY
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                     stem_dirs = [
                         (outx, outy),            # outward normal
                         (-outx, -outy),          # inward normal
@@ -3655,6 +4210,7 @@ class SurvyAIAgent:
                     if ref_match and pn_list:
                         ref_str = ref_match.group(1).strip()
                         ref_str_norm = re.sub(r"\s+", " ", ref_str)
+<<<<<<< HEAD
 
                         def _pillar_idx_in_text(chunk: str) -> Optional[int]:
                             """Resolve a single pillar mention (substring) to one pn_list index."""
@@ -3702,12 +4258,44 @@ class SurvyAIAgent:
                                 b_idx = _pillar_idx_in_text(parts[1])
                                 if a_idx is None or b_idx is None or a_idx == b_idx:
                                     continue
+=======
+                        matched_ordered: List[Tuple[int, int]] = []
+                        for idx, p_info in enumerate(pn_list):
+                            num = str(p_info.get("number", "")).strip()
+                            prefix = str(p_info.get("prefix", "")).strip()
+                            if not num:
+                                continue
+                            full_label = (prefix + " " + num).lower()
+                            num_lower = num.lower()
+                            ref_lower = ref_str_norm.lower()
+                            pos = ref_lower.find(full_label)
+                            if pos >= 0:
+                                matched_ordered.append((pos, idx))
+                                continue
+                            m_num = re.search(r"\b" + re.escape(num_lower) + r"\b", ref_lower)
+                            if m_num:
+                                matched_ordered.append((m_num.start(), idx))
+                        if len(matched_ordered) >= 2:
+                            matched_ordered.sort(key=lambda x: x[0])
+                            ordered_indices: List[int] = []
+                            seen_idx: set[int] = set()
+                            for _, idx in matched_ordered:
+                                if idx not in seen_idx:
+                                    ordered_indices.append(idx)
+                                    seen_idx.add(idx)
+                            n_pts = len(local_pts)
+                            # Chain support: "A to B to C to D" means fences on AB, BC, and CD.
+                            for kk in range(len(ordered_indices) - 1):
+                                a_idx = ordered_indices[kk]
+                                b_idx = ordered_indices[kk + 1]
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                                 for i in range(n_pts):
                                     j = (i + 1) % n_pts
                                     if (i == a_idx and j == b_idx) or (i == b_idx and j == a_idx):
                                         target_indices.append(i)
                                         break
 
+<<<<<<< HEAD
                         if not explicit_pairs_done:
                             matched_ordered: List[Tuple[int, int]] = []
                             for idx, p_info in enumerate(pn_list):
@@ -3742,6 +4330,10 @@ class SurvyAIAgent:
                                         if (i == a_idx and j == b_idx) or (i == b_idx and j == a_idx):
                                             target_indices.append(i)
                                             break
+=======
+                    if not target_indices and len(local_pts) >= 2:
+                        target_indices = [0]
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                     if not target_indices:
                         continue
                     for target_idx in target_indices:
@@ -5103,6 +5695,39 @@ class SurvyAIAgent:
         if self._current_session_id is None:
             self._current_session_id = str(uuid.uuid4())
         return self._current_session_id
+
+    @staticmethod
+    def _is_affirmative_reply(text: str) -> bool:
+        normalized = " ".join((text or "").strip().lower().split())
+        return normalized in {
+            "yes",
+            "y",
+            "yes.",
+            "ok",
+            "okay",
+            "proceed",
+            "continue",
+            "allow",
+            "go ahead",
+            "approved",
+            "permission granted",
+        }
+
+    @staticmethod
+    def _is_negative_reply(text: str) -> bool:
+        normalized = " ".join((text or "").strip().lower().split())
+        return normalized in {
+            "no",
+            "n",
+            "no.",
+            "deny",
+            "denied",
+            "don't",
+            "do not",
+            "stop",
+            "cancel",
+            "permission denied",
+        }
     
     # ==========================================================================
     # COMPLEXITY DETECTION
@@ -5291,6 +5916,7 @@ class SurvyAIAgent:
         # questions like "which is more correct?" or "why do they differ?".
         internet_signals = [
             "according to api", "api mpms", "api 653", "api standard", "astm", "iso",
+<<<<<<< HEAD
             "latest version", "current version", "updated standard",
             "as of 2023", "as of 2024", "as of 2025", "as of 2026",
             "cite", "citations", "references", "journal", "peer-reviewed", "paper", "studies",
@@ -5299,6 +5925,14 @@ class SurvyAIAgent:
             "find information", "look up on the web",
             "standards", "regulations", "requirements",
             "country-specific", "national standard", "local standard",
+=======
+            "latest", "current", "updated", "as of", "2023", "2024", "2025", "2026",
+            "cite", "citations", "references", "journal", "paper", "studies",
+            "who said", "source", "link", "search the internet", "search online",
+            "find information", "look up", "constraints",
+            "problems", "issues", "challenges", "standards", "regulations", "requirements",
+            "nigerian", "nigeria", "country-specific", "national", "local standards",
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         ]
         wants_internet = any(s in ql for s in internet_signals)
 
@@ -5743,6 +6377,7 @@ class SurvyAIAgent:
                 # current GPT-4o / GPT-5 class models).
                 openai_max_tokens_limits = {
                     # GPT-4 series
+<<<<<<< HEAD
                     "gpt-4": 8192,
                     "gpt-4-turbo": 4096,
                     "gpt-4o": 16384,
@@ -5762,11 +6397,60 @@ class SurvyAIAgent:
                     "gpt-5.5-nano": 16384,
                     "gpt-5.5-mini": 16384,
                     "gpt-5.5": 16384,
+=======
+                    "gpt-4": 8192,                    # GPT-4: 8,192 output tokens
+                    "gpt-4-turbo": 4096,               # GPT-4 Turbo: 4,096 output tokens
+                    "gpt-4o": 16384,                   # GPT-4o: 16,384 output tokens
+                    "gpt-4o-2024-08-06": 16384,       # GPT-4o (specific version): 16,384 output tokens
+                    "gpt-4o-mini": 16384,              # GPT-4o-mini: 16,384 output tokens
+                    
+                    # GPT-5 / GPT-5.1 / GPT-5.4 family (tiers + naming variants)
+                    "gpt-5-nano": 8192,
+                    "gpt-5-mini": 16384,
+                    "gpt-5": 65536,
+                    "gpt-5.1": 128000,
+                    "gpt-5.4-nano": 8192,
+                    "gpt-5.4-mini": 16384,
+                    "gpt-5.4": 128000,
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                 }
+
+                def _openai_output_cap(name: Optional[str]) -> int:
+                    if not name:
+                        return 4096
+                    key = name.strip()
+                    if key in openai_max_tokens_limits:
+                        return openai_max_tokens_limits[key]
+                    low = key.lower()
+                    # Longest-prefix wins for variant strings the API may return
+                    if low.startswith("gpt-5.4-nano"):
+                        return 8192
+                    if low.startswith("gpt-5.4-mini"):
+                        return 16384
+                    if low.startswith("gpt-5.4"):
+                        return 128000
+                    if low.startswith("gpt-5.1"):
+                        return 128000
+                    if low.startswith("gpt-5-nano"):
+                        return 8192
+                    if low.startswith("gpt-5-mini"):
+                        return 16384
+                    if low.startswith("gpt-5"):
+                        return 65536
+                    if low.startswith("gpt-4o-mini"):
+                        return 16384
+                    if low.startswith("gpt-4o"):
+                        return 16384
+                    return 4096
                 
+<<<<<<< HEAD
                 # Cap max_tokens to model's actual API limit — INFO, not WARNING,
                 # because clamping is the expected, harmless behaviour.
                 model_max = openai_max_tokens_limits.get(model_name, 16384)
+=======
+                # Cap max_tokens to model's limit
+                model_max = _openai_output_cap(model_name)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                 requested_tokens = self.settings.agent_max_tokens
                 actual_max_tokens = min(requested_tokens, model_max)
 
@@ -5860,6 +6544,30 @@ class SurvyAIAgent:
     # ==========================================================================
     # TOOL CREATION
     # ==========================================================================
+    
+    def _filter_tools_by_feature_flags(self, tools: List[BaseTool]) -> List[BaseTool]:
+        """
+        Phase 2: omit tools not allowed for the current license (builder vs pro + flags).
+
+        Core tools (Excel, documents, coordinates, filesystem, etc.) are never removed.
+        """
+        ff = self._feature_flags
+        removed: List[str] = []
+        kept: List[BaseTool] = []
+        for t in tools:
+            name = getattr(t, "name", "") or ""
+            if ff.is_tool_allowed(name):
+                kept.append(t)
+            else:
+                removed.append(name)
+        if removed:
+            logger.info(
+                "License/feature filter (%s): omitted %d tool(s): %s",
+                ff.license_mode,
+                len(removed),
+                ", ".join(removed[:40]) + (" ..." if len(removed) > 40 else ""),
+            )
+        return kept
     
     def _create_tools(self) -> List[BaseTool]:
         """
@@ -7121,6 +7829,8 @@ class SurvyAIAgent:
         # ==================================================================
         # BUILD TOOL LIST
         # ==================================================================
+        # After the list is built, `self._filter_tools_by_feature_flags` applies
+        # SURVYAI_LICENSE_MODE + SURVYAI_FEATURE_* (Phase 2).
         
         tools = [
             # AutoCAD tools
@@ -8214,7 +8924,16 @@ class SurvyAIAgent:
             ) -> str:
                 """
                 VERIFIED fill-volume workflow: no ArcGISProject('CURRENT'), ExcelToTable uses 3rd positional sheet.
+<<<<<<< HEAD
                 Use this when the user asks for fill volume from Pre-fill/Post-fill data, IDW rasters, Cut Fill, metric, results_fill.xlsx.
+=======
+                USE ONLY when one Excel workbook/table already contains BOTH the pre and post Z columns needed
+                for the full workflow. This is NOT the right tool for:
+                - separate PRE and POST files,
+                - DWG polygon/boundary masks or extent control,
+                - custom raster environment repair after ERROR 010092.
+                For those cases, use arcgis_execute_python_code with a complete custom ArcPy script.
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                 Call excel_inspect_workbook first to get sheet and column names, then call this with the resolved names.
                 """
                 res = self.arcgis_processor.compute_fill_volume_idw_cutfill(
@@ -8229,6 +8948,7 @@ class SurvyAIAgent:
                 )
                 return json.dumps(res, indent=2, ensure_ascii=False)
 
+<<<<<<< HEAD
             # --- Tool: PRE/POST CSV (or Excel) + DWG boundary -> IDW -> CutFill (verified) ---
             class ArcGISPrePostCSVDWGCutfillInput(BaseModel):
                 """Inputs for separate PRE/POST tabular files plus a DWG boundary -> IDW surfaces -> CutFill -> CSV."""
@@ -8251,6 +8971,35 @@ class SurvyAIAgent:
                 coordinate_system: Optional[str] = Field(
                     None,
                     description="Optional CRS (e.g. EPSG:26392, Minna / Nigeria Mid Belt); else inferred from DWG boundary",
+=======
+            # --- Tool: Separate PRE/POST tabular + DWG boundary -> IDW/CutFill ---
+            class ArcGISPrePostCsvDwgCutfillInput(BaseModel):
+                """Input for verified PRE/POST tabular (.csv/.xlsx) + DWG CutFill workflow."""
+                pre_csv_path: str = Field(
+                    description="Path to the PRE tabular file containing E/N/Z coordinates. Supported: .csv, .xlsx."
+                )
+                post_csv_path: str = Field(
+                    description="Path to the POST tabular file containing E/N/Z coordinates. Supported: .csv, .xlsx."
+                )
+                boundary_dwg_path: str = Field(
+                    description="Path to the DWG file whose polygon/polyline defines the analysis extent and mask."
+                )
+                workspace_folder: Optional[str] = Field(
+                    default=None,
+                    description="Workspace folder where CSV copies and final result CSV should be written. Default: current SurvyAI workspace.",
+                )
+                output_csv_path: Optional[str] = Field(
+                    default=None,
+                    description="Final output CSV path. Default: <workspace>/Adibawa_VolumeResult.csv",
+                )
+                project_name: str = Field(
+                    default="Adibawa_BorrowPit_Volume",
+                    description="ArcGIS Pro project name to create/use.",
+                )
+                coordinate_system: Optional[str] = Field(
+                    default=None,
+                    description="Optional coordinate system override. Leave blank to derive from DWG/native data when possible.",
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                 )
 
             def arcgis_pre_post_csv_dwg_cutfill(
@@ -8259,6 +9008,7 @@ class SurvyAIAgent:
                 boundary_dwg_path: str,
                 workspace_folder: Optional[str] = None,
                 output_csv_path: Optional[str] = None,
+<<<<<<< HEAD
                 project_name: str = "BorrowPit_Volume_Project",
                 coordinate_system: Optional[str] = None,
             ) -> str:
@@ -8266,6 +9016,17 @@ class SurvyAIAgent:
                 VERIFIED workflow: two point files + DWG boundary -> points in GDB -> IDW (Z) clipped to boundary
                 -> CutFill + dz raster -> metrics CSV. Adds boundary, points, rasters, and cutfill to the map,
                 finalizes visualization, opens ArcGIS Pro.
+=======
+                project_name: str = "Adibawa_BorrowPit_Volume",
+                coordinate_system: Optional[str] = None,
+            ) -> str:
+                """
+                VERIFIED deterministic ArcGIS workflow for:
+                separate PRE/POST tabular files (.csv or .xlsx) + DWG boundary -> points -> IDW -> CutFill -> CSV.
+
+                Preferred over arcgis_execute_python_code for this exact workflow because it avoids
+                fragile UI automation and opens ArcGIS Pro only after results are ready.
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                 """
                 res = self.arcgis_processor.compute_pre_post_csv_dwg_cutfill(
                     pre_csv_path=pre_csv_path,
@@ -8278,6 +9039,7 @@ class SurvyAIAgent:
                 )
                 return json.dumps(res, indent=2, ensure_ascii=False)
 
+<<<<<<< HEAD
             # --- Tool: PRE/POST CSV + DWG -> CreateTin -> volume CSV (verified; IDW fallback on failure) ---
             class ArcGISPrePostCSVDWGTinVolumeInput(BaseModel):
                 """TIN-based PRE/POST surfaces with DWG boundary; falls back to IDW workflow if CreateTin fails."""
@@ -8339,6 +9101,8 @@ class SurvyAIAgent:
                 )
                 return json.dumps(res, indent=2, ensure_ascii=False)
 
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             # --- Tool: Execute Python Code ---
             class ArcGISExecutePythonCodeInput(BaseModel):
                 """Input schema for executing dynamically generated Python/arcpy code."""
@@ -8392,7 +9156,29 @@ class SurvyAIAgent:
                 )
                 project_path: Optional[str] = Field(
                     None,
-                    description="Optional path to .aprx project file (used to determine script save location)"
+                    description=(
+                        "Path to an existing .aprx file. If omitted, SurvyAI auto-creates a project in the workspace "
+                        "so geoprocessing runs headlessly and ArcGIS Pro can open afterward with layers loaded "
+                        "(same end-to-end pattern as verified volume workflows)."
+                    ),
+                )
+                workspace_folder: Optional[str] = Field(
+                    None,
+                    description=(
+                        "When project_path is omitted: folder where the auto-created .aprx should live "
+                        "(default: current SurvyAI workspace / cwd)."
+                    ),
+                )
+                auto_project_name: Optional[str] = Field(
+                    None,
+                    description="When project_path is omitted: optional stem for the auto-created project name.",
+                )
+                coordinate_system: Optional[str] = Field(
+                    None,
+                    description=(
+                        "When project_path is omitted: optional coordinate system for the auto-created project "
+                        "(e.g. the user's stated CRS). Otherwise settings default may apply."
+                    ),
                 )
                 script_name: Optional[str] = Field(
                     None,
@@ -8400,16 +9186,24 @@ class SurvyAIAgent:
                 )
                 execute_automatically: bool = Field(
                     True,
-                    description="If True, execute code automatically via propy.bat. If False, save script and provide instructions."
+                    description=(
+                        "If True, execute automatically. Generated ArcGIS workflows should run deterministically first "
+                        "and ArcGIS Pro should open after outputs are ready for review. "
+                        "If False, save the script and provide instructions."
+                    )
                 )
             
             def arcgis_execute_python_code(
                 python_code: str,
                 project_path: Optional[str] = None,
+                workspace_folder: Optional[str] = None,
+                auto_project_name: Optional[str] = None,
+                coordinate_system: Optional[str] = None,
                 script_name: Optional[str] = None,
                 execute_automatically: bool = True,
             ) -> str:
                 """
+<<<<<<< HEAD
                 Execute dynamically generated Python/arcpy code.
                 
                 This tool allows you to generate arcpy code on-the-fly based on user requests and execute it.
@@ -8425,14 +9219,30 @@ class SurvyAIAgent:
                 
                 For volumetrics (IDW, Cut Fill): use a **projected CRS** with known Z units; **add all outputs
                 to the active map** (addDataFromPath) and **save the project** so layers appear when Pro opens.
+=======
+                Execute dynamically generated Python/arcpy code (novel ArcGIS tasks).
+
+                Prefer verified tools (arcgis_pre_post_csv_dwg_cutfill, arcgis_excel_hull_traverse, etc.)
+                when they match the user request. Use this tool when no verified tool fits: the LLM
+                supplies full ArcPy, SurvyAI runs it via propy.bat, finalizes the project (basemap + GDB
+                layers), then opens ArcGIS Pro — same end-to-end pattern as embedded workflows.
+
+                If you omit project_path, a workspace project is auto-created so finalize/launch always
+                have a real .aprx to work with.
+
+                On failure, read the returned JSON (stdout/stderr), revise the script, and retry.
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                 """
                 result = self.arcgis_processor.execute_python_code(
                     python_code=python_code,
                     project_path=project_path,
                     script_name=script_name,
                     execute_automatically=execute_automatically,
+                    workspace_folder=workspace_folder,
+                    auto_project_name=auto_project_name,
+                    coordinate_system=coordinate_system,
                 )
-                return str(result)
+                return json.dumps(result, ensure_ascii=True, default=str)
             
             # --- Tool: Finalize Project Visualization ---
             class ArcGISFinalizeVisualizationInput(BaseModel):
@@ -8476,7 +9286,7 @@ class SurvyAIAgent:
                     basemap_name=basemap_name,
                     load_geodatabase=load_geodatabase,
                 )
-                return str(result)
+                return json.dumps(result, ensure_ascii=True, default=str)
             
             # Add ArcGIS tools to the list
             tools.extend([
@@ -8492,8 +9302,10 @@ class SurvyAIAgent:
                 StructuredTool(
                     name="arcgis_launch",
                     description=(
-                        "Launch ArcGIS Pro application on the user's computer. "
-                        "Use this to open ArcGIS Pro before other operations."
+                        "Launch ArcGIS Pro. For automated geoprocessing, prefer arcgis_execute_python_code or a "
+                        "verified ArcGIS tool first — they run via propy.bat, finalize the project, and open ArcGIS Pro "
+                        "when done. Use arcgis_launch alone only when the user explicitly wants Pro opened without a "
+                        "scripted workflow, or after a tool result says Pro was not launched."
                     ),
                     func=arcgis_launch,
                     args_schema=ArcGISLaunchInput
@@ -8561,6 +9373,7 @@ class SurvyAIAgent:
                 StructuredTool(
                     name="arcgis_execute_python_code",
                     description=(
+<<<<<<< HEAD
                         "*** PRIMARY TOOL for FULLY AUTOMATED ArcGIS workflows *** "
                         "Generate and execute complete ArcPy code that performs entire workflows WITHOUT user intervention. "
                         "Use for requests like: 'import points, create polygon, calculate area and bearings', "
@@ -8570,9 +9383,33 @@ class SurvyAIAgent:
                         "prints results with RESULT_ prefix for parsing, saves project. "
                         "For IDW/CutFill/volume: set projected CRS, add EVERY output layer to the map (addDataFromPath), "
                         "project.save(). NO MANUAL STEPS - user sees final results and a populated map."
+=======
+                        "*** PRIMARY TOOL for novel / custom ArcGIS workflows (LLM-generated ArcPy) *** "
+                        "When no verified tool matches, generate complete ArcPy that: uses explicit .aprx paths "
+                        "(or omit project_path to auto-create a workspace project), writes outputs to the project GDB, "
+                        "prints RESULT_* lines for parsing, and saves the project. "
+                        "Execution is deterministic (propy.bat); on success the project is finalized (basemap + GDB layers) "
+                        "and ArcGIS Pro opens for review — same end pattern as arcgis_pre_post_csv_dwg_cutfill. "
+                        "On failure, read stdout/stderr from the tool JSON, fix the script, and retry. "
+                        "Do not call arcgis_launch before this for automated tasks."
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                     ),
                     func=arcgis_execute_python_code,
                     args_schema=ArcGISExecutePythonCodeInput
+                ),
+                StructuredTool(
+                    name="arcgis_pre_post_csv_dwg_cutfill",
+                    description=(
+                        "*** VERIFIED deterministic ArcGIS workflow *** "
+                        "Use this when the user provides separate PRE and POST tabular files (.csv or .xlsx) with E/N/Z columns, plus a DWG "
+                        "polygon/polyline boundary for extent/mask. "
+                        "Copies or converts both PRE/POST inputs into CSV files inside the SurvyAI workspace, creates point features, derives the DWG boundary, "
+                        "builds PRE/POST IDW rasters, runs CutFill, exports the requested result CSV, "
+                        "finalizes the ArcGIS Pro project, and then opens ArcGIS Pro for review. "
+                        "Preferred over arcgis_execute_python_code for this exact workflow."
+                    ),
+                    func=arcgis_pre_post_csv_dwg_cutfill,
+                    args_schema=ArcGISPrePostCsvDwgCutfillInput,
                 ),
                 StructuredTool(
                     name="arcgis_excel_hull_traverse",
@@ -8591,6 +9428,11 @@ class SurvyAIAgent:
                     description=(
                         "*** VERIFIED fill-volume workflow *** "
                         "Excel -> IDW rasters (pre + post) -> Cut Fill -> fill volume (m³) -> results_fill.xlsx. "
+<<<<<<< HEAD
+=======
+                        "ONLY for a single workbook/table that already contains both PRE and POST elevation columns. "
+                        "Do NOT use for separate PRE/POST files, DWG-derived mask/extent workflows, or after ERROR 010092 invalid extent. "
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                         "Creates ArcGIS Pro project, adds all layers (pre_idw, post_idw, cutfill, points, post_hull) to map, and opens ArcGIS Pro—as if a GIS analyst did it manually. "
                         "Use excel_inspect_workbook first for sheet/column names. Report project path and layers to user before final volume."
                     ),
@@ -8598,6 +9440,7 @@ class SurvyAIAgent:
                     args_schema=ArcGISFillVolumeIDWCutfillInput,
                 ),
                 StructuredTool(
+<<<<<<< HEAD
                     name="arcgis_pre_post_csv_dwg_cutfill",
                     description=(
                         "*** VERIFIED borrow-pit / two-surface workflow *** "
@@ -8620,6 +9463,8 @@ class SurvyAIAgent:
                     args_schema=ArcGISPrePostCSVDWGTinVolumeInput,
                 ),
                 StructuredTool(
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                     name="arcgis_finalize_visualization",
                     description=(
                         "Finalize ArcGIS Pro project visualization AFTER user operations complete. "
@@ -8634,11 +9479,16 @@ class SurvyAIAgent:
                 ),
             ])
             
+<<<<<<< HEAD
             logger.info(f"✓ Added {12} ArcGIS Pro tools")
+=======
+            logger.info(f"✓ Added {10} ArcGIS Pro tools")
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         else:
             logger.info("⚠ ArcGIS Pro not installed - ArcGIS tools not available")
         
-        logger.info(f"Created {len(tools)} tools for the agent")
+        tools = self._filter_tools_by_feature_flags(tools)
+        logger.info(f"Created {len(tools)} tools for the agent (after license feature filter)")
         return tools
     
     # ==========================================================================
@@ -8670,7 +9520,15 @@ class SurvyAIAgent:
 
     def _invoke_llm_with_retry(self, messages: List[Any]) -> Any:
         """Invoke LLM with timeout protection; raises TimeoutError or the LLM exception on failure."""
+<<<<<<< HEAD
         timeout_seconds = 60
+=======
+        # Per-call limit must cover slow models (e.g. GPT-5.x) and large post-tool contexts.
+        # A fixed 60s timeout routinely failed after long ArcGIS runs when the next reasoning step
+        # needed more wall time than the outer graph allowed in practice.
+        q_timeout = int(getattr(self.settings, "agent_query_timeout", 900) or 900)
+        timeout_seconds = max(120, min(q_timeout, 7200))
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         result, error, timed_out = self._run_with_timeout(
             timeout_seconds, lambda: self.llm_with_tools.invoke(messages)
         )
@@ -8989,6 +9847,12 @@ class SurvyAIAgent:
         """
         # Set interactive mode flag
         self._interactive_mode = interactive_mode
+
+        # Get or set session ID as early as possible so permission handling and
+        # short continuation replies can remain anchored to the active conversation.
+        if session_id:
+            self.set_session_id(session_id)
+        current_session_id = self.get_session_id()
         
         # Reset model switch flag for new query
         self._model_switched_this_query = False
@@ -8997,6 +9861,26 @@ class SurvyAIAgent:
         # IMPORTANT: Extract and set permission BEFORE routing/processing
         q_upper = (query or "").upper()
         original_query = query
+
+        pending_permission = self._pending_permission_requests.get(current_session_id)
+        if pending_permission and isinstance(query, str):
+            stripped_reply = query.strip()
+            if self._is_affirmative_reply(stripped_reply):
+                if pending_permission.get("kind") == "internet":
+                    self._internet_permission_granted = True
+                    query = f"[INTERNET_PERMISSION_GRANTED]\n{pending_permission.get('query', '')}".strip()
+                    q_upper = query.upper()
+                    original_query = str(pending_permission.get("query") or original_query)
+                    logger.info("✓ Applied plain-text approval reply to pending internet permission request")
+                self._pending_permission_requests.pop(current_session_id, None)
+            elif self._is_negative_reply(stripped_reply):
+                if pending_permission.get("kind") == "internet":
+                    self._internet_permission_granted = False
+                    query = f"[INTERNET_PERMISSION_DENIED]\n{pending_permission.get('query', '')}".strip()
+                    q_upper = query.upper()
+                    original_query = str(pending_permission.get("query") or original_query)
+                    logger.info("✓ Applied plain-text denial reply to pending internet permission request")
+                self._pending_permission_requests.pop(current_session_id, None)
         
         # FIRST: Extract actual query if this is a continuation (has context markers)
         # This must happen BEFORE permission tag handling so we route correctly
@@ -9016,12 +9900,14 @@ class SurvyAIAgent:
         
         if "[INTERNET_PERMISSION_GRANTED]" in q_upper:
             self._internet_permission_granted = True
+            self._pending_permission_requests.pop(current_session_id, None)
             # Clean the query to remove permission tags for cleaner processing
             query = query.replace("[INTERNET_PERMISSION_GRANTED]", "").replace("[internet_permission_granted]", "").strip()
             actual_query_for_routing = actual_query_for_routing.replace("[INTERNET_PERMISSION_GRANTED]", "").replace("[internet_permission_granted]", "").strip()
             logger.info("✓ Internet permission granted - permission tag removed from query")
         if "[INTERNET_PERMISSION_DENIED]" in q_upper:
             self._internet_permission_granted = False
+            self._pending_permission_requests.pop(current_session_id, None)
             query = query.replace("[INTERNET_PERMISSION_DENIED]", "").replace("[internet_permission_denied]", "").strip()
             actual_query_for_routing = actual_query_for_routing.replace("[INTERNET_PERMISSION_DENIED]", "").replace("[internet_permission_denied]", "").strip()
             logger.info("✓ Internet permission denied - permission tag removed from query")
@@ -9035,9 +9921,27 @@ class SurvyAIAgent:
             # Use the extracted actual query for routing (not the context-enhanced one)
             # ==================================================================
             early_rag_decision = self._decide_rag_route(actual_query_for_routing, interactive_mode=interactive_mode)
+            # Safety override: explicit local file/tool workflows should not trigger
+            # internet permission prompts unless the user explicitly asks for web search.
+            local_file_driven = looks_like_file_driven_task(actual_query_for_routing)
+            explicit_web_intent = any(
+                k in (actual_query_for_routing or "").lower()
+                for k in ("search the internet", "search online", "web search", "browse the web")
+            )
+            if local_file_driven and not explicit_web_intent:
+                if early_rag_decision.use_internet:
+                    logger.info("🔧 File-driven workflow detected - suppressing internet permission prompt")
+                early_rag_decision.use_internet = False
+                if early_rag_decision.route in ("internet", "hybrid"):
+                    early_rag_decision.route = "vector" if early_rag_decision.use_vector else "llm_only"
             if early_rag_decision.use_internet and not getattr(self, "_internet_permission_granted", False):
                 if interactive_mode:
                     logger.info("🔍 Router detected internet need - requesting permission BEFORE processing")
+                    self._pending_permission_requests[current_session_id] = {
+                        "kind": "internet",
+                        "query": original_query,
+                        "actual_query": actual_query_for_routing,
+                    }
                     return {
                         "query": original_query,
                         "response": (
@@ -9050,7 +9954,7 @@ class SurvyAIAgent:
                         "error": "internet_permission_required",
                         "llm_used": "fallback" if use_fallback else "primary",
                         "model_name": None,  # Not initialized yet
-                        "session_id": self.get_session_id(),
+                        "session_id": current_session_id,
                     }
                 else:
                     # Non-interactive: proceed without internet (user can't grant permission)
@@ -9114,6 +10018,44 @@ class SurvyAIAgent:
                     else:
                         model_name_used = self.settings.primary_llm
                     logger.info(f"✓ Using primary LLM: {self.settings.primary_llm} (model: {model_name_used})")
+
+            # FAST PATH: separate PRE/POST CSV + DWG boundary -> IDW/CutFill volume
+            if self._should_fastpath_pre_post_csv_dwg_cutfill(query):
+                fast = self._run_pre_post_csv_dwg_cutfill_pipeline(query)
+                llm_used = "fallback" if use_fallback else "primary"
+                return {
+                    "query": query,
+                    "response": fast.get("response", ""),
+                    "llm_used": llm_used,
+                    "model_name": model_name_used,
+                    "complexity": complexity,
+                    "success": bool(fast.get("success")),
+                    "session_id": self.get_session_id(),
+                    "context_retrieved": False,
+                    "output_path": fast.get("output_csv"),
+                    "error": fast.get("error") if not fast.get("success") else None,
+                }
+
+            # FAST PATH: novel file-driven ArcGIS workflow -> generate ArcPy, execute deterministically, repair/retry
+            if self._should_fastpath_dynamic_arcgis_workflow(query):
+                fast = self._run_dynamic_arcgis_workflow_pipeline(
+                    query=query,
+                    llm=llm_to_use,
+                    model_name_used=model_name_used or getattr(self.settings, "openai_model_mini", "gpt-5-mini"),
+                )
+                llm_used = "fallback" if use_fallback else "primary"
+                return {
+                    "query": query,
+                    "response": fast.get("response", ""),
+                    "llm_used": llm_used,
+                    "model_name": model_name_used,
+                    "complexity": complexity,
+                    "success": bool(fast.get("success")),
+                    "session_id": self.get_session_id(),
+                    "context_retrieved": False,
+                    "output_path": fast.get("output_csv"),
+                    "error": fast.get("error") if not fast.get("success") else None,
+                }
 
             # FAST PATH: report generation to .docx (avoids LangGraph recursion/tool loops)
             if self._should_fastpath_docx_report(query):
@@ -9279,11 +10221,6 @@ class SurvyAIAgent:
                     "error": mod.get("error") if isinstance(mod, dict) else "CAD modification failed",
                 }
 
-            # Get or set session ID for conversation continuity
-            if session_id:
-                self.set_session_id(session_id)
-            current_session_id = self.get_session_id()
-            
             # AUTOMATIC DOCUMENT PRE-PROCESSING: Detect document paths and get resource estimation
             # This prevents the agent from trying to process large documents without knowing the cost/size
             document_paths = self._extract_document_paths(query)
@@ -9471,6 +10408,29 @@ class SurvyAIAgent:
                     "7. If you reference external information, cite it from the results above."
                 )
                 logger.info("✓ Internet results injected into system prompt (permission granted)")
+
+            # Strong ArcGIS routing augmentation for the common "two files + DWG mask + IDW/CutFill" case.
+            ql_for_arcgis = (actual_query_for_routing or query or "").lower()
+            tabular_pair = ql_for_arcgis.count(".csv") >= 2 or ql_for_arcgis.count(".xlsx") >= 2
+            needs_custom_arcgis_workflow = (
+                tabular_pair
+                and ".dwg" in ql_for_arcgis
+                and ("idw" in ql_for_arcgis)
+                and ("cutfill" in ql_for_arcgis or "cut fill" in ql_for_arcgis)
+            )
+            if needs_custom_arcgis_workflow:
+                enhanced_system_prompt += (
+                    "\n\n---\n"
+                    "**CRITICAL ARCGIS ROUTING FOR THIS QUERY:**\n"
+                    "- The user provided separate PRE and POST tabular sources plus a DWG polygon/boundary and wants IDW/CutFill/volume-style output.\n"
+                    "- Prefer `arcgis_pre_post_csv_dwg_cutfill` when inputs are separate PRE/POST .csv or .xlsx plus a boundary .dwg — it is the verified end-to-end workflow.\n"
+                    "- Do NOT use `arcgis_fill_volume_idw_cutfill` when PRE and POST are in separate files or when a DWG defines the mask/extent.\n"
+                    "- Only use `arcgis_execute_python_code` if the request truly does not match that verified tool (e.g. unusual outputs, extra steps).\n"
+                    "- If you use `arcgis_execute_python_code`, follow the same pattern: headless ArcPy, RESULT_* stdout, save project; omit `project_path` to auto-create a workspace project if needed.\n"
+                    "- If ArcGIS returns `ERROR 010092: Invalid output extent`, repair extent/mask from the boundary and retry.\n"
+                    "---\n"
+                )
+                logger.info("✓ ArcGIS custom-workflow routing instructions injected into system prompt")
             
             # Bind tools to the selected LLM and rebuild graph
             # CRITICAL: If internet was already searched, conditionally remove internet_search tool
@@ -9560,7 +10520,22 @@ class SurvyAIAgent:
                 import threading
                 import signal
                 
-                overall_timeout = getattr(self.settings, 'agent_query_timeout', 300)  # Default 5 minutes
+                base_timeout = getattr(self.settings, 'agent_query_timeout', 300)
+                arcgis_ui_timeout = getattr(self.settings, 'arcgis_ui_execution_timeout', base_timeout)
+                _query_lower = (query or "").lower()
+                _arcgis_indicators = [
+                    "arcgis", "arcgis pro", "arcpy", "idw", "cutfill", "cut fill",
+                    ".dwg", ".gdb", ".aprx", "raster", "surface", "volume",
+                    "point feature", "point features", "polygon", "cadtogeodatabase",
+                ]
+                is_arcgis_workflow = any(tok in _query_lower for tok in _arcgis_indicators)
+
+                # ArcGIS Pro UI workflows can take materially longer than pure LLM/tool queries.
+                # Give them a larger overall query budget so the top-level watchdog does not kill
+                # the graph while ArcGIS is still processing visibly in the desktop app.
+                overall_timeout = base_timeout
+                if is_arcgis_workflow:
+                    overall_timeout = max(base_timeout, arcgis_ui_timeout + 300)
                 max_iterations = getattr(self.settings, 'agent_max_iterations', 20)
                 result_container = [None]
                 exception_container = [None]
@@ -9582,6 +10557,13 @@ class SurvyAIAgent:
                 
                 if graph_thread.is_alive():
                     logger.error(f"Graph execution timed out after {overall_timeout} seconds")
+                    if is_arcgis_workflow:
+                        raise TimeoutError(
+                            f"ArcGIS workflow timed out after {overall_timeout} seconds. "
+                            "SurvyAI was waiting for a long-running GIS operation in ArcGIS Pro to finish. "
+                            "If ArcGIS Pro is still processing, let it complete and check the saved project/script/log paths. "
+                            "If it appears stuck, reduce the workflow scope or rerun after confirming ArcGIS Pro is responsive."
+                        )
                     raise TimeoutError(
                         f"Query processing timed out after {overall_timeout} seconds. "
                         "The document may be too large or the query too complex. "
@@ -9875,27 +10857,137 @@ class SurvyAIAgent:
         Returns:
             str: The extracted response text
         """
+        import ast
+
+        def _stringify_content(content: Any) -> str:
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                text_parts: List[str] = []
+                for item in content:
+                    if isinstance(item, dict) and item.get("type") == "text":
+                        text = str(item.get("text", "")).strip()
+                        if text:
+                            text_parts.append(text)
+                    elif isinstance(item, str):
+                        text = item.strip()
+                        if text:
+                            text_parts.append(text)
+                return "\n".join(text_parts).strip()
+            return str(content).strip() if content is not None else ""
+
+        def _maybe_parse_tool_payload(raw_text: str) -> Optional[Dict[str, Any]]:
+            if not raw_text:
+                return None
+            try:
+                parsed = json.loads(raw_text)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                pass
+            try:
+                parsed = ast.literal_eval(raw_text)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
+
+        def _summarize_tool_payload(payload: Dict[str, Any]) -> str:
+            success = bool(payload.get("success", False))
+            lines: List[str] = []
+
+            message = str(payload.get("message") or "").strip()
+            note = str(payload.get("note") or "").strip()
+            error = str(payload.get("error") or "").strip()
+            instructions = str(payload.get("instructions") or "").strip()
+            script_path = str(payload.get("script_path") or "").strip()
+            project_path = str(payload.get("project_path") or "").strip()
+            stdout = str(payload.get("stdout") or "").strip()
+            results = payload.get("results")
+
+            if success:
+                lines.append(message or "Task completed successfully.")
+            else:
+                lines.append(message or "Task did not complete successfully.")
+
+            if isinstance(results, dict) and results:
+                preferred_keys = [
+                    "net_volume",
+                    "net_volume_cum",
+                    "net_volume_m3",
+                    "fill_volume",
+                    "fill_volume_cum",
+                    "cut_volume",
+                    "cut_volume_cum",
+                    "footprint_area",
+                    "boundary_area_sqm",
+                    "output_csv",
+                    "pre_csv_copy",
+                    "post_csv_copy",
+                    "project_path",
+                ]
+                seen = set()
+                for key in preferred_keys + list(results.keys()):
+                    if key in seen or key not in results:
+                        continue
+                    seen.add(key)
+                    val = results.get(key)
+                    if isinstance(val, dict):
+                        formatted = val.get("formatted") or val.get("text")
+                        if formatted:
+                            lines.append(f"- {key.replace('_', ' ').title()}: {formatted}")
+                    elif val not in (None, ""):
+                        lines.append(f"- {key.replace('_', ' ').title()}: {val}")
+
+            if error:
+                lines.append(f"Error: {error}")
+            if note:
+                lines.append(note)
+            if instructions and not success:
+                lines.append(instructions)
+            if script_path:
+                lines.append(f"Script: {script_path}")
+            if project_path:
+                lines.append(f"Project: {project_path}")
+
+            if stdout:
+                result_lines = [line.strip() for line in stdout.splitlines() if line.strip().startswith("RESULT_")]
+                for line in result_lines[:8]:
+                    parts = line.split(":", 1)
+                    if len(parts) == 2:
+                        key = parts[0].replace("RESULT_", "").replace("_", " ").title()
+                        value = parts[1].strip()
+                        lines.append(f"- {key}: {value}")
+                if not result_lines and not results and success:
+                    lines.append(stdout[:1500].strip())
+
+            compact = [line.strip() for line in lines if line and line.strip()]
+            return "\n".join(compact).strip()
+
         messages = result.get("messages", [])
         
         # Find the last AI message with actual content (not just tool calls)
         for message in reversed(messages):
             if isinstance(message, AIMessage):
                 # Check if this message has text content
-                if message.content and isinstance(message.content, str):
-                    return message.content
-                # Handle structured content (some models return lists)
-                elif message.content and isinstance(message.content, list):
-                    # Extract text from content blocks
-                    text_parts = []
-                    for item in message.content:
-                        if isinstance(item, dict) and item.get("type") == "text":
-                            text_parts.append(item.get("text", ""))
-                        elif isinstance(item, str):
-                            text_parts.append(item)
-                    if text_parts:
-                        return "\n".join(text_parts)
-        
-        return "No response generated."
+                text = _stringify_content(message.content)
+                if text:
+                    return text
+
+        # If the graph ended immediately after a tool call (for example because a
+        # same-error guard stopped another retry), there may be no final AI message.
+        # In that case, surface the last tool result instead of returning an empty response.
+        for message in reversed(messages):
+            if isinstance(message, ToolMessage):
+                tool_text = _stringify_content(getattr(message, "content", ""))
+                if not tool_text:
+                    continue
+                payload = _maybe_parse_tool_payload(tool_text)
+                if payload:
+                    summary = _summarize_tool_payload(payload)
+                    if summary:
+                        return summary
+                return tool_text
+
+        return "Task finished, but no final assistant message was produced. Check the latest tool output in the saved logs or output files."
 
 
 # ==============================================================================

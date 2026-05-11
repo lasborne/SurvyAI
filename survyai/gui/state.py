@@ -20,8 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+<<<<<<< HEAD
 from survyai.device_identity import compute_machine_fingerprint
 
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -58,7 +61,10 @@ class TaskHistoryEntry:
     error: str = ""
     llm_used: str = ""
     model_name: str = ""
+<<<<<<< HEAD
     llm_cost_usd: float = 0.0
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     cancelled: bool = False
 
 
@@ -84,6 +90,7 @@ class Conversation:
 class DesktopState:
     onboarding_complete: bool = False
     profile: AccountProfile = field(default_factory=AccountProfile)
+<<<<<<< HEAD
     cloud_api_base_url: str = ""
     cloud_access_token: str = ""
     cloud_refresh_token: str = ""
@@ -93,12 +100,15 @@ class DesktopState:
     # Bound PC for Pro: server device row id + fingerprint used when registering (see POST /v1/devices).
     cloud_device_id: str = ""
     cloud_device_fingerprint: str = ""
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     workspace_path: str = ""
     data_folder: str = ""
     safe_mode: bool = False
     use_fallback_llm: bool = False
     preferred_primary_llm: str = ""
     preferred_fallback_llm: str = ""
+<<<<<<< HEAD
     # Ollama runtime settings for offline/local models.
     # Stored here (not in .env) so end-users don't edit config files.
     ollama_base_url: str = ""
@@ -121,6 +131,8 @@ class DesktopState:
     credit_banner_dismissed_half: bool = False
     credit_banner_dismissed_eighty: bool = False
     credit_banner_dismissed_ninetyfive: bool = False
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     output_history: List[TaskHistoryEntry] = field(default_factory=list)
     conversations: List[Conversation] = field(default_factory=list)
     active_conversation_id: str = ""
@@ -138,6 +150,7 @@ class DesktopState:
                 company=str(profile.get("company", "")),
                 signed_in_at=str(profile.get("signed_in_at", "")),
             ),
+<<<<<<< HEAD
             cloud_api_base_url=str(raw.get("cloud_api_base_url", "")),
             cloud_access_token=str(raw.get("cloud_access_token", "")),
             cloud_refresh_token=str(raw.get("cloud_refresh_token", "")),
@@ -146,12 +159,15 @@ class DesktopState:
             cloud_bootstrap=raw.get("cloud_bootstrap") if isinstance(raw.get("cloud_bootstrap"), dict) else {},
             cloud_device_id=str(raw.get("cloud_device_id", "")),
             cloud_device_fingerprint=str(raw.get("cloud_device_fingerprint", "")),
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             workspace_path=str(raw.get("workspace_path", "")),
             data_folder=str(raw.get("data_folder", "")),
             safe_mode=bool(raw.get("safe_mode", False)),
             use_fallback_llm=bool(raw.get("use_fallback_llm", False)),
             preferred_primary_llm=str(raw.get("preferred_primary_llm", "")),
             preferred_fallback_llm=str(raw.get("preferred_fallback_llm", "")),
+<<<<<<< HEAD
             ollama_base_url=str(raw.get("ollama_base_url", "")),
             ollama_model=str(raw.get("ollama_model", "")),
             ollama_last_prompted_at=str(raw.get("ollama_last_prompted_at", "")),
@@ -167,6 +183,8 @@ class DesktopState:
             credit_banner_dismissed_half=bool(raw.get("credit_banner_dismissed_half", False)),
             credit_banner_dismissed_eighty=bool(raw.get("credit_banner_dismissed_eighty", False)),
             credit_banner_dismissed_ninetyfive=bool(raw.get("credit_banner_dismissed_ninetyfive", False)),
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             output_history=[
                 TaskHistoryEntry(
                     run_id=str(item.get("run_id", "")),
@@ -179,7 +197,10 @@ class DesktopState:
                     error=str(item.get("error", "")),
                     llm_used=str(item.get("llm_used", "")),
                     model_name=str(item.get("model_name", "")),
+<<<<<<< HEAD
                     llm_cost_usd=float(item.get("llm_cost_usd", 0.0) or 0.0),
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                     cancelled=bool(item.get("cancelled", False)),
                 )
                 for item in hist
@@ -306,6 +327,7 @@ class AppStateStore:
         self.save(state)
         return conv
 
+<<<<<<< HEAD
     def set_active_conversation(
         self,
         state: DesktopState,
@@ -318,6 +340,13 @@ class AppStateStore:
                 state.active_conversation_id = conversation_id
                 if persist:
                     self.save(state)
+=======
+    def set_active_conversation(self, state: DesktopState, conversation_id: str) -> Optional[Conversation]:
+        for conv in state.conversations:
+            if conv.conversation_id == conversation_id:
+                state.active_conversation_id = conversation_id
+                self.save(state)
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
                 return conv
         return None
 
@@ -388,6 +417,7 @@ class AppStateStore:
                 "company": state.profile.company,
                 "signed_in_at": state.profile.signed_in_at,
             },
+<<<<<<< HEAD
             "cloud_connected": bool(state.cloud_api_base_url.strip() and state.cloud_access_token.strip()),
             "cloud_plan": (state.cloud_me or {}).get("plan_slug"),
             "cloud_subscription_status": (state.cloud_me or {}).get("subscription_status"),
@@ -397,6 +427,8 @@ class AppStateStore:
             "can_use_platform_llm": state.can_use_platform_llm,
             "credits_billing_interval": state.credits_billing_interval,
             "machine_fingerprint_sha256": compute_machine_fingerprint(),
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             "history_count": len(state.output_history),
             "conversation_count": len(state.conversations),
             "active_conversation_id": state.active_conversation_id,

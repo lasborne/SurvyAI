@@ -23,7 +23,10 @@ class AgentRunResult:
     model_name: Optional[str] = None
     error: Optional[str] = None
     context_retrieved: Optional[bool] = None
+<<<<<<< HEAD
     llm_cost_usd: float = 0.0
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -37,7 +40,10 @@ class AgentRunResult:
             model_name=data.get("model_name"),
             error=data.get("error"),
             context_retrieved=data.get("context_retrieved"),
+<<<<<<< HEAD
             llm_cost_usd=float(data.get("llm_cost_usd") or 0.0),
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
             raw=dict(data),
         )
 

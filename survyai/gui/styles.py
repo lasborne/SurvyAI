@@ -10,17 +10,26 @@ Rationale:
 
 APPLICATION_STYLESHEET = """
 QWidget {
+<<<<<<< HEAD
     font-family: "Segoe UI", "Segoe UI Variable", "IBM Plex Sans", sans-serif;
+=======
+    font-family: "Segoe UI", "Segoe UI Variable", sans-serif;
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     font-size: 10pt;
 }
 QMainWindow, QDialog {
     background-color: #f5f6f8;
 }
+<<<<<<< HEAD
 QTextEdit, QPlainTextEdit, QLineEdit, QListWidget {
+=======
+QTextEdit, QPlainTextEdit, QLineEdit, QComboBox, QListWidget {
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     background-color: #ffffff;
     border: 1px solid #c8ccd4;
     border-radius: 4px;
     padding: 6px;
+<<<<<<< HEAD
     selection-background-color: #1d4ed8;
     selection-color: #ffffff;
 }
@@ -76,6 +85,8 @@ QComboBox QLineEdit {
     background: transparent;
     selection-background-color: #1d4ed8;
     selection-color: #ffffff;
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 }
 QPushButton {
     background-color: #2563eb;
@@ -162,6 +173,7 @@ QGroupBox::title {
     left: 10px;
     padding: 0 6px;
 }
+<<<<<<< HEAD
 /* Menu bar + popups: crisp typography, rounded panels, clear hover (Fusion-friendly). */
 QMenuBar {
     background-color: transparent;
@@ -335,5 +347,12 @@ QToolButton#creditUsageNoticeDismiss:hover {
     color: #64748b;
     background: #f1f5f9;
     border-radius: 4px;
+=======
+QMenuBar {
+    background-color: #f5f6f8;
+}
+QStatusBar {
+    color: #475569;
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 }
 """

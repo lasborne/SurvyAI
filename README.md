@@ -168,7 +168,11 @@ See [docs/PHASE1_SERVICE_LAYER.md](docs/PHASE1_SERVICE_LAYER.md) for Phase 1–2
 - **`SURVYAI_LICENSE_MODE=builder`** (default): full AutoCAD / ArcGIS / internet / vector tools for development — **free for building and testing**.
 - **`SURVYAI_LICENSE_MODE=pro`**: shipped commercial app; optional `SURVYAI_FEATURE_*=0` removes tool families (see docs).
 
+<<<<<<< HEAD
 There is **one paid product (Pro)**; billing is integrated with **Paystack** (plans + webhooks + desktop checkout).
+=======
+There is **one paid product (Pro)**; no Stripe tiers in this codebase yet.
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
 ## License
 

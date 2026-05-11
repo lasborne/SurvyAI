@@ -59,6 +59,9 @@ email-validator>=2.1.0
 # Windows desktop GUI (PySide6 is Qt for Python; LGPL / commercial)
 PySide6>=6.6.0
 
+# Windows desktop GUI (PySide6 is Qt for Python; LGPL / commercial)
+PySide6>=6.6.0
+
 # Additional utilities
 numpy>=1.26.0,<2.0.0
 requests>=2.31.0

@@ -240,11 +240,18 @@ class Settings(BaseSettings):
         env="AGENT_MAX_TOKENS",
         description=(
             "Maximum tokens in LLM response (output token budget per completion).\n"
+<<<<<<< HEAD
             "This value is automatically clamped to each model's real API limit before every call,\n"
             "so setting it higher than a model supports causes a harmless INFO-level log, not a warning.\n"
             "16384 is the practical ceiling for GPT-4o / GPT-5-mini; GPT-5.1 supports up to 128000.\n"
             "Typical useful range: 4000–16384 for most tasks; the 'complex' tier model (gpt-5.1) will\n"
             "automatically use its own higher limit without needing to raise this value."
+=======
+            "Values above each model's API limit are clamped automatically (very large values like 200000 "
+            "only produce warnings and do not increase output).\n"
+            "Typical useful range: 4000–128000 depending on model tier; use tiered OpenAI models instead of "
+            "raising this alone for hard tasks."
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         )
     )
     
@@ -621,6 +628,7 @@ class Settings(BaseSettings):
             "Phase 1: reserved for upcoming proxy; not yet used by the agent."
         ),
     )
+<<<<<<< HEAD
 
     # ==========================================================================
     # Plan policy scaffolding (NOT ENFORCED by default)
@@ -658,6 +666,8 @@ class Settings(BaseSettings):
         description="Pro plan cap: successful CAD jobs allowed in a rolling 365 days (dormant unless enforced).",
         ge=0,
     )
+=======
+>>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     
     # ==========================================================================
     # Pydantic Configuration
