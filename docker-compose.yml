@@ -1,0 +1,96 @@
+# =============================================================================
+# SurvyAI – Local Development Stack
+# =============================================================================
+# Starts a PostgreSQL 16 instance with the pgvector and PostGIS extensions
+# pre-installed.  This is the ONLY infrastructure dependency for local dev;
+# everything else (the desktop agent, cloud API) runs in your Python venv.
+#
+# Quick start:
+#   docker compose up -d        # start in background
+#   docker compose logs -f db   # watch logs
+#   docker compose down -v      # stop + wipe data
+#
+# After the container is up, run Alembic to create all tables:
+#   alembic upgrade head
+#
+# Connection details (match .env.example defaults):
+#   host:     localhost
+#   port:     5432
+#   user:     survyai
+#   password: survyai
+#   database: survyai
+#
+# The image used (pgvector/pgvector:pg16) is the official pgvector image
+# built on top of postgres:16.  It ships vector, pg_trgm, and supports
+# installing PostGIS via the POSTGRES_INITDB scripts below.
+# =============================================================================
+
+version: "3.9"
+
+services:
+  db:
+    # pgvector official image (postgres:16 + pgvector pre-installed)
+    # PostGIS is installed by the init script in ./docker/initdb/
+    image: pgvector/pgvector:pg16
+    container_name: survyai_db
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_USER: survyai
+      POSTGRES_PASSWORD: survyai
+      POSTGRES_DB: survyai
+      # Increase shared_buffers for better HNSW build performance
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C"
+
+    ports:
+      - "5432:5432"
+
+    volumes:
+      # Persist data across container restarts
+      - survyai_pgdata:/var/lib/postgresql/data
+      # Init script installs PostGIS extension on first startup
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+
+    # Tune PostgreSQL for vector workloads.
+    # These match the pgvector documentation recommendations.
+    command: >
+      postgres
+        -c shared_buffers=256MB
+        -c maintenance_work_mem=512MB
+        -c max_wal_size=1GB
+        -c checkpoint_completion_target=0.9
+        -c effective_cache_size=1GB
+        -c random_page_cost=1.1
+        -c max_connections=100
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U survyai -d survyai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # Optional: pgAdmin for database inspection
+  # Remove this block if you prefer psql or another GUI client.
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: survyai_pgadmin
+    restart: unless-stopped
+    profiles:
+      - admin   # only starts with: docker compose --profile admin up -d
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@survyai.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+    ports:
+      - "5050:80"
+    depends_on:
+      db:
+        condition: service_healthy
+    volumes:
+      - survyai_pgadmin_data:/var/lib/pgadmin
+
+volumes:
+  survyai_pgdata:
+    driver: local
+  survyai_pgadmin_data:
+    driver: local

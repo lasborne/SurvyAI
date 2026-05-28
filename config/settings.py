@@ -240,18 +240,11 @@ class Settings(BaseSettings):
         env="AGENT_MAX_TOKENS",
         description=(
             "Maximum tokens in LLM response (output token budget per completion).\n"
-<<<<<<< HEAD
             "This value is automatically clamped to each model's real API limit before every call,\n"
             "so setting it higher than a model supports causes a harmless INFO-level log, not a warning.\n"
             "16384 is the practical ceiling for GPT-4o / GPT-5-mini; GPT-5.1 supports up to 128000.\n"
             "Typical useful range: 4000–16384 for most tasks; the 'complex' tier model (gpt-5.1) will\n"
             "automatically use its own higher limit without needing to raise this value."
-=======
-            "Values above each model's API limit are clamped automatically (very large values like 200000 "
-            "only produce warnings and do not increase output).\n"
-            "Typical useful range: 4000–128000 depending on model tier; use tiered OpenAI models instead of "
-            "raising this alone for hard tasks."
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
         )
     )
     
@@ -491,53 +484,87 @@ class Settings(BaseSettings):
     )
     
     # ==========================================================================
-    # Vector Database Configuration
+    # Vector Database Configuration  (PostgreSQL + pgvector backend)
     # ==========================================================================
-    # ChromaDB is used for local vector storage with semantic search.
-    # Supports local embeddings (free) and OpenAI embeddings (higher quality).
-    
+    # The desktop agent stores embeddings, conversation history, CAD entities,
+    # and survey coordinates in PostgreSQL using pgvector (ANN) and PostGIS
+    # (geospatial queries).  Set VECTOR_DB_URL to your PostgreSQL connection
+    # string.  For local dev you can run the bundled docker-compose.yml which
+    # starts a postgres+postgis+pgvector container on port 5432.
+
     vector_store_enabled: bool = Field(
         default=True,
         env="VECTOR_STORE_ENABLED",
-        description="Enable/disable the vector database for semantic search."
+        description="Enable/disable the vector database for semantic search.",
     )
-    
+
+    vector_db_url: str = Field(
+        default="",
+        env="VECTOR_DB_URL",
+        description=(
+            "PostgreSQL connection URL for the vector store.\n"
+            "Format: postgresql://user:password@host:5432/dbname\n"
+            "Falls back to DATABASE_URL if empty."
+        ),
+    )
+
+    # Legacy field kept for back-compat; no longer used as a directory path
     vector_store_path: str = Field(
         default=".survyai_vectordb",
         env="VECTOR_STORE_PATH",
-        description=(
-            "Directory for vector database persistence.\n"
-            "Relative to project root or absolute path."
-        )
+        description="Deprecated (ChromaDB era).  Kept for backward compatibility.",
     )
-    
+
     embedding_provider: Literal["local", "openai"] = Field(
         default="local",
         env="EMBEDDING_PROVIDER",
         description=(
             "Which embedding provider to use:\n"
-            "  - local: Sentence Transformers (free, offline capable) - Default\n"
+            "  - local: Sentence Transformers (free, offline capable) – Default\n"
             "  - openai: OpenAI embeddings (higher quality, requires API key)"
-        )
+        ),
     )
-    
+
     local_embedding_model: str = Field(
         default="all-MiniLM-L6-v2",
         env="LOCAL_EMBEDDING_MODEL",
         description=(
             "Local embedding model from Sentence Transformers.\n"
-            "Options: all-MiniLM-L6-v2 (fast), all-mpnet-base-v2 (better quality)"
-        )
+            "Options: all-MiniLM-L6-v2 (384-dim, fast), "
+            "all-mpnet-base-v2 (768-dim, better quality)"
+        ),
     )
-    
+
     openai_embedding_model: str = Field(
         default="text-embedding-3-small",
         env="OPENAI_EMBEDDING_MODEL",
         description=(
             "OpenAI embedding model. Options:\n"
-            "  - text-embedding-3-small: Cost-effective (default)\n"
-            "  - text-embedding-3-large: Higher quality, more expensive"
-        )
+            "  - text-embedding-3-small: 1536-dim, cost-effective (default)\n"
+            "  - text-embedding-3-large: 3072-dim, higher quality"
+        ),
+    )
+
+    vector_search_mode: Literal["semantic", "hybrid", "keyword"] = Field(
+        default="hybrid",
+        env="VECTOR_SEARCH_MODE",
+        description=(
+            "Retrieval strategy for the RAG pipeline:\n"
+            "  - semantic: pure cosine-similarity ANN (fast)\n"
+            "  - hybrid: cosine ANN + BM25/ts_rank fused with RRF (best recall) – Default\n"
+            "  - keyword: full-text search only (no embeddings required)"
+        ),
+    )
+
+    vector_hybrid_alpha: float = Field(
+        default=0.6,
+        env="VECTOR_HYBRID_ALPHA",
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Balance between semantic and keyword in hybrid search.\n"
+            "0.0 = full keyword, 1.0 = full semantic, 0.6 = default."
+        ),
     )
     
     # ==========================================================================
@@ -628,7 +655,6 @@ class Settings(BaseSettings):
             "Phase 1: reserved for upcoming proxy; not yet used by the agent."
         ),
     )
-<<<<<<< HEAD
 
     # ==========================================================================
     # Plan policy scaffolding (NOT ENFORCED by default)
@@ -666,8 +692,6 @@ class Settings(BaseSettings):
         description="Pro plan cap: successful CAD jobs allowed in a rolling 365 days (dormant unless enforced).",
         ge=0,
     )
-=======
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     
     # ==========================================================================
     # Pydantic Configuration

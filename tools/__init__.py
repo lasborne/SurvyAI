@@ -45,11 +45,11 @@ real-world operations:
    - Work with geodatabases and feature classes
 
 7. VectorStore
-   - Semantic search using vector embeddings
-   - Local storage with ChromaDB
+   - Semantic and hybrid (RRF) search using pgvector
+   - PostgreSQL backend with HNSW index and full-text search
+   - PostGIS geospatial coordinate storage with proximity queries
    - Multiple embedding providers (local Sentence Transformers, OpenAI)
    - Collections for documents, drawings, coordinates, conversations
-   - Persistent storage for long-term memory
 
 HOW TOOLS WORK WITH LANGGRAPH:
 ------------------------------
@@ -107,7 +107,7 @@ from tools.geographic_calculator import BlueMarbleConverter, GeographicCalculato
 # ArcGIS Pro integration (advanced GIS operations)
 from tools.arcgis_tools import ArcGISProcessor
 
-# Vector database for semantic search
+# Vector database – PostgreSQL / pgvector / PostGIS backend
 from tools.vector_store import (
     VectorStore,
     create_vector_store,
@@ -115,6 +115,7 @@ from tools.vector_store import (
     COLLECTION_DRAWINGS,
     COLLECTION_COORDINATES,
     COLLECTION_CONVERSATIONS,
+    ALL_COLLECTIONS,
 )
 
 
@@ -134,10 +135,11 @@ __all__ = [
     "BlueMarbleConverter",      # Coordinate reference system conversions
     "GeographicCalculatorCLI",  # Geographic Calculator command-line interface
     "ArcGISProcessor",          # ArcGIS Pro operations (requires arcpy)
-    "VectorStore",              # Vector database for semantic search
-    "create_vector_store",      # Convenience function for creating VectorStore
+    "VectorStore",              # Vector store: pgvector ANN + PostGIS
+    "create_vector_store",      # Factory function for VectorStore
     "COLLECTION_DOCUMENTS",     # Collection name constant
     "COLLECTION_DRAWINGS",      # Collection name constant
     "COLLECTION_COORDINATES",   # Collection name constant
     "COLLECTION_CONVERSATIONS", # Collection name constant
+    "ALL_COLLECTIONS",          # Tuple of all collection names
 ]

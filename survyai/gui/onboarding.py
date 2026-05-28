@@ -222,7 +222,7 @@ class OnboardingWizard(QWizard):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle("Welcome to SurvyAI")
-        self.setWizardStyle(QWizard.ModernStyle)
+        self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
         self.addPage(_SignInPage(initial_profile))
         self.addPage(_EnvironmentPage(settings))
         self.addPage(_CapabilityPage(capabilities))

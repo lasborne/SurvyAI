@@ -2,11 +2,7 @@
 License mode and feature flags (Phase 2: enforced in LangGraph tool registration).
 
 Payment model (current):
-<<<<<<< HEAD
 - **pro** — what you ship to paying customers (single product; Paystack plans on the cloud API).
-=======
-- **pro** — what you ship to paying customers (single product; no Stripe tiers yet).
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 - **builder** — free unlimited use for development/testing; all integrations stay enabled
   regardless of SURVYAI_FEATURE_* so you never lock yourself out while building.
 

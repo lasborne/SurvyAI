@@ -1,20 +1,20 @@
 """
 Alembic environment for SurvyAI Cloud.
 
-Uses the same DATABASE_URL as the FastAPI app (async SQLAlchemy URL).
+Uses the **sync** database URL (``DATABASE_URL`` or sync form derived from
+``ASYNC_DATABASE_URL``).  The live FastAPI app uses the async URL separately —
+see ``survyai/database_urls.py`` and ``survyai_cloud.config.CloudSettings``.
 """
 
 from __future__ import annotations
 
-import asyncio
 import sys
 from logging.config import fileConfig
 from pathlib import Path
 
 from alembic import context
-from sqlalchemy import pool
+from sqlalchemy import create_engine, pool
 from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import create_async_engine
 
 # Repo root on sys.path (alembic/ -> parent)
 _ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +35,7 @@ def run_migrations_offline() -> None:
     """Generate SQL without connecting (URL from settings)."""
     settings = get_cloud_settings()
     context.configure(
-        url=settings.database_url,
+        url=settings.sqlalchemy_sync_url(),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
@@ -57,19 +57,14 @@ def do_run_migrations(connection: Connection) -> None:
         context.run_migrations()
 
 
-async def run_async_migrations() -> None:
-    settings = get_cloud_settings()
-    url = settings.database_url
-    connectable = create_async_engine(url, poolclass=pool.NullPool)
-
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-
-    await connectable.dispose()
-
-
 def run_migrations_online() -> None:
-    asyncio.run(run_async_migrations())
+    """Run migrations with a synchronous engine (psycopg / sqlite)."""
+    settings = get_cloud_settings()
+    url = settings.sqlalchemy_sync_url()
+    connectable = create_engine(url, poolclass=pool.NullPool)
+
+    with connectable.connect() as connection:
+        do_run_migrations(connection)
 
 
 if context.is_offline_mode():

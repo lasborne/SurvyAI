@@ -9,8 +9,10 @@ from __future__ import annotations
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from survyai.database_urls import ResolvedDatabaseUrls, resolve_database_urls
 
 
 class CloudSettings(BaseSettings):
@@ -24,14 +26,34 @@ class CloudSettings(BaseSettings):
     app_name: str = Field(default="SurvyAI Cloud API")
     debug: bool = Field(default=False)
 
-    # Database
+    # Database — see survyai/database_urls.py and .env.example
     database_url: str = Field(
         default="sqlite+aiosqlite:///./data/survyai_cloud.db",
-        description="SQLAlchemy async URL (postgresql+asyncpg://... in production).",
+        description=(
+            "Primary DB URL (DATABASE_URL). Sync ``postgresql://`` for Alembic; "
+            "``postgresql+asyncpg://`` also accepted (async derived for API)."
+        ),
+    )
+    async_database_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("ASYNC_DATABASE_URL", "async_database_url"),
+        description=(
+            "FastAPI-only async URL (postgresql+asyncpg://…). When set, overrides "
+            "async driver for the cloud API; Alembic still uses sync form of DATABASE_URL."
+        ),
     )
     run_migrations_on_startup: bool = Field(
         default=True,
         description="When using Postgres, run ``alembic upgrade head`` on startup (idempotent).",
+    )
+
+    vector_db_url: str = Field(
+        default="",
+        validation_alias=AliasChoices("VECTOR_DB_URL", "vector_db_url"),
+        description=(
+            "Sync URL for the desktop vector store (psycopg). "
+            "Falls back to sync form of DATABASE_URL if empty."
+        ),
     )
 
     # Redis (rate limits + future cache). Empty = in-process limiter (single worker only).
@@ -67,6 +89,15 @@ class CloudSettings(BaseSettings):
 
     # CORS (comma-separated origins; * for dev only)
     cors_origins: str = Field(default="*")
+
+    # Support / ops: enable admin API when set
+    admin_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("CLOUD_ADMIN_API_KEY", "admin_api_key"),
+        description=(
+            "If set, enables /v1/admin/* endpoints protected by header X-SurvyAI-Admin-Key."
+        ),
+    )
 
     # Paystack (Nigeria-first)
     paystack_secret_key: str = Field(default="", description="sk_live_* or sk_test_*")
@@ -164,10 +195,30 @@ class CloudSettings(BaseSettings):
     # Usage batch limits
     usage_batch_max_events: int = Field(default=100, ge=1, le=1000)
 
-    @field_validator("database_url")
+    @field_validator("database_url", "async_database_url", "vector_db_url")
     @classmethod
     def _normalize_db_url(cls, v: str) -> str:
-        return v.strip()
+        return (v or "").strip()
+
+    def resolved_database_urls(self) -> ResolvedDatabaseUrls:
+        """Sync (Alembic/vector) vs async (FastAPI) URLs from env."""
+        return resolve_database_urls(
+            database_url=self.database_url,
+            async_database_url=self.async_database_url,
+            vector_db_url=self.vector_db_url,
+        )
+
+    def sqlalchemy_async_url(self) -> str:
+        """URL for ``create_async_engine`` in the cloud API."""
+        return self.resolved_database_urls().async_
+
+    def sqlalchemy_sync_url(self) -> str:
+        """URL for Alembic and other blocking SQLAlchemy/psycopg tools."""
+        return self.resolved_database_urls().sync
+
+    def vector_store_sync_url(self) -> str:
+        """URL for the desktop agent PostgreSQL vector store."""
+        return self.resolved_database_urls().vector_sync
 
     def cors_origin_list(self) -> list[str]:
         raw = self.cors_origins.strip()

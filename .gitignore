@@ -50,6 +50,8 @@ temp/
 UsedFiles/
 *.dwg
 *.dxf
+*.bak
+*.ini
 *.xlsx
 *.xls
 *.docx

@@ -51,13 +51,8 @@
         "plan",
         "template3"
       ],
-<<<<<<< HEAD
-      "last_used_at": "2026-05-04T05:29:07Z",
-      "use_count": 120,
-=======
-      "last_used_at": "2026-03-29T13:47:30Z",
-      "use_count": 16,
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
+      "last_used_at": "2026-05-24T09:22:35Z",
+      "use_count": 25,
       "profile_path": "C:\\Users\\UZOR\\PycharmProjects\\untitled\\venv\\SurvyAI\\template_profiles\\survey_plan_template3.json",
       "signature": {
         "size_bytes": 102208,

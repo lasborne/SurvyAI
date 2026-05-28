@@ -19,7 +19,7 @@ from PySide6.QtWidgets import QApplication
 
 from survyai.gui.launch_args import parse_gui_argv
 from survyai.gui.main_window import MainWindow
-from survyai.gui.styles import APPLICATION_STYLESHEET
+from survyai.gui.styles import LIGHT_STYLESHEET
 
 
 def run_gui(argv: Optional[list[str]] = None) -> int:
@@ -41,7 +41,7 @@ def run_gui(argv: Optional[list[str]] = None) -> int:
     app.setApplicationName("SurvyAI")
     app.setOrganizationName("SurvyAI")
 
-    app.setStyleSheet(APPLICATION_STYLESHEET)
+    app.setStyleSheet(LIGHT_STYLESHEET)
 
     # Windows taskbar grouping / jump lists: explicit app user model id (optional).
     if sys.platform == "win32":

@@ -23,16 +23,55 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
     if any(
         x in low
         for x in (
+            "getaddrinfo failed",
+            "name or service not known",
+            "nodename nor servname",
+            "temporary failure in name resolution",
+        )
+    ):
+        return (
+            "The cloud API is running, but its database hostname could not be resolved. "
+            "Check DATABASE_URL in .env (Supabase project active? correct host?). "
+            "For local development, use Docker Postgres: docker compose up -d, then set "
+            "DATABASE_URL=postgresql+asyncpg://survyai:survyai@localhost:5432/survyai and restart "
+            "python -m survyai_cloud."
+        )
+
+    if any(
+        x in low
+        for x in (
+            "database unavailable",
+            "database connection failed",
+            "database_ok",
+            "could not connect to server",
+            "connection does not exist",
+            "password authentication failed",
+            "invalidpassworderror",
+            "asyncpg",
+            "sqlalchemy",
+        )
+    ):
+        return (
+            "The cloud API process is up, but it cannot reach the database. "
+            "Open http://127.0.0.1:8088/health — if database_ok is false, fix DATABASE_URL in .env "
+            "and restart python -m survyai_cloud. Local dev: docker compose up -d then use "
+            "postgresql+asyncpg://survyai:survyai@localhost:5432/survyai."
+        )
+
+    if any(
+        x in low
+        for x in (
             "network error",
             "connection refused",
             "failed to establish a new connection",
-            "name or service not known",
-            "getaddrinfo failed",
+            "readtimeout",
+            "connecttimeout",
         )
     ) or ("timed out" in low or "timeout" in low):
         return (
-            "Could not reach the SurvyAI cloud server. Check your internet connection, "
-            "confirm the API address, and try again."
+            "The cloud API did not respond in time. If http://127.0.0.1:8088/health opens but "
+            "database_ok is false, the server is waiting on a database that is down or unreachable. "
+            "Fix DATABASE_URL, restart python -m survyai_cloud, then try again."
         )
 
     if any(
@@ -75,18 +114,41 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
     if any(
         x in low
         for x in (
-            "500",
-            "502",
-            "503",
-            "504",
+            "undefinedcolumn",
+            "does not exist",
+            "column users.",
+            "schema",
+            "programmingerror",
+        )
+    ):
+        return (
+            "The cloud database schema is out of date. In the project folder run:\n"
+            "  python -m alembic upgrade head\n"
+            "then restart python -m survyai_cloud and sign in again."
+        )
+
+    if "database unavailable" in low:
+        return (
+            "The cloud API is running but the database is not ready. "
+            "Open http://127.0.0.1:8088/health — if database_ok is false, fix DATABASE_URL in .env "
+            "and restart python -m survyai_cloud."
+        )
+
+    if any(
+        x in low
+        for x in (
             "internal server error",
             "bad gateway",
             "service unavailable",
         )
+    ) or (
+        any(code in raw for code in ("502", "504"))
+        or ("500" in raw and "http 500" in low)
+        or ("503" in raw and "database" not in low)
     ):
         return (
-            "The cloud service is temporarily unavailable. Please try again in a few minutes. "
-            "If the problem continues, sign in again from Settings (Cloud sign-in)."
+            "The cloud API returned a server error. Restart python -m survyai_cloud, run "
+            "python -m alembic upgrade head if you recently updated the app, then try signing in again."
         )
 
     if "429" in raw or "too many requests" in low:
@@ -96,6 +158,19 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
         return (
             "Payment could not be started. Check your subscription plan settings, then try again "
             "or contact support."
+        )
+
+    if "no paystack plans configured" in low or "paystack_plan_code" in low:
+        return (
+            "Billing plans are not set up on the cloud server. Add PAYSTACK_PLAN_CODE_PRO_MONTHLY "
+            "and/or PAYSTACK_PLAN_CODE_PRO_ANNUAL (PLN_… codes from Paystack) to .env.cloud, "
+            "then restart python -m survyai_cloud."
+        )
+
+    if "paystack is not configured" in low or "missing paystack_secret_key" in low:
+        return (
+            "Paystack is not configured on the cloud server. Add PAYSTACK_SECRET_KEY to .env.cloud "
+            "and restart python -m survyai_cloud."
         )
 
     if "expected json" in low or "empty response" in low:

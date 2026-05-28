@@ -59,16 +59,26 @@ email-validator>=2.1.0
 # Windows desktop GUI (PySide6 is Qt for Python; LGPL / commercial)
 PySide6>=6.6.0
 
-# Windows desktop GUI (PySide6 is Qt for Python; LGPL / commercial)
-PySide6>=6.6.0
-
 # Additional utilities
 numpy>=1.26.0,<2.0.0
 requests>=2.31.0
 
-# Vector Database and Embeddings
-chromadb>=0.4.22
+# =============================================================================
+# Vector Database – PostgreSQL + pgvector + PostGIS
+# =============================================================================
+# psycopg v3: sync + async PostgreSQL driver with connection pool.
+# The [binary] extra ships pre-compiled libpq so no system-level install is
+# needed on Windows.  The [pool] extra adds ConnectionPool (used by VectorStore).
+psycopg[binary,pool]>=3.1.0
+
+# pgvector Python adapter: registers the vector type with psycopg/asyncpg,
+# enables numpy/list <-> pgvector column serialisation.
+pgvector>=0.3.0
+
+# Local embedding model (free, offline-capable).
+# Used when EMBEDDING_PROVIDER=local (default).
 sentence-transformers>=2.2.2
-langchain-chroma>=0.1.0
+
+# tiktoken – token counting for context window management
 tiktoken>=0.5.0
 

@@ -80,7 +80,7 @@ class ManagePcsDialog(QDialog):
         layout.addWidget(hint)
         if max_devices is not None and max_devices > 0:
             cap = QLabel(f"Maximum PCs for your current plan: {max_devices}")
-            cap.setStyleSheet("font-weight: 600;")
+            cap.setObjectName("hintLabel")
             layout.addWidget(cap)
 
         self._list = QListWidget()
@@ -113,7 +113,11 @@ class ManagePcsDialog(QDialog):
         try:
             rows = list_devices(base_url=self._base, access_token=self._token)
         except CloudApiError as exc:
-            QMessageBox.warning(self, "Could not load PCs", user_facing_cloud_message(exc))
+            QMessageBox.warning(
+                self,
+                "Could not load PCs",
+                f"{user_facing_cloud_message(exc)}\n\nCloud API: {self._base}",
+            )
             return
 
         if not rows:

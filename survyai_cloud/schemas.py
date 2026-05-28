@@ -193,3 +193,22 @@ class DiagnosticsOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# --- Admin (support) ---
+class AdminUserBillingPatch(BaseModel):
+    """
+    Support override payload. Protected by CLOUD_ADMIN_API_KEY + X-SurvyAI-Admin-Key.
+    """
+
+    plan_slug: Optional[str] = Field(default=None, max_length=64)
+    subscription_status: Optional[str] = Field(
+        default=None,
+        description="Must match server enum values: none, trialing, active, past_due, canceled, unpaid, ...",
+    )
+    grace_period_ends_at: Optional[datetime] = None
+    clear_grace: bool = False
+    last_reactivation_at: Optional[datetime] = None
+    touch_reactivated_now: bool = False
+    apply_free_defaults: bool = False
+    apply_pro_defaults: bool = False

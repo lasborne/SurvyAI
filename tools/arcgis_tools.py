@@ -3336,21 +3336,14 @@ arcpy.CheckOutExtension("Spatial")
 
 aprx = arcpy.mp.ArcGISProject(project_path)
 maps = aprx.listMaps()
-<<<<<<< HEAD
-=======
-mp = maps[0] if maps else None
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 try:
     aprx.defaultGeodatabase = gdb_path
 except Exception:
     pass
-<<<<<<< HEAD
 try:
     aprx.addFolderConnection(project_dir)
 except Exception:
     pass
-=======
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 
 run_tag = "r" + str(int(time.time()))
 cad_name = "cad_import_" + run_tag
@@ -3585,7 +3578,6 @@ with open(out_csv, "w", newline="", encoding="utf-8") as f:
     w.writerow(["post_copy", post_csv, "path"])
     w.writerow(["project_path", project_path, "path"])
 
-<<<<<<< HEAD
 mp = None
 try:
     mp = aprx.activeMap
@@ -3619,22 +3611,11 @@ if mp:
         ("cutfill", cutfill_raster),
     ]:
         _add_layer_to_map(mp, ds, tag)
-=======
-if mp:
-    for ds in [boundary_fc, pre_fc, post_fc, pre_idw, post_idw, cutfill_raster]:
-        try:
-            mp.addDataFromPath(ds)
-        except Exception:
-            pass
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     try:
         mp.defaultCamera.setExtent(arcpy.Describe(boundary_fc).extent)
     except Exception:
         pass
-<<<<<<< HEAD
 
-=======
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
 try:
     aprx.save()
 except Exception:
@@ -3696,7 +3677,6 @@ print("RESULT_PROJECT_PATH:", project_path)
             "arcgis_launch_details": launch_result,
             "note": "Workflow executed deterministically via ArcGIS Python and ArcGIS Pro was opened after output verification." if csv_exists else "ArcGIS execution finished but the result CSV was not found or is empty.",
         }
-<<<<<<< HEAD
 
     def compute_pre_post_csv_dwg_tin_volume(
         self,
@@ -4220,9 +4200,6 @@ print("RESULT_VOLUME_METHOD:", "tin_plus_zonal")
             ),
         }
 
-=======
-    
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
     def finalize_project_visualization(
         self,
         project_path: str,

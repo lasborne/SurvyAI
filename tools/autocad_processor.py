@@ -1938,6 +1938,270 @@ class AutoCADProcessor:
         except Exception as e:
             return {"success": False, "error": str(e)}
 
+    def get_table_cell_mtext_line_step(
+        self,
+        handle: str,
+        row: int,
+        col: int,
+        cell_text_hint: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Return the vertical distance between MTEXT baselines in a TABLE cell (drawing units).
+
+        Uses the cell's text height and line-spacing style/factor from AutoCAD when available.
+        AutoCAD "At least" spacing uses text_height * (5/3) * line_spacing_factor; "Exactly"
+        uses text_height * line_spacing_factor.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document.", "line_step": 0.0}
+        try:
+            modelspace = self.doc.ModelSpace
+            target = None
+            for i in range(modelspace.Count):
+                e = modelspace.Item(i)
+                if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                    target = e
+                    break
+            if target is None:
+                return {"success": False, "error": f"TABLE with handle {handle} not found", "line_step": 0.0}
+
+            r, c = int(row), int(col)
+            try:
+                text_height = float(target.GetTextHeight(r, c))
+            except Exception as ex:
+                return {"success": False, "error": f"Could not read text height: {ex}", "line_step": 0.0}
+
+            line_spacing_factor = 1.0
+            for method in ("GetTextLineSpacingFactor",):
+                try:
+                    line_spacing_factor = float(getattr(target, method)(r, c))
+                    break
+                except Exception:
+                    continue
+
+            line_spacing_style = 0  # acLineSpacingStyleAtLeast
+            for method in ("GetTextLineSpacingStyle",):
+                try:
+                    line_spacing_style = int(getattr(target, method)(r, c))
+                    break
+                except Exception:
+                    continue
+
+            hint = str(cell_text_hint or "")
+            if not hint.strip():
+                try:
+                    hint = str(target.GetText(r, c) or "")
+                except Exception:
+                    hint = ""
+            import re
+
+            m_px = re.search(r"\\pxsm([\d.]+)", hint, re.IGNORECASE)
+            if m_px:
+                try:
+                    line_spacing_factor = float(m_px.group(1))
+                except (TypeError, ValueError):
+                    pass
+
+            if line_spacing_style == 1:  # acLineSpacingStyleExactly
+                line_step = text_height * line_spacing_factor
+            else:
+                line_step = text_height * (5.0 / 3.0) * line_spacing_factor
+
+            return {
+                "success": True,
+                "handle": handle,
+                "row": r,
+                "col": c,
+                "text_height": float(text_height),
+                "line_spacing_factor": float(line_spacing_factor),
+                "line_spacing_style": int(line_spacing_style),
+                "line_step": float(line_step),
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "line_step": 0.0}
+
+    def get_table_cell_extents(
+        self,
+        handle: str,
+        row: int,
+        col: int,
+        outer: bool = True,
+    ) -> Dict[str, Any]:
+        """Return axis-aligned extents of a TABLE cell (ModelSpace coordinates)."""
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document."}
+        try:
+            modelspace = self.doc.ModelSpace
+            target = None
+            for i in range(modelspace.Count):
+                e = modelspace.Item(i)
+                if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                    target = e
+                    break
+            if target is None:
+                return {"success": False, "error": f"TABLE with handle {handle} not found"}
+
+            r, c = int(row), int(col)
+            corners = None
+            try:
+                corners = target.GetCellExtents(r, c, bool(outer))
+            except Exception:
+                try:
+                    corners = target.GetCellExtents(r, c)
+                except Exception as ex:
+                    return {"success": False, "error": f"GetCellExtents failed: {ex}"}
+
+            pts: List[Tuple[float, float]] = []
+            if corners is None:
+                return {"success": False, "error": "GetCellExtents returned no data"}
+            if isinstance(corners, (list, tuple)):
+                flat = list(corners)
+                if flat and isinstance(flat[0], (list, tuple)):
+                    for p in flat:
+                        if p is not None and len(p) >= 2:
+                            pts.append((float(p[0]), float(p[1])))
+                else:
+                    for i in range(0, len(flat) - 1, 3):
+                        try:
+                            pts.append((float(flat[i]), float(flat[i + 1])))
+                        except (TypeError, ValueError, IndexError):
+                            continue
+                    if not pts and len(flat) >= 4:
+                        for i in range(0, len(flat) - 1, 2):
+                            try:
+                                pts.append((float(flat[i]), float(flat[i + 1])))
+                            except (TypeError, ValueError, IndexError):
+                                continue
+
+            if not pts:
+                return {"success": False, "error": "Could not parse cell corner coordinates"}
+
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            return {
+                "success": True,
+                "handle": handle,
+                "row": r,
+                "col": c,
+                "minx": float(min(xs)),
+                "miny": float(min(ys)),
+                "maxx": float(max(xs)),
+                "maxy": float(max(ys)),
+                "corners": [{"x": x, "y": y} for x, y in pts],
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def adjust_scalebar_below_scale_label(
+        self,
+        title_table_handle: str,
+        scale_label_row: int = 8,
+        scale_label_col: int = 0,
+        gap: Optional[float] = None,
+        scalebar_layers: Optional[List[str]] = None,
+        template_scale_label_bottom: Optional[float] = None,
+        scale_base_y: Optional[float] = None,
+        scale_k: float = 1.0,
+    ) -> Dict[str, Any]:
+        """
+        Move CADA_SCALEBAR down so the scale-bar graphic sits below the title-block
+        \"SCALE:- 1:xxx\" cell with a small clearance gap.
+
+        Uses measured cell extents after table recompute/regen.
+        """
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document."}
+        layers = [str(l) for l in (scalebar_layers or ["CADA_SCALEBAR"])]
+        try:
+            modelspace = self.doc.ModelSpace
+            target = None
+            for i in range(modelspace.Count):
+                e = modelspace.Item(i)
+                if getattr(e, "Handle", None) == title_table_handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                    target = e
+                    break
+            if target is None:
+                return {"success": False, "error": f"TABLE with handle {title_table_handle} not found"}
+
+            try:
+                target.RecomputeTableBlock(True)
+            except Exception:
+                try:
+                    target.RecomputeTableBlock()
+                except Exception:
+                    pass
+            try:
+                self.execute_command("REGEN")
+            except Exception:
+                pass
+
+            cell = self.get_table_cell_extents(
+                title_table_handle, int(scale_label_row), int(scale_label_col), outer=True
+            )
+            if not cell.get("success"):
+                return cell
+
+            label_bottom = float(cell["miny"])
+
+            sb = self.get_modelspace_bbox(layers=layers)
+            if not sb.get("success"):
+                return {"success": False, "error": sb.get("error") or "Could not read scalebar bbox"}
+
+            scalebar_top = float(sb["maxy"])
+
+            clearance = gap
+            if clearance is None:
+                try:
+                    th = float(target.GetTextHeight(int(scale_label_row), int(scale_label_col)))
+                    clearance = max(0.25, 0.12 * th)
+                except Exception:
+                    clearance = 0.5
+
+            # Scale-bar top must sit below the bottom of the SCALE:- cell (Y-up: lower maxy).
+            dy_overlap = label_bottom - float(clearance) - scalebar_top
+            dy = dy_overlap if dy_overlap < -1e-6 else 0.0
+
+            if template_scale_label_bottom is not None:
+                try:
+                    base_y = float(scale_base_y or 0.0)
+                    sk = float(scale_k or 1.0)
+                    tpl_y = float(template_scale_label_bottom)
+                    scaled_tpl = base_y + sk * (tpl_y - base_y)
+                    drop = scaled_tpl - label_bottom
+                    if drop > 1e-6:
+                        dy_drop = -drop
+                        if dy < 0:
+                            dy = min(dy, dy_drop)
+                        else:
+                            dy = dy_drop
+                except (TypeError, ValueError):
+                    pass
+
+            if dy >= -1e-6:
+                return {
+                    "success": True,
+                    "moved": False,
+                    "dy": 0.0,
+                    "scale_label_bottom": label_bottom,
+                    "scalebar_top": scalebar_top,
+                    "clearance": float(clearance),
+                }
+
+            mv = self.move_modelspace_by_layers(0.0, dy, layers)
+            if not mv.get("success"):
+                return mv
+            return {
+                "success": True,
+                "moved": True,
+                "dy": float(dy),
+                "scale_label_bottom": label_bottom,
+                "scalebar_top_before": scalebar_top,
+                "clearance": float(clearance),
+                "moved_entities": int(mv.get("moved_entities", 0) or 0),
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
     def get_sample_text_height(self, layers: Optional[List[str]] = None) -> Dict[str, Any]:
         """
         Sample text height from the first TEXT or MTEXT entity on the given layers.

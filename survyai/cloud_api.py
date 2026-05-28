@@ -49,6 +49,30 @@ def _norm_base(url: str) -> str:
     return (url or "").strip().rstrip("/")
 
 
+def _api_error_detail(body: Any, *, status_code: int) -> str:
+    """Extract a human-readable message from FastAPI JSON error bodies."""
+    if isinstance(body, dict):
+        detail = body.get("detail")
+        if isinstance(detail, str) and detail.strip():
+            return detail.strip()
+        if isinstance(detail, list):
+            parts: list[str] = []
+            for item in detail:
+                if isinstance(item, dict):
+                    msg = item.get("msg")
+                    parts.append(str(msg if msg is not None else item))
+                else:
+                    parts.append(str(item))
+            if parts:
+                return "; ".join(parts)
+        if detail is not None:
+            return str(detail)
+        return str(body)
+    if body is None or body == "":
+        return f"HTTP {status_code}"
+    return str(body)
+
+
 def _parse_json(resp: requests.Response, *, what: str) -> Any:
     """
     Parse JSON from an API response; raise CloudApiError with context on empty or non-JSON bodies.
@@ -94,7 +118,7 @@ def register(
     )
     body = _parse_json(resp, what="Register")
     if not resp.ok:
-        raise CloudApiError(str(body.get("detail") or body))
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     return body if isinstance(body, dict) else {}
 
 
@@ -109,7 +133,7 @@ def login(*, base_url: str, email: str, password: str, timeout_s: int = 20) -> C
     )
     body = _parse_json(resp, what="Login")
     if not resp.ok:
-        raise CloudApiError(str(body.get("detail") or body))
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     return CloudTokenPair(
         access_token=str(body.get("access_token") or ""),
         refresh_token=str(body.get("refresh_token") or ""),
@@ -221,10 +245,7 @@ def list_devices(*, base_url: str, access_token: str, timeout_s: int = 20) -> li
     if resp.status_code == 401:
         raise CloudApiError("Unauthorized (access token expired or invalid)")
     if not resp.ok:
-        detail: object = body
-        if isinstance(body, dict):
-            detail = body.get("detail") or body
-        raise CloudApiError(str(detail))
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     if not isinstance(body, list):
         return []
     return [x for x in body if isinstance(x, dict)]
@@ -260,6 +281,18 @@ def delete_cloud_device(
         raise CloudApiError(str(detail or body or f"HTTP {resp.status_code}"))
 
 
+def cloud_health(*, base_url: str, timeout_s: int = 8) -> dict[str, Any]:
+    """GET /health — reachability and Paystack configuration flags (no auth)."""
+    base = _norm_base(base_url)
+    if not base:
+        raise CloudApiError("Missing cloud API base URL")
+    resp = _cloud_get(f"{base}/health", timeout=timeout_s)
+    body = _parse_json(resp, what="GET /health")
+    if not resp.ok:
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
+    return body if isinstance(body, dict) else {}
+
+
 def get_entitlements(*, base_url: str, access_token: str, timeout_s: int = 20) -> dict[str, Any]:
     base = _norm_base(base_url)
     resp = _cloud_get(
@@ -271,7 +304,7 @@ def get_entitlements(*, base_url: str, access_token: str, timeout_s: int = 20) -
     if resp.status_code == 401:
         raise CloudApiError("Unauthorized (access token expired or invalid)")
     if not resp.ok:
-        raise CloudApiError(str(body.get("detail") or body))
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     return body if isinstance(body, dict) else {}
 
 
@@ -284,8 +317,10 @@ def get_billing_plans(*, base_url: str, access_token: str, timeout_s: int = 20) 
         timeout=timeout_s,
     )
     body = _parse_json(resp, what="GET /v1/billing/plans")
+    if resp.status_code == 401:
+        raise CloudApiError("Unauthorized (access token expired or invalid)")
     if not resp.ok:
-        raise CloudApiError(str(body.get("detail") or body))
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     return body if isinstance(body, dict) else {}
 
 
@@ -309,7 +344,7 @@ def paystack_initialize(
     )
     body = _parse_json(resp, what="Paystack initialize")
     if not resp.ok:
-        raise CloudApiError(str(body.get("detail") or body))
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     return body if isinstance(body, dict) else {}
 
 
@@ -330,7 +365,7 @@ def paystack_verify(
     )
     body = _parse_json(resp, what="Paystack verify")
     if not resp.ok:
-        raise CloudApiError(str(body.get("detail") or body))
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     return body if isinstance(body, dict) else {}
 
 
@@ -349,6 +384,6 @@ def paystack_subscription_manage_url(
     )
     body = _parse_json(resp, what="GET subscription manage-link")
     if not resp.ok:
-        raise CloudApiError(str(body.get("detail") or body))
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     return body if isinstance(body, dict) else {}
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from pathlib import Path
 
@@ -12,6 +13,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy import text
 
 from survyai_cloud.config import get_cloud_settings
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_sqlite_directory(url: str) -> None:
@@ -31,12 +34,22 @@ def _ensure_sqlite_directory(url: str) -> None:
 
 
 _settings = get_cloud_settings()
-_ensure_sqlite_directory(_settings.database_url)
+_db_url = _settings.sqlalchemy_async_url()
+_ensure_sqlite_directory(_db_url)
+
+def _engine_connect_args(url: str) -> dict:
+    """Fail fast when Postgres is unreachable (avoids 20s+ hangs on every API call)."""
+    if url.startswith("postgresql+asyncpg://") or url.startswith("postgresql://"):
+        return {"timeout": 10, "command_timeout": 20}
+    return {}
+
 
 engine = create_async_engine(
-    _settings.database_url,
+    _db_url,
     echo=_settings.debug,
     future=True,
+    pool_pre_ping=True,
+    connect_args=_engine_connect_args(_db_url),
 )
 
 async_session_factory = async_sessionmaker(
@@ -55,7 +68,20 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
     commit. Without an explicit ``commit()``, INSERT/UPDATE from auth and
     other routers are rolled back when the session closes, so e.g. register
     appears to succeed while login immediately fails with "Invalid email or password".
+
+    If the database was unreachable at startup, this immediately raises a 503
+    so the request fails fast instead of hanging for 10+ seconds.
     """
+    if not _database_available:
+        from fastapi import HTTPException
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"Database unavailable: {_database_detail or 'unknown error'}. "
+                "Check DATABASE_URL in .env and restart python -m survyai_cloud. "
+                "Open http://127.0.0.1:8088/health for details."
+            ),
+        )
     async with async_session_factory() as session:
         try:
             yield session
@@ -79,18 +105,150 @@ def _alembic_upgrade_head_sync() -> None:
     command.upgrade(cfg, "head")
 
 
-async def init_db() -> None:
+async def _ensure_pg_extensions(conn) -> None:
+    """
+    Idempotently create the PostgreSQL extensions required by SurvyAI.
+
+    - vector   : pgvector for ANN/semantic search
+    - postgis  : geospatial types and functions for survey coordinates
+    - pg_trgm  : trigram similarity used in hybrid keyword search
+
+    These are no-ops if the extensions are already installed, so it is safe
+    to call on every startup.  Requires the database user to have CREATE
+    privilege on the extensions (typically the database owner or a superuser).
+    If the privilege is missing the error is logged but not re-raised so the
+    application can still start in a degraded mode.
+    """
+    for ext in ("vector", "postgis", "pg_trgm"):
+        try:
+            await conn.execute(text(f"CREATE EXTENSION IF NOT EXISTS {ext}"))
+            logger.debug(f"PostgreSQL extension '{ext}' ready.")
+        except Exception as exc:
+            logger.warning(
+                f"Could not create extension '{ext}': {exc}  "
+                f"(The vector store may not function correctly – "
+                f"ensure the database user has CREATE EXTENSION privilege.)"
+            )
+
+
+_database_available: bool = True
+_database_detail: str = ""
+
+
+def is_database_available() -> tuple[bool, str]:
+    """Check the last-known DB status (set during startup and by /health probes)."""
+    return _database_available, _database_detail
+
+
+async def check_database(timeout_s: float = 5.0) -> tuple[bool, str]:
+    """
+    Lightweight connectivity probe for /health and startup logs.
+    Returns (ok, detail_message).  Also updates the module-level flag so
+    ``get_db()`` can fast-fail instead of hanging.
+    """
+    global _database_available, _database_detail
+
     settings = get_cloud_settings()
-    if settings.database_url.startswith("postgresql"):
-        if settings.run_migrations_on_startup:
-            await asyncio.to_thread(_alembic_upgrade_head_sync)
+    async_url = settings.sqlalchemy_async_url()
+    if async_url.startswith("sqlite"):
+        try:
+            async with asyncio.timeout(timeout_s):
+                async with engine.connect() as conn:
+                    await conn.execute(text("SELECT 1"))
+            _database_available, _database_detail = True, "sqlite ok"
+            return True, "sqlite ok"
+        except TimeoutError:
+            msg = f"Timed out after {timeout_s:.0f}s opening sqlite database."
+            _database_available, _database_detail = False, msg
+            return False, msg
+        except Exception as exc:
+            msg = str(exc).strip() or f"{type(exc).__name__}"
+            _database_available, _database_detail = False, msg
+            return False, msg
+
+    if not async_url.startswith("postgresql"):
+        msg = f"Unsupported database URL scheme: {async_url.split(':', 1)[0]}"
+        _database_available, _database_detail = False, msg
+        return False, msg
+
+    try:
+        async with asyncio.timeout(timeout_s):
+            async with engine.connect() as conn:
+                await conn.execute(text("SELECT 1"))
+        _database_available, _database_detail = True, "postgresql ok"
+        return True, "postgresql ok"
+    except TimeoutError:
+        msg = (
+            f"Timed out after {timeout_s:.0f}s connecting to Postgres "
+            f"(check DATABASE_URL, VPN, and that Supabase/local Docker is running)."
+        )
+        _database_available, _database_detail = False, msg
+        return False, msg
+    except Exception as exc:
+        msg = str(exc).strip() or f"{type(exc).__name__}"
+        _database_available, _database_detail = False, msg
+        return False, msg
+
+
+async def init_db() -> None:
+    """
+    Initialise the database layer.
+
+    If the database is unreachable the server still starts in *degraded mode*
+    so that ``/health`` can report the problem and the desktop app shows a
+    clear error instead of a timeout.
+    """
+    global _database_available, _database_detail
+
+    settings = get_cloud_settings()
+
+    if settings.sqlalchemy_async_url().startswith("postgresql"):
+        ok, detail = await check_database(timeout_s=12.0)
+        if ok:
+            logger.info("Database connection OK (%s).", detail)
+            try:
+                async with engine.begin() as conn:
+                    await _ensure_pg_extensions(conn)
+            except Exception as exc:
+                logger.warning("Could not ensure PG extensions: %s", exc)
+            if settings.run_migrations_on_startup:
+                try:
+                    await asyncio.to_thread(_alembic_upgrade_head_sync)
+                except Exception as exc:
+                    logger.error("Alembic migration failed: %s", exc)
+        else:
+            _database_available = False
+            _database_detail = detail
+            logger.error(
+                "╔══════════════════════════════════════════════════════════════╗\n"
+                "║  DATABASE UNREACHABLE — server starting in degraded mode   ║\n"
+                "╚══════════════════════════════════════════════════════════════╝\n"
+                "  Error: %s\n"
+                "  \n"
+                "  Sign-in, billing, devices, and all authenticated routes\n"
+                "  will return 503 until the database is reachable.\n"
+                "  \n"
+                "  ► For local dev:  docker compose up -d\n"
+                "    DATABASE_URL=postgresql://survyai:survyai@localhost:5432/survyai\n"
+                "    ASYNC_DATABASE_URL=postgresql+asyncpg://survyai:survyai@localhost:5432/survyai\n"
+                "  ► For Supabase:   confirm the project is active (not paused) at\n"
+                "    https://supabase.com/dashboard and copy the correct connection string.\n"
+                "  \n"
+                "  Restart python -m survyai_cloud after fixing .env.",
+                detail,
+            )
         return
 
     from survyai_cloud.models import Base
 
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-        await _sqlite_migrate(conn)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+            await _sqlite_migrate(conn)
+    except Exception as exc:
+        _database_available = False
+        _database_detail = str(exc).strip() or type(exc).__name__
+        logger.error("SQLite init failed — degraded mode: %s", exc)
 
 
 async def _sqlite_migrate(conn) -> None:
@@ -101,7 +259,7 @@ async def _sqlite_migrate(conn) -> None:
     when models add new nullable columns.
     """
     settings = get_cloud_settings()
-    if not settings.database_url.startswith("sqlite"):
+    if not settings.sqlalchemy_async_url().startswith("sqlite"):
         return
 
     # Users table: add columns if missing.

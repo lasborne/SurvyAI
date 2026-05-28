@@ -92,6 +92,10 @@ class User(Base):
     )
     subscription_current_period_end: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
 
+    # Added by migration 20260503_002
+    grace_period_ends_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    last_reactivation_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+
     max_devices: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
     monthly_agent_runs_quota: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     monthly_agent_runs_used: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
