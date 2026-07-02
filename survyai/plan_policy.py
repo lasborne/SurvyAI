@@ -18,7 +18,7 @@ from dataclasses import dataclass
 from typing import Literal, Sequence
 
 PlanSlug = Literal["free", "pro"]
-PlanInterval = Literal["monthly", "annual"]
+PlanInterval = Literal["daily", "weekly", "monthly", "annual"]
 
 
 @dataclass(frozen=True)
@@ -92,7 +92,22 @@ def cad_policy_for(plan_slug: str, *, interval: PlanInterval) -> CadQuotaPolicy:
     p = policy_for_plan(plan_slug)
     if p.slug == "pro" and interval == "annual" and p.cad_annual is not None:
         return p.cad_annual
-    return p.cad_monthly
+    base = p.cad_monthly
+    if p.slug == "pro" and interval == "weekly":
+        cap = max(1, base.rolling_30d_success_cap // 4)
+        return CadQuotaPolicy(
+            rolling_30d_success_cap=cap,
+            rolling_30d_cap_is_soft_warning=base.rolling_30d_cap_is_soft_warning,
+            rolling_365d_success_cap=None,
+        )
+    if p.slug == "pro" and interval == "daily":
+        cap = max(1, base.rolling_30d_success_cap // 30)
+        return CadQuotaPolicy(
+            rolling_30d_success_cap=cap,
+            rolling_30d_cap_is_soft_warning=base.rolling_30d_cap_is_soft_warning,
+            rolling_365d_success_cap=None,
+        )
+    return base
 
 
 __all__ = [

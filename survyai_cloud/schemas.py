@@ -44,7 +44,7 @@ class MeOut(BaseModel):
     monthly_agent_runs_used: int
     monthly_credits_usd: float = 0.0
     monthly_credits_used_usd: float = 0.0
-    credit_markup_multiplier: float = 1.5
+    credit_markup_multiplier: float = 2.0
     credits_billing_interval: str = "monthly"
     can_use_platform_llm: bool
     primary_llm: str
@@ -127,10 +127,27 @@ class EntitlementsOut(BaseModel):
     monthly_agent_runs_used: int
     monthly_credits_usd: float = 0.0
     monthly_credits_used_usd: float = 0.0
-    credit_markup_multiplier: float = 1.5
+    credit_markup_multiplier: float = 2.0
     credits_billing_interval: str = "monthly"
     can_use_platform_llm: bool
     primary_llm: Optional[str] = None
+
+
+class AgentConfigOut(BaseModel):
+    version: str
+    system_prompt: str
+    primary_llm: Optional[str] = None
+    fallback_llm: Optional[str] = None
+    openai_model: Optional[str] = None
+    openai_model_nano: Optional[str] = None
+    openai_model_mini: Optional[str] = None
+    openai_model_complex: Optional[str] = None
+    enable_tiered_models: Optional[bool] = None
+    gemini_model: Optional[str] = None
+    claude_model: Optional[str] = None
+    deepseek_base_url: Optional[str] = None
+    agent_temperature: Optional[float] = None
+    agent_max_tokens: Optional[int] = None
 
 
 class BootstrapOut(BaseModel):
@@ -139,6 +156,8 @@ class BootstrapOut(BaseModel):
     access_token_hint: str = Field(
         default="Use Authorization: Bearer <access_token> on API calls.",
     )
+    llm_proxy_enabled: bool = False
+    llm_proxy_path: str = "/v1/llm/chat"
     primary_llm: str
     openai_api_key: Optional[str] = None
     anthropic_api_key: Optional[str] = None
@@ -152,6 +171,7 @@ class BootstrapOut(BaseModel):
     gemini_model: Optional[str] = None
     claude_model: Optional[str] = None
     deepseek_base_url: Optional[str] = None
+    agent_config: Optional[AgentConfigOut] = None
 
 
 # --- Usage ---
@@ -159,6 +179,10 @@ class UsageEventIn(BaseModel):
     kind: str = Field(min_length=1, max_length=64)
     quantity: int = Field(default=1, ge=1)
     cost_usd: float = Field(default=0.0, ge=0.0)
+    model_name: Optional[str] = Field(default=None, max_length=200)
+    input_tokens: int = Field(default=0, ge=0)
+    output_tokens: int = Field(default=0, ge=0)
+    cached_input_tokens: int = Field(default=0, ge=0)
     meta: Optional[dict[str, Any]] = None
 
 
@@ -177,12 +201,55 @@ class UsageBatchOut(BaseModel):
 # --- Updates ---
 class UpdateManifestOut(BaseModel):
     channel: str
+    platform: str = "windows-x64"
     latest_version: str
     min_supported_version: Optional[str] = None
     download_url: Optional[str] = None
     sha256: Optional[str] = None
+    artifact_kind: str = "full-installer"
+    signature: Optional[str] = None
+    signing_scheme: Optional[str] = None
+    rollback_version: Optional[str] = None
     release_notes_url: Optional[str] = None
     mandatory: bool = False
+
+
+class LlmToolCallIn(BaseModel):
+    id: Optional[str] = None
+    name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+class LlmMessageIn(BaseModel):
+    role: str = Field(min_length=1, max_length=32)
+    content: Any = ""
+    tool_call_id: Optional[str] = None
+    name: Optional[str] = None
+    tool_calls: list[LlmToolCallIn] = Field(default_factory=list)
+
+
+class LlmProxyChatIn(BaseModel):
+    provider: Literal["openai", "claude", "gemini", "deepseek"]
+    model: Optional[str] = Field(default=None, max_length=200)
+    temperature: float = Field(default=0.3, ge=0.0, le=2.0)
+    max_tokens: int = Field(default=4096, ge=1, le=200000)
+    messages: list[LlmMessageIn]
+    tools: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class LlmToolCallOut(BaseModel):
+    id: Optional[str] = None
+    name: str
+    args: dict[str, Any] = Field(default_factory=dict)
+
+
+class LlmProxyChatOut(BaseModel):
+    provider: str
+    model: str
+    content: Any = ""
+    tool_calls: list[LlmToolCallOut] = Field(default_factory=list)
+    usage: dict[str, Any] = Field(default_factory=dict)
+    billing: dict[str, Any] = Field(default_factory=dict)
 
 
 # --- Diagnostics ---

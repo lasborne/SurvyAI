@@ -85,6 +85,7 @@ class SurvyAIAgentService:
             session_id=session_id,
             interactive_mode=interactive,
         )
+        raw = agent.finalize_query_result_dict(raw)
         return AgentRunResult.from_process_query_dict(raw)
 
     def run_task_raw(
@@ -96,12 +97,14 @@ class SurvyAIAgentService:
         interactive: bool = False,
     ) -> Dict[str, Any]:
         """Same as run_task but returns the original dict (escape hatch)."""
-        return self._get_agent().process_query(
+        agent = self._get_agent()
+        raw = agent.process_query(
             query,
             use_fallback=use_fallback_llm,
             session_id=session_id,
             interactive_mode=interactive,
         )
+        return agent.finalize_query_result_dict(raw)
 
 
 __all__ = ["SurvyAIAgentService"]

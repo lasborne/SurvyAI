@@ -1,14 +1,16 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional, Tuple
 
 from fastapi import HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from agent.runtime_config import resolve_agent_runtime_config
 from survyai_cloud.config import CloudSettings, get_cloud_settings
 from survyai_cloud.models import SubscriptionStatus, User
-from survyai_cloud.schemas import BootstrapOut, EntitlementsOut
+from survyai_cloud.schemas import AgentConfigOut, BootstrapOut, EntitlementsOut
 
 
 ACTIVE_LLM_STATUSES = frozenset(
@@ -39,9 +41,65 @@ def _pro_monthly_credit_budget_usd(settings: CloudSettings) -> float:
     return round(settings.paystack_pro_monthly_amount_ngn * settings.ngn_to_usd_rate, 4)
 
 
+def _pro_weekly_credit_budget_usd(settings: CloudSettings) -> float:
+    """Pro weekly credit pool = monthly pool ÷ 4."""
+    return round(_pro_monthly_credit_budget_usd(settings) / 4, 4)
+
+
+def _pro_daily_credit_budget_usd(settings: CloudSettings) -> float:
+    """Pro daily credit pool = monthly pool ÷ 30."""
+    return round(_pro_monthly_credit_budget_usd(settings) / 30, 4)
+
+
 def _pro_annual_credit_budget_usd(settings: CloudSettings) -> float:
     """Convert the Pro annual NGN price to a USD credit balance (full period pool)."""
     return round(settings.paystack_pro_annual_amount_ngn * settings.ngn_to_usd_rate, 4)
+
+
+def billing_interval_period_days(interval: str) -> int:
+    """Rolling billing window length for Paystack Pro intervals."""
+    key = str(interval or "monthly").strip().lower()
+    return {"daily": 1, "weekly": 7, "monthly": 30, "annual": 365}.get(key, 30)
+
+
+def subscription_period_end_from_anchor(anchor: datetime, interval: str) -> datetime:
+    """Next period end from payment anchor and billing interval."""
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    else:
+        anchor = anchor.astimezone(timezone.utc)
+    return anchor + timedelta(days=billing_interval_period_days(interval))
+
+
+def interval_from_paystack_plan_code(plan_code: str, settings: CloudSettings) -> str:
+    """Map a Paystack plan code to a SurvyAI billing interval slug."""
+    pc = (plan_code or "").strip()
+    daily_code = (settings.paystack_plan_code_pro_daily or "").strip()
+    weekly_code = (settings.paystack_plan_code_pro_weekly or "").strip()
+    monthly_code = (settings.paystack_plan_code_pro_monthly or "").strip()
+    annual_code = (settings.paystack_plan_code_pro_annual or "").strip()
+    if annual_code and pc == annual_code:
+        return "annual"
+    if monthly_code and pc == monthly_code:
+        return "monthly"
+    if weekly_code and pc == weekly_code:
+        return "weekly"
+    if daily_code and pc == daily_code:
+        return "daily"
+    return "monthly"
+
+
+def pro_agent_runs_quota_for_interval(settings: CloudSettings, interval: str) -> int:
+    """Scale the monthly agent-run cap for shorter billing intervals."""
+    base = int(settings.pro_monthly_agent_runs or 0)
+    if base <= 0:
+        return 0
+    key = str(interval or "monthly").strip().lower()
+    if key == "daily":
+        return max(1, base // 30)
+    if key == "weekly":
+        return max(1, base // 4)
+    return base
 
 
 def credit_budget_and_interval_from_paystack_payload(
@@ -58,14 +116,23 @@ def credit_budget_and_interval_from_paystack_payload(
     pl = data.get("plan")
     if isinstance(pl, dict):
         plan_code = str(pl.get("plan_code") or pl.get("code") or "").strip()
-    annual_code = (settings.paystack_plan_code_pro_annual or "").strip()
-    monthly_code = (settings.paystack_plan_code_pro_monthly or "").strip()
-    if annual_code and plan_code == annual_code:
-        interval = "annual"
-    elif monthly_code and plan_code == monthly_code:
-        interval = "monthly"
-    else:
-        interval = "monthly"
+    interval = interval_from_paystack_plan_code(plan_code, settings)
+
+    if interval == "daily":
+        return _pro_daily_credit_budget_usd(settings), interval
+    if interval == "weekly":
+        return _pro_weekly_credit_budget_usd(settings), interval
+    if interval == "annual":
+        return _pro_annual_credit_budget_usd(settings), interval
+    if interval == "monthly":
+        amount_raw = data.get("amount")
+        try:
+            if isinstance(amount_raw, (int, float)) and float(amount_raw) > 0:
+                ngn = float(amount_raw) / 100.0
+                return round(ngn * settings.ngn_to_usd_rate, 4), interval
+        except Exception:
+            pass
+        return _pro_monthly_credit_budget_usd(settings), interval
 
     amount_raw = data.get("amount")
     credit_usd: Optional[float] = None
@@ -79,8 +146,31 @@ def credit_budget_and_interval_from_paystack_payload(
 
 
 async def ensure_usage_month_rolled(user: User, db: AsyncSession) -> None:
-    """Reset monthly counters when UTC calendar month changes."""
+    """Reset usage counters when the subscriber's billing period rolls."""
+    settings = get_cloud_settings()
     now = datetime.now(timezone.utc)
+    interval = str(user.credits_billing_interval or "monthly").strip().lower()
+    if (
+        user.plan_slug == settings.pro_plan_slug
+        and interval in ("daily", "weekly")
+    ):
+        period_days = billing_interval_period_days(interval)
+        anchor = user.usage_period_anchor
+        if anchor is None:
+            user.usage_period_anchor = now
+            db.add(user)
+            return
+        if anchor.tzinfo is None:
+            anchor = anchor.replace(tzinfo=timezone.utc)
+        else:
+            anchor = anchor.astimezone(timezone.utc)
+        if now >= anchor + timedelta(days=period_days):
+            user.monthly_agent_runs_used = 0
+            user.monthly_credits_used_usd = 0.0
+            user.usage_period_anchor = now
+            db.add(user)
+        return
+
     anchor = user.usage_period_anchor
     if anchor is None:
         user.usage_period_anchor = _month_start_utc(now)
@@ -94,10 +184,29 @@ async def ensure_usage_month_rolled(user: User, db: AsyncSession) -> None:
 
 
 def can_use_platform_llm(user: User, settings: CloudSettings | None = None) -> bool:
+    return subscription_allows_platform_llm(user, settings) and has_platform_credit_remaining(
+        user, settings
+    )
+
+
+def subscription_allows_platform_llm(
+    user: User, settings: CloudSettings | None = None
+) -> bool:
     settings = settings or get_cloud_settings()
     if user.plan_slug != settings.pro_plan_slug:
         return False
     return user.subscription_status in ACTIVE_LLM_STATUSES
+
+
+def has_platform_credit_remaining(
+    user: User, settings: CloudSettings | None = None
+) -> bool:
+    _ = settings or get_cloud_settings()
+    budget = float(getattr(user, "monthly_credits_usd", 0.0) or 0.0)
+    used = float(getattr(user, "monthly_credits_used_usd", 0.0) or 0.0)
+    if budget <= 0:
+        return False
+    return used + 1e-6 < budget
 
 
 def entitlements_for_user(user: User, settings: CloudSettings | None = None) -> EntitlementsOut:
@@ -123,7 +232,26 @@ def build_bootstrap_payload(user: User, settings: CloudSettings | None = None) -
         raise HTTPException(status_code=403, detail="Active Pro subscription required for platform keys")
 
     primary = settings.platform_primary_llm
+    agent_cfg = resolve_agent_runtime_config(
+        local_config_path=str(settings.platform_agent_config_path or ""),
+        cloud_config_json=json.dumps(
+            {
+                "primary_llm": settings.platform_primary_llm,
+                "openai_model": settings.platform_openai_model,
+                "openai_model_nano": settings.platform_openai_model_nano,
+                "openai_model_mini": settings.platform_openai_model_mini,
+                "openai_model_complex": settings.platform_openai_model_complex,
+                "enable_tiered_models": settings.platform_enable_tiered_models,
+                "gemini_model": settings.platform_gemini_model,
+                "claude_model": settings.platform_claude_model,
+                "deepseek_base_url": settings.platform_deepseek_base_url,
+            }
+        ),
+    )
     out = BootstrapOut(
+        llm_proxy_enabled=True,
+        llm_proxy_path=str(settings.platform_llm_proxy_path or "/v1/llm/chat").strip()
+        or "/v1/llm/chat",
         primary_llm=primary,
         openai_model=settings.platform_openai_model,
         openai_model_nano=settings.platform_openai_model_nano,
@@ -133,23 +261,15 @@ def build_bootstrap_payload(user: User, settings: CloudSettings | None = None) -
         gemini_model=settings.platform_gemini_model,
         claude_model=settings.platform_claude_model,
         deepseek_base_url=settings.platform_deepseek_base_url,
+        agent_config=AgentConfigOut(**agent_cfg.to_payload_dict()),
     )
-    if settings.platform_openai_api_key:
-        out.openai_api_key = settings.platform_openai_api_key
-    if settings.platform_anthropic_api_key:
-        out.anthropic_api_key = settings.platform_anthropic_api_key
-    if settings.platform_google_api_key:
-        out.google_api_key = settings.platform_google_api_key
-    if settings.platform_deepseek_api_key:
-        out.deepseek_api_key = settings.platform_deepseek_api_key
-
-    if primary == "openai" and not out.openai_api_key:
+    if primary == "openai" and not settings.platform_openai_api_key.strip():
         raise HTTPException(status_code=503, detail="Server missing platform OpenAI configuration")
-    if primary == "claude" and not out.anthropic_api_key:
+    if primary == "claude" and not settings.platform_anthropic_api_key.strip():
         raise HTTPException(status_code=503, detail="Server missing platform Anthropic configuration")
-    if primary == "gemini" and not out.google_api_key:
+    if primary == "gemini" and not settings.platform_google_api_key.strip():
         raise HTTPException(status_code=503, detail="Server missing platform Google configuration")
-    if primary == "deepseek" and not out.deepseek_api_key:
+    if primary == "deepseek" and not settings.platform_deepseek_api_key.strip():
         raise HTTPException(status_code=503, detail="Server missing platform DeepSeek configuration")
 
     return out
@@ -184,17 +304,24 @@ def apply_pro_defaults(
     settings = settings or get_cloud_settings()
     user.plan_slug = settings.pro_plan_slug
     user.max_devices = settings.default_max_devices_pro
-    user.monthly_agent_runs_quota = settings.pro_monthly_agent_runs
 
     raw_interval = (credits_billing_interval or getattr(user, "credits_billing_interval", None) or "monthly")
     raw_interval = str(raw_interval).strip().lower()
-    if raw_interval not in ("monthly", "annual"):
+    if raw_interval not in ("daily", "weekly", "monthly", "annual"):
         raw_interval = "monthly"
     user.credits_billing_interval = raw_interval
+    user.monthly_agent_runs_quota = pro_agent_runs_quota_for_interval(settings, raw_interval)
 
     if credit_budget_usd is not None and float(credit_budget_usd) >= 0:
         user.monthly_credits_usd = round(float(credit_budget_usd), 4)
+        user.monthly_agent_runs_used = 0
+        user.monthly_credits_used_usd = 0.0
+        user.usage_period_anchor = datetime.now(timezone.utc)
     elif user.credits_billing_interval == "annual":
         user.monthly_credits_usd = _pro_annual_credit_budget_usd(settings)
+    elif user.credits_billing_interval == "weekly":
+        user.monthly_credits_usd = _pro_weekly_credit_budget_usd(settings)
+    elif user.credits_billing_interval == "daily":
+        user.monthly_credits_usd = _pro_daily_credit_budget_usd(settings)
     else:
         user.monthly_credits_usd = _pro_monthly_credit_budget_usd(settings)

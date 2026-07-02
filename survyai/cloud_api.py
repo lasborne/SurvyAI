@@ -308,6 +308,36 @@ def get_entitlements(*, base_url: str, access_token: str, timeout_s: int = 20) -
     return body if isinstance(body, dict) else {}
 
 
+def report_usage_batch(
+    *,
+    base_url: str,
+    access_token: str,
+    events: list[dict[str, Any]],
+    device_id: Optional[str] = None,
+    timeout_s: int = 20,
+) -> dict[str, Any]:
+    base = _norm_base(base_url)
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    did = (device_id or "").strip()
+    if did:
+        headers["X-SurvyAI-Device-Id"] = did
+    resp = _cloud_post(
+        f"{base}/v1/usage/events",
+        headers=headers,
+        json={"events": events},
+        timeout=timeout_s,
+    )
+    body = _parse_json(resp, what="POST /v1/usage/events")
+    if resp.status_code == 401:
+        raise CloudApiError("Unauthorized (access token expired or invalid)")
+    if not resp.ok:
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
+    return body if isinstance(body, dict) else {}
+
+
 def get_billing_plans(*, base_url: str, access_token: str, timeout_s: int = 20) -> dict[str, Any]:
     """GET /v1/billing/plans — Paystack plan codes configured on the server."""
     base = _norm_base(base_url)
@@ -383,6 +413,62 @@ def paystack_subscription_manage_url(
         timeout=timeout_s,
     )
     body = _parse_json(resp, what="GET subscription manage-link")
+    if not resp.ok:
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
+    return body if isinstance(body, dict) else {}
+
+
+def get_update_manifest(
+    *,
+    base_url: str,
+    current_version: str,
+    channel: str = "stable",
+    platform: str = "windows-x64",
+    timeout_s: int = 20,
+) -> dict[str, Any]:
+    base = _norm_base(base_url)
+    resp = _cloud_get(
+        f"{base}/v1/updates/manifest",
+        params={
+            "current": current_version.strip(),
+            "channel": channel.strip() or "stable",
+            "platform": platform.strip() or "windows-x64",
+        },
+        timeout=timeout_s,
+    )
+    body = _parse_json(resp, what="GET /v1/updates/manifest")
+    if not resp.ok:
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
+    return body if isinstance(body, dict) else {}
+
+
+def proxy_llm_chat(
+    *,
+    base_url: str,
+    access_token: str,
+    payload: dict[str, Any],
+    device_id: Optional[str] = None,
+    proxy_path: str = "/v1/llm/chat",
+    timeout_s: int = 120,
+) -> dict[str, Any]:
+    base = _norm_base(base_url)
+    path = "/" + str(proxy_path or "/v1/llm/chat").lstrip("/")
+    headers: dict[str, str] = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json",
+    }
+    did = (device_id or "").strip()
+    if did:
+        headers["X-SurvyAI-Device-Id"] = did
+    resp = _cloud_post(
+        f"{base}{path}",
+        headers=headers,
+        json=payload,
+        timeout=timeout_s,
+    )
+    body = _parse_json(resp, what="POST /v1/llm/chat")
+    if resp.status_code == 401:
+        raise CloudApiError("Unauthorized (access token expired or invalid)")
     if not resp.ok:
         raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     return body if isinstance(body, dict) else {}

@@ -11,6 +11,8 @@ router = APIRouter(tags=["health"])
 @router.get("/health")
 async def health() -> dict[str, object]:
     settings = get_cloud_settings()
+    daily = settings.paystack_plan_code_pro_daily.strip()
+    weekly = settings.paystack_plan_code_pro_weekly.strip()
     monthly = settings.paystack_plan_code_pro_monthly.strip()
     annual = settings.paystack_plan_code_pro_annual.strip()
     db_ok, db_detail = is_database_available()
@@ -22,5 +24,5 @@ async def health() -> dict[str, object]:
         "database_async_url_scheme": resolved.async_.split("://", 1)[0] if resolved.async_ else "",
         "database_sync_url_scheme": resolved.sync.split("://", 1)[0] if resolved.sync else "",
         "paystack_secret_configured": bool(settings.paystack_secret_key.strip()),
-        "paystack_plans_configured": bool(monthly or annual),
+        "paystack_plans_configured": bool(daily or weekly or monthly or annual),
     }

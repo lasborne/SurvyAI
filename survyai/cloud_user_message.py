@@ -162,7 +162,8 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
 
     if "no paystack plans configured" in low or "paystack_plan_code" in low:
         return (
-            "Billing plans are not set up on the cloud server. Add PAYSTACK_PLAN_CODE_PRO_MONTHLY "
+            "Billing plans are not set up on the cloud server. Add PAYSTACK_PLAN_CODE_PRO_DAILY, "
+            "PAYSTACK_PLAN_CODE_PRO_WEEKLY, PAYSTACK_PLAN_CODE_PRO_MONTHLY, "
             "and/or PAYSTACK_PLAN_CODE_PRO_ANNUAL (PLN_… codes from Paystack) to .env.cloud, "
             "then restart python -m survyai_cloud."
         )

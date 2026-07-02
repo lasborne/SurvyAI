@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "target": "windows-desktop",
+  "build_system": "pyinstaller",
+  "entrypoint": "python -m survyai.gui",
+  "bundled_resources": [
+    "README.md",
+    "agent/agent_config.json",
+    "agent/system_prompt.txt"
+  ],
+  "user_generated_not_bundled": [
+    "template_profiles/*.json (learned per-user at runtime into %APPDATA%/SurvyAI; dev profiles contain machine-specific DWG paths and must NOT ship)"
+  ],
+  "desktop_only_modules": [
+    "survyai",
+    "agent",
+    "tools",
+    "utils",
+    "config"
+  ],
+  "exclude_from_desktop_bundle": [
+    "survyai_cloud",
+    "alembic",
+    "docker-compose.yml"
+  ],
+  "optional_integrations": [
+    {
+      "id": "autocad",
+      "required_for_features": [
+        "cad_plan_generation",
+        "cad_table_editing"
+      ],
+      "installer_strategy": "detect_or_prompt_install",
+      "bundled": false
+    },
+    {
+      "id": "arcgis_pro",
+      "required_for_features": [
+        "arcgis_analysis",
+        "generated_arcpy_execution"
+      ],
+      "installer_strategy": "detect_or_prompt_install",
+      "bundled": false
+    },
+    {
+      "id": "blue_marble",
+      "required_for_features": [
+        "geographic_calculator_cmd"
+      ],
+      "installer_strategy": "detect_or_prompt_install",
+      "bundled": false
+    },
+    {
+      "id": "postgresql",
+      "required_for_features": [
+        "vector_store",
+        "semantic_memory"
+      ],
+      "installer_strategy": "external_service_connection",
+      "bundled": false
+    }
+  ]
+}

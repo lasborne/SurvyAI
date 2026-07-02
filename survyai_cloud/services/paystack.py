@@ -39,9 +39,9 @@ def _reject_amount_confused_with_plan_code(plan_code: str) -> None:
         raise PaystackError(
             "plan_code looks like a Naira amount, not a Paystack plan code. In Paystack "
             "Dashboard → Plans, copy each plan's Code (e.g. PLN_xxxxxxxxxx) into "
-            "PAYSTACK_PLAN_CODE_PRO_MONTHLY and PAYSTACK_PLAN_CODE_PRO_ANNUAL. "
-            "Put the prices only in PAYSTACK_PRO_MONTHLY_AMOUNT_NGN / "
-            "PAYSTACK_PRO_ANNUAL_AMOUNT_NGN (or rely on defaults 15000 / 162000)."
+            "PAYSTACK_PLAN_CODE_PRO_DAILY, PAYSTACK_PLAN_CODE_PRO_WEEKLY, "
+            "PAYSTACK_PLAN_CODE_PRO_MONTHLY, and PAYSTACK_PLAN_CODE_PRO_ANNUAL. "
+            "Put the prices only in PAYSTACK_PRO_*_AMOUNT_NGN (or rely on defaults)."
         )
 
 
@@ -51,20 +51,28 @@ def _amount_kobo_for_plan(settings: CloudSettings, plan_code: str) -> int:
     For NGN that is kobo (1 Naira = 100 kobo). Plan slug still selects recurring billing.
     """
     pc = (plan_code or "").strip()
+    daily = (settings.paystack_plan_code_pro_daily or "").strip()
+    weekly = (settings.paystack_plan_code_pro_weekly or "").strip()
     monthly = (settings.paystack_plan_code_pro_monthly or "").strip()
     annual = (settings.paystack_plan_code_pro_annual or "").strip()
-    if monthly and pc == monthly:
+    if daily and pc == daily:
+        ngn = int(settings.paystack_pro_daily_amount_ngn)
+    elif weekly and pc == weekly:
+        ngn = int(settings.paystack_pro_weekly_amount_ngn)
+    elif monthly and pc == monthly:
         ngn = int(settings.paystack_pro_monthly_amount_ngn)
     elif annual and pc == annual:
         ngn = int(settings.paystack_pro_annual_amount_ngn)
     else:
         raise PaystackError(
             f"Unknown plan_code {plan_code!r}; it must match "
-            "PAYSTACK_PLAN_CODE_PRO_MONTHLY or PAYSTACK_PLAN_CODE_PRO_ANNUAL on the server."
+            "PAYSTACK_PLAN_CODE_PRO_DAILY, PAYSTACK_PLAN_CODE_PRO_WEEKLY, "
+            "PAYSTACK_PLAN_CODE_PRO_MONTHLY, or PAYSTACK_PLAN_CODE_PRO_ANNUAL on the server."
         )
     if ngn <= 0:
         raise PaystackError(
-            "Configured plan amount in NGN is invalid (set PAYSTACK_PRO_MONTHLY_AMOUNT_NGN / "
+            "Configured plan amount in NGN is invalid (set PAYSTACK_PRO_DAILY_AMOUNT_NGN / "
+            "PAYSTACK_PRO_WEEKLY_AMOUNT_NGN / PAYSTACK_PRO_MONTHLY_AMOUNT_NGN / "
             "PAYSTACK_PRO_ANNUAL_AMOUNT_NGN to match your Paystack plan)."
         )
     return ngn * 100

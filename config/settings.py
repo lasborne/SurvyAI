@@ -57,6 +57,16 @@ from typing import Literal
 from pydantic_settings import BaseSettings
 from pydantic import Field
 
+from runtime_paths import is_frozen_app, user_data_path
+
+
+def _default_log_file() -> str:
+    if is_frozen_app():
+        path = user_data_path("logs", "survyai.log")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return str(path)
+    return "survyai.log"
+
 
 # ==============================================================================
 # SETTINGS CLASS
@@ -180,31 +190,31 @@ class Settings(BaseSettings):
     
     # Tiered OpenAI models for intelligent complexity-based selection
     openai_model_nano: str = Field(
-        default="gpt-5-nano",
+        default="gpt-5.4-nano",
         env="OPENAI_MODEL_NANO",
         description=(
             "OpenAI model for simple tasks (e.g., basic questions, simple lookups).\n"
-            "Default: gpt-5-nano (cost-effective for trivial tasks).\n"
+            "Default: gpt-5.4-nano (cost-effective for trivial tasks).\n"
             "If unavailable, falls back to OPENAI_MODEL or gpt-4o-mini."
         )
     )
     
     openai_model_mini: str = Field(
-        default="gpt-5-mini",
+        default="gpt-5.4-mini",
         env="OPENAI_MODEL_MINI",
         description=(
             "OpenAI model for average complexity tasks (e.g., coordinate conversions, basic calculations).\n"
-            "Default: gpt-5-mini (balanced cost and capability).\n"
+            "Default: gpt-5.4-mini (balanced cost and capability).\n"
             "If unavailable, falls back to OPENAI_MODEL or gpt-4o-mini."
         )
     )
     
     openai_model_complex: str = Field(
-        default="gpt-5.1",
+        default="gpt-5.4",
         env="OPENAI_MODEL_COMPLEX",
         description=(
             "OpenAI model for very complex tasks (e.g., multi-step analysis, complex reasoning).\n"
-            "Default: gpt-5.1 (highest capability for complex tasks).\n"
+            "Default: gpt-5.4 (highest capability for complex tasks).\n"
             "If unavailable, falls back to OPENAI_MODEL or gpt-4o."
         )
     )
@@ -247,6 +257,24 @@ class Settings(BaseSettings):
             "automatically use its own higher limit without needing to raise this value."
         )
     )
+
+    agent_config_path: str = Field(
+        default="",
+        env="AGENT_CONFIG_PATH",
+        description=(
+            "Optional local JSON config path for runtime agent behavior (prompt/model overrides).\n"
+            "If empty, SurvyAI uses agent/agent_config.json when present."
+        ),
+    )
+
+    agent_cloud_config_json: str = Field(
+        default="",
+        env="AGENT_CLOUD_CONFIG_JSON",
+        description=(
+            "Authenticated cloud-delivered JSON payload for runtime agent config.\n"
+            "Desktop injects this from /v1/bootstrap; when blank, SurvyAI falls back to local config."
+        ),
+    )
     
     agent_query_timeout: int = Field(
         default=900,
@@ -257,6 +285,15 @@ class Settings(BaseSettings):
             "If a query takes longer, it will timeout with an error message.\n"
             "Increase this for very large documents or complex multi-step tasks."
         )
+    )
+
+    llm_invoke_timeout_seconds: int = Field(
+        default=180,
+        env="LLM_INVOKE_TIMEOUT_SECONDS",
+        description=(
+            "Per-call timeout (seconds) for a single LLM invoke inside the agent graph.\n"
+            "Default: 180. File-driven workflows with many tools need more than 60s for the first step."
+        ),
     )
     
     agent_max_iterations: int = Field(
@@ -568,6 +605,50 @@ class Settings(BaseSettings):
     )
     
     # ==========================================================================
+    # Web Research / Internet Search Configuration
+    # ==========================================================================
+    # SurvyAI's internet research uses a multi-stage pipeline (query rewriting →
+    # multi-source retrieval → trust + relevance re-ranking → page reading →
+    # evidence pack + confidence). It works KEY-FREE by default (DuckDuckGo HTML +
+    # Wikipedia). For higher-quality ranked results, configure ONE search API key
+    # below; the pipeline auto-detects and prefers it, falling back to key-free
+    # providers if the call fails. These are read from the environment directly by
+    # utils.internet, so they are optional here and primarily for documentation.
+
+    tavily_api_key: str = Field(
+        default="",
+        env="TAVILY_API_KEY",
+        description="Optional Tavily Search API key for high-quality ranked web results.",
+    )
+
+    brave_search_api_key: str = Field(
+        default="",
+        env="BRAVE_SEARCH_API_KEY",
+        description="Optional Brave Search API key (alternative web search provider).",
+    )
+
+    serpapi_api_key: str = Field(
+        default="",
+        env="SERPAPI_API_KEY",
+        description="Optional SerpAPI key (Google results) for web search.",
+    )
+
+    web_research_max_sources: int = Field(
+        default=8,
+        env="WEB_RESEARCH_MAX_SOURCES",
+        description="Max ranked sources kept in the evidence pack after re-ranking.",
+    )
+
+    web_research_fetch_pages: int = Field(
+        default=4,
+        env="WEB_RESEARCH_FETCH_PAGES",
+        description=(
+            "How many top sources to actually open and read (content extraction).\n"
+            "Higher = better evidence but slightly slower/more bandwidth. 0 = snippet-only."
+        ),
+    )
+
+    # ==========================================================================
     # Context Retrieval Configuration
     # ==========================================================================
     # Controls automatic context retrieval and conversation storage.
@@ -608,6 +689,26 @@ class Settings(BaseSettings):
             "Higher values mean stricter relevance filtering."
         )
     )
+
+    cadastral_intent_assessment_enabled: bool = Field(
+        default=True,
+        env="CADASTRAL_INTENT_ASSESSMENT_ENABLED",
+        description=(
+            "When enabled, cadastral CAD plotting uses vector-store retrieval plus a "
+            "cheap LLM pass to interpret access roads, fences, and other plan extras "
+            "from varied natural-language prompts. Regex parsing remains as fallback."
+        ),
+    )
+
+    pdf_survey_replot_enabled: bool = Field(
+        default=True,
+        env="PDF_SURVEY_REPLOT_ENABLED",
+        description=(
+            "When enabled, survey plan PDF replot requests bypass the generic agent and "
+            "use layout/vision extraction plus the cadastral CAD template pipeline "
+            "(AutoCAD DWG output — not ArcGIS)."
+        ),
+    )
     
     # ==========================================================================
     # Logging Configuration
@@ -627,9 +728,9 @@ class Settings(BaseSettings):
     )
     
     log_file: str = Field(
-        default="survyai.log",
+        default_factory=_default_log_file,
         env="LOG_FILE",
-        description="File to write logs to. Relative to project root."
+        description="File to write logs to. Frozen builds default to AppData\\Roaming\\SurvyAI\\logs."
     )
     
     # ==========================================================================
@@ -654,6 +755,27 @@ class Settings(BaseSettings):
             "Optional base URL for SurvyAI cloud API (e.g. https://api.example.com). "
             "Phase 1: reserved for upcoming proxy; not yet used by the agent."
         ),
+    )
+
+    survyai_llm_proxy_enabled: bool = Field(
+        default=False,
+        env="SURVYAI_LLM_PROXY_ENABLED",
+        description=(
+            "If True, hosted LLM requests are routed through the SurvyAI cloud proxy "
+            "instead of using provider API keys on the desktop."
+        ),
+    )
+
+    survyai_llm_proxy_path: str = Field(
+        default="/v1/llm/chat",
+        env="SURVYAI_LLM_PROXY_PATH",
+        description="Relative path for the hosted LLM proxy endpoint on the SurvyAI cloud API.",
+    )
+
+    survyai_device_id: str = Field(
+        default="",
+        env="SURVYAI_DEVICE_ID",
+        description="Registered cloud device id sent with hosted LLM proxy calls for PC enforcement.",
     )
 
     # ==========================================================================
@@ -710,8 +832,13 @@ class Settings(BaseSettings):
           (e.g. CLOUD_ADMIN_API_KEY) that have not yet been promoted to named fields.
         """
         
-        # Load settings from .env file if it exists
-        env_file = ".env"
+        # Load settings from .env file if it exists.
+        # Frozen desktop builds read %APPDATA%\\SurvyAI\\.env first, then CWD .env.
+        env_file = (
+            (str(user_data_path(".env")), ".env")
+            if is_frozen_app()
+            else ".env"
+        )
         
         # Use UTF-8 encoding (supports special characters)
         env_file_encoding = "utf-8"

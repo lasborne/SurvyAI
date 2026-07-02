@@ -8,11 +8,14 @@ from __future__ import annotations
 
 from functools import lru_cache
 from typing import Literal
+from urllib.parse import urlparse
 
 from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from survyai.database_urls import ResolvedDatabaseUrls, resolve_database_urls
+
+DEFAULT_JWT_SECRET = "change-me-in-production-use-openssl-rand-hex-32"
 
 
 class CloudSettings(BaseSettings):
@@ -21,10 +24,16 @@ class CloudSettings(BaseSettings):
         env_file=(".env", ".env.cloud"),
         env_file_encoding="utf-8",
         extra="ignore",
+        populate_by_name=True,
     )
 
     app_name: str = Field(default="SurvyAI Cloud API")
     debug: bool = Field(default=False)
+    deployment_env: Literal["development", "staging", "production"] = Field(
+        default="development",
+        validation_alias=AliasChoices("SURVYAI_ENV", "APP_ENV", "ENVIRONMENT", "environment"),
+    )
+    enforce_safe_production_startup: bool = Field(default=True)
 
     # Database — see survyai/database_urls.py and .env.example
     database_url: str = Field(
@@ -74,15 +83,15 @@ class CloudSettings(BaseSettings):
 
     # Auth
     jwt_secret: str = Field(
-        default="change-me-in-production-use-openssl-rand-hex-32",
+        default=DEFAULT_JWT_SECRET,
         min_length=16,
     )
     jwt_algorithm: str = Field(default="HS256")
     access_token_expire_minutes: int = Field(
-        default=7200,
+        default=120,
         ge=5,
         le=10080,
-        description="Access JWT lifetime in minutes (default 120h). Max 7 days.",
+        description="Access JWT lifetime in minutes (default 2h). Max 7 days.",
     )
     refresh_token_expire_days: int = Field(default=30, ge=1, le=365)
     bcrypt_rounds: int = Field(default=12, ge=4, le=31)
@@ -102,6 +111,14 @@ class CloudSettings(BaseSettings):
     # Paystack (Nigeria-first)
     paystack_secret_key: str = Field(default="", description="sk_live_* or sk_test_*")
     paystack_public_key: str = Field(default="", description="pk_live_* or pk_test_* (optional for backend)")
+    paystack_plan_code_pro_daily: str = Field(
+        default="",
+        description="Plan code PLN_* for Pro daily subscriptions.",
+    )
+    paystack_plan_code_pro_weekly: str = Field(
+        default="",
+        description="Plan code PLN_* for Pro weekly subscriptions.",
+    )
     paystack_plan_code_pro_monthly: str = Field(
         default="",
         description="Plan code PLN_* for Pro monthly subscriptions.",
@@ -109,6 +126,16 @@ class CloudSettings(BaseSettings):
     paystack_plan_code_pro_annual: str = Field(
         default="",
         description="Plan code PLN_* for Pro annual subscriptions (from Paystack Dashboard).",
+    )
+    paystack_pro_daily_amount_ngn: int = Field(
+        default=1000,
+        ge=0,
+        description="Display/label only; actual charge is set on the Paystack plan (default ₦1,000/day).",
+    )
+    paystack_pro_weekly_amount_ngn: int = Field(
+        default=5000,
+        ge=0,
+        description="Display/label only; actual charge is set on the Paystack plan (default ₦5,000/week).",
     )
     paystack_pro_monthly_amount_ngn: int = Field(
         default=15000,
@@ -139,15 +166,15 @@ class CloudSettings(BaseSettings):
         description="Legacy single OpenAI model name (used when tiered models are disabled).",
     )
     platform_openai_model_nano: str = Field(
-        default="gpt-5-nano",
+        default="gpt-5.4-nano",
         description="OpenAI model for trivial tasks (desktop tiered selection).",
     )
     platform_openai_model_mini: str = Field(
-        default="gpt-5-mini",
+        default="gpt-5.4-mini",
         description="OpenAI model for normal tasks (desktop tiered selection).",
     )
     platform_openai_model_complex: str = Field(
-        default="gpt-5.1",
+        default="gpt-5.4",
         description="OpenAI model for very complex tasks (desktop tiered selection).",
     )
     platform_enable_tiered_models: bool = Field(
@@ -157,6 +184,17 @@ class CloudSettings(BaseSettings):
     platform_gemini_model: str = Field(default="gemini-2.0-flash")
     platform_claude_model: str = Field(default="claude-3-5-sonnet-20241022")
     platform_deepseek_base_url: str = Field(default="https://api.deepseek.com/v1")
+    platform_llm_proxy_path: str = Field(
+        default="/v1/llm/chat",
+        description="Relative API path used by desktop builds for hosted LLM proxy calls.",
+    )
+    platform_agent_config_path: str = Field(
+        default="./agent/agent_config.json",
+        description=(
+            "Optional JSON file served through /v1/bootstrap for runtime agent config. "
+            "Use this for production prompt/model changes without rebuilding the desktop app."
+        ),
+    )
 
     # Plans & quotas
     pro_plan_slug: str = Field(default="pro")
@@ -174,7 +212,7 @@ class CloudSettings(BaseSettings):
         ),
     )
     credit_markup_multiplier: float = Field(
-        default=1.5,
+        default=2.0,
         ge=1.0,
         description=(
             "Multiplier applied to raw LLM cost before showing it to the user. "
@@ -225,6 +263,63 @@ class CloudSettings(BaseSettings):
         if raw == "*":
             return ["*"]
         return [o.strip() for o in raw.split(",") if o.strip()]
+
+    def is_production(self) -> bool:
+        return self.deployment_env == "production"
+
+    def startup_warnings(self) -> list[str]:
+        warnings: list[str] = []
+        if self.is_production() and not self.redis_url.strip():
+            warnings.append(
+                "REDIS_URL is not configured; rate limits will be process-local only."
+            )
+        if self.is_production() and not self.admin_api_key.strip():
+            warnings.append(
+                "CLOUD_ADMIN_API_KEY is not configured; support override endpoints remain disabled."
+            )
+        return warnings
+
+    def startup_validation_errors(self) -> list[str]:
+        if not self.is_production():
+            return []
+
+        errors: list[str] = []
+        if self.debug:
+            errors.append("DEBUG must be false in production.")
+        jwt = self.jwt_secret.strip()
+        if jwt == DEFAULT_JWT_SECRET or len(jwt) < 32:
+            errors.append("JWT_SECRET must be replaced with a strong production secret (32+ chars).")
+        if "*" in self.cors_origin_list():
+            errors.append("CORS_ORIGINS cannot be '*' in production; set explicit trusted origins.")
+        async_url = self.sqlalchemy_async_url().lower()
+        if async_url.startswith("sqlite"):
+            errors.append("Production requires PostgreSQL; SQLite is not allowed for DATABASE_URL/ASYNC_DATABASE_URL.")
+        if self.access_token_expire_minutes > 1440:
+            errors.append("ACCESS_TOKEN_EXPIRE_MINUTES must be 1440 minutes (24h) or less in production.")
+        if self.platform_primary_llm == "openai" and not self.platform_openai_api_key.strip():
+            errors.append("PLATFORM_OPENAI_API_KEY is required when PLATFORM_PRIMARY_LLM=openai.")
+        if self.platform_primary_llm == "claude" and not self.platform_anthropic_api_key.strip():
+            errors.append("PLATFORM_ANTHROPIC_API_KEY is required when PLATFORM_PRIMARY_LLM=claude.")
+        if self.platform_primary_llm == "gemini" and not self.platform_google_api_key.strip():
+            errors.append("PLATFORM_GOOGLE_API_KEY is required when PLATFORM_PRIMARY_LLM=gemini.")
+        if self.platform_primary_llm == "deepseek" and not self.platform_deepseek_api_key.strip():
+            errors.append("PLATFORM_DEEPSEEK_API_KEY is required when PLATFORM_PRIMARY_LLM=deepseek.")
+        callback = self.paystack_callback_url.strip()
+        if callback and _is_local_callback_url(callback):
+            errors.append("PAYSTACK_CALLBACK_URL must not point to localhost/127.0.0.1 in production.")
+        return errors
+
+    def assert_safe_startup(self) -> None:
+        errors = self.startup_validation_errors()
+        if errors and self.enforce_safe_production_startup:
+            joined = "\n- ".join(["Unsafe production cloud configuration detected:"] + errors)
+            raise RuntimeError(joined)
+
+
+def _is_local_callback_url(url: str) -> bool:
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").strip().lower()
+    return host in {"127.0.0.1", "localhost"}
 
 
 @lru_cache

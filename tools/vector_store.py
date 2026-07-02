@@ -356,12 +356,79 @@ class VectorStore:
                 max_size=self._pool_max,
                 kwargs={"autocommit": False},
             )
-            # Validate connectivity + register pgvector adapter
+            # Validate connectivity + register pgvector adapter, then make sure
+            # the stored embedding dimension matches the active provider so we
+            # never hit "expected N dimensions, not M" on every write.
             with self._pool.connection() as conn:
                 if PGVECTOR_AVAILABLE:
                     _register_vector(conn)
+                self._ensure_schema_dimension(conn)
             logger.info("✓ PostgreSQL connection pool ready")
         return self._pool
+
+    def _ensure_schema_dimension(self, conn) -> None:
+        """Align ``vector_documents.embedding`` with the active provider's dimension.
+
+        The schema is created by Alembic at a fixed dimension (default 1536 for
+        OpenAI). When the desktop app runs with a local model (e.g.
+        ``all-MiniLM-L6-v2`` → 384), every write would otherwise fail with
+        ``expected 1536 dimensions, not 384``.  This self-healing step rewrites
+        the column (and its HNSW index) to the provider's dimension. Existing
+        embeddings of the wrong dimension are reset to NULL (content/metadata are
+        preserved); they could not be searched against the new model anyway.
+        """
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT format_type(a.atttypid, a.atttypmod)
+                    FROM pg_attribute a
+                    JOIN pg_class c ON a.attrelid = c.oid
+                    WHERE c.relname = 'vector_documents'
+                      AND a.attname = 'embedding'
+                      AND a.attnum > 0
+                      AND NOT a.attisdropped
+                    """
+                )
+                row = cur.fetchone()
+            if not row or not row[0]:
+                return  # table/column not present yet; nothing to reconcile
+
+            match = re.search(r"vector\((\d+)\)", str(row[0]))
+            current_dim = int(match.group(1)) if match else None
+            if current_dim is None or current_dim == self._expected_dim:
+                return
+
+            logger.warning(
+                "Embedding dimension mismatch: DB column is vector(%s) but the "
+                "active provider '%s' produces %s-dim vectors. Reconciling schema "
+                "to vector(%s) (existing embeddings will be reset).",
+                current_dim, self.provider_type, self._expected_dim, self._expected_dim,
+            )
+            with conn.cursor() as cur:
+                cur.execute("DROP INDEX IF EXISTS ix_vd_embedding_hnsw")
+                # Old vectors carry the wrong dimension; clear them so the column
+                # type change succeeds without an impossible cast.
+                cur.execute("UPDATE vector_documents SET embedding = NULL")
+                cur.execute(
+                    f"ALTER TABLE vector_documents "
+                    f"ALTER COLUMN embedding TYPE vector({self._expected_dim})"
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS ix_vd_embedding_hnsw "
+                    "ON vector_documents USING hnsw (embedding vector_cosine_ops) "
+                    "WITH (m = 16, ef_construction = 64)"
+                )
+            conn.commit()
+            logger.info(
+                "✓ Vector store schema reconciled to vector(%s).", self._expected_dim
+            )
+        except Exception as exc:  # never block startup on reconcile failure
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            logger.warning("⚠ Could not reconcile embedding dimension automatically: %s", exc)
 
     @contextmanager
     def _conn(self) -> Iterator[psycopg.Connection]:

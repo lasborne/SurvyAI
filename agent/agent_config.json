@@ -1,0 +1,5 @@
+{
+  "version": "local-fallback-v1",
+  "agent_temperature": 0.3,
+  "agent_max_tokens": 16384
+}

@@ -1,179 +1,98 @@
-# SurvyAI - AI Agent for Surveyors
+# SurvyAI
 
-SurvyAI is an intelligent AI agent that controls native surveying and CAD software on your computer. Using LLM reasoning (Gemini, DeepSeek, Claude, or OpenAI), it interprets your natural language requests and executes them through application APIs.
+SurvyAI is an AI assistant for land surveyors and geospatial professionals. It
+understands natural-language requests and runs real survey workflows on your
+machine — reading and analyzing documents, generating and editing AutoCAD
+cadastral plans, running coordinate and area computations, performing GIS
+analysis, and producing reports.
 
-## Key Features
+---
 
-- **AutoCAD Integration**: Opens drawings, extracts data, calculates areas using AutoCAD's native engine
-- **Natural Language Control**: Ask questions like "What is the area of the red-verged boundary?"
-- **Text Extraction**: Find owner names, titles, and annotations from drawings
-- **Coordinate Conversion**: Transform coordinates between reference systems
-- **Document Analysis**: Extract information from PDF and Word documents
-- **Excel Processing**: Read coordinate data from spreadsheets
+## Getting started
 
-## Requirements
+1. **Choose a workspace.** Use the **Workspace** bar at the top to point SurvyAI
+   at the folder that contains your project files (drawings, spreadsheets,
+   documents, CSVs). SurvyAI reads inputs from and writes outputs to this folder.
+2. **Pick how you run the AI.**
+   - **Local models (Ollama)** — free, runs entirely on your PC, no account
+     required. Best for privacy and offline use.
+   - **Hosted models** — faster, higher-quality responses. Requires signing in
+     and a credit balance (see **Billing & credits** below).
+3. **Type a request** in the console and press **Send** (or `Enter`).
+   Use `Shift+Enter` for a new line.
 
-### Software
-- **AutoCAD** (any recent version) - Required for CAD operations
-- **Python 3.10+**
-- **Windows** (for COM automation)
+---
 
-### API Keys
-- At least one of the following API keys is required:
-  - **Google Gemini** API key (for Gemini models)
-  - **DeepSeek** API key (for DeepSeek models)
-  - **Anthropic** API key (for Claude Opus/Sonnet/Haiku models)
-  - **OpenAI** API key (for GPT-4, GPT-4o, GPT-4o-Turbo, GPT-5 models)
+## What you can ask it to do
 
-## Installation
+- **CAD / cadastral plans** — "Plot a cadastral plan from `template.dwg` using
+  these coordinates…", then follow up with "add a road on the eastern boundary"
+  or "change the title to ABC Limited".
+- **Document analysis** — "Summarize `report.docx` and save the summary as a Word
+  document", or extract specific sections from large reports.
+- **Coordinate & area work** — parse coordinates, transform between systems,
+  compute areas and bearings/distances, run Bowditch adjustment.
+- **GIS analysis** — IDW surfaces, cut/fill volumes, and other ArcGIS Pro
+  workflows when ArcGIS is installed.
+- **General questions** — surveying knowledge, standards, and explanations.
 
-```bash
-# Clone and install
-git clone <repository-url>
-cd SurvyAI
-pip install -r requirements.txt
+SurvyAI answers each request on its own. If you switch to an unrelated topic, it
+will not carry over or resume the previous task.
 
-# Configure API keys
-cp .env.example .env
-# Edit .env with your API keys
-```
+---
 
-## Usage
+## Conversations
 
-### Desktop GUI (Windows)
+- Each conversation tab keeps its own history and session.
+- Use **New** to start a fresh conversation and **Delete** to remove one.
+- A task started in one conversation always returns its result to that same
+  conversation, even if you switch tabs while it runs.
 
-Requires `PySide6` (see `requirements.txt`). From the project root:
+---
 
-```bash
-python -m survyai.gui
-# or
-python -m survyai.cli gui
-# or (legacy entry)
-python -m cli gui
-```
+## Optional integrations
 
-Desktop features now include:
-- onboarding wizard
-- local sign-in/profile section
-- license/status card
-- workspace selector
-- output history
-- settings page
-- diagnostics export
-- safe mode for troubleshooting
+SurvyAI detects and uses these when they are installed; none are bundled:
 
-See [`docs/PHASE2_DESKTOP_GUI.md`](docs/PHASE2_DESKTOP_GUI.md) for architecture notes and current limitations.
+| Integration | Enables |
+|---|---|
+| **AutoCAD** | CAD plan generation and table editing |
+| **ArcGIS Pro** | GIS analysis and generated ArcPy execution |
+| **Blue Marble Geographic Calculator** | advanced coordinate transformations |
+| **Ollama** | free local LLM models (installable from inside the app) |
 
-### Command Line
+---
 
-```bash
-# Simple query
-python -m cli query "What is the history of surveying?"
+## Billing & credits
 
-# AutoCAD operations (AutoCAD must be running)
-python -m cli query "Open survey_data.dwg and calculate the area of red boundaries"
+- The **free plan** uses local models (Ollama) only — no charges.
+- **Hosted models** draw from your purchased credit balance. Usage is metered on
+  the server per request.
+- You'll see reminders as you approach your limit (at roughly 50%, 80%, and 95%).
+- When credits run out, SurvyAI automatically switches to a free local model and
+  notifies you so work can continue. Top up to resume hosted models.
 
-# Find property owner
-python -m cli query "Search for 'property of' in the drawing and tell me the owner's name"
-```
+---
 
-### Python API
+## Updates
 
-**Recommended for apps and GUI (Phase 1 service layer):**
+SurvyAI checks for updates and verifies the integrity and digital signature of
+any downloaded installer before applying it. You stay in control of when an
+update is installed.
 
-```python
-from survyai import SurvyAIAgentService, merge_settings
+---
 
-# Optional: inject keys from your login / secure store instead of only .env
-# settings = merge_settings(openai_api_key="...")
-# service = SurvyAIAgentService(settings=settings, eager_init=True)
+## Privacy & local data
 
-service = SurvyAIAgentService(eager_init=True)
-result = service.run_task("What is the history of surveying?")
-print(result.response)
-```
+- Your files stay on your machine. Local tool operations (CAD, parsing,
+  computation) run on your PC.
+- Account tokens and other secrets are stored encrypted in your Windows user
+  profile (DPAPI), not in plaintext.
+- Diagnostics exports are redacted of sensitive values before they are saved.
 
-**Low-level agent (same as before):**
+---
 
-```python
-from agent import SurvyAIAgent
+## Support
 
-agent = SurvyAIAgent()
-
-# The LLM reasons about your request and controls AutoCAD
-result = agent.process_query("""
-    Open survey_data.dwg and:
-    1. Find the property owner's name
-    2. Calculate the total area of land verged in red
-    3. Report in both metric and imperial units
-""")
-
-print(result["response"])
-```
-
-You can also pass explicit settings: `SurvyAIAgent(settings=merge_settings(...))` for desktop builds.
-
-## How It Works
-
-1. **You ask a question** in natural language
-2. **The LLM reasons** about what operations are needed
-3. **Tools execute** via AutoCAD's COM API, Excel, etc.
-4. **Results are analyzed** and returned in a clear response
-
-## Available Tools
-
-| Tool | Description |
-|------|-------------|
-| `autocad_open_drawing` | Open DWG/DXF files in AutoCAD |
-| `autocad_calculate_area` | Calculate areas of closed shapes |
-| `autocad_search_text` | Find text matching patterns |
-| `autocad_get_entities` | Get entities by type, layer, or color |
-| `excel_processor` | Extract data from Excel files |
-| `document_processor` | Parse PDF/Word documents |
-| `coordinate_converter` | Convert between coordinate systems |
-| `geographic_calculator_check` | Check if Geographic Calculator is installed |
-| `geographic_calculator_execute_job` | Execute Geographic Calculator jobs |
-
-## Interactive Permissions
-
-SurvyAI supports interactive permission requests for file operations. See [docs/PERMISSIONS.md](docs/PERMISSIONS.md) for complete documentation on:
-- How to enable interactive mode
-- When permissions are needed
-- How to respond to permission requests
-- Security and privacy information
-
-## Project Structure
-
-```
-SurvyAI/
-├── agent/agent.py          # Main AI agent with LLM integration
-├── survyai/                # Product/service layer (GUI-ready API, Phase 1)
-│   ├── agent_service.py    # SurvyAIAgentService façade
-│   ├── capabilities.py     # Windows integration detection
-│   ├── feature_flags.py    # Plan / feature toggles
-│   └── ...
-├── tools/
-│   ├── autocad_processor.py  # AutoCAD COM automation
-│   ├── excel_processor.py    # Excel file handling
-│   └── ...
-├── config/settings.py      # Configuration management
-├── cli.py                  # Command-line entry (delegates to survyai.cli)
-└── requirements.txt
-```
-
-See [docs/PHASE1_SERVICE_LAYER.md](docs/PHASE1_SERVICE_LAYER.md) for Phase 1–2 architecture (service layer + license tool filtering).
-
-### License mode (Phase 2)
-
-- **`SURVYAI_LICENSE_MODE=builder`** (default): full AutoCAD / ArcGIS / internet / vector tools for development — **free for building and testing**.
-- **`SURVYAI_LICENSE_MODE=pro`**: shipped commercial app; optional `SURVYAI_FEATURE_*=0` removes tool families (see docs).
-
-<<<<<<< HEAD
-There is **one paid product (Pro)**; billing is integrated with **Paystack** (plans + webhooks + desktop checkout).
-=======
-There is **one paid product (Pro)**; no Stripe tiers in this codebase yet.
->>>>>>> a7b8ca66d633fcc18cfb695d86c8b7d288367d37
-
-## License
-
-MIT License
+Use **Help → Documentation** in the app for this guide, **Help → Tutorial** for a
+guided walkthrough, and **Help → About** for version information.

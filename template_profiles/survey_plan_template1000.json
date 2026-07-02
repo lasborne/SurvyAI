@@ -84,6 +84,9 @@
     "TITLE",
     "text"
   ],
+  "text_heights": {
+    "plan_number": 1.2
+  },
   "tables": {
     "title_block": {
       "handle": "1171"

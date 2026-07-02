@@ -25,6 +25,7 @@ from survyai_cloud.routers import (
     devices,
     entitlements,
     health,
+    llm,
     me,
     updates,
     usage,
@@ -50,7 +51,9 @@ async def lifespan(app: FastAPI):
             "PAYSTACK_SECRET_KEY is not set — desktop billing (Subscribe to Pro) is disabled until configured."
         )
     if not (
-        settings.paystack_plan_code_pro_monthly.strip()
+        settings.paystack_plan_code_pro_daily.strip()
+        or settings.paystack_plan_code_pro_weekly.strip()
+        or settings.paystack_plan_code_pro_monthly.strip()
         or settings.paystack_plan_code_pro_annual.strip()
     ):
         logger.warning(
@@ -61,6 +64,9 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     settings = get_cloud_settings()
+    for warning in settings.startup_warnings():
+        logger.warning(warning)
+    settings.assert_safe_startup()
     app = FastAPI(
         title=settings.app_name,
         lifespan=lifespan,
@@ -109,6 +115,7 @@ def create_app() -> FastAPI:
     app.include_router(billing.router, prefix="/v1")
     app.include_router(webhooks.router, prefix="/v1")
     app.include_router(entitlements.router, prefix="/v1")
+    app.include_router(llm.router, prefix="/v1")
     app.include_router(usage.router, prefix="/v1")
     app.include_router(updates.router, prefix="/v1")
     app.include_router(diagnostics.router, prefix="/v1")

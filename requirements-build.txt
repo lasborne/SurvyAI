@@ -1,0 +1,9 @@
+# Build-time only dependencies for packaging the SurvyAI desktop installer.
+# Install alongside requirements.txt on the build machine:
+#     pip install -r requirements.txt -r requirements-build.txt
+#
+# The Windows installer itself is produced by Inno Setup (ISCC.exe), which is a
+# separate native tool: https://jrsoftware.org/isdl.php
+
+pyinstaller>=6.3.0
+pyinstaller-hooks-contrib>=2024.1

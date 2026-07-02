@@ -11,7 +11,12 @@ from survyai_cloud.deps import device_from_header
 from survyai_cloud.models import Device, UsageEvent, User
 from survyai_cloud.rate_limiting import rate_limit_user_dependency
 from survyai_cloud.schemas import UsageBatchIn, UsageBatchOut
-from survyai_cloud.services.entitlements import can_use_platform_llm, ensure_usage_month_rolled
+from survyai_cloud.services.entitlements import (
+    can_use_platform_llm,
+    ensure_usage_month_rolled,
+    subscription_allows_platform_llm,
+)
+from utils.cost_estimator import estimate_token_cost_usd
 
 router = APIRouter(prefix="/usage", tags=["usage"])
 
@@ -36,9 +41,36 @@ async def ingest_usage(
     await ensure_usage_month_rolled(user, db)
 
     agent_run_delta = sum(e.quantity for e in body.events if e.kind == "agent_run")
-    batch_cost_usd = sum(e.cost_usd for e in body.events)
+    hosted_llm_allowed = subscription_allows_platform_llm(user, settings)
+    computed_events: list[tuple[object, float, dict]] = []
+    batch_cost_usd = 0.0
 
-    if agent_run_delta and can_use_platform_llm(user, settings):
+    for ev in body.events:
+        meta = dict(ev.meta or {})
+        computed_cost_usd = float(ev.cost_usd or 0.0)
+        if ev.kind == "agent_run" and ev.model_name:
+            computed_cost_usd = round(
+                estimate_token_cost_usd(
+                    ev.model_name,
+                    ev.input_tokens,
+                    ev.output_tokens,
+                    cached_input_tokens=ev.cached_input_tokens,
+                ),
+                6,
+            )
+            meta["billing_basis"] = "server_computed_tokens"
+            meta["model_name"] = ev.model_name
+            meta["input_tokens"] = int(ev.input_tokens)
+            meta["output_tokens"] = int(ev.output_tokens)
+            meta["cached_input_tokens"] = int(ev.cached_input_tokens)
+            if float(ev.cost_usd or 0.0) > 0:
+                meta["client_cost_usd"] = round(float(ev.cost_usd), 6)
+        else:
+            meta["billing_basis"] = "client_cost_usd"
+        batch_cost_usd += computed_cost_usd
+        computed_events.append((ev, computed_cost_usd, meta))
+
+    if agent_run_delta and hosted_llm_allowed:
         if device is None:
             raise HTTPException(
                 status_code=status.HTTP_403_FORBIDDEN,
@@ -54,27 +86,33 @@ async def ingest_usage(
                 detail="Monthly agent run quota exceeded",
             )
 
+    if batch_cost_usd > 0 and not can_use_platform_llm(user, settings):
+        raise HTTPException(
+            status_code=402,
+            detail="Subscription API credit balance exhausted for this period",
+        )
+
     dev_id = device.id if device is not None else None
-    for ev in body.events:
+    for ev, computed_cost_usd, meta in computed_events:
         db.add(
             UsageEvent(
                 user_id=user.id,
                 kind=ev.kind,
                 quantity=ev.quantity,
-                cost_usd=ev.cost_usd,
-                meta=ev.meta,
+                cost_usd=computed_cost_usd,
+                meta=meta,
                 device_id=dev_id,
             )
         )
 
-    if agent_run_delta and can_use_platform_llm(user, settings):
+    if agent_run_delta and hosted_llm_allowed:
         user.monthly_agent_runs_used += agent_run_delta
         db.add(user)
 
     if batch_cost_usd > 0:
         marked_up = batch_cost_usd * settings.credit_markup_multiplier
         if (
-            can_use_platform_llm(user, settings)
+            hosted_llm_allowed
             and user.monthly_credits_usd > 0
             and user.monthly_credits_used_usd + marked_up > user.monthly_credits_usd + 1e-6
         ):

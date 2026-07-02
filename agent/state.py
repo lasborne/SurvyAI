@@ -9,6 +9,25 @@ from langchain_core.messages import BaseMessage
 from pydantic import BaseModel, Field
 
 
+class PromptActionAssessment(BaseModel):
+    """Deterministic assessment of what a user prompt needs — decided BEFORE the LLM runs."""
+
+    kind: Literal[
+        "permission_affirm",
+        "permission_deny",
+        "current_fact_lookup",
+        "general_knowledge",
+        "file_task",
+        "continuation",
+        "other",
+    ] = "other"
+    effective_query: str = ""
+    needs_internet: bool = False
+    internet_search_query: Optional[str] = None
+    min_complexity: Literal["simple", "average", "complex"] = "simple"
+    reason: str = ""
+
+
 class RAGRouteDecision(BaseModel):
     """
     Routing decision for Agentic RAG:

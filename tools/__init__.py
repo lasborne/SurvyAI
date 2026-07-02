@@ -61,25 +61,8 @@ HOW TOOLS WORK WITH LANGGRAPH:
 
 ADDING NEW TOOLS:
 -----------------
-To add a new tool:
-1. Create a new module in this directory (e.g., gps_processor.py)
-2. Implement a class with methods for each operation
-3. Import it in this __init__.py file
-4. Add it to __all__
-5. Create corresponding StructuredTools in agent.py
-
-Example:
-    ```python
-    # tools/gps_processor.py
-    class GPSProcessor:
-        def read_gpx_file(self, file_path: str) -> Dict[str, Any]:
-            \"\"\"Read a GPX file and extract waypoints.\"\"\"
-            ...
-    
-    # tools/__init__.py
-    from tools.gps_processor import GPSProcessor
-    __all__ = [..., "GPSProcessor"]
-    ```
+Create a module in this directory, implement a processor class, import it here,
+add it to __all__, and register StructuredTools in agent.py.
 
 Author: SurvyAI Team
 License: MIT

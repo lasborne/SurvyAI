@@ -203,6 +203,8 @@ class AutoCADProcessor:
         
         # Connection state tracking
         self._connected = False
+        # When set, COM operations prefer re-activating this drawing (cadastral pipeline output).
+        self._workflow_doc_path: Optional[str] = None
         
         # Optionally connect immediately
         if auto_connect:
@@ -855,13 +857,14 @@ class AutoCADProcessor:
             Some commands require additional input (like picking points).
             These interactive commands may not work well through this method.
         """
-        if not self._ensure_active_document():
+        if not self.ensure_workflow_document():
             return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
         
         try:
-            # SendCommand sends the command string to AutoCAD
-            # The newline (\n) is like pressing Enter
-            self.doc.SendCommand(command + "\n")
+            def _send() -> None:
+                self.doc.SendCommand(command + "\n")
+
+            self._com_retry(_send, attempts=8, base_sleep=0.25)
             
             # Wait for command to complete
             time.sleep(0.3)
@@ -876,6 +879,95 @@ class AutoCADProcessor:
             logger.error(f"Command execution failed: {e}")
             return {"success": False, "error": str(e)}
     
+    def set_workflow_document(self, file_path: Optional[str]) -> None:
+        """Pin the drawing SurvyAI is automating so COM calls stay on the correct tab."""
+        if not file_path:
+            self._workflow_doc_path = None
+            return
+        try:
+            self._workflow_doc_path = str(Path(file_path).resolve())
+        except Exception:
+            self._workflow_doc_path = str(file_path)
+
+    def _com_retry(self, fn, attempts: int = 10, base_sleep: float = 0.2):
+        """Retry COM calls rejected while AutoCAD is busy or the user is interacting."""
+        try:
+            import pywintypes  # type: ignore
+        except Exception:
+            pywintypes = None
+        last = None
+        for k in range(max(1, int(attempts))):
+            try:
+                return fn()
+            except Exception as ex:
+                last = ex
+                retryable = False
+                try:
+                    if pywintypes is not None and isinstance(ex, pywintypes.com_error):
+                        hr = int(ex.hresult) if hasattr(ex, "hresult") else None
+                        if hr == -2147418111:
+                            retryable = True
+                except Exception:
+                    pass
+                try:
+                    if isinstance(ex, AttributeError) and any(
+                        s in str(ex) for s in (".Open", ".Count", ".Item", ".SendCommand")
+                    ):
+                        retryable = True
+                except Exception:
+                    pass
+                if retryable or k + 1 < attempts:
+                    time.sleep(base_sleep * (k + 1))
+                    continue
+                break
+        raise last if last is not None else Exception("COM retry failed")
+
+    def quiesce_autocad(self, *, esc_count: int = 2) -> None:
+        """Best-effort cancel of in-progress AutoCAD commands before automation."""
+        if not self._connected or not self.acad:
+            return
+        for _ in range(max(1, int(esc_count))):
+            try:
+                doc = self.doc or getattr(self.acad, "ActiveDocument", None)
+                if doc is not None:
+                    self._com_retry(lambda: doc.SendCommand("\x1b"), attempts=3, base_sleep=0.08)
+            except Exception:
+                pass
+            time.sleep(0.05)
+
+    def ensure_workflow_document(self) -> bool:
+        """
+        Re-activate the pinned workflow drawing and quiesce stray commands.
+
+        Returns True when a usable document is ready for COM edits.
+        """
+        if not self._connected or not self.acad:
+            if not self.connect():
+                return False
+        self.quiesce_autocad()
+        if self._workflow_doc_path:
+            try:
+                want = Path(self._workflow_doc_path).resolve()
+                cur = None
+                try:
+                    cur_raw = getattr(self.doc, "FullName", None) if self.doc else None
+                    if cur_raw:
+                        cur = Path(str(cur_raw)).resolve()
+                except Exception:
+                    cur = None
+                if cur != want:
+                    opened = self.open_drawing(str(want), read_only=False)
+                    if not opened.get("success"):
+                        logger.warning(
+                            "ensure_workflow_document: could not activate %s: %s",
+                            want,
+                            opened.get("error"),
+                        )
+                self.quiesce_autocad()
+            except Exception as e:
+                logger.debug("ensure_workflow_document: %s", e)
+        return self._ensure_active_document()
+
     # ==========================================================================
     # TEXT EXTRACTION
     # ==========================================================================
@@ -898,6 +990,32 @@ class AutoCADProcessor:
             if not self.connect():
                 logger.warning("Could not connect to AutoCAD")
                 return False
+
+        # Prefer the pinned workflow drawing when the user switched tabs mid-pipeline.
+        if self._workflow_doc_path:
+            try:
+                want = Path(self._workflow_doc_path).resolve()
+                active_ok = False
+                try:
+                    if self.doc:
+                        ap = Path(str(getattr(self.doc, "FullName", "") or "")).resolve()
+                        active_ok = ap == want
+                except Exception:
+                    active_ok = False
+                if not active_ok:
+                    for i in range(self.acad.Documents.Count):
+                        try:
+                            doc = self.acad.Documents.Item(i)
+                            dp = Path(str(getattr(doc, "FullName", "") or "")).resolve()
+                            if dp == want:
+                                self._com_retry(lambda d=doc: d.Activate(), attempts=6)
+                                self.doc = doc
+                                time.sleep(0.12)
+                                break
+                        except Exception:
+                            continue
+            except Exception as e:
+                logger.debug("Workflow document re-activation skipped: %s", e)
         
         # Verify connection is still valid
         try:
@@ -1916,8 +2034,147 @@ class AutoCADProcessor:
 
     def set_table_cell_text(self, handle: str, row: int, col: int, text: str) -> Dict[str, Any]:
         """Set text for a TABLE cell by handle."""
-        if not self._ensure_active_document():
+        if not self.ensure_workflow_document():
             return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
+        try:
+            def _do() -> Dict[str, Any]:
+                modelspace = self.doc.ModelSpace
+                target = None
+                for i in range(modelspace.Count):
+                    e = modelspace.Item(i)
+                    if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                        target = e
+                        break
+                if target is None:
+                    return {"success": False, "error": f"TABLE with handle {handle} not found"}
+                target.SetText(int(row), int(col), str(text))
+                return {"success": True, "handle": handle, "row": int(row), "col": int(col), "text": str(text)}
+
+            return self._com_retry(_do, attempts=8)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def set_table_cell_text_height(
+        self, handle: str, row: int, col: int, height: float
+    ) -> Dict[str, Any]:
+        """Set the text height for one TABLE cell."""
+        if not self.ensure_workflow_document():
+            return {"success": False, "error": "No active document."}
+        try:
+            def _do() -> Dict[str, Any]:
+                modelspace = self.doc.ModelSpace
+                target = None
+                for i in range(modelspace.Count):
+                    e = modelspace.Item(i)
+                    if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                        target = e
+                        break
+                if target is None:
+                    return {"success": False, "error": f"TABLE with handle {handle} not found"}
+                err = None
+                for method in ("SetCellTextHeight", "SetTextHeight"):
+                    try:
+                        getattr(target, method)(int(row), int(col), float(height))
+                        err = None
+                        break
+                    except Exception as ex:
+                        err = ex
+                        continue
+                if err is not None:
+                    return {"success": False, "error": f"Could not set text height ({row},{col}): {err}"}
+                return {
+                    "success": True,
+                    "handle": handle,
+                    "row": int(row),
+                    "col": int(col),
+                    "height": float(height),
+                }
+
+            return self._com_retry(_do, attempts=8)
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_table_cell_text_height(
+        self, handle: str, row: int, col: int
+    ) -> Dict[str, Any]:
+        """Read the text height for one TABLE cell."""
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document.", "height": 0.0}
+        try:
+            modelspace = self.doc.ModelSpace
+            target = None
+            for i in range(modelspace.Count):
+                e = modelspace.Item(i)
+                if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                    target = e
+                    break
+            if target is None:
+                return {"success": False, "error": f"TABLE with handle {handle} not found", "height": 0.0}
+            err = None
+            height = 0.0
+            for method in ("GetCellTextHeight", "GetTextHeight"):
+                try:
+                    height = float(getattr(target, method)(int(row), int(col)))
+                    err = None
+                    break
+                except Exception as ex:
+                    err = ex
+                    continue
+            if err is not None:
+                return {"success": False, "error": f"Could not read text height ({row},{col}): {err}", "height": 0.0}
+            return {
+                "success": True,
+                "handle": handle,
+                "row": int(row),
+                "col": int(col),
+                "height": float(height),
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "height": 0.0}
+
+    def get_table_cell_text_style(
+        self, handle: str, row: int, col: int
+    ) -> Dict[str, Any]:
+        """Read the text style name for one TABLE cell."""
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document.", "style": ""}
+        try:
+            modelspace = self.doc.ModelSpace
+            target = None
+            for i in range(modelspace.Count):
+                e = modelspace.Item(i)
+                if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                    target = e
+                    break
+            if target is None:
+                return {"success": False, "error": f"TABLE with handle {handle} not found", "style": ""}
+            style = ""
+            for method in ("GetCellTextStyle", "GetTextStyle"):
+                try:
+                    style = str(getattr(target, method)(int(row), int(col)) or "")
+                    if style:
+                        break
+                except Exception:
+                    continue
+            return {
+                "success": True,
+                "handle": handle,
+                "row": int(row),
+                "col": int(col),
+                "style": style,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e), "style": ""}
+
+    def set_table_cell_text_style(
+        self, handle: str, row: int, col: int, style_name: str
+    ) -> Dict[str, Any]:
+        """Set the text style name for one TABLE cell."""
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document."}
+        style_name = str(style_name or "").strip()
+        if not style_name:
+            return {"success": False, "error": "style_name is empty"}
         try:
             modelspace = self.doc.ModelSpace
             target = None
@@ -1928,13 +2185,49 @@ class AutoCADProcessor:
                     break
             if target is None:
                 return {"success": False, "error": f"TABLE with handle {handle} not found"}
+            err = None
+            for method in ("SetCellTextStyle", "SetTextStyle"):
+                try:
+                    getattr(target, method)(int(row), int(col), style_name)
+                    err = None
+                    break
+                except Exception as ex:
+                    err = ex
+                    continue
+            if err is not None:
+                return {"success": False, "error": f"Could not set text style ({row},{col}): {err}"}
+            return {
+                "success": True,
+                "handle": handle,
+                "row": int(row),
+                "col": int(col),
+                "style": style_name,
+            }
+        except Exception as e:
+            return {"success": False, "error": str(e)}
 
+    def recompute_table(self, handle: str) -> Dict[str, Any]:
+        """Force a TABLE to recompute layout after cell edits."""
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document."}
+        try:
+            modelspace = self.doc.ModelSpace
+            target = None
+            for i in range(modelspace.Count):
+                e = modelspace.Item(i)
+                if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                    target = e
+                    break
+            if target is None:
+                return {"success": False, "error": f"TABLE with handle {handle} not found"}
             try:
-                target.SetText(int(row), int(col), str(text))
-            except Exception as ex:
-                return {"success": False, "error": f"Could not set cell ({row},{col}): {ex}"}
-
-            return {"success": True, "handle": handle, "row": int(row), "col": int(col), "text": str(text)}
+                target.RecomputeTableBlock(True)
+            except Exception:
+                try:
+                    target.RecomputeTableBlock()
+                except Exception as ex:
+                    return {"success": False, "error": str(ex)}
+            return {"success": True, "handle": handle}
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -1966,10 +2259,18 @@ class AutoCADProcessor:
                 return {"success": False, "error": f"TABLE with handle {handle} not found", "line_step": 0.0}
 
             r, c = int(row), int(col)
-            try:
-                text_height = float(target.GetTextHeight(r, c))
-            except Exception as ex:
-                return {"success": False, "error": f"Could not read text height: {ex}", "line_step": 0.0}
+            err = None
+            text_height = 0.0
+            for method in ("GetCellTextHeight", "GetTextHeight"):
+                try:
+                    text_height = float(getattr(target, method)(r, c))
+                    err = None
+                    break
+                except Exception as ex:
+                    err = ex
+                    continue
+            if err is not None:
+                return {"success": False, "error": f"Could not read text height: {err}", "line_step": 0.0}
 
             line_spacing_factor = 1.0
             for method in ("GetTextLineSpacingFactor",):
@@ -2152,7 +2453,10 @@ class AutoCADProcessor:
             clearance = gap
             if clearance is None:
                 try:
-                    th = float(target.GetTextHeight(int(scale_label_row), int(scale_label_col)))
+                    th_res = self.get_table_cell_text_height(
+                        title_table_handle, int(scale_label_row), int(scale_label_col)
+                    )
+                    th = float(th_res.get("height") or 0.0) if th_res.get("success") else 0.0
                     clearance = max(0.25, 0.12 * th)
                 except Exception:
                     clearance = 0.5
@@ -2315,7 +2619,7 @@ class AutoCADProcessor:
 
     def delete_entities(self, layer: str, entity_object_names: Optional[List[str]] = None) -> Dict[str, Any]:
         """Delete entities in ModelSpace on a given layer. Retries once on COM hiccups."""
-        if not self._ensure_active_document():
+        if not self.ensure_workflow_document():
             return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
 
         def _do_delete() -> Dict[str, Any]:
@@ -2593,7 +2897,7 @@ class AutoCADProcessor:
         rotation_rad: float = 0.0,
     ) -> Dict[str, Any]:
         """Insert a block reference into ModelSpace."""
-        if not self._ensure_active_document():
+        if not self.ensure_workflow_document():
             return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
         try:
             import pythoncom
@@ -2856,7 +3160,7 @@ class AutoCADProcessor:
         Scale all ModelSpace entities on the given layers by scale_factor about (base_x, base_y).
         Uses AutoCAD COM ScaleEntity; best-effort across entity types.
         """
-        if not self._ensure_active_document():
+        if not self.ensure_workflow_document():
             return {"success": False, "error": "No active document. Please open a drawing first using autocad_open_drawing."}
         if not layers or float(scale_factor) <= 0.0:
             return {"success": False, "error": "layers must be non-empty and scale_factor must be positive"}
@@ -2864,35 +3168,41 @@ class AutoCADProcessor:
             import pythoncom
             import win32com.client
 
-            ms = self.doc.ModelSpace
-            want = {str(l).upper() for l in layers}
-            base_pt = win32com.client.VARIANT(pythoncom.VT_ARRAY | pythoncom.VT_R8, (float(base_x), float(base_y), 0.0))
-            sf = float(scale_factor)
-            scaled = 0
-            for i in range(ms.Count):
-                try:
-                    e = ms.Item(i)
-                    if str(getattr(e, "Layer", "")).upper() not in want:
-                        continue
+            def _do() -> Dict[str, Any]:
+                ms = self.doc.ModelSpace
+                want = {str(l).upper() for l in layers}
+                base_pt = win32com.client.VARIANT(
+                    pythoncom.VT_ARRAY | pythoncom.VT_R8,
+                    (float(base_x), float(base_y), 0.0),
+                )
+                sf = float(scale_factor)
+                scaled = 0
+                for i in range(ms.Count):
                     try:
-                        e.ScaleEntity(base_pt, sf)
-                        scaled += 1
-                    except Exception:
+                        e = ms.Item(i)
+                        if str(getattr(e, "Layer", "")).upper() not in want:
+                            continue
                         try:
-                            e.ScaleEntity((float(base_x), float(base_y), 0.0), sf)
+                            e.ScaleEntity(base_pt, sf)
                             scaled += 1
                         except Exception:
-                            continue
-                except Exception:
-                    continue
-            return {
-                "success": True,
-                "base_x": float(base_x),
-                "base_y": float(base_y),
-                "scale_factor": sf,
-                "layers": list(want),
-                "scaled_entities": scaled,
-            }
+                            try:
+                                e.ScaleEntity((float(base_x), float(base_y), 0.0), sf)
+                                scaled += 1
+                            except Exception:
+                                continue
+                    except Exception:
+                        continue
+                return {
+                    "success": True,
+                    "base_x": float(base_x),
+                    "base_y": float(base_y),
+                    "scale_factor": sf,
+                    "layers": list(want),
+                    "scaled_entities": scaled,
+                }
+
+            return self._com_retry(_do, attempts=6, base_sleep=0.25)
         except Exception as e:
             return {"success": False, "error": str(e)}
 

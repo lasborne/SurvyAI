@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from survyai.device_identity import compute_machine_fingerprint
+from survyai.gui.secret_store import DesktopSecretStore
 
 
 def _utc_now() -> str:
@@ -113,10 +114,10 @@ class DesktopState:
     # Credits accounting (synced from cloud entitlements / usage)
     monthly_credits_usd: float = 0.0
     monthly_credits_used_usd: float = 0.0
-    credit_markup_multiplier: float = 1.5
+    credit_markup_multiplier: float = 2.0
     # Pro platform keys (server decides); used client-side to gate paid LLM when credits hit zero.
     can_use_platform_llm: bool = False
-    credits_billing_interval: str = ""  # "monthly" | "annual" from cloud (display + UX)
+    credits_billing_interval: str = ""  # "daily" | "weekly" | "monthly" | "annual" from cloud
     # Soft credit-usage reminders (console strip); reset when budget/period changes (see main_window).
     credit_banner_anchor_budget_usd: float = -1.0
     credit_banner_anchor_used_usd: float = -1.0
@@ -162,7 +163,7 @@ class DesktopState:
             theme=str(raw.get("theme", "light") or "light"),
             monthly_credits_usd=float(raw.get("monthly_credits_usd", 0.0)),
             monthly_credits_used_usd=float(raw.get("monthly_credits_used_usd", 0.0)),
-            credit_markup_multiplier=float(raw.get("credit_markup_multiplier", 1.5)),
+            credit_markup_multiplier=float(raw.get("credit_markup_multiplier", 2.0)),
             can_use_platform_llm=bool(raw.get("can_use_platform_llm", False)),
             credits_billing_interval=str(raw.get("credits_billing_interval", "") or ""),
             credit_banner_anchor_budget_usd=float(raw.get("credit_banner_anchor_budget_usd", -1.0)),
@@ -223,6 +224,7 @@ class AppStateStore:
         self.app_dir = Path(app_dir) if app_dir is not None else _default_app_dir()
         self.app_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.app_dir / "desktop_state.json"
+        self.secret_store = DesktopSecretStore(self.app_dir)
         self.default_data_dir = self.app_dir / "data"
         self.default_data_dir.mkdir(parents=True, exist_ok=True)
 
@@ -230,6 +232,7 @@ class AppStateStore:
         return str(Path.cwd())
 
     def load(self) -> DesktopState:
+        raw_data: Dict[str, Any] = {}
         if not self.state_path.is_file():
             state = DesktopState(
                 workspace_path=self.default_workspace_path(),
@@ -239,24 +242,91 @@ class AppStateStore:
             return state
         try:
             raw = json.loads(self.state_path.read_text(encoding="utf-8"))
-            state = DesktopState.from_dict(raw if isinstance(raw, dict) else {})
+            raw_data = raw if isinstance(raw, dict) else {}
+            state = DesktopState.from_dict(raw_data)
         except Exception:
             state = DesktopState()
+        self._hydrate_secrets(state, raw_data)
         if not state.workspace_path:
             state.workspace_path = self.default_workspace_path()
         if not state.data_folder:
             state.data_folder = str(self.default_data_dir)
         Path(state.data_folder).mkdir(parents=True, exist_ok=True)
         self.ensure_conversations(state)
+        if self._legacy_sensitive_fields_present(raw_data):
+            self.save(state)
         return state
+
+    def _legacy_sensitive_fields_present(self, raw_state: Dict[str, Any]) -> bool:
+        return any(
+            [
+                str(raw_state.get("cloud_access_token") or "").strip(),
+                str(raw_state.get("cloud_refresh_token") or "").strip(),
+                str(raw_state.get("cloud_access_token_expires_at") or "").strip(),
+                isinstance(raw_state.get("cloud_bootstrap"), dict)
+                and bool(raw_state.get("cloud_bootstrap")),
+            ]
+        )
 
     def save(self, state: DesktopState) -> None:
         if state.data_folder:
             Path(state.data_folder).mkdir(parents=True, exist_ok=True)
+        self.secret_store.save(self._secret_payload(state))
         self.state_path.write_text(
-            json.dumps(state.to_dict(), indent=2, ensure_ascii=True),
+            json.dumps(self._public_state_dict(state), indent=2, ensure_ascii=True),
             encoding="utf-8",
         )
+
+    def _public_state_dict(self, state: DesktopState) -> Dict[str, Any]:
+        data = asdict(state)
+        data["cloud_access_token"] = ""
+        data["cloud_refresh_token"] = ""
+        data["cloud_access_token_expires_at"] = ""
+        data["cloud_bootstrap"] = {}
+        return data
+
+    def _secret_payload(self, state: DesktopState) -> Dict[str, Any]:
+        return {
+            "cloud_access_token": state.cloud_access_token.strip(),
+            "cloud_refresh_token": state.cloud_refresh_token.strip(),
+            "cloud_access_token_expires_at": state.cloud_access_token_expires_at.strip(),
+            "cloud_bootstrap": state.cloud_bootstrap if isinstance(state.cloud_bootstrap, dict) else {},
+        }
+
+    def _hydrate_secrets(self, state: DesktopState, raw_state: Dict[str, Any]) -> None:
+        secrets = self.secret_store.load()
+        state.cloud_access_token = str(
+            secrets.get("cloud_access_token")
+            or raw_state.get("cloud_access_token")
+            or state.cloud_access_token
+            or ""
+        )
+        state.cloud_refresh_token = str(
+            secrets.get("cloud_refresh_token")
+            or raw_state.get("cloud_refresh_token")
+            or state.cloud_refresh_token
+            or ""
+        )
+        state.cloud_access_token_expires_at = str(
+            secrets.get("cloud_access_token_expires_at")
+            or raw_state.get("cloud_access_token_expires_at")
+            or state.cloud_access_token_expires_at
+            or ""
+        )
+        cloud_bootstrap = secrets.get("cloud_bootstrap")
+        if not isinstance(cloud_bootstrap, dict):
+            cloud_bootstrap = raw_state.get("cloud_bootstrap")
+        state.cloud_bootstrap = cloud_bootstrap if isinstance(cloud_bootstrap, dict) else {}
+
+    def exportable_state_snapshot(self, state: DesktopState) -> Dict[str, Any]:
+        data = self._public_state_dict(state)
+        data["profile"] = {
+            "display_name": state.profile.display_name,
+            "email": state.profile.email,
+            "company": state.profile.company,
+            "signed_in_at": state.profile.signed_in_at,
+        }
+        return data
 
     def ensure_conversations(self, state: DesktopState) -> Conversation:
         if state.conversations:
@@ -399,6 +469,8 @@ class AppStateStore:
             "monthly_credits_used_usd": state.monthly_credits_used_usd,
             "can_use_platform_llm": state.can_use_platform_llm,
             "credits_billing_interval": state.credits_billing_interval,
+            "secret_storage_enabled": bool(self.secret_store.secret_path.exists() or os.name == "nt"),
+            "secret_storage_path": str(self.secret_store.secret_path),
             "machine_fingerprint_sha256": compute_machine_fingerprint(),
             "history_count": len(state.output_history),
             "conversation_count": len(state.conversations),

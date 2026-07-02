@@ -91,7 +91,8 @@
     "text"
   ],
   "text_heights": {
-    "bearing_dist_road": 1.1999999999999997
+    "bearing_dist_road": 1.1999999999999997,
+    "plan_number": 1.2
   },
   "tables": {
     "title_block": {

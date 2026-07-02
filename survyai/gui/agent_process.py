@@ -1,0 +1,268 @@
+"""
+Persistent, warm agent worker process for the SurvyAI desktop GUI.
+
+Why this exists
+---------------
+The agent is *extremely* expensive to construct: building one ``SurvyAIAgent``
+imports the full dependency tree (LangChain, LangGraph, GeoPandas, ezdxf,
+sentence-transformers, …), loads a local embedding model, initialises the
+primary + fallback LLMs, creates every tool, and builds/compiles the LangGraph.
+On Windows this easily costs ~30-45 seconds.
+
+The previous design spawned a *brand new* Python process — and therefore paid
+that entire cold-start cost — on **every single prompt**. That is the dominant
+source of the "it takes ~45s before anything happens" latency.
+
+This module keeps **one** worker process alive for the lifetime of the app. The
+heavy agent is built **once** and then reused for every prompt, so steady-state
+latency collapses to just the real LLM round-trip. Cancellation terminates the
+process (a rare event); the next prompt transparently respawns + re-warms it.
+
+The agent logic, routing, tools, accuracy and output quality are completely
+unchanged — only the process lifecycle is optimised.
+"""
+
+from __future__ import annotations
+
+import json
+import multiprocessing
+import os
+import queue
+import threading
+import traceback
+import uuid
+from typing import Any, Dict, Optional
+
+
+def _payload_signature(settings_payload: Dict[str, Any], ff_payload: Dict[str, Any]) -> str:
+    """Stable fingerprint of the inputs the agent is built from.
+
+    When this changes (e.g. user switches primary LLM or toggles a feature flag
+    in Settings) the warm worker rebuilds the agent; otherwise it reuses it.
+    """
+    # Bump _WORKER_CODE_REV when agent routing/pipelines change so a running app
+    # picks up new fast-path logic after restart (warm process rebuilds on mismatch).
+    _WORKER_CODE_REV = "20260614-pdf-replot-v10"
+    try:
+        return json.dumps([settings_payload, ff_payload, _WORKER_CODE_REV], sort_keys=True, default=str)
+    except Exception:
+        return repr((settings_payload, ff_payload, _WORKER_CODE_REV))
+
+
+def _agent_worker_loop(in_queue: "multiprocessing.Queue", out_queue: "multiprocessing.Queue") -> None:
+    """Long-lived child-process loop.
+
+    Heavy imports are done lazily *inside* this function so that importing this
+    module in the parent (and re-importing it during ``spawn`` bootstrap) stays
+    cheap. The agent/service is constructed once and reused across requests.
+    """
+    try:
+        from config import Settings
+        from survyai.agent_service import SurvyAIAgentService
+        from survyai.feature_flags import FeatureFlags
+    except Exception:
+        try:
+            out_queue.put({"kind": "fatal", "payload": traceback.format_exc()})
+        except Exception:
+            pass
+        return
+
+    service: Optional[Any] = None
+    current_sig: Optional[str] = None
+    base_cwd = os.getcwd()
+
+    def _ensure_service(settings_payload: Dict[str, Any], ff_payload: Dict[str, Any]):
+        nonlocal service, current_sig
+        sig = _payload_signature(settings_payload, ff_payload)
+        if service is None or sig != current_sig:
+            settings = Settings(**settings_payload)
+            feature_flags = FeatureFlags(**ff_payload)
+            service = SurvyAIAgentService(
+                settings=settings,
+                feature_flags=feature_flags,
+                eager_init=True,  # build the heavy agent now, once
+            )
+            current_sig = sig
+        return service
+
+    while True:
+        try:
+            req = in_queue.get()
+        except (EOFError, OSError, KeyboardInterrupt):
+            break
+        if req is None:
+            break
+
+        kind = req.get("kind")
+        if kind == "shutdown":
+            break
+
+        req_id = req.get("req_id")
+        try:
+            # Apply the workspace directory for this request. Reset to the
+            # original cwd when none is supplied so requests stay isolated.
+            wd = req.get("working_directory")
+            try:
+                os.chdir(wd if wd else base_cwd)
+            except Exception:
+                pass
+
+            svc = _ensure_service(
+                req.get("settings_payload") or {},
+                req.get("feature_flags_payload") or {},
+            )
+
+            if kind == "warmup":
+                out_queue.put({"kind": "warmed", "req_id": req_id})
+                continue
+
+            result = svc.run_task(
+                req.get("query") or "",
+                use_fallback_llm=bool(req.get("use_fallback_llm", False)),
+                session_id=req.get("session_id"),
+                interactive=bool(req.get("interactive", False)),
+            )
+            out_queue.put({"kind": "result", "req_id": req_id, "payload": result.raw})
+        except Exception:
+            out_queue.put({"kind": "error", "req_id": req_id, "payload": traceback.format_exc()})
+
+
+class PersistentAgentProcess:
+    """Manages a single warm worker process and a request/response channel.
+
+    Only one request is ever in flight at a time (the GUI disables submit while
+    a run is active), which keeps the queue protocol simple: callers match
+    responses by ``req_id`` and ignore anything that doesn't belong to them
+    (e.g. a leftover ``warmed`` acknowledgement).
+    """
+
+    def __init__(self) -> None:
+        self._ctx = multiprocessing.get_context("spawn")
+        self._proc: Optional[multiprocessing.Process] = None
+        self._in: Optional[multiprocessing.Queue] = None
+        self._out: Optional[multiprocessing.Queue] = None
+        self._lock = threading.Lock()
+
+    def ensure_started(self) -> None:
+        with self._lock:
+            if self._proc is not None and self._proc.is_alive():
+                return
+            # Clean up any dead handles before respawning.
+            self._close_queues_locked()
+            self._in = self._ctx.Queue()
+            self._out = self._ctx.Queue()
+            self._proc = self._ctx.Process(
+                target=_agent_worker_loop,
+                args=(self._in, self._out),
+                daemon=True,
+            )
+            self._proc.start()
+
+    @property
+    def pid(self) -> Optional[int]:
+        return self._proc.pid if self._proc is not None else None
+
+    def is_alive(self) -> bool:
+        return self._proc is not None and self._proc.is_alive()
+
+    def submit(self, request: Dict[str, Any]) -> str:
+        """Queue a request for the worker. Returns the request id used to match
+        the eventual response."""
+        self.ensure_started()
+        req_id = request.get("req_id") or uuid.uuid4().hex
+        request["req_id"] = req_id
+        assert self._in is not None
+        self._in.put(request)
+        return req_id
+
+    def warmup(self, settings_payload: Dict[str, Any], feature_flags_payload: Dict[str, Any]) -> str:
+        """Fire-and-forget: build the agent ahead of the first real prompt."""
+        return self.submit(
+            {
+                "kind": "warmup",
+                "settings_payload": settings_payload,
+                "feature_flags_payload": feature_flags_payload,
+            }
+        )
+
+    def poll(self, timeout: float = 0.3) -> Optional[Dict[str, Any]]:
+        if self._out is None:
+            return None
+        try:
+            return self._out.get(timeout=timeout)
+        except (queue.Empty, OSError, ValueError):
+            return None
+
+    def kill(self) -> None:
+        """Terminate the worker (used on cancel). The next request respawns it."""
+        with self._lock:
+            proc = self._proc
+            self._proc = None
+            try:
+                if proc is not None:
+                    if proc.is_alive():
+                        proc.terminate()
+                        proc.join(timeout=5)
+                    if proc.is_alive():
+                        proc.kill()
+                        proc.join(timeout=2)
+            except Exception:
+                pass
+            self._close_queues_locked()
+
+    def _close_queues_locked(self) -> None:
+        for q_ in (self._in, self._out):
+            try:
+                if q_ is not None:
+                    q_.close()
+            except Exception:
+                pass
+        self._in = None
+        self._out = None
+
+
+_shared_process: Optional[PersistentAgentProcess] = None
+_shared_lock = threading.Lock()
+
+
+def get_shared_agent_process() -> PersistentAgentProcess:
+    """Return the process-wide warm agent worker, creating it on first use."""
+    global _shared_process
+    with _shared_lock:
+        if _shared_process is None:
+            _shared_process = PersistentAgentProcess()
+        return _shared_process
+
+
+def prewarm_shared_agent_process(
+    settings_payload: Dict[str, Any],
+    feature_flags_payload: Dict[str, Any],
+) -> None:
+    """Start + warm the shared worker so the first prompt is fast too.
+
+    Safe to call from a background thread; it only enqueues work and returns
+    immediately (the heavy build happens inside the child process).
+    """
+    try:
+        proc = get_shared_agent_process()
+        proc.warmup(settings_payload, feature_flags_payload)
+    except Exception:
+        pass
+
+
+def shutdown_shared_agent_process() -> None:
+    """Best-effort teardown of the warm worker (call on app exit)."""
+    global _shared_process
+    with _shared_lock:
+        proc = _shared_process
+        _shared_process = None
+    if proc is not None:
+        proc.kill()
+
+
+__all__ = [
+    "PersistentAgentProcess",
+    "get_shared_agent_process",
+    "prewarm_shared_agent_process",
+    "shutdown_shared_agent_process",
+]

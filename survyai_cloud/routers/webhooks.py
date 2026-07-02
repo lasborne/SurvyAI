@@ -18,6 +18,7 @@ from survyai_cloud.services.entitlements import (
     apply_free_defaults,
     apply_pro_defaults,
     credit_budget_and_interval_from_paystack_payload,
+    subscription_period_end_from_anchor,
 )
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
@@ -174,7 +175,9 @@ def _apply_charge_success_entitlements(user: User, data: dict[str, Any], setting
     paid_at = _ts_parse(data.get("paid_at") if isinstance(data, dict) else None)
     anchor = paid_at or now
     period_hint = _renewal_hint_from_invoice_or_subscription(data)
-    user.subscription_current_period_end = period_hint or (anchor + timedelta(days=30))
+    user.subscription_current_period_end = period_hint or subscription_period_end_from_anchor(
+        anchor, bill_interval
+    )
 
     cust = _customer_dict(data)
     if cust:
@@ -288,7 +291,9 @@ async def paystack_webhook(
                 )
                 user.subscription_status = SubscriptionStatus.active
                 period_hint = _renewal_hint_from_invoice_or_subscription(data)
-                user.subscription_current_period_end = period_hint or (anchor + timedelta(days=30))
+                user.subscription_current_period_end = period_hint or subscription_period_end_from_anchor(
+                    anchor, bill_interval
+                )
                 cust = _customer_dict(data)
                 if cust and cust.get("customer_code"):
                     user.paystack_customer_code = str(cust.get("customer_code"))

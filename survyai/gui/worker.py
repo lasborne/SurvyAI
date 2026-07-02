@@ -1,64 +1,28 @@
 """
 Background execution of `SurvyAIAgentService.run_task`.
 
-The GUI needs true cancellation, so the blocking agent run happens inside a child
-process. The Qt thread stays responsive, can emit progress text, and can terminate
-the child process immediately when the user clicks Cancel.
+The GUI needs true cancellation, so the blocking agent run happens inside a
+**persistent, warm** child process (see `survyai.gui.agent_process`). That
+process builds the heavy agent exactly once and reuses it for every prompt,
+which removes the multi-second cold-start that previously occurred on each run.
+The Qt thread stays responsive, emits progress text, and can terminate the
+child process immediately when the user clicks Cancel.
 """
 
 from __future__ import annotations
 
-import os
-import multiprocessing
-import queue
 import traceback
 from typing import Any, Optional
 
 from PySide6.QtCore import QThread, Signal
 
-from config import Settings
-from survyai.feature_flags import FeatureFlags
 from survyai.agent_service import SurvyAIAgentService
+from survyai.gui.agent_process import get_shared_agent_process
 from survyai.types import AgentRunResult
 
 
-def _run_agent_task_in_subprocess(
-    result_queue: multiprocessing.Queue,
-    *,
-    settings_payload: dict,
-    feature_flags_payload: dict,
-    query: str,
-    use_fallback_llm: bool,
-    session_id: Optional[str],
-    interactive: bool,
-    working_directory: Optional[str],
-) -> None:
-    try:
-        if working_directory:
-            try:
-                os.chdir(working_directory)
-            except Exception:
-                pass
-        settings = Settings(**settings_payload)
-        feature_flags = FeatureFlags(**feature_flags_payload)
-        service = SurvyAIAgentService(
-            settings=settings,
-            feature_flags=feature_flags,
-            eager_init=False,
-        )
-        result = service.run_task(
-            query,
-            use_fallback_llm=use_fallback_llm,
-            session_id=session_id,
-            interactive=interactive,
-        )
-        result_queue.put({"kind": "result", "payload": result.raw})
-    except Exception:
-        result_queue.put({"kind": "error", "payload": traceback.format_exc()})
-
-
 class AgentRunThread(QThread):
-    """Runs one killable `run_task` call off the GUI thread."""
+    """Runs one killable `run_task` call against the warm agent process."""
 
     result_ready = Signal(object)
     failed = Signal(str)
@@ -93,8 +57,6 @@ class AgentRunThread(QThread):
             "allow_internet_tools": service.feature_flags.allow_internet_tools,
             "allow_vector_store": service.feature_flags.allow_vector_store,
         }
-        self._process: Optional[multiprocessing.Process] = None
-        self._result_queue: Optional[multiprocessing.Queue] = None
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
@@ -102,32 +64,18 @@ class AgentRunThread(QThread):
             "Cancellation requested. SurvyAI is terminating the active agent run now."
         )
 
-    def _terminate_active_process(self) -> None:
-        proc = self._process
-        if proc is None:
-            return
-        try:
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=5)
-            if proc.is_alive():
-                proc.kill()
-                proc.join(timeout=2)
-        except Exception:
-            pass
-
     def run(self) -> None:
+        proc = get_shared_agent_process()
         try:
             if self._working_directory:
                 self.progress_text.emit(f"Workspace active: {self._working_directory}")
             self.progress_text.emit("Starting agent run…")
 
-            ctx = multiprocessing.get_context("spawn")
-            self._result_queue = ctx.Queue()
-            self._process = ctx.Process(
-                target=_run_agent_task_in_subprocess,
-                kwargs={
-                    "result_queue": self._result_queue,
+            proc.ensure_started()
+
+            req_id = proc.submit(
+                {
+                    "kind": "run",
                     "settings_payload": self._settings_payload,
                     "feature_flags_payload": self._feature_flags_payload,
                     "query": self._query,
@@ -135,23 +83,30 @@ class AgentRunThread(QThread):
                     "session_id": self._session_id,
                     "interactive": self._interactive,
                     "working_directory": self._working_directory,
-                },
+                }
             )
-            self._process.start()
-            self.progress_text.emit(f"Agent process started (PID {self._process.pid}).")
+            self.progress_text.emit(f"Agent process ready (PID {proc.pid}).")
 
             while True:
                 if self._cancel_requested:
-                    self._terminate_active_process()
+                    proc.kill()
                     self.cancelled.emit("Task cancelled. The active agent run was terminated.")
                     return
 
-                try:
-                    assert self._result_queue is not None
-                    message = self._result_queue.get(timeout=0.35)
-                except queue.Empty:
-                    if self._process is not None and not self._process.is_alive():
-                        break
+                if not proc.is_alive():
+                    # Drain any final message the worker managed to emit.
+                    message = proc.poll(timeout=0.1)
+                    if message is None:
+                        self.failed.emit("Agent process exited unexpectedly before returning a result.")
+                        return
+                else:
+                    message = proc.poll(timeout=0.35)
+                    if message is None:
+                        continue
+
+                # Ignore stale messages (e.g. a leftover warmup acknowledgement)
+                # that don't belong to this run.
+                if message.get("kind") in ("warmed",) or message.get("req_id") not in (req_id, None):
                     continue
 
                 kind = message.get("kind")
@@ -163,26 +118,9 @@ class AgentRunThread(QThread):
                 if kind == "error":
                     self.failed.emit(str(payload or "Unknown agent subprocess error"))
                     return
-
-            if self._cancel_requested:
-                self.cancelled.emit("Task cancelled. The active agent run was terminated.")
-            elif self._process is not None and self._process.exitcode not in (0, None):
-                self.failed.emit(
-                    f"Agent process exited unexpectedly with code {self._process.exitcode}."
-                )
-            else:
-                self.failed.emit("Agent process ended without returning a result.")
+                if kind == "fatal":
+                    proc.kill()
+                    self.failed.emit(str(payload or "Agent worker failed to initialise"))
+                    return
         except Exception:
             self.failed.emit(traceback.format_exc())
-        finally:
-            try:
-                self._terminate_active_process()
-            except Exception:
-                pass
-            try:
-                if self._result_queue is not None:
-                    self._result_queue.close()
-            except Exception:
-                pass
-            self._process = None
-            self._result_queue = None

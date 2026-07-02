@@ -1,0 +1,16 @@
+{
+  "stable": {
+    "channel": "stable",
+    "platform": "windows-x64",
+    "latest_version": "1.0.1",
+    "min_supported_version": "1.0.0",
+    "download_url": "https://downloads.example.com/SurvyAI-1.0.1-setup.exe",
+    "sha256": "replace-with-real-sha256",
+    "artifact_kind": "full-installer",
+    "signature": "PUT-WINDOWS-CODE-SIGNING-THUMBPRINT-HERE",
+    "signing_scheme": "authenticode",
+    "rollback_version": "1.0.0",
+    "release_notes_url": "https://downloads.example.com/SurvyAI-1.0.1-notes.html",
+    "mandatory": false
+  }
+}

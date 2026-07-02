@@ -13,6 +13,7 @@ import html
 import json
 import os
 import re
+import sys
 import time
 import uuid
 import zipfile
@@ -58,6 +59,7 @@ from PySide6.QtWidgets import (
 )
 
 from survyai.agent_service import SurvyAIAgentService
+from agent.state import looks_like_file_driven_task
 from survyai.app_config import merge_settings
 from survyai.capabilities import format_capabilities_summary, scan_machine_capabilities
 from survyai.credit_gate import credit_limit_enforcement_enabled
@@ -77,10 +79,12 @@ from survyai.cloud_api import (
     get_bootstrap,
     get_entitlements,
     get_me,
+    get_update_manifest,
     login,
     paystack_initialize,
     paystack_subscription_manage_url,
     paystack_verify,
+    report_usage_batch,
     refresh_tokens,
     register_device,
     register as cloud_register,
@@ -95,6 +99,17 @@ from survyai.gui.state import (
     TaskHistoryEntry,
 )
 from survyai.gui.worker import AgentRunThread
+from survyai.gui.agent_process import (
+    prewarm_shared_agent_process,
+    shutdown_shared_agent_process,
+)
+from survyai.gui.cloud_sync import (
+    CloudAccountSyncPayload,
+    CloudAccountSyncResult,
+    CloudCreditsSyncPayload,
+    CloudCreditsSyncResult,
+)
+from survyai.gui.cloud_worker import CloudAccountSyncThread, CloudCreditsSyncThread
 from survyai.ollama_support import (
     OLLAMA_DOWNLOAD_PAGE,
     install_ollama_with_winget,
@@ -104,7 +119,10 @@ from survyai.ollama_support import (
     try_connect_ollama,
 )
 from survyai.types import AgentRunResult
+from survyai.updater import UpdateManager, UpdateManifest
 from survyai.version import __version__
+from runtime_paths import resource_path
+from utils.cost_estimator import summarize_graph_llm_usage
 
 # --- Follow-up vs new-topic heuristics (conversation context injection) -----------------
 _FU_STOP = {
@@ -188,6 +206,39 @@ def _fu_short_affirm(t: str) -> bool:
     return len(w) <= 5 and t.startswith("go ahead")
 
 
+def _assistant_asked_internet_permission(assistant_text: str) -> bool:
+    body = (assistant_text or "").lower()
+    markers = (
+        "search the internet",
+        "search online",
+        "browse the web",
+        "may i search",
+        "you may search",
+        "permission",
+        "(yes/no)",
+        "latest official",
+        "up-to-date",
+        "latest confirmed",
+    )
+    return any(m in body for m in markers)
+
+
+def _is_permission_affirmation(raw_query: str) -> bool:
+    t = (raw_query or "").strip().lower()
+    if _fu_short_affirm(raw_query):
+        return True
+    grants = (
+        "you may search",
+        "you can search",
+        "search the internet",
+        "search online",
+        "permission granted",
+        "go ahead and search",
+        "please search",
+    )
+    return any(g in t for g in grants)
+
+
 def _fu_anaphora(t: str) -> bool:
     s = f" {t.lower().strip()} "
     for p in (
@@ -214,6 +265,66 @@ def _fu_shared_paths(history: str, raw: str) -> bool:
     return False
 
 
+def _is_save_session_docx_request(raw_query: str) -> bool:
+    """True when the user wants to save a prior answer into a Word document."""
+    q = (raw_query or "").lower().strip()
+    if not q:
+        return False
+
+    # Do not treat GIS/CAD/file automation jobs as essay-save requests.
+    if looks_like_file_driven_task(raw_query):
+        operational = (
+            "arcgis", "arcpy", "cutfill", "cut fill", "tin", "idw", "volume",
+            "point feature", "create a copy", "copy each", "calculate", "compute",
+            "borrow pit", "exported result",
+        )
+        has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.I))
+        explicit_essay = any(
+            k in q for k in ("essay", "well-structured", "turn this", "previous topic")
+        )
+        if any(m in q for m in operational) and not (has_docx and explicit_essay):
+            return False
+
+    has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.I))
+    wants_save = any(k in q for k in ("save", "saved", "write it", "write this"))
+    wants_essay = any(
+        k in q
+        for k in (
+            "essay", "well-structured", "turn this", "previous topic", "previous answer",
+            "last answer", "above", "report",
+        )
+    )
+    if has_docx and wants_save and wants_essay:
+        return True
+    return False
+
+
+def _is_clearly_new_topic(raw_query: str, last_exchange_messages: list) -> bool:
+    """Return True when the new query is unrelated to the most-recent exchange.
+
+    Criteria (ALL must hold):
+    - No anaphora (no "it", "this", "the same", etc.)
+    - No shared file paths with the last exchange
+    - Either a new-topic keyword is detected  OR  the query has ≥12 words and
+      shares no significant tokens with the last exchange.
+    """
+    if _fu_anaphora(raw_query):
+        return False
+    prev_text = " ".join((m.content or "") for m in last_exchange_messages)
+    if _fu_shared_paths(prev_text, raw_query):
+        return False
+    nt = _fu_topic_score(raw_query, prev_text)
+    if nt >= 1:
+        return True
+    nw = len((raw_query or "").split())
+    if nw >= 12:
+        sig_new = _fu_sig_tokens(raw_query)
+        sig_prev = _fu_sig_tokens(prev_text)
+        if not (sig_new & sig_prev):
+            return True
+    return False
+
+
 def _should_inject_conversation_context(raw: str, prior_user_assistant_text: str) -> bool:
     """True when the new message is likely a follow-up to the last exchange, not a brand-new task."""
     raw = (raw or "").strip()
@@ -223,7 +334,7 @@ def _should_inject_conversation_context(raw: str, prior_user_assistant_text: str
     nw = len(raw.split())
     nt = _fu_topic_score(raw, prev)
     if _fu_short_affirm(raw):
-        return True
+        return False
     if _fu_anaphora(raw):
         return not (nt >= 4 and nw > 8)
     if _fu_shared_paths(prev, raw):
@@ -502,7 +613,7 @@ class PaystackPlanPickerDialog(QDialog):
         self._plan_codes: list[str] = []
         root = QVBoxLayout(self)
         intro = QLabel(
-            "Choose monthly or annual billing. Both plans are listed below. "
+            "Choose daily, weekly, monthly, or annual billing. All plans are listed below. "
             "You will complete payment securely in your browser."
         )
         intro.setWordWrap(True)
@@ -555,7 +666,7 @@ class PaystackManageSubscriptionDialog(QDialog):
         intro = QLabel(
             "Billing is handled on Paystack. Your current plan options are shown below. "
             "Use the button to open the customer portal (payment method, invoices, cancellation). "
-            "To switch between monthly and annual, use Subscribe to Pro… and complete a new checkout."
+            "To switch plans, use Subscribe to Pro… and complete a new checkout."
         )
         intro.setWordWrap(True)
         root.addWidget(intro)
@@ -637,6 +748,10 @@ class MainWindow(QMainWindow):
         )
 
         self._thread: Optional[AgentRunThread] = None
+        self._cloud_account_sync_thread: Optional[CloudAccountSyncThread] = None
+        self._cloud_credits_sync_thread: Optional[CloudCreditsSyncThread] = None
+        self._cloud_busy_depth: int = 0
+        self._cloud_busy_saved_texts: dict[int, str] = {}
         self._running_conversation_id: Optional[str] = None
         active_conversation = self._state_store.ensure_conversations(self._state)
         self._session_id = active_conversation.session_id
@@ -744,6 +859,10 @@ class MainWindow(QMainWindow):
             self._fast_mode_indicator.setTextInteractionFlags(Qt.TextSelectableByMouse)
             sb.addPermanentWidget(self._fast_mode_indicator)
             self._refresh_fast_mode_indicator()
+            self._cloud_busy_label = QLabel("")
+            self._cloud_busy_label.setObjectName("cloudBusyLabel")
+            self._cloud_busy_label.setToolTip("Cloud API activity in progress")
+            sb.addPermanentWidget(self._cloud_busy_label)
         except Exception:
             # Cosmetic only; never block app startup.
             pass
@@ -753,6 +872,187 @@ class MainWindow(QMainWindow):
             return
         enabled = bool(getattr(self._state, "fast_mode_non_file_prompts", False))
         self._fast_mode_indicator.setText(f"Fast mode: {'ON' if enabled else 'OFF'}")
+
+    def _cloud_network_busy(self) -> bool:
+        for attr in ("_cloud_account_sync_thread", "_cloud_credits_sync_thread"):
+            thread = getattr(self, attr, None)
+            if thread is not None and thread.isRunning():
+                return True
+        return False
+
+    def _cloud_action_widgets(self) -> list[QPushButton]:
+        names = (
+            "_cloud_refresh_license_btn",
+            "_paystack_subscribe_btn",
+            "_paystack_manage_btn",
+            "_paystack_verify_btn",
+            "_manage_pcs_btn",
+        )
+        widgets: list[QPushButton] = []
+        for name in names:
+            w = getattr(self, name, None)
+            if isinstance(w, QPushButton):
+                widgets.append(w)
+        if hasattr(self, "_credits_refresh_btn"):
+            w = getattr(self, "_credits_refresh_btn", None)
+            if isinstance(w, QPushButton):
+                widgets.append(w)
+        return widgets
+
+    def _begin_cloud_busy(self, message: str) -> None:
+        """Show immediate feedback while cloud HTTP runs on a worker thread."""
+        self._cloud_busy_depth += 1
+        if self._cloud_busy_depth == 1:
+            app = QApplication.instance()
+            if app is not None:
+                app.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            for btn in self._cloud_action_widgets():
+                btn_id = id(btn)
+                if btn_id not in self._cloud_busy_saved_texts:
+                    self._cloud_busy_saved_texts[btn_id] = btn.text()
+                btn.setEnabled(False)
+            for attr, label in (
+                ("_cloud_refresh_license_btn", "Refreshing…"),
+                ("_credits_refresh_btn", "Syncing…"),
+            ):
+                btn = getattr(self, attr, None)
+                if isinstance(btn, QPushButton):
+                    btn_id = id(btn)
+                    if btn_id not in self._cloud_busy_saved_texts:
+                        self._cloud_busy_saved_texts[btn_id] = btn.text()
+                    btn.setText(label)
+            if hasattr(self, "_cloud_busy_label"):
+                self._cloud_busy_label.setText("Cloud: working…")
+        self.statusBar().showMessage(message)
+        app = QApplication.instance()
+        if app is not None:
+            app.processEvents()
+
+    def _end_cloud_busy(self) -> None:
+        if self._cloud_busy_depth <= 0:
+            return
+        self._cloud_busy_depth -= 1
+        if self._cloud_busy_depth != 0:
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.restoreOverrideCursor()
+        for btn in self._cloud_action_widgets():
+            saved = self._cloud_busy_saved_texts.pop(id(btn), None)
+            if saved is not None:
+                btn.setText(saved)
+            btn.setEnabled(True)
+        self._cloud_busy_saved_texts.clear()
+        if hasattr(self, "_cloud_busy_label"):
+            self._cloud_busy_label.setText("")
+
+    def _make_cloud_account_sync_payload(self) -> CloudAccountSyncPayload:
+        label = (os.environ.get("COMPUTERNAME") or "").strip() or None
+        return CloudAccountSyncPayload(
+            base_url=self._state.cloud_api_base_url.strip(),
+            access_token=self._state.cloud_access_token.strip(),
+            refresh_token=self._state.cloud_refresh_token.strip(),
+            access_token_expires_at=self._state.cloud_access_token_expires_at.strip(),
+            device_id=self._state.cloud_device_id.strip(),
+            device_fingerprint=self._state.cloud_device_fingerprint.strip(),
+            machine_label=label,
+        )
+
+    def _make_cloud_credits_sync_payload(self) -> CloudCreditsSyncPayload:
+        return CloudCreditsSyncPayload(
+            base_url=self._state.cloud_api_base_url.strip(),
+            access_token=self._state.cloud_access_token.strip(),
+            refresh_token=self._state.cloud_refresh_token.strip(),
+            access_token_expires_at=self._state.cloud_access_token_expires_at.strip(),
+        )
+
+    def _apply_cloud_account_sync_result(
+        self,
+        result: CloudAccountSyncResult,
+        *,
+        success_status: str,
+    ) -> None:
+        if result.access_token:
+            self._state.cloud_access_token = result.access_token
+        if result.refresh_token:
+            self._state.cloud_refresh_token = result.refresh_token
+        if result.access_token_expires_at:
+            self._state.cloud_access_token_expires_at = result.access_token_expires_at
+        if result.device_fingerprint:
+            self._state.cloud_device_fingerprint = result.device_fingerprint
+        if result.device_id:
+            self._state.cloud_device_id = result.device_id
+        elif not result.registered and result.pro_keys:
+            self._state.cloud_bootstrap = {}
+
+        self._state.cloud_me = result.me if isinstance(result.me, dict) else {}
+        self._state.cloud_bootstrap = (
+            result.bootstrap if isinstance(result.bootstrap, dict) else {}
+        )
+        ent_d = result.ent if isinstance(result.ent, dict) else {}
+        self._sync_credits_from_entitlements(ent_d)
+        self._state_store.save(self._state)
+        self._rebuild_service(skip_cloud_refresh=True)
+        self._refresh_license_card()
+        self._refresh_diagnostics()
+        self._refresh_account_views()
+
+        if result.bootstrap_status == "skipped_no_device":
+            self.statusBar().showMessage(
+                "This PC is not registered for hosted Pro keys (device limit or registration error).",
+                9000,
+            )
+        elif result.bootstrap_status == "failed_pro":
+            self.statusBar().showMessage(
+                "Hosted keys unavailable. Confirm this PC is registered and your Pro subscription is active.",
+                8000,
+            )
+        elif result.bootstrap_status == "failed_free":
+            self.statusBar().showMessage(
+                "Account refreshed. Hosted keys load when your plan includes them.",
+                6000,
+            )
+        else:
+            self.statusBar().showMessage(success_status, 6000)
+
+    def _start_cloud_account_sync(
+        self,
+        *,
+        success_status: str,
+        missing_auth_message: str = "Sign in from the account menu (top right) first.",
+    ) -> bool:
+        if self._cloud_network_busy():
+            self.statusBar().showMessage("Cloud update already in progress…", 3000)
+            return False
+        base, token = self._cloud_base_and_token()
+        if not base or not token:
+            QMessageBox.warning(self, "Sign in required", missing_auth_message)
+            return False
+
+        self._begin_cloud_busy("Refreshing cloud account…")
+        thread = CloudAccountSyncThread(self._make_cloud_account_sync_payload(), parent=self)
+        self._cloud_account_sync_thread = thread
+
+        def _done() -> None:
+            self._end_cloud_busy()
+            if self._cloud_account_sync_thread is thread:
+                self._cloud_account_sync_thread = None
+
+        def _on_ok(result_obj: object) -> None:
+            result = result_obj if isinstance(result_obj, CloudAccountSyncResult) else None
+            if result is None:
+                QMessageBox.warning(self, "Couldn't refresh account", "Unexpected sync response.")
+                return
+            self._apply_cloud_account_sync_result(result, success_status=success_status)
+
+        def _on_fail(msg: str) -> None:
+            QMessageBox.warning(self, "Couldn't refresh account", msg)
+
+        thread.succeeded.connect(_on_ok)
+        thread.failed.connect(_on_fail)
+        thread.finished.connect(_done)
+        thread.start()
+        return True
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1195,7 +1495,9 @@ class MainWindow(QMainWindow):
         pay_row.setSpacing(8)
         self._paystack_subscribe_btn = QPushButton("Subscribe to Pro…")
         self._paystack_subscribe_btn.clicked.connect(self._on_paystack_subscribe)
-        self._paystack_subscribe_btn.setToolTip("Choose monthly or annual, then complete checkout in your browser.")
+        self._paystack_subscribe_btn.setToolTip(
+            "Choose daily, weekly, monthly, or annual billing, then complete checkout in your browser."
+        )
         pay_row.addWidget(self._paystack_subscribe_btn)
         self._paystack_manage_btn = QPushButton("Manage subscription…")
         self._paystack_manage_btn.setObjectName("secondaryButton")
@@ -1374,9 +1676,9 @@ class MainWindow(QMainWindow):
         credits_title = QLabel("Credits & usage")
         credits_title.setObjectName("pageTitle")
         credits_sub = QLabel(
-            "Your subscription defines a USD credit pool for hosted models — converted from your "
-            "payment amount using the exchange rate in effect on the server when you subscribed or renewed. "
-            "Usage is shown and deducted in US dollars against that pool."
+            "Track API spend for runs in this desktop app. \"Used\" updates after each task "
+            "(including PDF replot and other fast paths). Displayed USD = raw API cost × SurvyAI markup. "
+            "Pro hosted plans: sign in and use Refresh from cloud to sync your subscription pool."
         )
         credits_sub.setObjectName("pageSubtitle")
         credits_sub.setWordWrap(True)
@@ -1438,11 +1740,18 @@ class MainWindow(QMainWindow):
 
         # --- Refresh ---
         btn_row = QHBoxLayout()
-        refresh_btn = QPushButton("Refresh from cloud")
-        refresh_btn.clicked.connect(self._on_refresh_credits_from_cloud)
-        btn_row.addWidget(refresh_btn)
+        self._credits_refresh_btn = QPushButton("Refresh usage")
+        self._credits_refresh_btn.clicked.connect(self._on_refresh_credits_from_cloud)
+        btn_row.addWidget(self._credits_refresh_btn)
         btn_row.addStretch()
         page_layout.addLayout(btn_row)
+
+        self._credits_lifetime_label = QLabel("")
+        self._credits_lifetime_label.setObjectName("hintLabel")
+        self._credits_lifetime_label.setWordWrap(True)
+        self._credits_lifetime_label.setAlignment(Qt.AlignRight)
+        self._credits_lifetime_label.setStyleSheet("color: #9ca3af; font-size: 11px;")
+        page_layout.addWidget(self._credits_lifetime_label)
 
         page_layout.addStretch()
         return tab
@@ -1587,7 +1896,7 @@ class MainWindow(QMainWindow):
         self._describe_menu_action(
             pay_sub,
             "Opens Paystack checkout in your browser to subscribe or upgrade to Pro (hosted models and "
-            "monthly credits).",
+            "periodic API credits). Choose daily, weekly, monthly, or annual billing.",
         )
         account_menu.addAction(pay_sub)
 
@@ -1643,6 +1952,14 @@ class MainWindow(QMainWindow):
         )
         help_menu.addAction(readme)
 
+        updates = QAction("Check for updates…", self)
+        updates.triggered.connect(self._check_for_updates)
+        self._describe_menu_action(
+            updates,
+            "Compare this build with the cloud manifest, then stage a hash-verified full installer when available.",
+        )
+        help_menu.addAction(updates)
+
         tutorial = QAction("First-run tutorial", self)
         tutorial.triggered.connect(self._run_onboarding)
         self._describe_menu_action(
@@ -1689,7 +2006,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _show_credits_page(self) -> None:
+        self._silent_pull_entitlements_from_cloud()
         self._refresh_credits_page()
+        self._central_stack.setCurrentWidget(self._credits_page)
         self._central_stack.setCurrentIndex(_PAGE_CREDITS)
         self._back_workspace_btn.setVisible(True)
 
@@ -1829,9 +2148,38 @@ class MainWindow(QMainWindow):
         st.polish(self._user_menu_btn)
         self._user_menu_btn.update()
 
+    def _agent_process_payloads(self) -> tuple[dict, dict]:
+        """Settings + feature-flag payloads matching what `AgentRunThread` sends,
+        so the pre-warmed agent is reused (not rebuilt) on the first prompt."""
+        ff = self._effective_feature_flags()
+        return (
+            self._service.settings.model_dump(),
+            {
+                "license_mode": ff.license_mode,
+                "allow_autocad": ff.allow_autocad,
+                "allow_arcgis": ff.allow_arcgis,
+                "allow_blue_marble": ff.allow_blue_marble,
+                "allow_internet_tools": ff.allow_internet_tools,
+                "allow_vector_store": ff.allow_vector_store,
+            },
+        )
+
+    def _prewarm_agent(self) -> None:
+        """Build the heavy agent in the background warm process ahead of time so
+        the first prompt doesn't pay the cold-start cost."""
+        try:
+            settings_payload, ff_payload = self._agent_process_payloads()
+            prewarm_shared_agent_process(settings_payload, ff_payload)
+            self._append_activity("Warming up agent engine…")
+        except Exception:
+            pass
+
     def _finish_startup(self) -> None:
         if not self._state.onboarding_complete:
             self._run_onboarding()
+        # Kick off agent warm-up right away so the engine is ready by the time
+        # the user submits their first prompt (eliminates per-prompt cold start).
+        QTimer.singleShot(200, self._prewarm_agent)
         # Non-blocking post-start prompts (e.g. local models setup).
         QTimer.singleShot(650, self._maybe_prompt_ollama_install)
         if self._startup_initial_query:
@@ -1949,17 +2297,26 @@ class MainWindow(QMainWindow):
         if self._state.cloud_api_base_url.strip() and self._state.cloud_access_token.strip():
             overrides["survyai_api_base_url"] = self._state.cloud_api_base_url.strip()
             overrides["survyai_access_token"] = self._state.cloud_access_token.strip()
+            overrides["survyai_device_id"] = self._state.cloud_device_id.strip()
             bs = self._state.cloud_bootstrap or {}
             if isinstance(bs, dict):
-                # Provider keys
-                if str(bs.get("openai_api_key") or "").strip():
-                    overrides["openai_api_key"] = str(bs.get("openai_api_key")).strip()
-                if str(bs.get("google_api_key") or "").strip():
-                    overrides["google_api_key"] = str(bs.get("google_api_key")).strip()
-                if str(bs.get("anthropic_api_key") or "").strip():
-                    overrides["anthropic_api_key"] = str(bs.get("anthropic_api_key")).strip()
-                if str(bs.get("deepseek_api_key") or "").strip():
-                    overrides["deepseek_api_key"] = str(bs.get("deepseek_api_key")).strip()
+                proxy_enabled = bool(bs.get("llm_proxy_enabled"))
+                if proxy_enabled:
+                    overrides["survyai_llm_proxy_enabled"] = True
+                    overrides["survyai_llm_proxy_path"] = (
+                        str(bs.get("llm_proxy_path") or "/v1/llm/chat").strip()
+                        or "/v1/llm/chat"
+                    )
+                else:
+                    # Legacy provider key injection path (kept for backward compatibility only).
+                    if str(bs.get("openai_api_key") or "").strip():
+                        overrides["openai_api_key"] = str(bs.get("openai_api_key")).strip()
+                    if str(bs.get("google_api_key") or "").strip():
+                        overrides["google_api_key"] = str(bs.get("google_api_key")).strip()
+                    if str(bs.get("anthropic_api_key") or "").strip():
+                        overrides["anthropic_api_key"] = str(bs.get("anthropic_api_key")).strip()
+                    if str(bs.get("deepseek_api_key") or "").strip():
+                        overrides["deepseek_api_key"] = str(bs.get("deepseek_api_key")).strip()
                 # Models (single + tiered)
                 for k_src, k_dst in [
                     ("openai_model", "openai_model"),
@@ -1974,6 +2331,25 @@ class MainWindow(QMainWindow):
                 ]:
                     if k_src in bs and bs.get(k_src) is not None:
                         overrides[k_dst] = bs.get(k_src)
+                agent_cfg = bs.get("agent_config")
+                if isinstance(agent_cfg, dict):
+                    overrides["agent_cloud_config_json"] = json.dumps(agent_cfg)
+                    for k in [
+                        "primary_llm",
+                        "fallback_llm",
+                        "openai_model",
+                        "openai_model_nano",
+                        "openai_model_mini",
+                        "openai_model_complex",
+                        "enable_tiered_models",
+                        "gemini_model",
+                        "claude_model",
+                        "deepseek_base_url",
+                        "agent_temperature",
+                        "agent_max_tokens",
+                    ]:
+                        if k in agent_cfg and agent_cfg.get(k) is not None:
+                            overrides[k] = agent_cfg.get(k)
         if self._state.safe_mode:
             overrides["vector_store_enabled"] = False
             overrides["auto_context_retrieval"] = False
@@ -2008,6 +2384,9 @@ class MainWindow(QMainWindow):
             eager_init=False,
         )
         self._refresh_active_llm_status()
+        # Settings/flags changed: re-warm the agent with the new configuration so
+        # the next prompt stays fast instead of rebuilding mid-run.
+        QTimer.singleShot(0, self._prewarm_agent)
 
     def _ensure_cloud_token_valid(self, *, silent: bool = False) -> bool:
         """
@@ -2458,11 +2837,25 @@ class MainWindow(QMainWindow):
     def _flush_desktop_state_save(self) -> None:
         self._state_store.save(self._state)
 
-    def _store_conversation_message(self, role: str, text: str, *, error: bool = False) -> None:
-        conv = self._active_conversation()
+    def _store_conversation_message(
+        self,
+        role: str,
+        text: str,
+        *,
+        error: bool = False,
+        conversation_id: Optional[str] = None,
+    ) -> None:
+        """Append a message to a conversation.
+
+        If *conversation_id* is given, the message is written to that specific
+        conversation regardless of which tab is currently active.  This prevents
+        results from one conversation bleeding into another when the user
+        switches tabs while a query is running.
+        """
+        target_id = conversation_id or self._active_conversation().conversation_id
         self._state_store.append_conversation_message(
             self._state,
-            conversation_id=conv.conversation_id,
+            conversation_id=target_id,
             role=role,
             content=text,
             error=error,
@@ -2502,21 +2895,191 @@ class MainWindow(QMainWindow):
             f"{state_report}\n"
         )
 
-    def _refresh_credits_page(self) -> None:
-        budget = self._state.monthly_credits_usd
-        used = self._state.monthly_credits_used_usd
-        remaining = max(budget - used, 0.0)
-        markup = self._state.credit_markup_multiplier
-        interval = (self._state.credits_billing_interval or "").strip().lower()
-        interval_words = (
-            "Annual billing period"
-            if interval == "annual"
-            else ("Monthly billing period" if interval == "monthly" else "Billing period")
+    def _credit_markup_multiplier(self) -> float:
+        m = float(self._state.credit_markup_multiplier or 0.0)
+        return m if m > 0 else 2.0
+
+    def _billed_cost_usd(self, raw_cost_usd: float) -> float:
+        """SurvyAI user-facing USD = raw LLM API cost × markup (default 2×)."""
+        raw = float(raw_cost_usd or 0.0)
+        if raw <= 0:
+            return 0.0
+        return round(raw * self._credit_markup_multiplier(), 6)
+
+    def _parse_datetime_value(self, raw: object) -> Optional[datetime]:
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            dt = raw
+        else:
+            text = str(raw).strip()
+            if not text:
+                return None
+            try:
+                if text.endswith("Z"):
+                    text = text[:-1] + "+00:00"
+                dt = datetime.fromisoformat(text)
+            except Exception:
+                try:
+                    dt = datetime.strptime(text, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                except Exception:
+                    return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    def _format_history_timestamp(self, created_at: str) -> str:
+        ts = self._parse_datetime_value(created_at)
+        if ts is None:
+            return created_at or ""
+        return ts.astimezone().strftime("%Y-%m-%d %H:%M:%S")
+
+    def _is_rolling_pro_billing_period(self) -> bool:
+        me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
+        interval = (
+            self._state.credits_billing_interval
+            or me.get("credits_billing_interval")
+            or ""
+        ).strip().lower()
+        plan = str(me.get("plan_slug") or "").strip().lower()
+        status = str(me.get("subscription_status") or "").strip().lower()
+        has_pro = plan == "pro" and status in {"active", "trialing", "non_renewing"}
+        return has_pro and interval in {"daily", "weekly", "monthly"}
+
+    def _billing_period_days(self, interval: str) -> int:
+        return {"daily": 1, "weekly": 7, "monthly": 30}.get(interval.strip().lower(), 30)
+
+    def _is_monthly_pro_billing_period(self) -> bool:
+        """Backward-compatible alias for monthly rolling Pro billing."""
+        me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
+        interval = (
+            self._state.credits_billing_interval
+            or me.get("credits_billing_interval")
+            or ""
+        ).strip().lower()
+        plan = str(me.get("plan_slug") or "").strip().lower()
+        status = str(me.get("subscription_status") or "").strip().lower()
+        has_pro = plan == "pro" and status in {"active", "trialing", "non_renewing"}
+        return has_pro and interval == "monthly"
+
+    def _credits_usage_period_bounds(self) -> tuple[datetime, Optional[datetime], str]:
+        """
+        Return (start inclusive, end exclusive, human label) for the current usage window.
+
+        - Daily / weekly / monthly Paystack Pro: activation anchor → period end from cloud.
+        - Free, annual, or no subscription: 1st of calendar month (local time) → 1st of next month.
+        """
+        if self._is_rolling_pro_billing_period():
+            me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
+            interval = (
+                self._state.credits_billing_interval
+                or me.get("credits_billing_interval")
+                or "monthly"
+            ).strip().lower()
+            period_days = self._billing_period_days(interval)
+            period_end = self._parse_datetime_value(me.get("subscription_current_period_end"))
+            if period_end is not None:
+                period_start = period_end - timedelta(days=period_days)
+                interval_label = {
+                    "daily": "daily",
+                    "weekly": "weekly",
+                    "monthly": "monthly",
+                }.get(interval, "billing")
+                label = (
+                    f"Current {interval_label} billing period "
+                    f"({period_start.strftime('%d %b %Y')} – {period_end.strftime('%d %b %Y')} UTC)"
+                )
+                return period_start, period_end, label
+
+        now_local = datetime.now().astimezone()
+        period_start_local = now_local.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        if period_start_local.month == 12:
+            period_end_local = period_start_local.replace(year=period_start_local.year + 1, month=1)
+        else:
+            period_end_local = period_start_local.replace(month=period_start_local.month + 1)
+        period_start = period_start_local.astimezone(timezone.utc)
+        period_end = period_end_local.astimezone(timezone.utc)
+        label = (
+            f"Current calendar month "
+            f"({period_start_local.strftime('%d %b')} – {now_local.strftime('%d %b %Y')}, local time)"
         )
+        return period_start, period_end, label
+
+    def _history_entry_in_period(
+        self,
+        created_at: str,
+        *,
+        period_start: datetime,
+        period_end: Optional[datetime],
+    ) -> bool:
+        ts = self._parse_datetime_value(created_at)
+        if ts is None:
+            return False
+        if ts < period_start:
+            return False
+        if period_end is not None and ts >= period_end:
+            return False
+        return True
+
+    def _billed_usage_total_from_history(
+        self,
+        *,
+        period_start: Optional[datetime] = None,
+        period_end: Optional[datetime] = None,
+    ) -> float:
+        """Sum of marked-up run costs; optionally limited to a billing window."""
+        total = 0.0
+        for entry in self._state.output_history:
+            if period_start is not None:
+                if not self._history_entry_in_period(
+                    entry.created_at,
+                    period_start=period_start,
+                    period_end=period_end,
+                ):
+                    continue
+            raw = float(getattr(entry, "llm_cost_usd", 0.0) or 0.0)
+            if raw > 0:
+                total += self._billed_cost_usd(raw)
+        return round(total, 6)
+
+    def _period_credits_used_usd(self) -> float:
+        """Billed USD consumed in the active billing window (not lifetime)."""
+        period_start, period_end, _ = self._credits_usage_period_bounds()
+        from_history = self._billed_usage_total_from_history(
+            period_start=period_start,
+            period_end=period_end,
+        )
+        cloud_used = round(float(self._state.monthly_credits_used_usd or 0.0), 6)
+        if self._state.output_history or cloud_used > 0:
+            return round(max(from_history, cloud_used), 6)
+        return cloud_used
+
+    def _lifetime_credits_used_usd(self) -> float:
+        return self._billed_usage_total_from_history()
+
+    def _reconcile_credits_used_from_history(self) -> None:
+        """Align stored period-used with in-window local history and cloud (never lifetime)."""
+        period_start, period_end, _ = self._credits_usage_period_bounds()
+        from_history = self._billed_usage_total_from_history(
+            period_start=period_start,
+            period_end=period_end,
+        )
+        stored = float(self._state.monthly_credits_used_usd or 0.0)
+        merged = max(from_history, stored)
+        if abs(merged - stored) > 1e-6:
+            self._state.monthly_credits_used_usd = merged
+
+    def _refresh_credits_page(self) -> None:
+        self._reconcile_credits_used_from_history()
+        budget = self._state.monthly_credits_usd
+        used = self._period_credits_used_usd()
+        remaining = max(budget - used, 0.0)
+        markup = self._credit_markup_multiplier()
+        _, _, period_label = self._credits_usage_period_bounds()
         self._credits_period_note.setText(
-            f"{interval_words}. The credit pool is the US dollar value from your subscription charge "
-            f"at checkout (Nigerian Naira converted to USD on the server at the then-current rate). "
-            '"Used" and "Remaining" are all in US dollars on the same basis.'
+            f"{period_label}. \"Used\" is the total of every hosted-model run in this window "
+            f"(from the 1st of the month through today for free/annual accounts), billed at "
+            f"raw LLM API cost × {markup:g} SurvyAI markup. Lifetime total is at the bottom."
         )
 
         self._credits_total_label.setText(f"${budget:,.2f}")
@@ -2550,24 +3113,37 @@ class MainWindow(QMainWindow):
             )
 
         lines: list[str] = []
-        for entry in self._state.output_history[:30]:
+        period_start, period_end, _ = self._credits_usage_period_bounds()
+        for entry in self._state.output_history:
+            if not self._history_entry_in_period(
+                entry.created_at,
+                period_start=period_start,
+                period_end=period_end,
+            ):
+                continue
             cost_val = float(getattr(entry, "llm_cost_usd", 0.0) or 0.0)
             if cost_val <= 0:
                 continue
-            billed_usd = cost_val * markup
+            billed_usd = self._billed_cost_usd(cost_val)
             model = entry.model_name or "?"
-            ts = entry.created_at or ""
+            ts = self._format_history_timestamp(entry.created_at)
             q_preview = (entry.query or "")[:60].replace("\n", " ")
             lines.append(f"[{ts}]  ${billed_usd:,.2f}  ({model})  {q_preview}")
+            if len(lines) >= 50:
+                break
         self._credits_history_text.setPlainText(
-            "\n".join(lines) if lines else "No cost data recorded yet."
+            "\n".join(lines) if lines else "No cost data recorded yet for this billing window."
+        )
+        lifetime = self._lifetime_credits_used_usd()
+        self._credits_lifetime_label.setText(
+            f"Lifetime hosted-model usage (all time): ${lifetime:,.2f} USD billed"
         )
         self._update_credit_usage_notice()
 
     def _credit_banner_reset_dismissals_if_period_changed(self) -> None:
         """Clear dismiss flags when the server budget changes or usage rolls back (new period)."""
         b = float(self._state.monthly_credits_usd or 0.0)
-        u = float(self._state.monthly_credits_used_usd or 0.0)
+        u = self._period_credits_used_usd()
         ab = float(getattr(self._state, "credit_banner_anchor_budget_usd", -1.0))
         au = float(getattr(self._state, "credit_banner_anchor_used_usd", -1.0))
         if ab < 0.0 and au < 0.0:
@@ -2596,7 +3172,7 @@ class MainWindow(QMainWindow):
         self._credit_banner_reset_dismissals_if_period_changed()
 
         budget = float(self._state.monthly_credits_usd or 0.0)
-        used = float(self._state.monthly_credits_used_usd or 0.0)
+        used = self._period_credits_used_usd()
         remaining = budget - used
         eps = max(1e-6, abs(budget) * 1e-9)
         self._credit_notice_current_band = "none"
@@ -2695,13 +3271,19 @@ class MainWindow(QMainWindow):
         self._update_credit_usage_notice()
 
     def _average_run_cost(self) -> float:
-        """Average billed USD per run (same dollars as the Credits page Used column)."""
-        markup = self._state.credit_markup_multiplier
+        """Average billed USD per run in the current billing window."""
+        period_start, period_end, _ = self._credits_usage_period_bounds()
         costs: list[float] = []
         for entry in self._state.output_history[:20]:
+            if not self._history_entry_in_period(
+                entry.created_at,
+                period_start=period_start,
+                period_end=period_end,
+            ):
+                continue
             c = float(getattr(entry, "llm_cost_usd", 0.0) or 0.0)
             if c > 0:
-                costs.append(c * markup)
+                costs.append(self._billed_cost_usd(c))
         return sum(costs) / len(costs) if costs else 0.0
 
     def _effective_run_llm_id(self) -> str:
@@ -2738,12 +3320,12 @@ class MainWindow(QMainWindow):
         """
         if not credit_limit_enforcement_enabled():
             return False, ""
-        if not self._state.can_use_platform_llm or not self._state.cloud_access_token.strip():
+        if not self._state.cloud_access_token.strip():
             return False, ""
         if self._effective_run_llm_id() == "ollama":
             return False, ""
         budget = float(self._state.monthly_credits_usd or 0.0)
-        used = float(self._state.monthly_credits_used_usd or 0.0)
+        used = self._period_credits_used_usd()
         remaining = budget - used
         if budget <= 0:
             return False, ""
@@ -2769,28 +3351,52 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_refresh_credits_from_cloud(self) -> None:
+        self._refresh_credits_page()
         base, token = self._cloud_base_and_token()
         if not base or not token:
-            QMessageBox.information(
-                self,
-                "Not signed in",
-                "Sign in from the account menu to sync credits.",
-            )
+            self.statusBar().showMessage("Usage refreshed from local run history.", 4000)
             return
-        if not self._ensure_cloud_token_valid(silent=False):
+        if self._cloud_network_busy():
+            self.statusBar().showMessage("Cloud update already in progress…", 3000)
             return
-        base, token = self._cloud_base_and_token()
-        try:
-            ent = get_entitlements(base_url=base, access_token=token)
-            ent_d = ent if isinstance(ent, dict) else {}
-            self._state.monthly_credits_usd = float(ent_d.get("monthly_credits_usd") or 0)
-            self._state.monthly_credits_used_usd = float(ent_d.get("monthly_credits_used_usd") or 0)
-            self._state.credit_markup_multiplier = float(ent_d.get("credit_markup_multiplier") or 1.5)
+
+        self._begin_cloud_busy("Syncing credits from cloud…")
+        thread = CloudCreditsSyncThread(self._make_cloud_credits_sync_payload(), parent=self)
+        self._cloud_credits_sync_thread = thread
+
+        def _done() -> None:
+            self._end_cloud_busy()
+            if self._cloud_credits_sync_thread is thread:
+                self._cloud_credits_sync_thread = None
+
+        def _on_ok(result_obj: object) -> None:
+            result = result_obj if isinstance(result_obj, CloudCreditsSyncResult) else None
+            if result is None:
+                QMessageBox.warning(self, "Credits sync failed", "Unexpected sync response.")
+                return
+            if result.access_token:
+                self._state.cloud_access_token = result.access_token
+            if result.refresh_token:
+                self._state.cloud_refresh_token = result.refresh_token
+            if result.access_token_expires_at:
+                self._state.cloud_access_token_expires_at = result.access_token_expires_at
+            ent_d = result.ent if isinstance(result.ent, dict) else {}
+            self._sync_credits_from_entitlements(ent_d)
             self._state_store.save(self._state)
             self._refresh_credits_page()
             self.statusBar().showMessage("Credits refreshed from cloud.", 4000)
-        except CloudApiError as exc:
-            QMessageBox.warning(self, "Credits sync failed", user_facing_cloud_message(exc))
+
+        def _on_fail(msg: str) -> None:
+            if self._cloud_sync_message_is_session_expired(msg):
+                self._clear_cloud_session()
+                self._prompt_session_expired()
+                return
+            QMessageBox.warning(self, "Credits sync failed", msg)
+
+        thread.succeeded.connect(_on_ok)
+        thread.failed.connect(_on_fail)
+        thread.finished.connect(_done)
+        thread.start()
 
     # ------------------------------------------------------------------
     # Console / history helpers
@@ -2815,6 +3421,9 @@ class MainWindow(QMainWindow):
         self._activity_log.appendPlainText(f"[{stamp}] {text}")
 
     def _persist_history_from_result(self, result: AgentRunResult) -> None:
+        cost = float(result.llm_cost_usd or 0.0)
+        if cost <= 0:
+            _, cost = self._usage_event_for_result(result)
         entry = TaskHistoryEntry(
             run_id=str(uuid.uuid4()),
             created_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -2826,7 +3435,7 @@ class MainWindow(QMainWindow):
             error=str(result.error or ""),
             llm_used=str(result.llm_used or ""),
             model_name=str(result.model_name or ""),
-            llm_cost_usd=float(result.llm_cost_usd or 0.0),
+            llm_cost_usd=float(cost or 0.0),
             cancelled=False,
         )
         self._state_store.add_history_entry(self._state, entry=entry)
@@ -2853,57 +3462,109 @@ class MainWindow(QMainWindow):
         """Pull credit balance fields from an /entitlements or /me response dict."""
         self._state.monthly_credits_usd = float(ent.get("monthly_credits_usd") or 0)
         self._state.monthly_credits_used_usd = float(ent.get("monthly_credits_used_usd") or 0)
-        self._state.credit_markup_multiplier = float(ent.get("credit_markup_multiplier") or 1.5)
+        self._state.credit_markup_multiplier = float(ent.get("credit_markup_multiplier") or 2.0)
         self._state.can_use_platform_llm = bool(ent.get("can_use_platform_llm"))
         self._state.credits_billing_interval = str(ent.get("credits_billing_interval") or "").strip().lower()
+        self._reconcile_credits_used_from_history()
         self._update_credit_usage_notice()
+
+    def _usage_event_for_result(self, result: AgentRunResult) -> tuple[dict[str, object] | None, float]:
+        usage = summarize_graph_llm_usage(
+            list((result.raw or {}).get("messages") or []),
+            str(result.model_name or ""),
+            response_text=result.response or "",
+        )
+        raw_cost = float(usage.get("cost_usd") or result.llm_cost_usd or 0.0)
+        if raw_cost <= 0:
+            return None, 0.0
+        event: dict[str, object] = {
+            "kind": "agent_run",
+            "quantity": 1,
+            "cost_usd": round(raw_cost, 6),
+            "model_name": str(usage.get("model_name") or result.model_name or ""),
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
+            "meta": {
+                "usage_estimated": bool(usage.get("estimated")),
+                "usage_turns": int(usage.get("usage_turns") or 0),
+                "llm_used": str(result.llm_used or ""),
+            },
+        }
+        return event, raw_cost
+
+    def _using_cloud_llm_proxy(self) -> bool:
+        return bool(
+            getattr(self._settings, "survyai_llm_proxy_enabled", False)
+            and str(getattr(self._settings, "survyai_api_base_url", "") or "").strip()
+            and str(getattr(self._settings, "survyai_access_token", "") or "").strip()
+        )
+
+    def _auto_switch_to_ollama_after_credit_exhaustion(self) -> None:
+        if self._effective_run_llm_id() == "ollama":
+            return
+        self._state.preferred_primary_llm = "ollama"
+        self._state.preferred_fallback_llm = "ollama"
+        self._state.use_fallback_llm = False
+        self._state_store.save(self._state)
+        self._rebuild_service(skip_cloud_refresh=True)
+        self._refresh_account_views()
+        self._refresh_credits_page()
+        QMessageBox.information(
+            self,
+            "Hosted credits exhausted",
+            "Your hosted SurvyAI credit balance has been exhausted for this billing period.\n\n"
+            "SurvyAI has switched your Primary and Fallback models to Ollama so you can keep working locally. "
+            "If you have not installed or selected an Ollama model yet, open Account -> Local models (Ollama) to finish setup.",
+        )
 
     def _account_for_run_cost(self, result: AgentRunResult) -> None:
         """Update local credit tally and (best-effort) report cost to the cloud usage API."""
-        raw_cost = result.llm_cost_usd
-        if raw_cost <= 0:
+        if self._using_cloud_llm_proxy():
+            self._silent_pull_entitlements_from_cloud()
+            self._reconcile_credits_used_from_history()
+            self._state_store.save(self._state)
+            self._refresh_credits_page()
+            blocked, _msg = self._platform_credit_wall_should_block()
+            if blocked:
+                self._auto_switch_to_ollama_after_credit_exhaustion()
+            self._update_credit_usage_notice()
             return
-        markup = self._state.credit_markup_multiplier
-        marked_up = raw_cost * markup
+        usage_event, raw_cost = self._usage_event_for_result(result)
+        if raw_cost <= 0:
+            self._refresh_credits_page()
+            return
+        marked_up = self._billed_cost_usd(raw_cost)
         self._state.monthly_credits_used_usd = round(
             self._state.monthly_credits_used_usd + marked_up, 6
         )
+        self._reconcile_credits_used_from_history()
         self._state_store.save(self._state)
-        self._report_cost_to_cloud(raw_cost)
+        if usage_event is not None:
+            self._report_cost_to_cloud(usage_event)
+        self._refresh_credits_page()
         self._update_credit_usage_notice()
 
-    def _report_cost_to_cloud(self, raw_cost_usd: float) -> None:
-        """Best-effort POST to /v1/usage/events with the raw LLM cost."""
+    def _report_cost_to_cloud(self, usage_event: dict[str, object]) -> None:
+        """Best-effort POST to /v1/usage/events with structured run usage."""
         base, token = self._cloud_base_and_token()
         if not base or not token:
             return
         try:
-            import requests as _requests
-
-            did = (self._state.cloud_device_id or "").strip()
-            headers: dict[str, str] = {
-                "Authorization": f"Bearer {token}",
-                "Content-Type": "application/json",
-            }
-            if did:
-                headers["X-SurvyAI-Device-Id"] = did
-            payload = {
-                "events": [
-                    {
-                        "kind": "agent_run",
-                        "quantity": 1,
-                        "cost_usd": round(raw_cost_usd, 6),
-                    }
-                ]
-            }
-            resp = _requests.post(
-                f"{base.rstrip('/')}/v1/usage/events",
-                json=payload,
-                headers=headers,
-                timeout=8,
+            resp = report_usage_batch(
+                base_url=base,
+                access_token=token,
+                device_id=(self._state.cloud_device_id or "").strip() or None,
+                events=[usage_event],
+                timeout_s=8,
             )
-            if resp is not None and resp.status_code == 402:
-                # Server rejected usage (credits); resync balances from entitlements.
+            self._state.monthly_credits_used_usd = float(resp.get("monthly_credits_used_usd") or 0.0)
+            self._state.monthly_credits_usd = float(resp.get("monthly_credits_usd") or self._state.monthly_credits_usd)
+            self._reconcile_credits_used_from_history()
+            self._state_store.save(self._state)
+            self._refresh_credits_page()
+        except CloudApiError as exc:
+            if "credit balance exhausted" in str(exc).lower():
                 self._silent_pull_entitlements_from_cloud()
                 self._refresh_credits_page()
         except Exception:
@@ -2968,7 +3629,12 @@ class MainWindow(QMainWindow):
         self._input.clear()
         self._store_conversation_message("user", text)
         self._append_user_message(text)
-        enhanced = self._build_continuation_query(text)
+        resolved = self._try_resolve_internet_permission_reply(text)
+        if resolved:
+            enhanced = resolved
+            self._append_activity("Internet permission granted — searching for your original question.")
+        else:
+            enhanced = self._build_continuation_query(text)
         # Store the history-enriched version so _handle_internet_permission can
         # re-submit it (with full context) instead of the bare plain query.
         self._pending_enhanced_query = enhanced
@@ -2980,6 +3646,48 @@ class MainWindow(QMainWindow):
 
     _MAX_HISTORY_TURNS = 12       # user + assistant messages to keep
     _MAX_MSG_CHARS     = 3000     # truncation per message (raised: GIS results are verbose)
+    _MAX_MSG_CHARS_ESSAY_SAVE = 1_000_000  # preserve full assistant answers for essay export
+
+    def _try_resolve_internet_permission_reply(self, raw_query: str) -> Optional[str]:
+        """If the user is answering a prior internet-permission ask, return a clean
+        tagged query for the agent (skips history injection that confuses routing)."""
+        conv = self._active_conversation()
+        prior = conv.messages[:-1] if conv.messages else []
+        last_assistant = ""
+        for m in reversed(prior):
+            if m.role == "assistant":
+                last_assistant = m.content or ""
+                break
+        if not _assistant_asked_internet_permission(last_assistant):
+            return None
+        if not _is_permission_affirmation(raw_query):
+            return None
+        users = [(m.content or "").strip() for m in prior if m.role == "user"]
+        underlying = ""
+        for u in reversed(users):
+            if u and len(u) >= 8 and not _is_permission_affirmation(u):
+                underlying = u
+                break
+        if not underlying and users:
+            underlying = users[0]
+        if not underlying:
+            return None
+        return f"[INTERNET_PERMISSION_GRANTED]\n{underlying}"
+
+    @staticmethod
+    def _clean_question_from_enhanced(q: str) -> str:
+        """Extract the substantive user question from a history-enriched agent query."""
+        text = (q or "").strip()
+        marker = "NOW, the user wants you to continue with this new request:"
+        if marker in text:
+            text = text.split(marker)[-1].strip()
+        for tag in (
+            "[INTERNET_PERMISSION_GRANTED]",
+            "[INTERNET_PERMISSION_DENIED]",
+            "[INTERNET_PERMISSION_REQUEST]",
+        ):
+            text = text.replace(tag, "").strip()
+        return text
 
     def _build_continuation_query(self, raw_query: str) -> str:
         """Prepend recent conversation history to *raw_query* so the spawned
@@ -3017,24 +3725,45 @@ class MainWindow(QMainWindow):
         prior_for_relevance = "\n".join(rel_parts)
         include_full_history = _should_inject_conversation_context(raw_query, prior_for_relevance)
 
-        # If not confident it's a follow-up, still include the last exchange only.
-        # This gives the agent enough evidence to decide "related vs new topic"
-        # using the LLM, without bloating the prompt.
+        # Determine how much context to inject:
+        # - Clear follow-up  → full recent history (up to _MAX_HISTORY_TURNS)
+        # - Ambiguous        → last exchange only (2 messages)
+        # - Clearly new topic → send bare query, no context prefix at all.
+        #   This prevents the agent from "continuing" an unrelated prior workflow
+        #   (e.g. a knowledge question sent after a CAD task) and is the primary
+        #   guard against the agent picking up the wrong task.
         if include_full_history:
             turns = turns[-self._MAX_HISTORY_TURNS:]
         else:
-            turns = turns[-2:]
+            last_two = turns[-2:]
+            if _is_clearly_new_topic(raw_query, last_two):
+                return raw_query
+            turns = last_two
 
         parts: list[str] = [
-            "=== CONTINUATION OF PREVIOUS WORK ===",
-            "Below is recent conversation context. The user may be continuing the last task OR starting a new one.",
+            "=== CONVERSATION CONTEXT (REFERENCE ONLY) ===",
+            "The block below is recent conversation history provided ONLY as optional",
+            "background. It is NOT a task. Follow these rules strictly:",
+            "1. Answer the CURRENT REQUEST at the very bottom — nothing else.",
+            "2. Use this history ONLY if the current request clearly refers to it",
+            "   (e.g. 'it', 'that plan', 'add another road', 'change the title').",
+            "3. If the current request is a new/unrelated topic, IGNORE this history",
+            "   completely and do NOT resume or repeat any previous tool/file/CAD",
+            "   operation. Do not open files or run tools unless the CURRENT request",
+            "   explicitly asks for it.",
             "",
         ]
+        preserve_full_assistant = _is_save_session_docx_request(raw_query)
         exchange = 0
         for t in turns:
             content = t.content
-            if len(content) > self._MAX_MSG_CHARS:
-                content = content[: self._MAX_MSG_CHARS] + "…[truncated]"
+            max_chars = (
+                self._MAX_MSG_CHARS_ESSAY_SAVE
+                if preserve_full_assistant and t.role == "assistant"
+                else self._MAX_MSG_CHARS
+            )
+            if len(content) > max_chars:
+                content = content[:max_chars] + "…[truncated]"
             if t.role == "user":
                 exchange += 1
                 parts.append(f"--- Exchange {exchange} ---")
@@ -3043,7 +3772,7 @@ class MainWindow(QMainWindow):
                 parts.append(f"Assistant: {content}")
             parts.append("")
 
-        parts.append("--- End of History ---")
+        parts.append("--- End of History (reference only) ---")
         parts.append("")
         parts.append(
             "NOW, the user wants you to continue with this new request:"
@@ -3102,21 +3831,49 @@ class MainWindow(QMainWindow):
 
         self._append_system_line("Done.")
         self._append_activity("Task completed.")
+
+        # Use the conversation that *submitted* this query, not the currently
+        # selected one.  The user may have switched tabs while the query was
+        # running, and writing to the active conversation would bleed the
+        # response into the wrong tab.
+        target_conv_id = self._running_conversation_id or self._active_conversation_id
+
         if result.session_id:
-            self._session_id = result.session_id
-            conv = self._active_conversation()
-            conv.session_id = result.session_id
+            # Update the session_id on the conversation that ran the query.
+            target_conv = next(
+                (c for c in self._state.conversations if c.conversation_id == target_conv_id),
+                None,
+            )
+            if target_conv is not None:
+                target_conv.session_id = result.session_id
+            # Only update the UI-level session pointer if we're still on the
+            # same conversation that ran the task.
+            if target_conv_id == self._active_conversation_id:
+                self._session_id = result.session_id
             self._state_store.save(self._state)
             self._refresh_conversation_list()
             self._session_settings_label.setText(f"{self._session_id}\nStatus: Ready")
 
         body = result.response or ""
+        result_is_active = (target_conv_id == self._active_conversation_id)
         if not result.success and result.error:
-            self._store_conversation_message("assistant", f"{body}\n\n(Error: {result.error})", error=True)
-            self._append_assistant_message(f"{body}\n\n(Error: {result.error})", error=True)
+            self._store_conversation_message(
+                "assistant",
+                f"{body}\n\n(Error: {result.error})",
+                error=True,
+                conversation_id=target_conv_id,
+            )
+            if result_is_active:
+                self._append_assistant_message(f"{body}\n\n(Error: {result.error})", error=True)
         else:
-            self._store_conversation_message("assistant", body, error=not result.success)
-            self._append_assistant_message(body, error=not result.success)
+            self._store_conversation_message(
+                "assistant",
+                body,
+                error=not result.success,
+                conversation_id=target_conv_id,
+            )
+            if result_is_active:
+                self._append_assistant_message(body, error=not result.success)
         self._persist_history_from_result(result)
         self._account_for_run_cost(result)
 
@@ -3134,6 +3891,7 @@ class MainWindow(QMainWindow):
             or self._pending_plain_query
             or ""
         )
+        clean_q = self._clean_question_from_enhanced(q) or self._pending_plain_query or q
         box = QMessageBox(self)
         box.setWindowTitle("Internet search permission")
         box.setIcon(QMessageBox.Question)
@@ -3148,9 +3906,9 @@ class MainWindow(QMainWindow):
         box.exec()
 
         tagged = (
-            f"[INTERNET_PERMISSION_GRANTED]\n{q}"
+            f"[INTERNET_PERMISSION_GRANTED]\n{clean_q}"
             if box.clickedButton() == allow
-            else f"[INTERNET_PERMISSION_DENIED]\n{q}"
+            else f"[INTERNET_PERMISSION_DENIED]\n{clean_q}"
         )
         self._append_activity("Permission dialog answered.")
         self._append_system_line("Running (with your choice)…")
@@ -3161,11 +3919,10 @@ class MainWindow(QMainWindow):
         self._append_system_line("Done.")
         self._append_activity("Unexpected GUI/worker error.")
         msg = "An unexpected error occurred in the agent.\n\n" + tb
-        self._store_conversation_message("assistant", msg, error=True)
-        self._append_assistant_message(
-            msg,
-            error=True,
-        )
+        target_conv_id = self._running_conversation_id or self._active_conversation_id
+        self._store_conversation_message("assistant", msg, error=True, conversation_id=target_conv_id)
+        if target_conv_id == self._active_conversation_id:
+            self._append_assistant_message(msg, error=True)
 
     @Slot(str)
     def _on_worker_progress(self, text: str) -> None:
@@ -3173,10 +3930,14 @@ class MainWindow(QMainWindow):
 
     @Slot(str)
     def _on_agent_cancelled(self, text: str) -> None:
-        self._store_conversation_message("system", text)
+        target_conv_id = self._running_conversation_id or self._active_conversation_id
+        self._store_conversation_message("system", text, conversation_id=target_conv_id)
         self._persist_cancelled_history(self._pending_plain_query or self._last_query, text)
         self._append_system_line(text)
         self._append_activity(text)
+        # Cancelling terminates the warm worker; re-warm it so the next prompt
+        # doesn't pay the cold-start cost again.
+        QTimer.singleShot(0, self._prewarm_agent)
 
     @Slot()
     def _on_thread_finished(self) -> None:
@@ -3534,6 +4295,8 @@ class MainWindow(QMainWindow):
                 (
                     "This cloud API has no Paystack plan codes.\n\n"
                     "On the machine running python -m survyai_cloud, add to .env or .env.cloud:\n"
+                    "  PAYSTACK_PLAN_CODE_PRO_DAILY=PLN_…\n"
+                    "  PAYSTACK_PLAN_CODE_PRO_WEEKLY=PLN_…\n"
                     "  PAYSTACK_PLAN_CODE_PRO_MONTHLY=PLN_…\n"
                     "  PAYSTACK_PLAN_CODE_PRO_ANNUAL=PLN_…\n\n"
                     "Copy plan Codes from Paystack Dashboard → Plans (not the Naira price).\n"
@@ -3585,7 +4348,8 @@ class MainWindow(QMainWindow):
                 "Billing not configured",
                 (
                     "The cloud API returned no billing plans.\n\n"
-                    "Set PAYSTACK_PLAN_CODE_PRO_MONTHLY and/or PAYSTACK_PLAN_CODE_PRO_ANNUAL "
+                    "Set PAYSTACK_PLAN_CODE_PRO_DAILY, PAYSTACK_PLAN_CODE_PRO_WEEKLY, "
+                    "PAYSTACK_PLAN_CODE_PRO_MONTHLY, and/or PAYSTACK_PLAN_CODE_PRO_ANNUAL "
                     "in .env.cloud (plan codes PLN_… from Paystack Dashboard), then restart "
                     "python -m survyai_cloud."
                 ),
@@ -3760,6 +4524,9 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_refresh_cloud_license(self) -> None:
+        if self._cloud_network_busy():
+            self.statusBar().showMessage("Cloud update already in progress…", 3000)
+            return
         base, token = self._cloud_base_and_token()
         if not base or not token:
             QMessageBox.warning(
@@ -3768,60 +4535,50 @@ class MainWindow(QMainWindow):
                 "Sign in from the account menu (top right) first.",
             )
             return
-        if not self._ensure_cloud_token_valid(silent=False):
-            return
-        base, token = self._cloud_base_and_token()
-        try:
-            me = get_me(base_url=base, access_token=token)
-            ent = get_entitlements(base_url=base, access_token=token)
-            me_d = me if isinstance(me, dict) else {}
-            ent_d = ent if isinstance(ent, dict) else {}
-            registered = self._register_cloud_device_for_this_pc(silent=False)
-            if not registered and _cloud_entitlements_allow_platform_llm(me_d, ent_d):
-                self._state.cloud_bootstrap = {}
-            bs: dict = {}
-            pro_keys = _cloud_entitlements_allow_platform_llm(me_d, ent_d)
-            did = self._state.cloud_device_id.strip()
-            try:
-                if pro_keys:
-                    if not did:
-                        self.statusBar().showMessage(
-                            "This PC is not registered for hosted Pro keys (device limit or registration error).",
-                            9000,
-                        )
-                    else:
-                        bs = get_bootstrap(
-                            base_url=base,
-                            access_token=token,
-                            device_id=did,
-                        )
-                else:
-                    bs = get_bootstrap(base_url=base, access_token=token)
-            except CloudApiError:
-                bs = {}
-                if pro_keys:
-                    self.statusBar().showMessage(
-                        "Hosted keys unavailable. Confirm this PC is registered and your Pro subscription is active.",
-                        8000,
-                    )
-                else:
-                    self.statusBar().showMessage(
-                        "Account refreshed. Hosted keys load when your plan includes them.",
-                        6000,
-                    )
-        except CloudApiError as exc:
-            QMessageBox.warning(self, "Couldn't refresh account", user_facing_cloud_message(exc))
-            return
-        self._state.cloud_me = me if isinstance(me, dict) else {}
-        self._state.cloud_bootstrap = bs if isinstance(bs, dict) else {}
-        self._sync_credits_from_entitlements(ent_d)
-        self._state_store.save(self._state)
-        self._rebuild_service()
-        self._refresh_license_card()
-        self._refresh_diagnostics()
-        plan = str(ent.get("plan_slug") or me.get("plan_slug") or "")
-        st = str(ent.get("subscription_status") or me.get("subscription_status") or "")
-        self.statusBar().showMessage(f"Cloud refreshed. Plan={plan} Status={st}", 6000)
+
+        self._begin_cloud_busy("Refreshing cloud account…")
+        thread = CloudAccountSyncThread(self._make_cloud_account_sync_payload(), parent=self)
+        self._cloud_account_sync_thread = thread
+
+        def _done() -> None:
+            self._end_cloud_busy()
+            if self._cloud_account_sync_thread is thread:
+                self._cloud_account_sync_thread = None
+
+        def _on_ok(result_obj: object) -> None:
+            result = result_obj if isinstance(result_obj, CloudAccountSyncResult) else None
+            if result is None:
+                QMessageBox.warning(self, "Couldn't refresh account", "Unexpected sync response.")
+                return
+            ent = result.ent if isinstance(result.ent, dict) else {}
+            me = result.me if isinstance(result.me, dict) else {}
+            plan = str(ent.get("plan_slug") or me.get("plan_slug") or "")
+            st = str(ent.get("subscription_status") or me.get("subscription_status") or "")
+            self._apply_cloud_account_sync_result(
+                result,
+                success_status=f"Cloud refreshed. Plan={plan} Status={st}",
+            )
+
+        def _on_fail(msg: str) -> None:
+            if self._cloud_sync_message_is_session_expired(msg):
+                self._clear_cloud_session()
+                self._prompt_session_expired()
+                return
+            QMessageBox.warning(self, "Couldn't refresh account", msg)
+
+        thread.succeeded.connect(_on_ok)
+        thread.failed.connect(_on_fail)
+        thread.finished.connect(_done)
+        thread.start()
+
+    @staticmethod
+    def _cloud_sync_message_is_session_expired(msg: str) -> bool:
+        low = (msg or "").lower()
+        return (
+            "session expired" in low
+            or "refresh token" in low
+            or "no refresh token" in low
+        )
 
     @Slot()
     def _cloud_sign_in(self) -> None:
@@ -3944,83 +4701,87 @@ class MainWindow(QMainWindow):
                 "Your cloud account was created. You will be signed in next.",
             )
 
+        self._begin_cloud_busy("Signing in…")
         try:
             tokens = login(base_url=base_url, email=email.strip(), password=password)
-            me = get_me(base_url=base_url, access_token=tokens.access_token)
-            ent = get_entitlements(base_url=base_url, access_token=tokens.access_token)
-            me_d = me if isinstance(me, dict) else {}
-            ent_d = ent if isinstance(ent, dict) else {}
-            registered = self._register_cloud_device_with_credentials(
-                base_url=base_url,
-                access_token=tokens.access_token,
-                silent=False,
-            )
-            if not registered and _cloud_entitlements_allow_platform_llm(me_d, ent_d):
-                self._state.cloud_bootstrap = {}
-            bs: dict = {}
-            pro_keys = _cloud_entitlements_allow_platform_llm(me_d, ent_d)
-            did = self._state.cloud_device_id.strip()
-            try:
-                if pro_keys:
-                    if not did:
-                        self.statusBar().showMessage(
-                            "Signed in. This PC is not registered for hosted Pro keys (device limit or error).",
-                            9000,
-                        )
-                    else:
-                        bs = get_bootstrap(
-                            base_url=base_url,
-                            access_token=tokens.access_token,
-                            device_id=did,
-                        )
-                else:
-                    bs = get_bootstrap(base_url=base_url, access_token=tokens.access_token)
-            except CloudApiError:
-                bs = {}
-                if pro_keys:
-                    self.statusBar().showMessage(
-                        "Signed in. Hosted keys unavailable — confirm Pro subscription and PC registration.",
-                        8000,
-                    )
-                else:
-                    self.statusBar().showMessage(
-                        "Signed in. Hosted model keys load when your cloud plan includes them.",
-                        8000,
-                    )
         except CloudApiError as exc:
+            self._end_cloud_busy()
             QMessageBox.warning(self, "Couldn't sign in", user_facing_cloud_message(exc))
             return
         except Exception as exc:
+            self._end_cloud_busy()
             QMessageBox.warning(self, "Couldn't sign in", user_facing_cloud_message(exc))
             return
 
-        # Persist cloud auth + bootstrap, then rebuild service.
         self._state.cloud_api_base_url = base_url.strip()
         self._state.cloud_access_token = tokens.access_token
         self._state.cloud_refresh_token = tokens.refresh_token
         self._state.cloud_access_token_expires_at = access_token_expires_at_iso(
             expires_in_seconds=tokens.expires_in
         )
-        self._state.cloud_me = me if isinstance(me, dict) else {}
-        self._state.cloud_bootstrap = bs if isinstance(bs, dict) else {}
-        ent_d = ent if isinstance(ent, dict) else {}
-        self._sync_credits_from_entitlements(ent_d)
-        from_me = str(me.get("display_name") or "").strip() if isinstance(me, dict) else ""
         local = _email_local_part(email.strip())
         entered = (display_name_for_profile or "").strip()
-        self._state.profile.display_name = entered or local or from_me
+        self._state.profile.display_name = entered or local
         self._state.profile.company = (company_for_profile or "").strip()
         self._state.profile.email = email.strip()
         if not self._state.profile.signed_in_at:
             self._state.profile.signed_in_at = datetime.now(timezone.utc).isoformat()
         self._state_store.save(self._state)
-        self._rebuild_service()
-        self._refresh_license_card()
-        self._refresh_account_views()
-        self._refresh_diagnostics()
-        plan = str(ent.get("plan_slug") or me.get("plan_slug") or "")
-        status = str(ent.get("subscription_status") or me.get("subscription_status") or "")
-        self.statusBar().showMessage(f"Cloud connected. Plan={plan} Status={status}", 6000)
+
+        payload = CloudAccountSyncPayload(
+            base_url=base_url.strip(),
+            access_token=tokens.access_token,
+            refresh_token=tokens.refresh_token,
+            access_token_expires_at=self._state.cloud_access_token_expires_at,
+            device_id="",
+            device_fingerprint="",
+            machine_label=(os.environ.get("COMPUTERNAME") or "").strip() or None,
+        )
+        thread = CloudAccountSyncThread(payload, parent=self)
+        self._cloud_account_sync_thread = thread
+
+        def _done() -> None:
+            self._end_cloud_busy()
+            if self._cloud_account_sync_thread is thread:
+                self._cloud_account_sync_thread = None
+
+        def _on_ok(result_obj: object) -> None:
+            result = result_obj if isinstance(result_obj, CloudAccountSyncResult) else None
+            if result is None:
+                QMessageBox.warning(self, "Couldn't sign in", "Unexpected sync response.")
+                return
+            from_me = str((result.me or {}).get("display_name") or "").strip()
+            self._state.profile.display_name = entered or local or from_me
+            ent = result.ent if isinstance(result.ent, dict) else {}
+            me = result.me if isinstance(result.me, dict) else {}
+            plan = str(ent.get("plan_slug") or me.get("plan_slug") or "")
+            status = str(ent.get("subscription_status") or me.get("subscription_status") or "")
+            self._apply_cloud_account_sync_result(
+                result,
+                success_status=f"Cloud connected. Plan={plan} Status={status}",
+            )
+            if result.bootstrap_status == "skipped_no_device":
+                self.statusBar().showMessage(
+                    "Signed in. This PC is not registered for hosted Pro keys (device limit or error).",
+                    9000,
+                )
+            elif result.bootstrap_status == "failed_pro":
+                self.statusBar().showMessage(
+                    "Signed in. Hosted keys unavailable — confirm Pro subscription and PC registration.",
+                    8000,
+                )
+
+        def _on_fail(msg: str) -> None:
+            if self._cloud_sync_message_is_session_expired(msg):
+                self._clear_cloud_session()
+                self._prompt_session_expired()
+                return
+            QMessageBox.warning(self, "Couldn't sign in", msg)
+
+        thread.succeeded.connect(_on_ok)
+        thread.failed.connect(_on_fail)
+        thread.finished.connect(_done)
+        thread.start()
 
     @Slot()
     def _sign_out_account(self) -> None:
@@ -4079,6 +4840,48 @@ class MainWindow(QMainWindow):
         except OSError as e:
             QMessageBox.critical(self, "Export failed", str(e))
 
+    def _diagnostic_redaction_secrets(self) -> list[str]:
+        secrets: list[str] = []
+        for value in (
+            self._state.cloud_access_token,
+            self._state.cloud_refresh_token,
+            self._state.cloud_access_token_expires_at,
+        ):
+            value = str(value or "").strip()
+            if value:
+                secrets.append(value)
+
+        def _walk(payload: object, parent_key: str = "") -> None:
+            if isinstance(payload, dict):
+                for key, value in payload.items():
+                    _walk(value, str(key or ""))
+                return
+            if isinstance(payload, list):
+                for item in payload:
+                    _walk(item, parent_key)
+                return
+            if not isinstance(payload, str):
+                return
+            probe = parent_key.lower()
+            if any(marker in probe for marker in ("token", "secret", "key", "password")):
+                candidate = payload.strip()
+                if candidate:
+                    secrets.append(candidate)
+
+        _walk(self._state.cloud_bootstrap or {})
+        return sorted(set(secrets), key=len, reverse=True)
+
+    def _redact_text_for_diagnostics(self, text: str) -> str:
+        redacted = text or ""
+        for secret in self._diagnostic_redaction_secrets():
+            redacted = redacted.replace(secret, "[REDACTED]")
+        redacted = re.sub(
+            r"\beyJ[A-Za-z0-9_\-]+?\.[A-Za-z0-9_\-]+?\.[A-Za-z0-9_\-]+?\b",
+            "[REDACTED_JWT]",
+            redacted,
+        )
+        return redacted
+
     @Slot()
     def _export_diagnostics_bundle(self) -> None:
         answer = QMessageBox.question(
@@ -4101,12 +4904,14 @@ class MainWindow(QMainWindow):
         log_path = Path(self._settings.log_file)
         try:
             with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as zf:
-                zf.writestr("diagnostics.txt", self._diagnostics_text.toPlainText())
-                zf.writestr("transcript.txt", self._transcript.toPlainText())
-                zf.writestr("activity_log.txt", self._activity_log.toPlainText())
+                zf.writestr("diagnostics.txt", self._redact_text_for_diagnostics(self._diagnostics_text.toPlainText()))
+                zf.writestr("transcript.txt", self._redact_text_for_diagnostics(self._transcript.toPlainText()))
+                zf.writestr("activity_log.txt", self._redact_text_for_diagnostics(self._activity_log.toPlainText()))
                 zf.writestr(
                     "history.json",
-                    json.dumps([entry.__dict__ for entry in self._state.output_history], indent=2, ensure_ascii=True),
+                    self._redact_text_for_diagnostics(
+                        json.dumps([entry.__dict__ for entry in self._state.output_history], indent=2, ensure_ascii=True)
+                    ),
                 )
                 zf.writestr(
                     "desktop_state_snapshot.json",
@@ -4116,10 +4921,19 @@ class MainWindow(QMainWindow):
                         ensure_ascii=True,
                     ),
                 )
-                if self._state_store.state_path.is_file():
-                    zf.write(self._state_store.state_path, arcname="desktop_state.json")
+                zf.writestr(
+                    "desktop_state_redacted.json",
+                    json.dumps(
+                        self._state_store.exportable_state_snapshot(self._state),
+                        indent=2,
+                        ensure_ascii=True,
+                    ),
+                )
                 if log_path.is_file():
-                    zf.write(log_path, arcname=log_path.name)
+                    zf.writestr(
+                        log_path.name,
+                        self._redact_text_for_diagnostics(log_path.read_text(encoding="utf-8", errors="replace")),
+                    )
             self.statusBar().showMessage(f"Diagnostics exported: {path}", 5000)
         except Exception as e:
             QMessageBox.critical(self, "Diagnostics export failed", str(e))
@@ -4131,8 +4945,102 @@ class MainWindow(QMainWindow):
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
     @Slot()
+    def _check_for_updates(self) -> None:
+        base = (self._state.cloud_api_base_url or getattr(self._settings, "survyai_api_base_url", "") or "").strip()
+        if not base:
+            QMessageBox.information(
+                self,
+                "Updates unavailable",
+                "No SurvyAI cloud API base URL is configured for update checks yet.",
+            )
+            return
+        try:
+            manifest_dict = get_update_manifest(
+                base_url=base,
+                current_version=__version__,
+                channel="stable",
+                platform="windows-x64",
+                timeout_s=10,
+            )
+            manifest = UpdateManifest.from_dict(manifest_dict)
+        except CloudApiError as exc:
+            QMessageBox.warning(self, "Update check failed", str(exc))
+            return
+
+        if not manifest.is_newer_than(__version__):
+            QMessageBox.information(
+                self,
+                "Up to date",
+                f"SurvyAI {__version__} is the latest available build on the {manifest.channel} channel.",
+            )
+            return
+
+        extra_lines = [
+            f"Current version: {__version__}",
+            f"Available version: {manifest.latest_version}",
+            f"Channel: {manifest.channel}",
+            f"Package type: {manifest.artifact_kind}",
+        ]
+        if manifest.release_notes_url:
+            extra_lines.append(f"Release notes: {manifest.release_notes_url}")
+        if manifest.requires_upgrade_from(__version__):
+            extra_lines.append(
+                "This update raises the minimum supported version, so a full installer upgrade is required."
+            )
+        if not manifest.download_url or not manifest.sha256:
+            QMessageBox.information(
+                self,
+                "Update available",
+                "\n".join(extra_lines + ["No downloadable installer is attached to this manifest yet."]),
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Update available",
+            "\n".join(extra_lines + ["\nDownload and stage this installer now?"]),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer != QMessageBox.Yes:
+            return
+
+        try:
+            manager = UpdateManager()
+            staged_path = manager.stage_update(
+                manifest,
+                current_version=__version__,
+                current_executable=sys.executable,
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Update download failed", str(exc))
+            return
+
+        launch = QMessageBox.question(
+            self,
+            "Installer ready",
+            "The verified installer was downloaded successfully.\n\n"
+            f"Path: {staged_path}\n\n"
+            "Launch it now? Close SurvyAI first if the installer requests it.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if launch == QMessageBox.Yes:
+            try:
+                if os.name == "nt":
+                    os.startfile(str(staged_path))  # type: ignore[attr-defined]
+                else:
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(staged_path)))
+            except Exception as exc:
+                QMessageBox.warning(
+                    self,
+                    "Installer not launched",
+                    f"The installer is ready but could not be opened automatically:\n\n{exc}",
+                )
+
+    @Slot()
     def _open_readme_docs(self) -> None:
-        readme = Path(__file__).resolve().parents[2] / "README.md"
+        readme = resource_path("README.md")
         if readme.is_file():
             self._show_markdown_dialog(readme, "SurvyAI Documentation")
         else:
@@ -4233,4 +5141,8 @@ class MainWindow(QMainWindow):
         if self._desktop_state_save_timer.isActive():
             self._desktop_state_save_timer.stop()
             self._flush_desktop_state_save()
+        try:
+            shutdown_shared_agent_process()
+        except Exception:
+            pass
         event.accept()

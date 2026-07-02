@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,6 +22,7 @@ from survyai_cloud.schemas import (
 from survyai_cloud.services.entitlements import (
     apply_pro_defaults,
     credit_budget_and_interval_from_paystack_payload,
+    subscription_period_end_from_anchor,
 )
 from survyai_cloud.services.paystack import (
     PaystackError,
@@ -52,6 +53,28 @@ async def list_paystack_plans(
 ) -> BillingPlansOut:
     settings = get_cloud_settings()
     plans: list[BillingPlanOption] = []
+    daily = settings.paystack_plan_code_pro_daily.strip()
+    if daily:
+        plans.append(
+            BillingPlanOption(
+                slug="pro_daily",
+                label=(
+                    f"SurvyAI Pro — {_fmt_ngn(settings.paystack_pro_daily_amount_ngn)} / day"
+                ),
+                plan_code=daily,
+            )
+        )
+    weekly = settings.paystack_plan_code_pro_weekly.strip()
+    if weekly:
+        plans.append(
+            BillingPlanOption(
+                slug="pro_weekly",
+                label=(
+                    f"SurvyAI Pro — {_fmt_ngn(settings.paystack_pro_weekly_amount_ngn)} / week"
+                ),
+                plan_code=weekly,
+            )
+        )
     monthly = settings.paystack_plan_code_pro_monthly.strip()
     if monthly:
         plans.append(
@@ -78,7 +101,8 @@ async def list_paystack_plans(
         raise HTTPException(
             status_code=501,
             detail=(
-                "No Paystack plans configured. Set PAYSTACK_PLAN_CODE_PRO_MONTHLY and/or "
+                "No Paystack plans configured. Set PAYSTACK_PLAN_CODE_PRO_DAILY, "
+                "PAYSTACK_PLAN_CODE_PRO_WEEKLY, PAYSTACK_PLAN_CODE_PRO_MONTHLY, and/or "
                 "PAYSTACK_PLAN_CODE_PRO_ANNUAL in .env.cloud (plan codes from Paystack Dashboard)."
             ),
         )
@@ -182,7 +206,7 @@ async def paystack_verify(
             anchor = datetime.fromisoformat(dt)
         except Exception:
             anchor = now
-    user.subscription_current_period_end = anchor + timedelta(days=30)
+    user.subscription_current_period_end = subscription_period_end_from_anchor(anchor, bill_interval)
 
     if isinstance(data.get("customer"), dict):
         cust = data["customer"]

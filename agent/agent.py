@@ -68,12 +68,12 @@ License: MIT
 from __future__ import annotations
 
 import json
-import operator
 import os
 import re
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
 
 # Ensure Any is available globally (for Pydantic model evaluation)
 # This prevents "name 'Any' is not defined" errors
@@ -113,6 +113,7 @@ from pydantic import BaseModel, Field
 # Local imports
 from config import get_settings
 from config.settings import Settings
+from survyai.proxy_chat_model import SurvyAIProxyChatModel
 from utils.logger import get_logger
 from utils.token_limiter import (
     estimate_message_tokens,
@@ -141,11 +142,22 @@ from tools.geopandas_tools import GeoPandasExecutor
 from datetime import datetime
 from utils.coordinate_parsing import extract_points, infer_crs_from_text
 from utils.area import best_area
-from utils.internet import internet_search as _internet_search
+from utils.internet import (
+    internet_search as _internet_search,
+    research as _web_research,
+    rule_based_query_variants as _rule_based_query_variants,
+)
 
 # Prompts and state live in separate modules for smaller, maintainable agent.py
 from agent.prompts import SYSTEM_PROMPT
-from agent.state import AgentState, RAGRouteDecision, looks_like_file_driven_task
+from agent.runtime_config import resolve_agent_runtime_config
+from agent.state import (
+    AgentState,
+    PromptActionAssessment,
+    RAGRouteDecision,
+    looks_like_file_driven_task,
+)
+from runtime_paths import is_frozen_app, project_root, resource_path, user_data_path
 from survyai.feature_flags import FeatureFlags
 
 # ==============================================================================
@@ -182,10 +194,29 @@ _CADASTRAL_FASTPATH_EXCLUDE_MARKERS: Tuple[str, ...] = (
 )
 
 
+# Stop cadastral metadata captures at the next labelled field (newline or comma-separated).
+from agent.pdf_survey_plan import (
+    CADASTRAL_FIELD_BOUNDARY as _CADASTRAL_NEXT_FIELD,
+    CADASTRAL_COORDINATES_FOR_STOP as _COORDINATES_FOR_STOP,
+    extract_coordinates_blob_from_cadastral_query,
+    resolve_cadastral_coordinates_blob,
+)
+
+
 _ACCESS_ROAD_SPEC_RE = re.compile(
-    r"(?:add\s+)?(?:another\s+)?(?:an?\s+)?access(?:\s+road)?\s+of\s+(?:width\s+)?(\d+(?:\.\d+)?)\s*m\s+.*?"
-    r"(?:on\s+the\s+side\s+of|joining\s+pillars|(?:on|along)\s+(?:the\s+)?(?:boundary\s+line\s+)?connecting)\s+(.+?)"
-    r"(?=\s*;|\s*Add\s+(?:another\s+)?(?:an?\s+)?access|\s*and\s+add\s+(?:another\s+)?(?:an?\s+)?access|\.\s*Add|\.\s*$|$)",
+    r"(?:add\s+)?(?:another\s+)?(?:an?\s+)?access(?:\s+road)?\s+(?:of\s+)?(?:width\s+)?(\d+(?:\.\d+)?)\s*m\s+.*?"
+    r"(?:on\s+the\s+side\s+of|(?:on|along)\s+(?:the\s+)?side(?:\s+of)?|joining\s+pillars|(?:on|along)\s+(?:the\s+)?(?:boundary\s+line\s+)?connecting)\s+(.+?)"
+    r"(?=\s*;|,\s*and\s+(?:yet\s+)?(?:another\s+)?(?:road|access)|\s+and\s+(?:yet\s+)?(?:another\s+)?(?:road|access)|"
+    r"\s*Add\s+(?:another\s+)?(?:an?\s+)?access|\s*and\s+add\s+(?:another\s+)?(?:an?\s+)?access|"
+    r"\n\s*(?:Plot\s+using|date\s+on|title\s+as|pillar\s+numbers?|coordinates\s+for)|\.\s*Add|\.\s*$|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_EXTRA_ROAD_SPEC_RE = re.compile(
+    r"(?:,\s*|\s*)(?:and\s+)?(?:yet\s+another\s+|another\s+)road\s+(?:of\s+)?(?:width\s+)?(\d+(?:\.\d+)?)\s*m\s+.*?"
+    r"(?:on\s+the\s+side\s+of|(?:on|along)\s+(?:the\s+)?side(?:\s+of)?)\s+(.+?)"
+    r"(?=,\s*and\s+(?:yet\s+)?(?:another\s+)?(?:road|access)|\s+and\s+(?:yet\s+)?(?:another\s+)?(?:road|access)|"
+    r"\s*Add\s|\.\s*Add|\.\s*$|$)",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -198,6 +229,7 @@ def _parse_access_road_specs_from_query(query: str) -> List[str]:
 
     def _add(width: str, ref: str, seg: str, *, boundary: bool = False) -> None:
         ref = re.sub(r"\s+", " ", (ref or "").strip()).strip(" ,.;")
+        ref = re.sub(r"\s+to\s+", " and ", ref, flags=re.IGNORECASE)
         if not width or not ref:
             return
         if boundary:
@@ -237,6 +269,9 @@ def _parse_access_road_specs_from_query(query: str) -> List[str]:
     for m in _ACCESS_ROAD_SPEC_RE.finditer(q):
         _add(m.group(1), m.group(2), m.group(0))
 
+    for m in _EXTRA_ROAD_SPEC_RE.finditer(q):
+        _add(m.group(1), m.group(2), m.group(0))
+
     # Legacy single-match patterns (boundary / joining pillars) when finditer misses phrasing
     if not specs:
         segments = re.split(
@@ -257,7 +292,7 @@ def _parse_access_road_specs_from_query(query: str) -> List[str]:
                 _add(m_ar.group(1), m_ar.group(2), seg, boundary=True)
                 continue
             m_ar2 = re.search(
-                r"(?:add\s+)?(?:another\s+)?(?:an?\s+)?access(?:\s+road)?\s+of\s+(?:width\s+)?(\d+(?:\.\d+)?)\s*m\s+.*?joining\s+pillars\s+(.+?)(?:\.|$)",
+                r"(?:add\s+)?(?:another\s+)?(?:an?\s+)?access(?:\s+road)?\s+(?:of\s+)?(?:width\s+)?(\d+(?:\.\d+)?)\s*m\s+.*?joining\s+pillars\s+(.+?)(?:\.|$)",
                 seg,
                 flags=re.IGNORECASE | re.DOTALL,
             )
@@ -265,7 +300,7 @@ def _parse_access_road_specs_from_query(query: str) -> List[str]:
                 _add(m_ar2.group(1), f"pillars {m_ar2.group(2).strip()}", seg)
                 continue
             m_ar3 = re.search(
-                r"(?:add\s+)?(?:another\s+)?(?:an?\s+)?access(?:\s+road)?\s+of\s+(?:width\s+)?(\d+(?:\.\d+)?)\s*m\s+.*?on\s+the\s+side\s+of\s+(.+?)(?=\s*;|\s*Add\s|$|\.)",
+                r"(?:add\s+)?(?:another\s+)?(?:an?\s+)?access(?:\s+road)?\s+(?:of\s+)?(?:width\s+)?(\d+(?:\.\d+)?)\s*m\s+.*?(?:on\s+the\s+side\s+of|(?:on|along)\s+(?:the\s+)?side(?:\s+of)?)\s+(.+?)(?=\s*;|,\s*and\s+(?:another\s+)?(?:an?\s+)?access|\s+and\s+(?:another\s+)?(?:an?\s+)?access|\s*Add\s|$|\n\s*(?:Plot\s+using|date\s+on|title\s+as)|\.)",
                 seg,
                 flags=re.IGNORECASE | re.DOTALL,
             )
@@ -324,6 +359,680 @@ def _mtext_content_line_count(raw: str) -> int:
     if not content:
         return 1
     return max(1, content.count("\\P") + 1)
+
+
+# Approximate MTEXT width in drawing units (condensed title-block fonts).
+_CARTO_CHAR_WIDTH_FACTOR = 0.50
+
+
+def _mtext_plain_len(text: str) -> int:
+    """Visible character count for layout (ignores AutoCAD format codes)."""
+    t = str(text or "")
+    t = t.replace("\\P", "")
+    t = re.sub(r"\\[A-Za-z][^;\\]*;", "", t)
+    t = re.sub(r"\{[^}]*\}", "", t)
+    return len(t.strip())
+
+
+def _mtext_height_prefix(height_scale: float) -> str:
+    """Flat MTEXT height prefix (must not be nested inside another {…} group)."""
+    scale = float(height_scale)
+    if scale >= 0.999:
+        return ""
+    scale_s = f"{scale:.3f}".rstrip("0").rstrip(".")
+    return f"\\H{scale_s}x;"
+
+
+def _mtext_apply_height_scale(content: str, height_scale: float) -> str:
+    """Inline MTEXT height override for a plain-text fragment."""
+    scale = float(height_scale)
+    if scale >= 0.999 or not (content or "").strip():
+        return content or ""
+    scale_s = f"{scale:.3f}".rstrip("0").rstrip(".")
+    return f"{{\\H{scale_s}x;{content}}}"
+
+
+def _mtext_with_uniform_height(content: str, height_scale: float) -> str:
+    """Apply one \\H override to an entire cell body (single or \\P-separated lines)."""
+    if height_scale >= 0.999 or not (content or "").strip():
+        return content or ""
+    body = content or ""
+    if body.startswith("{") and body.endswith("}"):
+        return body
+    return _mtext_height_prefix(height_scale) + body
+
+
+def _mtext_preserve_style_set_content(
+    existing_cell: str,
+    new_content: str,
+    *,
+    height_scale: float = 1.0,
+) -> str:
+    """Keep colour/font wrapper; replace textual body (prevents template leakage)."""
+    body = _mtext_with_uniform_height(new_content or "", height_scale)
+    raw = existing_cell or ""
+    if raw.startswith("{") and raw.endswith("}"):
+        color = ""
+        font = ""
+        try:
+            m = re.search(r"(\\C\d+;)", raw)
+            if m:
+                color = m.group(1)
+        except Exception:
+            color = ""
+        try:
+            m = re.search(r"(\\f[^;]+;)", raw)
+            if m:
+                font = m.group(1)
+        except Exception:
+            font = ""
+        if color or font:
+            # Flat {\\f;\\C;\\H;text} — nested {\\H{…}} groups break table-cell height.
+            return "{" + (color or "") + (font or "") + body + "}"
+    if raw.startswith("{") and raw.endswith("}") and ";" in raw:
+        idx = raw.rfind(";")
+        return raw[: idx + 1] + body + "}"
+    return body
+
+
+def _mtext_strip_inline_size_codes(text: str) -> str:
+    """Remove inline \\H / \\W overrides that fight SetTextHeight in TABLE cells."""
+    t = str(text or "")
+    t = re.sub(r"\\H[\d.]+x;", "", t, flags=re.IGNORECASE)
+    t = re.sub(r"\\W[\d.]+x;", "", t, flags=re.IGNORECASE)
+    return t
+
+
+def _ideal_plan_number_text_height(
+    *,
+    template_nominal_h: Optional[float],
+    template_denom: int,
+    chosen_denom: int,
+    profile_ref: Optional[float] = None,
+) -> float:
+    """
+    Nominal CADA_PLANNUMBER height at the output plan scale.
+
+    ``template_denom`` must be the template authoring scale (1:500), not the
+    output scale. Example: 1.2 at 1:500 → 0.6 at 1:250.
+    """
+    ref = float(profile_ref or 0.0)
+    if ref <= 0:
+        ref = float(template_nominal_h or 0.0)
+    if ref <= 0:
+        ref = _CADASTRAL_TEMPLATE_PLANNUMBER_REF_H
+    td = max(1, int(template_denom or _CADASTRAL_TEMPLATE_REF_DENOM))
+    cd = max(1, int(chosen_denom or td))
+    return ref * (float(cd) / float(td))
+
+
+_CADASTRAL_ALLOWED_SCALES = [250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 25000]
+# survey_plan_template3.dwg CADA_PLANNUMBER nominal height at template authoring scale 1:500.
+_CADASTRAL_TEMPLATE_REF_DENOM = 500
+_CADASTRAL_TEMPLATE_PLANNUMBER_REF_H = 1.2
+
+
+def _resolve_cadastral_output_scale(
+    *,
+    template_denom: int,
+    user_scale_denom: Optional[int],
+    required_k: float,
+    allowed_denoms: Optional[List[int]] = None,
+) -> tuple[int, float, str]:
+    """
+    Choose output plan scale (denominator) and sheet scale factor.
+
+    When the user/PDF states a scale (e.g. 1:250), that scale is used unless the
+    parcel (+ road padding) cannot fit — then the next coarser allowed scale is chosen.
+  """
+    import math
+
+    allowed = allowed_denoms or _CADASTRAL_ALLOWED_SCALES
+    td = max(1, int(template_denom or 500))
+    rk = max(0.0, float(required_k))
+
+    if user_scale_denom and int(user_scale_denom) in allowed:
+        usd = int(user_scale_denom)
+        scale_k_pref = float(usd) / float(td)
+        if rk <= scale_k_pref + 0.015:
+            return usd, scale_k_pref, "user_scale"
+        min_denom = max(usd, int(math.ceil(rk * float(td) - 1e-9)))
+        candidates = [d for d in allowed if d >= min_denom]
+        chosen = min(candidates) if candidates else max(allowed)
+        return chosen, float(chosen) / float(td), "user_scale_overflow"
+
+    chosen = td
+    scale_k = 1.0
+    if rk > 1.0 + 1e-6:
+        target_denom = float(td) * rk * 1.02
+        candidates = [s for s in allowed if s >= target_denom and s >= td]
+        chosen = min(candidates) if candidates else max(allowed)
+        scale_k = float(chosen) / float(td)
+        return int(chosen), scale_k, "auto_upscale"
+    return int(chosen), scale_k, "template"
+
+
+def _split_address_segments(raw: str) -> List[str]:
+    addr = (raw or "").strip().upper()
+    if not addr:
+        return []
+    if "\\P" in addr:
+        return [ln.strip() for ln in addr.split("\\P") if ln.strip()]
+    return [p.strip() for p in re.split(r",\s*", addr) if p.strip()]
+
+
+def _merge_city_state_tail(parts: List[str]) -> List[str]:
+    """Prefer 'PORT HARCOURT, RIVERS STATE' on one line (cartographic convention)."""
+    if len(parts) < 2:
+        return parts
+    city, state = parts[-2], parts[-1]
+    state_u = state.upper()
+    if "STATE" in state_u or state_u in {"FCT", "ABUJA"}:
+        merged = parts[:-2] + [f"{city}, {state}"]
+        return merged
+    return parts
+
+
+def _pack_segments_into_lines(
+    parts: List[str],
+    *,
+    max_chars_per_line: int,
+    max_lines: int,
+) -> List[str]:
+    """Greedy horizontal packing: join segments with ', ' until the line would overflow."""
+    max_chars = max(8, int(max_chars_per_line))
+    max_lines = max(1, int(max_lines))
+    lines: List[str] = []
+    current = ""
+    for part in parts:
+        segment = part.strip()
+        if not segment:
+            continue
+        candidate = f"{current}, {segment}" if current else segment
+        if len(candidate) <= max_chars or not current:
+            current = candidate
+        else:
+            lines.append(current)
+            current = segment
+    if current:
+        lines.append(current)
+
+    while len(lines) > max_lines and len(lines) >= 2:
+        tail = lines.pop()
+        lines[-1] = f"{lines[-1]}, {tail}"
+
+    return lines[:max_lines]
+
+
+# Plan numbers use BOLD_SURVEY — wider than body text in the same cell width.
+_PLAN_NUMBER_CHAR_WIDTH_FACTOR = 0.64
+# Cartographic rule: shrink to fit one line, but never below 85% of template height.
+_PLAN_NUMBER_MIN_HEIGHT_SCALE = 0.85
+
+
+def _plan_number_line_width(
+    line: str, text_height: float, *, height_scale: float = 1.0
+) -> float:
+    h = max(0.01, float(text_height) * float(height_scale))
+    return _mtext_plain_len(line) * h * _PLAN_NUMBER_CHAR_WIDTH_FACTOR
+
+
+def _plan_number_line_fits(
+    line: str,
+    *,
+    usable_width: float,
+    text_height: float,
+    height_scale: float,
+) -> bool:
+    if not (line or "").strip():
+        return True
+    return _plan_number_line_width(line, text_height, height_scale=height_scale) <= usable_width
+
+
+def _plan_number_two_line_candidates(plain: str) -> List[str]:
+    """
+    Deliberate two-line breaks at slash/year boundaries (never mid-token like 202|6).
+    """
+    plain = (plain or "").strip()
+    if not plain:
+        return []
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def _add(left: str, right: str, *, keep_slash_on_left: bool) -> None:
+        left = left.strip()
+        right = right.strip()
+        if not left or not right:
+            return
+        text = f"{left}/\\P{right}" if keep_slash_on_left else f"{left}\\P{right}"
+        if text not in seen:
+            seen.add(text)
+            out.append(text)
+
+    parts = [p for p in plain.split("/") if p != ""]
+    if len(parts) >= 2:
+        for i, part in enumerate(parts):
+            if re.fullmatch(r"\d{4}", part):
+                left = "/".join(parts[: i + 1])
+                right = "/".join(parts[i + 1 :])
+                if right:
+                    _add(left, right, keep_slash_on_left=False)
+        for i in range(len(parts) - 1, 0, -1):
+            left = "/".join(parts[:i])
+            right = "/".join(parts[i:])
+            _add(left, right, keep_slash_on_left=False)
+            _add(left, right, keep_slash_on_left=True)
+
+    if "-" in plain:
+        idx = plain.find("-", plain.find("/") if "/" in plain else 0)
+        if 0 < idx < len(plain) - 1:
+            _add(plain[:idx], plain[idx + 1 :], keep_slash_on_left=False)
+            _add(plain[:idx], plain[idx:], keep_slash_on_left=False)
+
+    if not out:
+        mid = max(1, len(plain) // 2)
+        out.append(f"{plain[:mid]}\\P{plain[mid:]}")
+    return out
+
+
+def _fit_plan_number_mtext(
+    text: str,
+    *,
+    cell_width: float,
+    cell_height: float,
+    base_text_height: float,
+    line_step: float,
+    min_height_scale: float = _PLAN_NUMBER_MIN_HEIGHT_SCALE,
+) -> tuple[str, float]:
+    """
+    Fit CADA_PLANNUMBER text without ever enlarging the template height.
+
+    1. Try single line, reducing height in small steps down to ``min_height_scale`` (0.85×).
+    2. Only if still too wide at 0.85×, use a cartographic two-line break (e.g. after year).
+    """
+    plain = (text or "").strip()
+    if not plain or base_text_height <= 0:
+        return plain, 1.0
+
+    min_scale = max(0.5, min(1.0, float(min_height_scale)))
+    pad_x = max(0.1, float(base_text_height) * 0.28)
+    pad_y = max(0.08, float(base_text_height) * 0.22)
+    usable_w = max(float(cell_width) - 2.0 * pad_x, float(base_text_height) * 3.0)
+    step = float(line_step) if line_step > 0 else float(base_text_height) * (5.0 / 3.0)
+    usable_h = (
+        max(float(cell_height) - 2.0 * pad_y, step * 2.0)
+        if cell_height > 0
+        else step * 2.5
+    )
+
+    scales: List[float] = []
+    s = 1.0
+    while True:
+        scales.append(round(s, 4))
+        if s <= min_scale + 1e-6:
+            break
+        s = max(min_scale, round(s - 0.01, 4))
+
+    for scale in scales:
+        if _plan_number_line_fits(
+            plain, usable_width=usable_w, text_height=base_text_height, height_scale=scale
+        ):
+            # Ladder runs 1.0 → min_scale: first match is the largest size that fits one line.
+            return plain, scale
+
+    two_line_candidates = _plan_number_two_line_candidates(plain)
+
+    def _plan_break_rank(candidate: str) -> int:
+        left = candidate.split("\\P")[0]
+        if re.search(r"/\d{4}$", left):
+            return 0
+        return 1
+
+    two_line_candidates.sort(key=_plan_break_rank)
+
+    # Prefer two lines at full ideal height before shrinking below 0.85×.
+    for candidate in two_line_candidates:
+        lines = [ln for ln in candidate.split("\\P") if ln.strip()]
+        if len(lines) > 2:
+            continue
+        if len(lines) == 2 and 2.0 * step > usable_h + 1e-6:
+            continue
+        if all(
+            _plan_number_line_fits(
+                ln, usable_width=usable_w, text_height=base_text_height, height_scale=1.0
+            )
+            for ln in lines
+        ):
+            return candidate, 1.0
+
+    for candidate in two_line_candidates:
+        lines = [ln for ln in candidate.split("\\P") if ln.strip()]
+        if len(lines) > 2:
+            continue
+        if len(lines) == 2 and 2.0 * step * min_scale > usable_h + 1e-6:
+            continue
+        if all(
+            _plan_number_line_fits(
+                ln, usable_width=usable_w, text_height=base_text_height, height_scale=min_scale
+            )
+            for ln in lines
+        ):
+            return candidate, min_scale
+
+    fallback = _plan_number_two_line_candidates(plain)
+    return (fallback[0] if fallback else plain), min_scale
+
+
+def _apply_plan_number_table_cell(
+    autocad: Any,
+    *,
+    plan_h: str,
+    plan_number: str,
+    get_cell: Callable[..., str],
+    set_cell: Callable[..., Any],
+    ideal_text_height: Optional[float] = None,
+    cell_text_style: str = "",
+    sheet_scale_k: float = 1.0,
+) -> Dict[str, Any]:
+    """
+    Fit CADA_PLANNUMBER after all sheet scaling/regen (final cell size and text height).
+
+    Uses the computed ideal height for the output plan scale (never enlarges above it).
+    Shrinks down to 0.85× ideal when needed for a single line.
+    """
+    debug: Dict[str, Any] = {}
+    if not plan_h or not (plan_number or "").strip():
+        return debug
+
+    import time
+
+    plan_plain = plan_number.strip().upper()
+    plan_row, plan_col = 1, 0
+    plan_template = get_cell(plan_h, plan_row, plan_col)
+
+    try:
+        autocad.recompute_table(plan_h)
+    except Exception:
+        pass
+
+    measured_th = 0.0
+    plan_cell_w = 0.0
+    plan_cell_h = 0.0
+    plan_step = 0.0
+    try:
+        step_res = autocad.get_table_cell_mtext_line_step(
+            plan_h, plan_row, plan_col, plan_template
+        )
+        if step_res.get("success"):
+            if step_res.get("text_height"):
+                measured_th = float(step_res["text_height"])
+            plan_step = float(step_res.get("line_step") or 0.0)
+    except Exception:
+        pass
+
+    ideal_base = float(ideal_text_height) if ideal_text_height and ideal_text_height > 0 else 0.0
+    if ideal_base <= 0 and measured_th > 0:
+        ideal_base = measured_th
+    if ideal_base <= 0:
+        ideal_base = 0.6
+    sk = float(sheet_scale_k) if sheet_scale_k else 1.0
+    sheet_already_scaled = abs(sk - 1.0) > 1e-6
+    # After sheet scaling, COM may still report pre-scale TABLE text height (e.g. 1.2 not 0.6).
+    if measured_th > ideal_base + 1e-6:
+        debug["measured_inflated"] = float(measured_th)
+        if sheet_already_scaled and measured_th * sk <= ideal_base + 0.08:
+            debug["measured_scaled_to"] = float(measured_th * sk)
+    # Never derive nominal height from inflated COM readback when caller supplied ideal.
+    plan_th = ideal_base
+
+    style_name = str(cell_text_style or "").strip()
+    if not style_name:
+        try:
+            for r in (plan_row, 0):
+                st = autocad.get_table_cell_text_style(plan_h, r, plan_col)
+                if st.get("success") and str(st.get("style") or "").strip():
+                    style_name = str(st["style"]).strip()
+                    break
+        except Exception:
+            pass
+
+    try:
+        ext_inner = autocad.get_table_cell_extents(
+            plan_h, plan_row, plan_col, outer=False
+        )
+        ext_outer = autocad.get_table_cell_extents(
+            plan_h, plan_row, plan_col, outer=True
+        )
+        widths: List[float] = []
+        heights: List[float] = []
+        for ext in (ext_inner, ext_outer):
+            if ext.get("success"):
+                w = float(ext["maxx"]) - float(ext["minx"])
+                h = float(ext["maxy"]) - float(ext["miny"])
+                if w > 0:
+                    widths.append(w)
+                if h > 0:
+                    heights.append(h)
+        if widths:
+            plan_cell_w = min(widths)
+        if heights:
+            plan_cell_h = min(heights)
+    except Exception:
+        pass
+    if plan_cell_w <= 0:
+        plan_cell_w = max(10.0, plan_th * 14.0)
+    if plan_cell_h <= 0:
+        plan_cell_h = max(plan_th * 2.5, plan_step * 2.0 if plan_step > 0 else plan_th * 2.5)
+
+    # After sheet scaling, cell geometry is final — always shrink-to-fit from ideal height.
+    if sheet_already_scaled:
+        plan_body, plan_scale = _fit_plan_number_mtext(
+            plan_plain,
+            cell_width=plan_cell_w,
+            cell_height=plan_cell_h,
+            base_text_height=plan_th,
+            line_step=plan_step,
+        )
+        plan_scale = min(1.0, float(plan_scale))
+        debug["sheet_scaled_nominal"] = True
+    else:
+        plan_body, plan_scale = _fit_plan_number_mtext(
+            plan_plain,
+            cell_width=plan_cell_w,
+            cell_height=plan_cell_h,
+            base_text_height=plan_th,
+            line_step=plan_step,
+        )
+        plan_scale = min(1.0, float(plan_scale))
+
+    def _plan_mtext(body: str, *, inline_height_scale: float = 1.0) -> str:
+        tpl = _mtext_strip_inline_size_codes(plan_template)
+        raw = _mtext_preserve_style_set_content(
+            tpl,
+            body,
+            height_scale=inline_height_scale,
+        )
+        if inline_height_scale >= 0.999:
+            return _mtext_strip_inline_size_codes(raw)
+        return raw
+
+    def _apply_style_and_height(target_h: float) -> None:
+        if style_name:
+            try:
+                autocad.set_table_cell_text_style(
+                    plan_h, plan_row, plan_col, style_name
+                )
+            except Exception:
+                pass
+        try:
+            autocad.set_table_cell_text_height(plan_h, plan_row, plan_col, target_h)
+        except Exception:
+            pass
+
+    def _write_plan_cell(body: str, scale: float, *, inline_scale: float = 1.0) -> float:
+        target_h = plan_th * scale
+        # SetText resets style/height — always apply text first, then style, then height.
+        set_cell(plan_h, plan_row, plan_col, _plan_mtext(body, inline_height_scale=inline_scale))
+        _apply_style_and_height(target_h)
+        try:
+            autocad.recompute_table(plan_h)
+        except Exception:
+            pass
+        readback_h = 0.0
+        try:
+            hr = autocad.get_table_cell_text_height(plan_h, plan_row, plan_col)
+            if hr.get("success"):
+                readback_h = float(hr.get("height") or 0.0)
+        except Exception:
+            pass
+        return readback_h
+
+    def _enforce_plan_cell_height(body: str, scale: float, target_h: float) -> float:
+        """Retry style+height until TABLE cell readback matches the cartographic target."""
+        style_candidates: List[str] = []
+        for candidate in (style_name, "BOLD_SURVEY", "Standard"):
+            c = str(candidate or "").strip()
+            if c and c not in style_candidates:
+                style_candidates.append(c)
+        readback_h = 0.0
+        for attempt in range(6):
+            readback_h = _write_plan_cell(body, scale)
+            if abs(readback_h - target_h) <= 0.03:
+                return readback_h
+            for st in style_candidates:
+                try:
+                    autocad.set_table_cell_text_style(plan_h, plan_row, plan_col, st)
+                except Exception:
+                    pass
+            try:
+                autocad.set_table_cell_text_height(plan_h, plan_row, plan_col, target_h)
+                autocad.recompute_table(plan_h)
+            except Exception:
+                pass
+            try:
+                hr = autocad.get_table_cell_text_height(plan_h, plan_row, plan_col)
+                if hr.get("success"):
+                    readback_h = float(hr.get("height") or 0.0)
+                    if abs(readback_h - target_h) <= 0.03:
+                        return readback_h
+            except Exception:
+                pass
+            if readback_h > target_h + 0.03 and readback_h > 1e-6:
+                inline = max(0.5, target_h / readback_h)
+                readback_h = _write_plan_cell(body, scale, inline_scale=inline)
+                if abs(readback_h - target_h) <= 0.05:
+                    return readback_h
+            time.sleep(0.08 * (attempt + 1))
+        return readback_h
+
+    readback_h = _write_plan_cell(plan_body, plan_scale)
+    target_h = float(plan_th * plan_scale)
+    # Inline \\H shrink only when the sheet was NOT scaled but COM still reports template height.
+    if measured_th > plan_th + 1e-6 and not sheet_already_scaled:
+        pre_inline = max(_PLAN_NUMBER_MIN_HEIGHT_SCALE, plan_th / max(measured_th, 1e-6))
+        readback_h = _write_plan_cell(plan_body, plan_scale, inline_scale=pre_inline)
+        debug["pre_inline_height_scale"] = float(pre_inline)
+        debug["readback_height_pre_inline"] = float(readback_h)
+        target_h = float(plan_th * plan_scale)
+    readback_h = _enforce_plan_cell_height(plan_body, plan_scale, target_h)
+    debug.update(
+        {
+            "ideal_height": float(plan_th),
+            "shrink_scale": float(plan_scale),
+            "target_height": float(target_h),
+            "readback_height": float(readback_h),
+            "text_style": style_name,
+        }
+    )
+
+    # SetText often resets TABLE cells to Standard (~0.9); force height if still too large.
+    if readback_h > target_h + 0.03:
+        ratio = max(0.5, target_h / max(readback_h, 1e-6))
+        readback_h = _enforce_plan_cell_height(plan_body, plan_scale, target_h)
+        debug["inline_height_scale"] = float(ratio)
+        debug["readback_height_after_inline"] = float(readback_h)
+
+    # If AutoCAD still wrapped a single-line fit, step down until one line or 0.85× floor.
+    if (
+        not sheet_already_scaled
+        and "\\P" not in plan_body
+        and plan_scale > _PLAN_NUMBER_MIN_HEIGHT_SCALE + 1e-6
+    ):
+        try:
+            readback = get_cell(plan_h, plan_row, plan_col) or ""
+            if "\\P" in readback:
+                retry_scale = plan_scale
+                while retry_scale > _PLAN_NUMBER_MIN_HEIGHT_SCALE + 1e-6:
+                    retry_scale = max(
+                        _PLAN_NUMBER_MIN_HEIGHT_SCALE,
+                        round(retry_scale - 0.02, 4),
+                    )
+                    if _plan_number_line_fits(
+                        plan_plain,
+                        usable_width=max(
+                            0.01,
+                            plan_cell_w
+                            - 2.0 * max(0.1, plan_th * 0.28),
+                        ),
+                        text_height=plan_th,
+                        height_scale=retry_scale,
+                    ):
+                        readback_h = _write_plan_cell(plan_plain, retry_scale)
+                        debug["retry_shrink_scale"] = float(retry_scale)
+                        debug["readback_height_retry"] = float(readback_h)
+                        break
+        except Exception:
+            pass
+
+    return debug
+
+
+def _layout_surveyor_address_mtext(
+    raw_address: str,
+    *,
+    cell_width: float,
+    cell_height: float,
+    text_height: float,
+    line_step: float,
+) -> str:
+    """
+    Pack surveyor company/address inside the table cell without vertical overflow.
+    Uses horizontal joins (city + state on one line) before adding extra lines.
+    """
+    parts = _merge_city_state_tail(_split_address_segments(raw_address))
+    if not parts:
+        return ""
+
+    pad_x = max(0.15, float(text_height) * 0.35)
+    pad_y = max(0.10, float(text_height) * 0.25)
+    usable_w = max(float(cell_width) - 2.0 * pad_x, float(text_height) * 4.0)
+    usable_h = max(float(cell_height) - 2.0 * pad_y, float(line_step) or float(text_height))
+    step = float(line_step) if line_step > 0 else float(text_height) * (5.0 / 3.0)
+    max_lines = max(1, int(usable_h / step))
+
+    height_scale = 1.0
+    for scale in (1.0, 0.97, 0.94, 0.92, 0.9, 0.88, 0.85):
+        chars_per_line = int(usable_w / (max(0.01, text_height * scale) * _CARTO_CHAR_WIDTH_FACTOR))
+        lines = _pack_segments_into_lines(
+            parts, max_chars_per_line=chars_per_line, max_lines=max_lines
+        )
+        if len(lines) <= max_lines and len(lines) * step * scale <= usable_h + 1e-6:
+            height_scale = scale
+            packed = "\\P".join(lines)
+            if scale < 0.999:
+                packed = _mtext_apply_height_scale(packed, scale)
+            return packed
+        height_scale = scale
+
+    chars_per_line = int(usable_w / (max(0.01, text_height * 0.85) * _CARTO_CHAR_WIDTH_FACTOR))
+    lines = _pack_segments_into_lines(
+        parts, max_chars_per_line=max(6, chars_per_line), max_lines=max_lines
+    )
+    while len(lines) > max_lines and len(lines) >= 2:
+        tail = lines.pop()
+        lines[-1] = f"{lines[-1]}, {tail}"
+    packed = "\\P".join(lines[:max_lines])
+    return _mtext_apply_height_scale(packed, 0.85)
 
 
 def _find_title_scale_label_row(
@@ -417,8 +1126,22 @@ class SurvyAIAgent:
         # Settings come from environment variables and .env file, or are injected
         # (e.g. desktop app with merged cloud tokens) via `settings=`.
         self.settings = settings if settings is not None else get_settings()
+        runtime_cfg = resolve_agent_runtime_config(
+            local_config_path=str(getattr(self.settings, "agent_config_path", "") or ""),
+            cloud_config_json=str(getattr(self.settings, "agent_cloud_config_json", "") or ""),
+        )
+        runtime_overrides = runtime_cfg.to_settings_overrides()
+        if runtime_overrides:
+            self.settings = self.settings.model_copy(update=runtime_overrides)
+        self._system_prompt = str(runtime_cfg.system_prompt or SYSTEM_PROMPT)
+        self._agent_runtime_config = runtime_cfg
         self.feature_flags = (
             feature_flags if feature_flags is not None else FeatureFlags.from_env()
+        )
+        logger.info(
+            "Agent runtime config loaded (source=%s, version=%s)",
+            runtime_cfg.source,
+            runtime_cfg.version,
         )
 
         # Validate that primary LLM is set correctly
@@ -435,11 +1158,19 @@ class SurvyAIAgent:
         # Lightweight caches to avoid expensive re-initialization/re-compilation
         # (No functional impact; improves latency and reduces mid-flight churn.)
         self._openai_llm_cache: Dict[tuple, BaseChatModel] = {}
-        self._app_signature: Optional[tuple] = None  # (model_name, tool_names_tuple)
+        self._app_signature: Optional[tuple] = None
+        self._pipeline_llm_cost_usd: float = 0.0
+        self._cloud_proxy_enabled = bool(
+            getattr(self.settings, "survyai_llm_proxy_enabled", False)
+            and str(getattr(self.settings, "survyai_api_base_url", "") or "").strip()
+            and str(getattr(self.settings, "survyai_access_token", "") or "").strip()
+        )
         
         # If primary is OpenAI, ensure API key is configured
         if self.settings.primary_llm == "openai":
-            if not self.settings.openai_api_key or not self.settings.openai_api_key.strip():
+            if not self._cloud_proxy_enabled and (
+                not self.settings.openai_api_key or not self.settings.openai_api_key.strip()
+            ):
                 raise ValueError(
                     "Primary LLM is set to 'openai' but OPENAI_API_KEY is not configured. "
                     "Please set OPENAI_API_KEY in your .env file or environment variables."
@@ -449,7 +1180,9 @@ class SurvyAIAgent:
         
         # If primary is Claude, ensure API key is configured
         elif self.settings.primary_llm == "claude":
-            if not self.settings.anthropic_api_key or not self.settings.anthropic_api_key.strip():
+            if not self._cloud_proxy_enabled and (
+                not self.settings.anthropic_api_key or not self.settings.anthropic_api_key.strip()
+            ):
                 raise ValueError(
                     "Primary LLM is set to 'claude' but ANTHROPIC_API_KEY is not configured. "
                     "Please set ANTHROPIC_API_KEY in your .env file or environment variables."
@@ -626,6 +1359,9 @@ class SurvyAIAgent:
         # Default: False (must ask user before searching the internet)
         self._internet_permission_granted: bool = False
         self._pending_permission_requests: Dict[str, Dict[str, Any]] = {}
+        # Set per-query when the user affirmatively answered an internet-permission
+        # request (deterministic or conversational); forces the search to actually run.
+        self._force_internet_search_this_query: bool = False
     
     # ==========================================================================
     # CONTEXT RETRIEVAL AND STORAGE
@@ -902,24 +1638,464 @@ class SurvyAIAgent:
         """
         q = (query or "").lower()
         has_output_docx = ".docx" in q or "history.docx" in q or "save" in q
-        wants_save = any(k in q for k in ["save", "saved", "export", "into the folder", "project folder", "same folder"])
-        # Many users don't say "report" explicitly; treat any substantial write-up request as report-like.
-        is_report_like = any(k in q for k in ["report", "trace", "history", "explain", "overview", "process", "licens", "licensing", "practice"])
+        wants_save = any(k in q for k in ["save", "saved", "export", "into the folder", "project folder", "same folder", "workspace"])
+        is_report_like = any(
+            k in q
+            for k in [
+                "report", "trace", "history", "explain", "overview", "process",
+                "licens", "licensing", "practice", "essay", "well-structured",
+                "turn this", "write-up", "write up",
+            ]
+        )
         has_input_doc = bool(self._extract_document_paths(query))
         return bool(has_output_docx and wants_save and is_report_like and not has_input_doc)
+
+    def _is_pdf_replot_affirmation(self, routing_query: str, full_query: str) -> bool:
+        """True when the user affirms a prior PDF→DWG replot request in injected history."""
+        body = (self._cadastral_user_message_body(full_query) or routing_query or "").lower().strip()
+        if not self._is_affirmative_reply(body) and not body.startswith("proceed"):
+            return False
+        hist = self._extract_history_block(full_query).lower()
+        if ".pdf" not in hist or ".dwg" not in hist:
+            return False
+        return any(
+            k in hist
+            for k in ("replot", "generate", "plot using", "survey plan", "cadastral", "save strictly as")
+        )
+
+    def _is_explicit_session_docx_save_request(self, routing_query: str) -> bool:
+        """True only when the user clearly asks to save a prior essay/report to .docx."""
+        q = (routing_query or "").lower().strip()
+        if not q:
+            return False
+        has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.IGNORECASE))
+        wants_save = any(
+            k in q for k in ("save", "saved", "write it", "write this", "into '", 'into "')
+        )
+        explicit_essay = any(
+            k in q
+            for k in (
+                "essay", "well-structured", "turn this", "turn the previous",
+                "previous topic", "previous answer", "last answer",
+            )
+        )
+        if has_docx and wants_save and explicit_essay:
+            return True
+        if wants_save and explicit_essay and ("turn this" in q or "turn the" in q):
+            return True
+        return False
+
+    def _looks_like_operational_workflow_request(self, routing_query: str) -> bool:
+        """True for GIS/CAD/file automation jobs that must never route to essay-save."""
+        q = (routing_query or "").lower()
+        if not looks_like_file_driven_task(routing_query):
+            return False
+        operational_markers = (
+            "arcgis", "arcpy", "cutfill", "cut fill", "cut/fill", "tin", "idw",
+            "volume", "point feature", "feature class", "geodatabase", "create a copy",
+            "copy each", "import", "compute", "calculate", "generate point",
+            "borrow pit", "surface", "exported result",
+        )
+        return any(m in q for m in operational_markers)
+
+    def _should_fastpath_save_session_docx(self, routing_query: str, full_query: str) -> bool:
+        """
+        Save a prior assistant answer (essay/report) from session history to .docx.
+
+        Handles explicit save requests and short affirmations ('go ahead') after the
+        assistant offered to create the document.
+        """
+        q = (routing_query or "").lower().strip()
+        if not q:
+            return False
+
+        # Never hijack operational file/GIS/CAD workflows (e.g. PRE/POST CSV + DWG volume).
+        if self._classify_query_intent(routing_query) == "task":
+            if not self._is_explicit_session_docx_save_request(routing_query):
+                return False
+        if self._looks_like_operational_workflow_request(routing_query):
+            if not self._is_explicit_session_docx_save_request(routing_query):
+                return False
+
+        has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.IGNORECASE))
+        wants_save = any(
+            k in q
+            for k in ("save", "saved", "write it", "write this", "into '", 'into "')
+        )
+        wants_essay = any(
+            k in q
+            for k in (
+                "essay", "well-structured", "turn this", "previous topic", "previous answer",
+                "last answer", "above", "report",
+            )
+        )
+        has_history = "Assistant:" in (full_query or "")
+        if has_docx and wants_save and (wants_essay or "turn this" in q):
+            return has_history
+        if self._is_affirmative_reply(q) and has_history:
+            if self._last_assistant_offered_session_docx_save(full_query):
+                return True
+        return False
+
+    def _last_assistant_offered_session_docx_save(self, query: str) -> bool:
+        block = self._extract_history_block(query)
+        idx = block.rfind("Assistant:")
+        if idx == -1:
+            return False
+        last_assistant = block[idx + len("Assistant:"):].lower()
+        markers = (
+            "essay", "essay1.docx", "save it as", "well-structured essay",
+            "turn the previous topic", "turn this into", "save as **essay",
+            "save as essay", "i can turn",
+        )
+        return any(m in last_assistant for m in markers)
+
+    _SESSION_TEXT_TRUNCATION_MARKERS = ("…[truncated]", "[truncated]")
+    _MAX_DOCX_ESSAY_SOURCE_CHARS = 1_000_000
+
+    @classmethod
+    def _session_text_looks_truncated(cls, text: str) -> bool:
+        t = (text or "").strip()
+        if not t:
+            return False
+        return any(m in t for m in cls._SESSION_TEXT_TRUNCATION_MARKERS)
+
+    def _get_full_assistant_response_from_session(
+        self, session_id: Optional[str] = None
+    ) -> str:
+        """Return the longest stored assistant reply for this session (untruncated)."""
+        if self.vector_store is None:
+            return ""
+        sid = session_id or self.get_session_id()
+        if not sid:
+            return ""
+        try:
+            recents = self.vector_store.get_recent_conversations(
+                session_id=sid, limit=30, role="assistant"
+            )
+            if not recents:
+                recents = self.vector_store.get_recent_conversations(
+                    session_id=sid, limit=30
+                )
+            best = ""
+            for conv in recents:
+                meta = conv.get("metadata") or {}
+                role = meta.get("role") or conv.get("role")
+                if role and role != "assistant":
+                    continue
+                content = (conv.get("content") or "").strip()
+                if len(content) > len(best):
+                    best = content
+            return best
+        except Exception as exc:
+            logger.debug("Session assistant lookup failed: %s", exc)
+            return ""
+
+    def _extract_user_question_for_docx_essay(self, query: str) -> str:
+        """Pick the substantive user question that produced the essay source material."""
+        block = self._extract_history_block(query)
+        users: List[str] = []
+        for line in block.splitlines():
+            if line.startswith("User:"):
+                users.append(line[len("User:"):].strip())
+        skip = (
+            "turn this", "well-structured", "essay", "save it", "go ahead",
+            "same folder", "workspace",
+        )
+        for text in reversed(users):
+            tl = text.lower()
+            if len(text) < 20:
+                continue
+            if any(k in tl for k in skip):
+                continue
+            return text
+        return users[0] if users else ""
+
+    def _resolve_docx_save_source_text(self, query: str) -> str:
+        """Prefer full vector-store text over truncated injected history."""
+        history_text = self._extract_assistant_content_for_docx_save(query)
+        session_text = self._get_full_assistant_response_from_session()
+        candidates = [t for t in (history_text, session_text) if (t or "").strip()]
+        if not candidates:
+            return ""
+
+        def _score(text: str) -> tuple:
+            return (0 if self._session_text_looks_truncated(text) else 1, len(text))
+
+        return max(candidates, key=_score).strip()
+
+    def _extract_assistant_content_for_docx_save(self, query: str) -> str:
+        """Pick the substantive assistant answer to persist (not a short follow-up)."""
+        block = self._extract_history_block(query)
+        if not block.strip():
+            return ""
+        assistants: List[str] = []
+        current: List[str] = []
+        for line in block.splitlines():
+            if line.startswith("Assistant:"):
+                if current:
+                    assistants.append("\n".join(current).strip())
+                current = [line[len("Assistant:"):].strip()]
+            elif line.startswith("User:") or line.startswith("--- Exchange"):
+                if current:
+                    assistants.append("\n".join(current).strip())
+                    current = []
+            elif line.startswith("--- End of History"):
+                if current:
+                    assistants.append("\n".join(current).strip())
+                    current = []
+                break
+            elif current:
+                current.append(line)
+        if current:
+            assistants.append("\n".join(current).strip())
+        if not assistants:
+            return ""
+        skip_markers = (
+            "i'm ready to proceed",
+            "i'm missing",
+            "missing the source",
+            "please send either",
+            "understood — i'll use",
+            "understood - i'll use",
+            "permission required",
+            "may i search",
+        )
+        for text in reversed(assistants):
+            tl = text.lower()
+            if len(text) < 120:
+                continue
+            if any(m in tl for m in skip_markers):
+                continue
+            return text.strip()
+        return assistants[-1].strip()
+
+    def _resolve_session_docx_output_path(self, routing_query: str, workspace: Optional[Path] = None) -> Path:
+        ws = (workspace or Path.cwd()).resolve()
+        out = self._extract_any_output_docx(routing_query)
+        if out:
+            p = Path(out)
+            if p.is_absolute():
+                return p if p.suffix.lower() == ".docx" else p.with_suffix(".docx")
+            return ws / (p.name if p.suffix else f"{p.name}.docx")
+        m = re.search(r"['\"]([^'\"]+\.docx)['\"]", routing_query or "", flags=re.IGNORECASE)
+        if m:
+            return ws / Path(m.group(1)).name
+        m2 = re.search(r"\b(essay\d*)\b", routing_query or "", flags=re.IGNORECASE)
+        if m2:
+            name = m2.group(1)
+            return ws / (name if name.lower().endswith(".docx") else f"{name}.docx")
+        return ws / "essay1.docx"
+
+    def _run_save_session_docx_pipeline(
+        self,
+        *,
+        query: str,
+        routing_query: str,
+        llm: Optional[BaseChatModel] = None,
+        model_name_used: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Format the prior assistant answer as an essay/report and save to .docx."""
+        from pathlib import Path
+
+        if (
+            self._classify_query_intent(routing_query) == "task"
+            or self._looks_like_operational_workflow_request(routing_query)
+        ) and not self._is_explicit_session_docx_save_request(routing_query):
+            return {
+                "success": False,
+                "error": "misroute_operational_task",
+                "response": (
+                    "This request looks like a file/GIS/CAD operation, not saving a prior essay. "
+                    "Use the standard agent workflow with the appropriate tools."
+                ),
+            }
+
+        workspace = Path.cwd().resolve()
+        output_path = self._resolve_session_docx_output_path(routing_query, workspace)
+        source_text = self._resolve_docx_save_source_text(query)
+        rq_lower = (routing_query or "").lower()
+        wants_essay_format = any(
+            k in rq_lower
+            for k in ("essay", "well-structured", "turn this", "report")
+        )
+        needs_llm_essay = llm is not None and (
+            len(source_text) < 200
+            or self._session_text_looks_truncated(source_text)
+            or wants_essay_format
+        )
+
+        if needs_llm_essay:
+            user_question = self._extract_user_question_for_docx_essay(query)
+            hist = self._extract_history_block(query)
+            truncated_note = ""
+            if self._session_text_looks_truncated(source_text):
+                truncated_note = (
+                    "\nIMPORTANT: The SOURCE MATERIAL below may end abruptly or contain "
+                    "'[truncated]'. Complete every section logically from the topic — "
+                    "do not stop mid-sentence.\n"
+                )
+            prompt = (
+                "Write a complete, well-structured professional essay for "
+                "surveyors/geospatial analysts.\n"
+                "REQUIREMENTS:\n"
+                "- Use the SOURCE MATERIAL as the factual basis; preserve technical detail.\n"
+                "- Include an introduction, numbered sections, and a short conclusion.\n"
+                "- Output the final essay text only — no preambles or follow-up questions.\n"
+                f"{truncated_note}\n"
+                f"ORIGINAL USER QUESTION:\n{user_question or routing_query}\n\n"
+                f"SOURCE MATERIAL (prior assistant answer):\n"
+                f"{source_text[: self._MAX_DOCX_ESSAY_SOURCE_CHARS]}\n\n"
+                f"CONVERSATION (reference):\n{hist[-8000:]}\n\n"
+                f"CURRENT SAVE REQUEST:\n{routing_query}\n"
+            )
+            from langchain_core.messages import HumanMessage
+
+            msg, err, timed_out = self._run_with_timeout(
+                120, lambda: llm.invoke([HumanMessage(content=prompt)]), llm_model_name=model_name_used
+            )
+            if not timed_out and not err and msg is not None:
+                raw = msg.content if hasattr(msg, "content") else str(msg)
+                if isinstance(raw, list):
+                    raw = "\n".join(
+                        str(p.get("text", "")) if isinstance(p, dict) else str(p) for p in raw
+                    )
+                if str(raw).strip():
+                    source_text = str(raw).strip()
+
+        if not source_text.strip():
+            return {
+                "success": False,
+                "error": "No prior assistant content found to save.",
+                "response": (
+                    "I could not find the essay text in this session. "
+                    "Ask your question again, then request saving to essay1.docx."
+                ),
+            }
+
+        title = output_path.stem.replace("_", " ").title()
+        create_result = self.document_processor.create_word_document(
+            str(output_path), source_text, title=title
+        )
+        if not create_result.get("success"):
+            return {
+                "success": False,
+                "error": create_result.get("error", "Failed to create Word document"),
+                "response": str(create_result),
+                "output_path": str(output_path),
+            }
+
+        return {
+            "success": True,
+            "response": (
+                f"Saved essay to Word document.\n"
+                f"- Output: {output_path}\n"
+                f"- Title: {title}\n"
+            ),
+            "output_path": str(output_path),
+            "model_name": model_name_used,
+        }
+
+    def _should_fastpath_dwg_plan_extract_to_docx(self, query: str) -> bool:
+        """Fast-path: extract cadastral plan details from one or more DWGs into Word."""
+        from agent.pdf_survey_plan import should_fastpath_dwg_plan_extract_to_docx
+
+        return should_fastpath_dwg_plan_extract_to_docx(query)
+
+    def _run_dwg_plan_extract_to_docx_pipeline(self, query: str) -> Dict[str, Any]:
+        """Structured cadastral extraction per DWG → Word (heuristics + LLM + vector context)."""
+        from pathlib import Path
+
+        from agent.pdf_survey_plan import run_dwg_plan_extract_to_docx
+
+        workspace = Path.cwd().resolve()
+        scope = self._cadastral_user_message_body(query)
+
+        llm, model_name = self._try_openai_tier_llm("average")
+        run_with_timeout = self._llm_run_with_timeout(model_name) if llm else None
+
+        field_context = ""
+        try:
+            snippets: List[str] = []
+            for collection in (COLLECTION_DOCUMENTS, COLLECTION_DRAWINGS):
+                hits = self._vs_search(
+                    "Nigerian cadastral survey plan buyer location LGA surveyor plan number certification",
+                    collection,
+                    top_k=2,
+                )
+                for hit in hits or []:
+                    text = (hit.get("text") or hit.get("content") or "").strip()
+                    if text:
+                        snippets.append(text[:800])
+            if snippets:
+                field_context = (
+                    "RELEVANT SURVEY KNOWLEDGE (from vector store):\n"
+                    + "\n---\n".join(snippets[:4])
+                )
+        except Exception:
+            pass
+
+        return run_dwg_plan_extract_to_docx(
+            query=scope,
+            autocad=self.autocad,
+            dxf_fallback=self.dxf_fallback,
+            document_processor=self.document_processor,
+            workspace=workspace,
+            llm=llm,
+            run_with_timeout=run_with_timeout,
+            field_context=field_context,
+        )
 
     # ==========================================================================
     # FAST-PATH: CAD CADASTRAL PLAN (Template DWG -> Output DWG)
     # ==========================================================================
 
     def _cad_template_profiles_dir(self):
-        from pathlib import Path
-        # Anchor template memory/profiles to the project root, not the caller's cwd.
-        # This prevents prompts from "losing" remembered templates when the CLI is launched
-        # from a different working directory.
-        d = (Path(__file__).resolve().parent.parent / "template_profiles").resolve()
+        """Writable directory for learned CAD template profiles + memory.
+
+        Frozen-safe: in a packaged (PyInstaller) build the source tree lives under
+        a read-only/ephemeral _MEIPASS temp dir, so learned profiles MUST be
+        written to a stable, user-writable location (%APPDATA%\\SurvyAI on
+        Windows).  In dev (non-frozen) we also use the user-data dir for
+        consistency; existing project-root profiles are still read for seeding via
+        _cad_template_profiles_seed_dirs().
+        """
+        d = user_data_path("template_profiles").resolve()
         d.mkdir(parents=True, exist_ok=True)
         return d
+
+    def _cad_template_profiles_seed_dirs(self):
+        """Read-only directories scanned to seed/bootstrap template memory.
+
+        Order: bundled resources (shipped with the app) and, in dev only, the
+        project-root template_profiles/ folder.  These are never written to.
+        """
+        from pathlib import Path
+
+        seeds = []
+        try:
+            bundled = resource_path("template_profiles").resolve()
+            if bundled.exists():
+                seeds.append(bundled)
+        except Exception:
+            pass
+        if not is_frozen_app():
+            try:
+                dev_dir = (project_root() / "template_profiles").resolve()
+                if dev_dir.exists():
+                    seeds.append(dev_dir)
+            except Exception:
+                pass
+        # De-duplicate while preserving order, and never include the writable dir here.
+        out = []
+        seen = set()
+        writable = str(self._cad_template_profiles_dir())
+        for s in seeds:
+            key = str(s)
+            if key != writable and key not in seen:
+                seen.add(key)
+                out.append(s)
+        return out
 
     def _cad_template_memory_path(self):
         from pathlib import Path
@@ -972,40 +2148,49 @@ class SurvyAIAgent:
             except Exception:
                 continue
 
-        profile_dir = self._cad_template_profiles_dir()
+        # Scan the writable profiles dir first, then read-only seed dirs (bundled
+        # resources + dev project root) so a fresh install can bootstrap from
+        # shipped profiles while still preferring user-learned ones.
+        scan_dirs = [self._cad_template_profiles_dir()] + list(self._cad_template_profiles_seed_dirs())
+        seen_profile_names: set = set()
         dirty = False
-        for prof_path in profile_dir.glob("*.json"):
-            try:
-                if prof_path.name.lower() == "template_memory.json":
+        for profile_dir in scan_dirs:
+            for prof_path in profile_dir.glob("*.json"):
+                try:
+                    if prof_path.name.lower() == "template_memory.json":
+                        continue
+                    # First occurrence wins (writable dir takes precedence over seeds).
+                    if prof_path.name.lower() in seen_profile_names:
+                        continue
+                    seen_profile_names.add(prof_path.name.lower())
+                    raw = _json.loads(prof_path.read_text(encoding="utf-8"))
+                    template_meta = raw.get("template") or {}
+                    tp_raw = str(template_meta.get("path") or "").strip()
+                    if not tp_raw:
+                        continue
+                    tp = Path(tp_raw).resolve()
+                    tp_res = str(tp)
+                    learned_at = str(template_meta.get("learned_at") or "")
+                    sig = template_meta.get("signature") or {}
+                    stat = tp.stat() if tp.exists() else None
+                    entry = by_path.get(tp_res) or {
+                        "id": tp.stem,
+                        "path": tp_res,
+                        "name": tp.name,
+                        "aliases": self._candidate_template_aliases(tp_res),
+                        "use_count": 0,
+                    }
+                    entry["profile_path"] = str(prof_path.resolve())
+                    entry["last_used_at"] = str(entry.get("last_used_at") or learned_at or "")
+                    entry["is_available"] = bool(tp.exists())
+                    entry["signature"] = {
+                        "size_bytes": int(sig.get("size_bytes") or (stat.st_size if stat else -1)),
+                        "mtime_ns": int(sig.get("mtime_ns") or (getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)) if stat else -1)),
+                    }
+                    by_path[tp_res] = entry
+                    dirty = True
+                except Exception:
                     continue
-                raw = _json.loads(prof_path.read_text(encoding="utf-8"))
-                template_meta = raw.get("template") or {}
-                tp_raw = str(template_meta.get("path") or "").strip()
-                if not tp_raw:
-                    continue
-                tp = Path(tp_raw).resolve()
-                tp_res = str(tp)
-                learned_at = str(template_meta.get("learned_at") or "")
-                sig = template_meta.get("signature") or {}
-                stat = tp.stat() if tp.exists() else None
-                entry = by_path.get(tp_res) or {
-                    "id": tp.stem,
-                    "path": tp_res,
-                    "name": tp.name,
-                    "aliases": self._candidate_template_aliases(tp_res),
-                    "use_count": 0,
-                }
-                entry["profile_path"] = str(prof_path.resolve())
-                entry["last_used_at"] = str(entry.get("last_used_at") or learned_at or "")
-                entry["is_available"] = bool(tp.exists())
-                entry["signature"] = {
-                    "size_bytes": int(sig.get("size_bytes") or (stat.st_size if stat else -1)),
-                    "mtime_ns": int(sig.get("mtime_ns") or (getattr(stat, "st_mtime_ns", int(stat.st_mtime * 1e9)) if stat else -1)),
-                }
-                by_path[tp_res] = entry
-                dirty = True
-            except Exception:
-                continue
 
         if dirty:
             data["templates"] = list(by_path.values())
@@ -1165,6 +2350,313 @@ class SurvyAIAgent:
             return q.split(marker, 1)[-1].strip()
         return q
 
+    def _should_fastpath_pdf_survey_replot(
+        self, query: str, routing_query: Optional[str] = None
+    ) -> bool:
+        """
+        True when the user wants to replot a survey/cadastral plan PDF to a DWG.
+
+        Uses routing_query (current turn only) for intent/keywords so injected GUI
+        history cannot hijack unrelated knowledge questions.
+        """
+        if not getattr(self.settings, "pdf_survey_replot_enabled", True):
+            return False
+
+        body = self._cadastral_user_message_body(query).lower().strip()
+        scope_q = (routing_query or body or "").lower().strip()
+
+        if self._classify_query_intent(scope_q) == "knowledge":
+            return False
+        if any(m in scope_q for m in _CADASTRAL_FASTPATH_EXCLUDE_MARKERS):
+            return False
+
+        affirmation = self._is_pdf_replot_affirmation(scope_q, query)
+        if affirmation:
+            return True
+
+        if ".pdf" not in scope_q:
+            return False
+        if ".dwg" not in scope_q:
+            return False
+        if not any(
+            k in scope_q
+            for k in ("replot", "plot using", "generate", "create", "draw", "cad", "dwg")
+        ):
+            return False
+        if not any(
+            k in scope_q
+            for k in (
+                "cadastral", "survey plan", "survey/cadastral", "replot",
+                "pillar", "bearing", "parcel", ".pdf",
+            )
+        ):
+            return False
+        return True
+
+    def _resolve_pdf_path_for_replot(self, query: str) -> Dict[str, Any]:
+        """
+        Resolve the survey-plan PDF from the *current* user request only.
+
+        Conversation history must not override an explicit path in the latest turn.
+        Missing files return similar candidates for user approval — never auto-substitute.
+        """
+        from agent.pdf_survey_plan import resolve_pdf_path_for_replot
+
+        scope = self._cadastral_user_message_body(query)
+        return resolve_pdf_path_for_replot(scope, query)
+
+    def _ensure_autocad_connected(self) -> bool:
+        """Connect to AutoCAD early so COM is warm before template plotting."""
+        try:
+            if self.autocad.is_connected:
+                return True
+            return bool(self.autocad.connect())
+        except Exception as exc:
+            logger.debug("AutoCAD pre-connect failed: %s", exc)
+            return False
+
+    @staticmethod
+    def _scope_requests_cadastral_extras(text: str) -> bool:
+        """True when the user turn asks to add/change roads, fences, or road titles."""
+        ql = (text or "").lower()
+        markers = (
+            "add an access", "add access", "add another", "another access",
+            "concrete wall", "dwarf concrete", "c.w.f", "d.c.w.f",
+            "add fence", "add a fence", "add concrete", "wall fence",
+            "title as", "give it the title", "road title",
+        )
+        return any(m in ql for m in markers)
+
+    def _extract_pdf_survey_plan_with_tier_fallback(
+        self,
+        pdf_path: str,
+        *,
+        user_notes: str,
+        timeout_s: int = 120,
+    ) -> tuple[Any, Optional[str]]:
+        """Extract from PDF using average-tier vision first; escalate to complex if needed."""
+        from agent.pdf_survey_plan import (
+            SurveyPlanExtraction,
+            extract_survey_plan_from_pdf,
+            validate_extraction_for_replot,
+        )
+
+        tiers: List[tuple[str, int]] = [("average", 1), ("complex", 2)]
+        last: Optional[SurveyPlanExtraction] = None
+        last_model: Optional[str] = None
+
+        for tier, vision_pages in tiers:
+            llm, model_name = self._try_openai_tier_llm(tier)  # type: ignore[arg-type]
+            if llm is None:
+                llm = getattr(self, "llm_primary", None)
+            if llm is None:
+                break
+            if not model_name:
+                model_name = getattr(self, "_current_openai_model", None) or getattr(
+                    self.settings, "openai_model", "gpt-5.4-mini"
+                )
+            self._current_openai_model = model_name
+            extraction = extract_survey_plan_from_pdf(
+                pdf_path,
+                llm=llm,
+                run_with_timeout=self._llm_run_with_timeout(model_name),
+                user_notes=user_notes,
+                timeout_s=timeout_s,
+                vision_max_pages=vision_pages,
+            )
+            last = extraction
+            last_model = model_name
+            if extraction.source in ("error", "llm_parse_failed"):
+                continue
+            if not validate_extraction_for_replot(extraction):
+                return extraction, model_name
+            logger.info(
+                "PDF extraction incomplete on tier %s — retrying with stronger model if available",
+                tier,
+            )
+
+        if last is None:
+            return SurveyPlanExtraction(source="error", notes="No LLM available for PDF extraction"), None
+        return last, last_model
+
+    def _run_pdf_survey_replot_pipeline(self, query: str) -> Dict[str, Any]:
+        """Extract survey plan from PDF (layout + vision) and replot via cadastral CAD pipeline."""
+        from pathlib import Path
+
+        from agent.pdf_survey_plan import (
+            apply_plan_overrides_to_extraction,
+            build_cadastral_subprompt,
+            filter_user_facing_extraction_notes,
+            resolve_output_dwg_path,
+            resolve_plan_overrides_from_query,
+            validate_extraction_for_replot,
+            validate_subprompt_geometry,
+        )
+
+        scope = self._cadastral_user_message_body(query)
+        pdf_resolution = self._resolve_pdf_path_for_replot(query)
+        if not pdf_resolution.get("success"):
+            return {
+                "success": False,
+                "error": pdf_resolution.get("error") or "No PDF path found in the request.",
+                "requested_pdf": pdf_resolution.get("requested"),
+                "similar_pdfs": pdf_resolution.get("similar") or [],
+                "needs_user_approval": bool(pdf_resolution.get("needs_user_approval")),
+            }
+
+        pdf_path = str(pdf_resolution.get("path") or "")
+        if not pdf_path or not Path(pdf_path).exists():
+            return {
+                "success": False,
+                "error": f"PDF not found: {pdf_path or pdf_resolution.get('requested')}",
+            }
+
+        output_dwg = resolve_output_dwg_path(query, pdf_path, scope_text=scope)
+        if not output_dwg:
+            return {"success": False, "error": "Could not resolve output DWG path."}
+
+        logger.info(
+            "PDF survey replot paths (strict): pdf=%s output_dwg=%s scope=%r",
+            pdf_path,
+            output_dwg,
+            scope[:160],
+        )
+
+        template_hint: Optional[str] = None
+        mem: Optional[Dict[str, str]] = None
+
+        def _resolve_template() -> Optional[Dict[str, str]]:
+            return self._resolve_cadastral_template_from_memory(query)
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            fut_template = pool.submit(_resolve_template)
+            fut_simple = pool.submit(self._try_openai_tier_llm, "simple")
+            fut_cad = pool.submit(self._ensure_autocad_connected)
+            mem = fut_template.result()
+            override_llm, override_model = fut_simple.result()
+            fut_cad.result()
+
+        extraction, model_name = self._extract_pdf_survey_plan_with_tier_fallback(
+            pdf_path,
+            user_notes=self._cadastral_user_message_body(query),
+            timeout_s=120,
+        )
+
+        if override_llm is None:
+            override_llm = getattr(self, "llm_primary", None)
+        if not override_model:
+            override_model = model_name
+        if model_name:
+            self._current_openai_model = model_name
+        if extraction.source in ("error", "llm_parse_failed"):
+            return {
+                "success": False,
+                "error": extraction.notes or "PDF survey plan extraction failed.",
+                "extraction": extraction.model_dump(),
+            }
+
+        validation_issues = validate_extraction_for_replot(extraction)
+        if validation_issues:
+            return {
+                "success": False,
+                "error": (
+                    "PDF extraction is incomplete and cannot be replotted safely: "
+                    + "; ".join(validation_issues)
+                ),
+                "validation_issues": validation_issues,
+                "extraction": extraction.model_dump(),
+            }
+
+        if mem and mem.get("template_path"):
+            template_hint = mem["template_path"]
+
+        plan_overrides = resolve_plan_overrides_from_query(
+            query,
+            scope_text=scope,
+            base_extraction=extraction,
+            llm=override_llm,
+            run_with_timeout=self._llm_run_with_timeout(override_model),
+        )
+        extraction = apply_plan_overrides_to_extraction(extraction, plan_overrides)
+        from agent.pdf_survey_plan import enrich_extraction_coordinates
+
+        extraction = enrich_extraction_coordinates(extraction, "")
+        cert_date = plan_overrides.certification_date or extraction.certification_date or None
+
+        subprompt = build_cadastral_subprompt(
+            extraction,
+            output_dwg_path=output_dwg,
+            certification_date=cert_date,
+            template_path=template_hint,
+        )
+        subprompt_issues = validate_subprompt_geometry(subprompt)
+        if subprompt_issues:
+            return {
+                "success": False,
+                "error": (
+                    "Generated CAD sub-prompt is missing required geometry: "
+                    + "; ".join(subprompt_issues)
+                ),
+                "validation_issues": subprompt_issues,
+                "extraction": extraction.model_dump(),
+                "subprompt": subprompt,
+            }
+        logger.info("PDF survey replot sub-prompt:\n%s", subprompt)
+
+        plot_result = self._run_cadastral_cad_prompt_pipeline(
+            subprompt,
+            source_scale_denom=extraction.scale_denom,
+            skip_intent_assessment=True,
+            user_scope_for_extras=scope,
+        )
+        if not plot_result.get("success"):
+            return {
+                "success": False,
+                "error": plot_result.get("error", "Cadastral replot failed."),
+                "extraction": extraction.model_dump(),
+                "subprompt": subprompt,
+            }
+
+        out_lines = [
+            "✅ Survey plan PDF replotted to CAD.",
+            f"- Source PDF: {pdf_path}",
+            f"- Output DWG: {plot_result.get('output_dwg') or output_dwg}",
+            f"- Extraction: {extraction.source} (confidence {extraction.confidence:.0%})",
+        ]
+        if plan_overrides.override_fields:
+            out_lines.append(
+                f"- User overrides applied: {', '.join(plan_overrides.override_fields)}"
+            )
+            if extraction.buyer_name and "buyer_name" in plan_overrides.override_fields:
+                out_lines.append(f"- Buyer name: {extraction.buyer_name}")
+            if extraction.plan_number and "plan_number" in plan_overrides.override_fields:
+                out_lines.append(f"- Plan number: {extraction.plan_number}")
+            if cert_date and "certification_date" in plan_overrides.override_fields:
+                out_lines.append(f"- Certification date: {cert_date}")
+        elif cert_date:
+            out_lines.append(f"- Certification date updated to: {cert_date}")
+        if extraction.pillar_numbers:
+            out_lines.append(f"- Pillars: {', '.join(extraction.pillar_numbers)}")
+        if extraction.traverse_legs:
+            out_lines.append(f"- Traverse legs: {len(extraction.traverse_legs)}")
+        if extraction.fences:
+            out_lines.append(f"- Concrete wall fences: {len(extraction.fences)} boundary side(s)")
+        filtered_notes = filter_user_facing_extraction_notes(
+            extraction.notes or "",
+            plan_overrides.override_fields,
+        )
+        if filtered_notes:
+            out_lines.append(f"- Notes: {filtered_notes}")
+
+        return {
+            "success": True,
+            "response": "\n".join(out_lines) + "\n",
+            "output_dwg": plot_result.get("output_dwg") or output_dwg,
+            "output_path": plot_result.get("output_dwg") or output_dwg,
+            "extraction": extraction.model_dump(),
+            "model_name": model_name,
+        }
+
     def _should_fastpath_cadastral_cad(self, query: str) -> bool:
         import re
 
@@ -1234,43 +2726,6 @@ class SurvyAIAgent:
                 seen.add(bn)
                 distinct_out.append(bn)
         return bool(has_blocks or len(distinct_out) >= 2)
-
-    def _should_fastpath_pre_post_csv_dwg_cutfill(self, query: str) -> bool:
-        """
-        Reserved fast-path: skip LangGraph for the verified PRE/POST CSV + DWG → IDW/CutFill flow.
-
-        Left disabled until prompt parsing reliably extracts pre_csv_path, post_csv_path,
-        and boundary_dwg_path without the full agent. The tool ``arcgis_pre_post_csv_dwg_cutfill``
-        remains available in the normal graph.
-        """
-        return False
-
-    def _run_pre_post_csv_dwg_cutfill_pipeline(self, query: str) -> Dict[str, Any]:
-        """Stub for a future deterministic pipeline; not used while the fast-path is off."""
-        return {
-            "success": False,
-            "response": "PRE/POST CSV+DWG fast path is not enabled; use the standard agent with arcgis_pre_post_csv_dwg_cutfill.",
-            "error": "fastpath_disabled",
-            "output_csv": None,
-        }
-
-    def _should_fastpath_dynamic_arcgis_workflow(self, query: str) -> bool:
-        """Reserved: one-shot LLM → ArcPy execution without full graph. Disabled for now."""
-        return False
-
-    def _run_dynamic_arcgis_workflow_pipeline(
-        self,
-        query: str,
-        llm: BaseChatModel,
-        model_name_used: Optional[str],
-    ) -> Dict[str, Any]:
-        """Stub; only called if _should_fastpath_dynamic_arcgis_workflow returns True."""
-        return {
-            "success": False,
-            "response": "Dynamic ArcGIS fast path is not enabled; use arcgis_execute_python_code in the standard agent.",
-            "error": "fastpath_disabled",
-            "output_csv": None,
-        }
 
     def _split_cadastral_batch_requests(self, query: str) -> List[str]:
         """
@@ -1392,18 +2847,125 @@ class SurvyAIAgent:
             "results": results,
         }
 
-    def _run_cadastral_cad_prompt_pipeline(self, query: str) -> Dict[str, Any]:
+    def _enrich_cadastral_extras_with_intent_assessment(
+        self,
+        query: str,
+        *,
+        access_roads: List[str],
+        fences: List[Dict[str, str]],
+        pillar_list: List[str],
+    ) -> tuple[List[str], List[Dict[str, str]], Optional[str]]:
+        """
+        Use vector-store recall + a cheap LLM pass to interpret plan extras
+        (access roads, fences) from natural language. Falls back to regex-only
+        results when assessment is disabled or unavailable.
+        """
+        if not getattr(self.settings, "cadastral_intent_assessment_enabled", True):
+            return access_roads, fences, None
+
+        try:
+            from agent.cadastral_intent import (
+                assess_cadastral_plan_extras,
+                merge_access_roads,
+                merge_fences,
+            )
+        except Exception as exc:
+            logger.info("Cadastral intent module unavailable: %s", exc)
+            return access_roads, fences, None
+
+        llm = None
+        try:
+            if self.settings.primary_llm == "openai" and getattr(
+                self.settings, "enable_tiered_models", True
+            ):
+                model = self._get_openai_model_for_complexity("simple")
+                llm = self._initialize_llm("openai", model_name=model)
+        except Exception:
+            llm = None
+        if llm is None:
+            llm = getattr(self, "llm_primary", None)
+
+        threshold = float(getattr(self.settings, "context_score_threshold", 0.3))
+        assessment = assess_cadastral_plan_extras(
+            query,
+            pillar_numbers=pillar_list,
+            vector_store=self.vector_store,
+            search_fn=self._vs_search,
+            llm=llm,
+            run_with_timeout=self._run_with_timeout,
+            score_threshold=threshold,
+        )
+
+        if assessment.source in ("unavailable", "error", "llm_parse_failed", "none"):
+            logger.info(
+                "Cadastral extras assessment skipped (%s): %s",
+                assessment.source,
+                assessment.notes or "no notes",
+            )
+            return access_roads, fences, None
+
+        merged_roads = merge_access_roads(
+            access_roads,
+            assessment.access_roads,
+            confidence=assessment.confidence,
+        )
+        merged_fences = merge_fences(
+            fences,
+            assessment.fences,
+            confidence=assessment.confidence,
+            query=query,
+        )
+
+        if len(merged_roads) != len(access_roads) or len(merged_fences) != len(fences):
+            logger.info(
+                "Cadastral intent assessment (%s, confidence=%.2f) adjusted extras: "
+                "roads %s→%s, fences %s→%s",
+                assessment.source,
+                assessment.confidence,
+                len(access_roads),
+                len(merged_roads),
+                len(fences),
+                len(merged_fences),
+            )
+
+        return merged_roads, merged_fences, assessment.access_road_title
+
+    def _run_cadastral_cad_prompt_pipeline(
+        self,
+        query: str,
+        *,
+        source_scale_denom: Optional[int] = None,
+        skip_intent_assessment: bool = False,
+        user_scope_for_extras: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Deterministic parser for your cadastral prompts.
         - Learns a template profile if missing
         - Applies the template and replots parcel + bearings/dist + tables
         - ABSOLUTE: The survey template DWG is never modified; all edits are to a copy (output drawing).
-        - Access road: Extracts width, offset, and pillar ref from natural language (e.g. "7m (and an offset of 3m) on the side joining pillars X and Y") so the LLM/agent can reason through user input and assign tasks without hardcoded phrasing.
+        - Access road / fence extras: regex baseline plus optional vector-store + LLM assessment
+          (see cadastral_intent_assessment_enabled) so varied prompt styles still plot correctly.
         """
         import re
+        from concurrent.futures import ThreadPoolExecutor
         from pathlib import Path
 
+        cad_pool = ThreadPoolExecutor(max_workers=1)
+        cad_future = cad_pool.submit(self._ensure_autocad_connected)
+
         q = self._cadastral_user_message_body(query or "")
+
+        simple_override_llm: Any = None
+        simple_override_model: Optional[str] = None
+
+        def _simple_override_llm() -> Any:
+            nonlocal simple_override_llm, simple_override_model
+            if simple_override_llm is not None:
+                return simple_override_llm
+            llm_inst, model_inst = self._try_openai_tier_llm("simple")
+            simple_override_llm = llm_inst or getattr(self, "llm_primary", None)
+            simple_override_model = model_inst
+            return simple_override_llm
 
         def _pick(pats: list[str]) -> Optional[str]:
             for pat in pats:
@@ -1436,46 +2998,68 @@ class SurvyAIAgent:
         # Quoted first, then flexible ':' / '=' and unquoted values (comma-delimited fields as in real prompts).
         buyer = _pick(
             [
-                r"buyer\s*name\s*[:=]\s*'([^']+)'",
-                r'buyer\s*name\s*[:=]\s*"([^"]+)"',
-                r"buyer\s*name\s*[:=]\s*(.+?)(?=\s*,\s*location\b|\s*location\s*[:=]|\Z)",
+                r"buyer\s*'?s?\s*name\s*[:=]\s*'([^']+)'",
+                r'buyer\s*\'?s?\s*name\s*[:=]\s*"([^"]+)"',
+                rf"buyer\s*'?s?\s*name\s*[:=]\s*(.+?){_CADASTRAL_NEXT_FIELD}",
+                r"buyer\s*'?s?\s*name\s+should\s+(?:now\s+)?be\s+['\"]([^'\"]+)['\"]",
+                r"owner\s*'?s?\s*name\s+should\s+(?:now\s+)?be\s+['\"]([^'\"]+)['\"]",
+                r"(?:change|update|set)\s+(?:the\s+)?(?:buyer|owner)(?:'s)?\s*name\s+to\s+['\"]([^'\"]+)['\"]",
             ]
         )
+        if not buyer:
+            try:
+                from agent.pdf_survey_plan import resolve_buyer_name_from_query
+
+                buyer = resolve_buyer_name_from_query(
+                    q,
+                    scope_text=q,
+                    llm=_simple_override_llm(),
+                    run_with_timeout=self._run_with_timeout,
+                )
+            except Exception:
+                buyer = None
         location = _pick(
             [
                 r"location\s*[:=]\s*'([^']+)'",
                 r'location\s*[:=]\s*"([^"]+)"',
-                r"location\s*[:=]\s*(.+?)(?=\s*,\s*local\s+(?:govt\.?|government)\s+area\b|\Z)",
+                rf"location\s*[:=]\s*(.+?){_CADASTRAL_NEXT_FIELD}",
             ]
         )
         lga = _pick(
             [
                 r"local\s+(?:govt\.?|government)\s+area\s*[:=]\s*'([^']+)'",
                 r'local\s+(?:govt\.?|government)\s+area\s*[:=]\s*"([^"]+)"',
-                r"local\s+(?:govt\.?|government)\s+area\s*[:=]\s*(.+?)(?=\s*,\s*state\b|\s*state\s*[:=]|\Z)",
+                rf"local\s+(?:govt\.?|government)\s+area\s*[:=]\s*(.+?){_CADASTRAL_NEXT_FIELD}",
             ]
         )
         state = _pick(
             [
                 r"state\s*[:=]\s*'([^']+)'",
                 r'state\s*[:=]\s*"([^"]+)"',
-                r"state\s*[:=]\s*(.+?)(?=\s*,\s*(?:crs_?origin|origin_?crs)\b|\s*,\s*plan\s*(?:no|number)?\.?|\s*,\s*date\s+on\s+the|\s*date\s+on\s+the|\Z)",
+                rf"state\s*[:=]\s*(.+?){_CADASTRAL_NEXT_FIELD}",
             ]
         )
         origin = _pick(
             [
                 r"(?:crs_?origin|origin_?crs|origin(?:_crs|/crs)?)\s*[:=]\s*'([^']+)'",
                 r'(?:crs_?origin|origin_?crs|origin(?:_crs|/crs)?)\s*[:=]\s*"([^"]+)"',
-                r"(?:crs_?origin|origin_?crs)\s*[:=]\s*(.+?)(?=\s*,\s*plan|\s*plan\s*(?:no|number)|\s*,\s*date\s+on\s+the|\s*date\s+on\s+the|\s*Surveyor\s+name|\Z)",
+                rf"(?:crs_?origin|origin_?crs)\s*[:=]\s*(.+?){_CADASTRAL_NEXT_FIELD}",
             ]
         )
         plan_no = _pick(
             [
                 r"plan\s*(?:no\.?|number)\s*[:=]\s*'([^']+)'",
                 r'plan\s*(?:no\.?|number)\s*[:=]\s*"([^"]+)"',
-                r"plan\s*(?:no\.?|number)\s*[:=]\s*([^\s,;]+?)(?=\s*,\s*date\s+on\s+the|\s*date\s+on\s+the|\s*,\s*Surveyor|\Z)",
+                r"plan\s*(?:no\.?|number)\s*[:=]\s*([A-Z0-9][A-Z0-9/\-]+)\s*(?=\n|\r|$|\s+Surveyor|\s*,\s*date\s+on)",
             ]
         )
+        if plan_no:
+            try:
+                from agent.pdf_survey_plan import normalize_plan_number
+
+                plan_no = normalize_plan_number(plan_no.split("\n")[0].strip())
+            except Exception:
+                plan_no = plan_no.split("\n")[0].strip()
         cert_date = _pick(
             [
                 r"date\s+on\s+the\s+certification\s*[:=]\s*'([^']+)'",
@@ -1483,6 +3067,18 @@ class SurvyAIAgent:
                 r"date\s+on\s+the\s+certification\s*[:=]\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})",
             ]
         )
+        if not cert_date:
+            try:
+                from agent.pdf_survey_plan import resolve_plan_overrides_from_query
+
+                cert_date = resolve_plan_overrides_from_query(
+                    q,
+                    scope_text=q,
+                    llm=_simple_override_llm(),
+                    run_with_timeout=self._run_with_timeout,
+                ).certification_date
+            except Exception:
+                cert_date = None
         surveyor = _pick(
             [
                 r"surveyor\s+name\s*[:=]\s*'([^']+)'",
@@ -1503,75 +3099,100 @@ class SurvyAIAgent:
         # - pillar numbers = 'SC/BE 6060, SC/BG 1665, ...'
         # - pillar numbers: SC/BE 6060, SC/BG 1665, ...
         pillar_list = _quoted_list(
-            r"pillar\s+numbers\s*[:=]\s*(.*?)(?:coordinates\s+for\s+the\s+point(?:s)?\s*[:=]|$)"
+            rf"pillar\s+numbers\s*[:=]\s*(.*?)(?={_COORDINATES_FOR_STOP}|$)"
         )
         if not pillar_list:
             m_p = re.search(
-                r"pillar\s+numbers\s*[:=]\s*(.*?)(?:coordinates\s+for\s+the\s+point(?:s)?\s*[:=]|$)",
+                rf"pillar\s+numbers\s*[:=]\s*(.*?)(?={_COORDINATES_FOR_STOP}|$)",
                 q,
                 flags=re.IGNORECASE | re.DOTALL,
             )
-            raw = (m_p.group(1).strip() if m_p else "").strip()
-            # Split on commas/newlines and strip optional quotes.
+            raw = (m_p.group(1).strip() if m_p else "").strip().rstrip(",").strip()
             pillar_list = [p.strip().strip("'\"") for p in re.split(r"[,\n]+", raw) if p.strip()]
         pillars = ", ".join(pillar_list)
 
-        # Support:
-        # - coordinates for the point = (...)
-        # - coordinates for the point: (...)
-        # and stop the capture before "Add an access ..." so we don't pollute bearings parsing.
-        coords_blob = (
-            _pick(
-                [
-                    r"coordinates\s+for\s+the\s+points\s*=\s*(.+?)(?=\s*Add\s+an?\s+access|Add\s+\d+|Add\s+\w|$)",
-                    r"coordinates\s+for\s+the\s+point\s*=\s*(.+?)(?=\s*Add\s+an?\s+access|Add\s+\d+|Add\s+\w|$)",
-                    r"coordinates\s+for\s+the\s+points\s*:\s*(.+?)(?=\s*Add\s+an?\s+access|Add\s+\d+|Add\s+\w|$)",
-                    r"coordinates\s+for\s+the\s+point\s*:\s*(.+?)(?=\s*Add\s+an?\s+access|Add\s+\d+|Add\s+\w|$)",
-                ]
+        coords_blob = extract_coordinates_blob_from_cadastral_query(q)
+        if not coords_blob:
+            coords_blob = resolve_cadastral_coordinates_blob(
+                q,
+                pillar_list=pillar_list,
+                llm=_simple_override_llm(),
+                run_with_timeout=self._run_with_timeout,
+                vector_store=self.vector_store,
+                search_fn=self._vs_search,
             )
-            or q
-        )
-        
-        # Parse access road(s): support one or multiple roads (e.g. "6m on side of A and B; 4m on side of C and D")
+        if not coords_blob and re.search(
+            r"coordinates\s+for\s+the\s+points?\b|(?:plot|draw|use)\s+(?:using\s+)?coordinate[s]?\b",
+            q,
+            re.IGNORECASE,
+        ):
+            cad_pool.shutdown(wait=False)
+            return {
+                "success": False,
+                "error": (
+                    "Could not parse coordinates/traverse from this plan block. "
+                    "Use 'coordinates for the point: (EmE, NmN), with bearing ...' or "
+                    "'coordinates for the point SC/XX 1234: (EmE, NmN), with bearing ...'."
+                ),
+            }
+
+        # Parse access road(s):
         access_roads: List[str] = _parse_access_road_specs_from_query(q)
 
         # Parse Concrete Wall Fence / Dwarf Concrete Wall Fence requests (C.W.F / D.C.W.F)
         # Supports multiple fences across different traverse legs, but max 1 fence per leg.
-        fences: List[Dict[str, str]] = []
-        fence_segments = re.split(r"(?<=[.;])\s+|\s+and\s+add\s+|\s+also\s+add\s+|\s+,\s*and\s+", q, flags=re.IGNORECASE)
-        for seg in fence_segments:
-            seg = (seg or "").strip()
-            if not seg:
-                continue
-            seg_l = seg.lower()
-            if not re.search(r"\bfence\b|c\.w\.f|d\.c\.w\.f|concrete\s+wall\s+fence|dwarf\s+concrete\s+wall\s+fence|short\s+wall\s+fence|wall\s+fence", seg_l, re.IGNORECASE):
-                continue
-            kind = None
-            if re.search(r"d\.c\.w\.f|dwarf\s+concrete\s+wall\s+fence|short\s+wall\s+fence|dwarf\s+wall\s+fence", seg_l, re.IGNORECASE):
-                kind = "DCWF"
-            elif re.search(r"c\.w\.f|concrete\s+wall\s+fence|wall\s+fence|\bfence\b", seg_l, re.IGNORECASE):
-                kind = "CWF"
-            if not kind:
-                continue
-            # Only keep segments that reference a traverse leg (side of / joining / connecting / along / between)
-            if not re.search(r"side\s+of|joining|connecting|along|between|linking", seg_l, re.IGNORECASE):
-                continue
-            fences.append({"kind": kind, "spec": seg})
+        from agent.pdf_survey_plan import parse_fence_specs_from_text
 
-        # Parse user-requested plot scale (e.g. "Plot using scale 1:250", "scale 1:250")
+        fences: List[Dict[str, str]] = parse_fence_specs_from_text(q)
+
+        extras_scope = (user_scope_for_extras or q).strip()
+        run_intent_assessment = (
+            getattr(self.settings, "cadastral_intent_assessment_enabled", True)
+            and (
+                not skip_intent_assessment
+                or self._scope_requests_cadastral_extras(extras_scope)
+            )
+        )
+        intent_title: Optional[str] = None
+        if run_intent_assessment:
+            access_roads, fences, intent_title = self._enrich_cadastral_extras_with_intent_assessment(
+                extras_scope or q,
+                access_roads=access_roads,
+                fences=fences,
+                pillar_list=pillar_list,
+            )
+        else:
+            logger.info(
+                "Cadastral intent assessment skipped (PDF-derived subprompt; no extra road/fence request)"
+            )
+
+        cad_future.result()
+        cad_pool.shutdown(wait=False)
+
+        # Parse user-requested plot scale — prefer explicit "Plot using scale 1:xxx" (PDF replot).
         user_scale_denom = None
-        scale_m = re.search(r"plot\s+using\s+scale\s+1\s*:\s*(\d+)|scale\s+1\s*:\s*(\d+)", q, re.IGNORECASE)
+        scale_m = re.search(r"plot\s+using\s+scale\s+1\s*:\s*(\d+)", q, re.IGNORECASE)
         if scale_m:
-            user_scale_denom = int(scale_m.group(1) or scale_m.group(2) or 0)
+            user_scale_denom = int(scale_m.group(1))
+        if not user_scale_denom:
+            scale_m = re.search(
+                r"(?:^|\n)\s*scale\s+1\s*:\s*(\d+)",
+                q,
+                re.IGNORECASE,
+            )
+            if scale_m:
+                user_scale_denom = int(scale_m.group(1))
         if not user_scale_denom:
             scale_m = re.search(r"1\s*:\s*(\d+)\s*(?:scale|plot)", q, re.IGNORECASE)
             if scale_m:
                 user_scale_denom = int(scale_m.group(1))
+        if source_scale_denom and int(source_scale_denom) > 0:
+            user_scale_denom = int(source_scale_denom)
 
         # Parse optional road title override for first road (e.g. "title as 'UMUAKURU-UMUALILI ROAD'")
         access_road_title = None
         if access_roads:
-            access_road_title = _pick([
+            access_road_title = intent_title or _pick([
                 r"(?:road\s+)?title\s+as\s+['\"]([^'\"]+)['\"]",
                 r"(?:give\s+it\s+the\s+)?title\s+as\s+['\"]([^'\"]+)['\"]",
                 r"title\s+['\"]([^'\"]+)['\"]",
@@ -1580,6 +3201,42 @@ class SurvyAIAgent:
             ])
             if access_road_title:
                 access_road_title = access_road_title.strip()
+
+        if buyer:
+            try:
+                from agent.pdf_survey_plan import trim_metadata_field
+
+                buyer = trim_metadata_field(buyer, max_len=140)
+            except Exception:
+                buyer = buyer.split("\n")[0].strip()[:140]
+        if location:
+            try:
+                from agent.pdf_survey_plan import trim_metadata_field
+
+                location = trim_metadata_field(location, max_len=120)
+            except Exception:
+                location = location.split("\n")[0].strip()[:120]
+        if lga:
+            try:
+                from agent.pdf_survey_plan import trim_metadata_field
+
+                lga = trim_metadata_field(lga, max_len=80)
+            except Exception:
+                lga = lga.split("\n")[0].strip()[:80]
+        if state:
+            try:
+                from agent.pdf_survey_plan import trim_metadata_field
+
+                state = trim_metadata_field(state, max_len=40)
+            except Exception:
+                state = state.split("\n")[0].strip()[:40]
+        if origin:
+            try:
+                from agent.pdf_survey_plan import trim_metadata_field
+
+                origin = trim_metadata_field(origin, max_len=60)
+            except Exception:
+                origin = origin.split("\n")[0].strip()[:60]
 
         resolved_from_memory = None
         if not template:
@@ -1671,6 +3328,19 @@ class SurvyAIAgent:
         )
         if isinstance(result, dict) and result.get("success"):
             self._register_cad_template_memory(str(template_p), str(profile_path))
+            try:
+                from agent.cadastral_intent import store_cadastral_plan_extras
+
+                store_cadastral_plan_extras(
+                    self.vector_store,
+                    query=q,
+                    output_dwg=str(out_p),
+                    access_roads=access_roads,
+                    fences=fences,
+                    pillar_numbers=pillars or "",
+                )
+            except Exception:
+                pass
         return result
 
     def _learn_cadastral_template_profile(
@@ -1688,7 +3358,13 @@ class SurvyAIAgent:
         tp = Path(template_path).resolve()
         if not tp.exists():
             return {"success": False, "error": f"Template not found: {str(tp)}"}
-        outp = Path(profile_output).resolve() if profile_output else (Path("template_profiles") / f"{tp.stem}.json").resolve()
+        # Default to the frozen-safe, user-writable profiles dir (%APPDATA%\SurvyAI)
+        # instead of a CWD-relative path, so learned profiles persist in packaged builds.
+        outp = (
+            Path(profile_output).resolve()
+            if profile_output
+            else (self._cad_template_profiles_dir() / f"{tp.stem}.json").resolve()
+        )
         outp.parent.mkdir(parents=True, exist_ok=True)
 
         if not self.autocad.is_connected and not self.autocad.connect():
@@ -1891,13 +3567,21 @@ class SurvyAIAgent:
         opened = self.autocad.open_drawing(str(outp))
         if not opened.get("success"):
             return {"success": False, "error": opened.get("error", "Failed to open output drawing")}
+        self.autocad.set_workflow_document(str(outp))
         time.sleep(0.3)
         # With several DWGs open (template + prior outputs), the active tab can be wrong.
         # Force the output we just copied to be active before any table/geometry edits.
         act2 = self.autocad.open_drawing(str(outp), read_only=False)
         if not act2.get("success"):
             logger.warning("Could not re-activate output drawing before edits: %s", act2.get("error"))
+        self.autocad.ensure_workflow_document()
         time.sleep(0.2)
+
+        def _cad_checkpoint() -> None:
+            try:
+                self.autocad.ensure_workflow_document()
+            except Exception:
+                pass
 
         # --- helpers for table formatting preservation ---
         def _get_cell(h: str, r: int, c: int = 0) -> str:
@@ -1978,16 +3662,40 @@ class SurvyAIAgent:
             except Exception:
                 pass
             _set_cell(title_h, 2, 0, _mtxt_replace(template_owner_cell_raw, formatted_buyer_name))
-            _set_cell(title_h, 4, 0, _mtxt_replace(_get_cell(title_h, 4), location.strip().upper()))
+            loc_cell = _get_cell(title_h, 4)
+            loc_val = location.strip().upper()
+            if loc_val:
+                if re.search(r"\bAT\b", loc_cell or "", re.IGNORECASE):
+                    _set_cell(title_h, 4, 0, _replace_after_label(loc_cell, "AT", loc_val))
+                else:
+                    _set_cell(title_h, 4, 0, _mtxt_replace(loc_cell, loc_val))
             lga_u = lga.strip().upper()
             lga_line = lga_u if "LOCAL GOVERNMENT AREA" in lga_u else f"{lga_u} LOCAL GOVERNMENT AREA"
             _set_cell(title_h, 5, 0, _mtxt_replace(_get_cell(title_h, 5), lga_line))
             _set_cell(title_h, 6, 0, _mtxt_replace(_get_cell(title_h, 6), state.strip().upper()))
             _set_cell(title_h, 11, 0, _replace_after_label(_get_cell(title_h, 11), "ORIGIN:-", origin_crs.strip().upper()))
 
-        # Plan number + surveyor
+        # CADA_PLANNUMBER is fitted after sheet scaling (see _apply_plan_number_table_cell).
+        template_plan_nominal_h: Optional[float] = None
+        template_plan_text_style = ""
         if plan_h:
-            _set_cell(plan_h, 1, 0, _mtxt_replace(_get_cell(plan_h, 1), plan_number.strip().upper()))
+            _pn_row, _pn_col = 1, 0
+            _pn_tpl = _get_cell(plan_h, _pn_row, _pn_col)
+            try:
+                _pn_step = self.autocad.get_table_cell_mtext_line_step(
+                    plan_h, _pn_row, _pn_col, _pn_tpl
+                )
+                if _pn_step.get("success") and _pn_step.get("text_height"):
+                    template_plan_nominal_h = float(_pn_step["text_height"])
+            except Exception:
+                pass
+            try:
+                _pn_st = self.autocad.get_table_cell_text_style(plan_h, _pn_row, _pn_col)
+                if _pn_st.get("success") and str(_pn_st.get("style") or "").strip():
+                    template_plan_text_style = str(_pn_st["style"]).strip()
+            except Exception:
+                pass
+
         if surv_h:
             # Surveyor name: if it includes bracket text, render that bracket part at ~2/3 height.
             def _format_surveyor_name(raw: str) -> str:
@@ -2004,72 +3712,58 @@ class SurvyAIAgent:
                     return f"{main} {{\\H0.67x;{br}}}".strip()
                 return s
 
-            _set_cell(surv_h, 0, 0, _mtxt_replace(_get_cell(surv_h, 0), _format_surveyor_name(surveyor_name)))
+            _set_cell(
+                surv_h,
+                0,
+                0,
+                _mtext_preserve_style_set_content(
+                    _get_cell(surv_h, 0, 0),
+                    _format_surveyor_name(surveyor_name),
+                ),
+            )
 
-            # Surveyor address: user may provide address-only (no company). In that case,
-            # keep it as address only (no template company leakage) and format cleanly.
-            def _looks_like_company(text: str) -> bool:
-                t = (text or "").upper()
-                return any(k in t for k in [
-                    " LTD", " LIMITED", " NIG", " NIGERIA", " COMPANY", " CO.", " SERVICES", " ENTERPRISE",
-                    " GLOBAL", " VENTURES", " CONSULT", " CONSULTS", " CONSULTANCY", " GEO", " SURVEY",
-                ])
-
-            def _format_address(raw: str) -> str:
-                addr = (raw or "").strip().upper()
-                if not addr:
-                    return addr
-                # If caller already passed MTEXT newline codes, respect them.
-                if "\\P" in addr:
-                    return addr
-                # Heuristic: address-only → at most 2 lines (street; city/state tail).
-                parts = [p.strip() for p in re.split(r",\s*", addr) if p.strip()]
-                if parts and not _looks_like_company(addr):
-                    if len(parts) >= 2:
-                        return parts[0] + "\\P" + ", ".join(parts[1:])
-                    # Try a readable split for common localities if no commas
-                    if " PORT HARCOURT" in addr:
-                        return addr.replace(" PORT HARCOURT", "\\PPORT HARCOURT")
-                    return addr
-                # Company+address → allow multi-line split on commas
-                if len(parts) >= 2:
-                    return "\\P".join(parts)
-                return addr
-
-            addr_u = _format_address(surveyor_company_address)
-
-            def _mtxt_set_with_style(existing_cell: str, new_content: str) -> str:
-                """
-                Build a new MTEXT string that preserves ONLY formatting codes (color/font),
-                and replaces ALL textual content (prevents template company/address leakage).
-                """
-                raw = existing_cell or ""
-                # If cell uses MTEXT wrapper, try to keep color + font style.
-                if raw.startswith("{") and raw.endswith("}"):
-                    color = ""
-                    font = ""
-                    try:
-                        m = re.search(r"(\\C\d+;)", raw)
-                        if m:
-                            color = m.group(1)
-                    except Exception:
-                        color = ""
-                    try:
-                        m = re.search(r"(\\f[^;]+;)", raw)
-                        if m:
-                            font = m.group(1)
-                    except Exception:
-                        font = ""
-                    if color or font:
-                        return "{" + (color or "") + (font or "") + (new_content or "") + "}"
-                # Fallback to existing wrapper replacement (best-effort)
-                return _mtxt_replace(raw, new_content or "")
+            # Surveyor address: pack horizontally (city + state on one line) and
+            # vertically inside the cell — never one comma segment per line by default.
+            addr_template = _get_cell(surv_h, 1, 0)
+            addr_th = 0.6
+            addr_step = 0.0
+            addr_cell_w = 0.0
+            addr_cell_h = 0.0
+            try:
+                step_res = self.autocad.get_table_cell_mtext_line_step(surv_h, 1, 0, addr_template)
+                if step_res.get("success"):
+                    addr_th = float(step_res.get("text_height") or addr_th)
+                    addr_step = float(step_res.get("line_step") or 0.0)
+            except Exception:
+                pass
+            try:
+                ext = self.autocad.get_table_cell_extents(surv_h, 1, 0, outer=True)
+                if ext.get("success"):
+                    addr_cell_w = float(ext["maxx"]) - float(ext["minx"])
+                    addr_cell_h = float(ext["maxy"]) - float(ext["miny"])
+            except Exception:
+                pass
+            if addr_cell_w <= 0:
+                addr_cell_w = max(20.0, addr_th * 30.0)
+            if addr_cell_h <= 0:
+                addr_cell_h = max(6.0, addr_th * 8.0)
+            addr_u = _layout_surveyor_address_mtext(
+                surveyor_company_address,
+                cell_width=addr_cell_w,
+                cell_height=addr_cell_h,
+                text_height=addr_th,
+                line_step=addr_step,
+            )
 
             # Apply to all columns in the address row (some templates use multiple columns)
             cols = int((tables_now.get(surv_h) or {}).get("cols") or 1)
             for c in range(max(1, cols)):
                 cur = _get_cell(surv_h, 1, c)
-                _set_cell(surv_h, 1, c, _mtxt_set_with_style(cur, addr_u))
+                _set_cell(surv_h, 1, c, _mtext_preserve_style_set_content(cur, addr_u))
+            try:
+                self.autocad.recompute_table(surv_h)
+            except Exception:
+                pass
 
         # Certification date
         if cert_h and certification_date:
@@ -2276,7 +3970,7 @@ class SurvyAIAgent:
                                             break
                                         t_esc = re.escape(tok).replace("\\ ", "\\s+")
                                         if re.search(
-                                            rf"(?:coordinate|coordinates)\s+for\s+(?:the\s+)?(?:pillar|peg)?\s*{t_esc}\b",
+                                            rf"(?:coordinate|coordinates)\s+for\s+(?:the\s+)?(?:pillar|peg|point(?:s)?)?\s*{t_esc}\b",
                                             ct,
                                             re.IGNORECASE,
                                         ):
@@ -2325,9 +4019,27 @@ class SurvyAIAgent:
                 except Exception:
                     pass
 
+        if coordinates and len(coord_pairs) < 3:
+            return {
+                "success": False,
+                "error": (
+                    "Could not build a closed parcel from the supplied coordinates/traverse "
+                    f"(parsed {len(coord_pairs)} point(s); need at least 3). "
+                    "Check bearing/distance legs or provide explicit (E,N) pairs for each pillar."
+                ),
+            }
+
         geometry = {"pillars_moved": 0, "boundary_redrawn": False, "bearing_mtext": 0, "access_road_title": None}
         if bowditch_info:
             geometry["bowditch"] = bowditch_info
+
+        # Plan-scale state (updated inside the coordinate plotting block when present).
+        scale_k = 1.0
+        chosen_denom = 500
+        template_denom = 500
+        template_native_denom = 500
+        output_plan_denom = 500
+        output_scale_k = 1.0
 
         if coord_pairs and len(coord_pairs) >= 3:
             # Pillar ↔ vertex order follows the user's pillar list and traverse-leg order.
@@ -2394,11 +4106,11 @@ class SurvyAIAgent:
             # so the result stays neat like the template.
             scale_k = 1.0
             chosen_denom = 500  # plan scale 1:chosen_denom; used for road min-length check and title
+            template_denom = 500
             try:
                 allowed_denoms = [250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 25000]
 
                 # Parse template denom from title block (best-effort)
-                template_denom = 500
                 if title_h:
                     try:
                         tbl = tables_now.get(title_h, {}) if isinstance(tables_now, dict) else {}
@@ -2435,6 +4147,7 @@ class SurvyAIAgent:
                         template_denom = 500
                 if template_denom not in allowed_denoms:
                     template_denom = 500
+                template_native_denom = int(template_denom)
                 chosen_denom = template_denom  # plan scale denominator (1:chosen_denom); may be updated below
 
                 # Interior border bbox (template coords)
@@ -2479,6 +4192,15 @@ class SurvyAIAgent:
                         pass
                     boundary_w_pad = float(boundary_w) + 2.0 * road_pad_m
                     boundary_h_pad = float(boundary_h) + 2.0 * road_pad_m
+                    # PDF/user-stated finer scale already implies the parcel fits at that scale;
+                    # do not inflate extents with road padding (avoids false overflow to 1:500).
+                    if (
+                        user_scale_denom
+                        and int(user_scale_denom) in allowed_denoms
+                        and int(user_scale_denom) < int(template_denom)
+                    ):
+                        boundary_w_pad = float(boundary_w)
+                        boundary_h_pad = float(boundary_h)
                     # Vertical band where parcel + road may be drawn: inside inner border, but not in CADA_TITLEBLOCK.
                     y_lo = iy0 + margin * interior_h
                     y_hi_interior = iy1 - margin * interior_h
@@ -2520,30 +4242,27 @@ class SurvyAIAgent:
                             boundary_h_pad / usable_h_plot,
                         )
                         geometry["scale_debug"]["required_k"] = float(required_k)
-                        chosen_denom = template_denom
-                        # Prefer user-requested scale if it meets minimum standards and boundary fits
-                        if user_scale_denom and user_scale_denom in allowed_denoms:
-                            scale_k_user = float(user_scale_denom) / float(template_denom)
-                            if scale_k_user >= required_k:
-                                chosen_denom = user_scale_denom
-                                scale_k = scale_k_user
-                                geometry["scale_debug"].update({
-                                    "user_scale_used": True,
-                                    "chosen_denom": int(chosen_denom),
-                                    "k": float(scale_k),
-                                })
-                        if scale_k == 1.0 and required_k > 1.0 + 1e-6:
-                            target_denom = float(template_denom) * float(required_k) * 1.02
-                            candidates = [s for s in allowed_denoms if s >= target_denom and s >= template_denom]
-                            chosen_denom = min(candidates) if candidates else max(allowed_denoms)
-                            scale_k = float(chosen_denom) / float(template_denom)
-                            geometry["scale_debug"].update({
-                                "target_denom": float(target_denom),
-                                "chosen_denom": int(chosen_denom),
-                                "k": float(scale_k),
-                            })
 
-                        if scale_k != 1.0:
+                chosen_denom, scale_k, scale_reason = _resolve_cadastral_output_scale(
+                    template_denom=int(template_denom),
+                    user_scale_denom=user_scale_denom,
+                    required_k=float(geometry["scale_debug"].get("required_k") or 0.0),
+                    allowed_denoms=allowed_denoms,
+                )
+                geometry["scale_debug"].update({
+                    "chosen_denom": int(chosen_denom),
+                    "k": float(scale_k),
+                    "scale_reason": scale_reason,
+                    "user_scale_denom": user_scale_denom,
+                })
+                output_plan_denom = int(chosen_denom)
+                output_scale_k = float(scale_k)
+                geometry["output_plan_denom"] = int(output_plan_denom)
+                geometry["output_scale_k"] = float(output_scale_k)
+                geometry["template_native_denom"] = int(template_native_denom)
+
+                _cad_checkpoint()
+                if scale_k != 1.0:
                             # Scale the template/sheet about the TEMPLATE PRIMARY PILLAR (base_x/base_y).
                             # This preserves arrow/coordinate geometry emanating from the pillar.
                             layers_to_scale = list(profile.get("sheet_layers") or []) or [
@@ -2668,8 +4387,8 @@ class SurvyAIAgent:
                                                 _set_cell(title_h, rr, cc, "")
                                 except Exception:
                                     pass
-            except Exception:
-                scale_k = 1.0
+            except Exception as scale_exc:
+                logger.warning("Cadastral scale/title-block step failed (keeping resolved scale): %s", scale_exc)
 
             # Keep CADA_SCALEBAR below the "SCALE:- 1:xxx" title-block cell (small gap).
             if title_h and formatted_buyer_name:
@@ -2709,6 +4428,7 @@ class SurvyAIAgent:
 
             local_pts = [{"x": base_x + (p["e"] - e0), "y": base_y + (p["n"] - n0)} for p in pts]
 
+            _cad_checkpoint()
             # Clear old parcel graphics (not tables/border)
             self.autocad.delete_entities("CADA_BEARING_DIST")
             self.autocad.delete_entities("CADA_BOUNDARY")
@@ -4192,9 +5912,21 @@ class SurvyAIAgent:
                             l2_e = {"x": rex + (offset + width) * outx, "y": rey + (offset + width) * outy}
                             self.autocad.create_lwpolyline([l2_s, l2_e], layer="CADA_ROAD", closed=False, linetype_scale=3.0)
 
-                            # Road title: first road uses access_road_title if set, else "ACCESS    ROAD"; others use "ACCESS    ROAD"
-                            road_title = (access_road_title if road_idx == 0 else None) or "ACCESS    ROAD"
+                            # Road title: per-spec titled '...', else first road uses access_road_title
+                            m_spec_title = re.search(r"titled\s+['\"]([^'\"]+)['\"]", ar_lower)
+                            if m_spec_title:
+                                road_title = m_spec_title.group(1).strip()
+                            elif road_idx == 0 and access_road_title:
+                                road_title = access_road_title.strip()
+                            else:
+                                road_title = "ACCESS    ROAD"
                             road_title = road_title.strip() or "ACCESS    ROAD"
+                            try:
+                                from agent.pdf_survey_plan import normalize_access_road_title
+
+                                road_title = normalize_access_road_title(road_title)
+                            except Exception:
+                                pass
                             if road_idx == 0:
                                 geometry["access_road_title"] = road_title
 
@@ -4505,6 +6237,63 @@ class SurvyAIAgent:
             except Exception:
                 pass
 
+        # Plan number must be fitted last: sheet scaling changes final cell width vs text height.
+        if plan_h:
+            try:
+                _cad_checkpoint()
+                sd = geometry.get("scale_debug") if isinstance(geometry.get("scale_debug"), dict) else {}
+                template_ref_denom = int(
+                    geometry.get("template_native_denom")
+                    or sd.get("template_denom")
+                    or profile.get("template_scale_denom")
+                    or _CADASTRAL_TEMPLATE_REF_DENOM
+                )
+                output_denom = int(
+                    geometry.get("output_plan_denom")
+                    or sd.get("chosen_denom")
+                    or output_plan_denom
+                    or user_scale_denom
+                    or template_ref_denom
+                )
+                output_sk = float(
+                    geometry.get("output_scale_k")
+                    or sd.get("k")
+                    or output_scale_k
+                    or 1.0
+                )
+                ideal_plan_h = _ideal_plan_number_text_height(
+                    template_nominal_h=template_plan_nominal_h,
+                    template_denom=template_ref_denom,
+                    chosen_denom=output_denom,
+                    profile_ref=float(
+                        (profile.get("text_heights") or {}).get("plan_number")
+                        or _CADASTRAL_TEMPLATE_PLANNUMBER_REF_H
+                    ),
+                )
+                fit_debug = _apply_plan_number_table_cell(
+                    self.autocad,
+                    plan_h=plan_h,
+                    plan_number=plan_number,
+                    get_cell=_get_cell,
+                    set_cell=_set_cell,
+                    ideal_text_height=ideal_plan_h,
+                    cell_text_style=template_plan_text_style,
+                    sheet_scale_k=float(output_sk),
+                )
+                if fit_debug:
+                    geometry["plan_number_fit"] = {
+                        **fit_debug,
+                        "template_nominal_h": template_plan_nominal_h,
+                        "template_denom": int(template_ref_denom),
+                        "chosen_denom": int(output_denom),
+                        "ideal_height": float(ideal_plan_h),
+                        "sheet_scale_k": float(output_sk),
+                    }
+            except Exception as plan_fit_exc:
+                logger.warning("Plan number table fit failed: %s", plan_fit_exc)
+
+        _cad_checkpoint()
+
         try:
             self.autocad.execute_command("REGEN")
         except Exception:
@@ -4538,6 +6327,18 @@ class SurvyAIAgent:
         except Exception:
             pass
 
+        if coordinates and not geometry.get("boundary_redrawn"):
+            return {
+                "success": False,
+                "error": (
+                    "Parcel geometry was not replotted from your coordinates/traverse — "
+                    "the output would have kept the template land drawing. "
+                    "Check pillar numbers, bearing/distance legs, and coordinate format."
+                ),
+                "geometry": geometry,
+                "profile_path": profile_path,
+            }
+
         out_result = {"success": True, "output_dwg": str(outp), "geometry": geometry, "profile_path": profile_path}
         if geometry.get("access_road_title"):
             out_result["access_road_title"] = geometry["access_road_title"]
@@ -4570,23 +6371,26 @@ class SurvyAIAgent:
         """Load all known survey plan template paths from template_profiles so they are never written."""
         from pathlib import Path
         import json as _json
-        profile_dir = self._cad_template_profiles_dir()
-        if not profile_dir.exists():
-            return
-        for prof_path in profile_dir.glob("*.json"):
-            try:
-                data = _json.loads(prof_path.read_text(encoding="utf-8"))
-                if isinstance(data.get("templates"), list):
-                    for ent in data.get("templates") or []:
-                        tp = str((ent or {}).get("path") or "")
-                        if tp:
-                            self._protected_template_paths.add(str(Path(tp).resolve()))
-                    continue
-                tp = (data.get("template") or {}).get("path") or ""
-                if tp:
-                    self._protected_template_paths.add(str(Path(tp).resolve()))
-            except Exception:
+        # Scan the writable profiles dir plus read-only seed dirs (bundled + dev)
+        # so templates shipped with the app are also protected from writes.
+        scan_dirs = [self._cad_template_profiles_dir()] + list(self._cad_template_profiles_seed_dirs())
+        for profile_dir in scan_dirs:
+            if not profile_dir.exists():
                 continue
+            for prof_path in profile_dir.glob("*.json"):
+                try:
+                    data = _json.loads(prof_path.read_text(encoding="utf-8"))
+                    if isinstance(data.get("templates"), list):
+                        for ent in data.get("templates") or []:
+                            tp = str((ent or {}).get("path") or "")
+                            if tp:
+                                self._protected_template_paths.add(str(Path(tp).resolve()))
+                        continue
+                    tp = (data.get("template") or {}).get("path") or ""
+                    if tp:
+                        self._protected_template_paths.add(str(Path(tp).resolve()))
+                except Exception:
+                    continue
 
     def _is_protected_template_path(self, dwg_path: str) -> bool:
         """True if dwg_path is a protected survey plan template (must never be written)."""
@@ -5428,7 +7232,473 @@ class SurvyAIAgent:
             "cancel",
             "permission denied",
         }
-    
+
+    @staticmethod
+    def _is_affirmative_permission_reply(text: str) -> bool:
+        """Lenient yes-detector used ONLY when the previous assistant turn asked
+        for internet permission. Accepts natural replies like "yes please",
+        "yes, you may search the internet", "sure", "go ahead and search"."""
+        n = " ".join((text or "").strip().lower().split()).rstrip(".!")
+        if not n:
+            return False
+        if SurvyAIAgent._is_affirmative_reply(n):
+            return True
+        starters = ("yes", "yeah", "yep", "yup", "sure", "ok", "okay", "please do",
+                    "go ahead", "affirmative", "do it", "please")
+        if any(n == s or n.startswith(s + " ") or n.startswith(s + ",") for s in starters):
+            return True
+        grants = ("you may search", "you can search", "search the internet",
+                  "search online", "permission granted", "go ahead and search",
+                  "please search", "browse the web", "look it up online")
+        return any(g in n for g in grants)
+
+    @staticmethod
+    def _is_negative_permission_reply(text: str) -> bool:
+        """Lenient no-detector for the same conversational permission context."""
+        n = " ".join((text or "").strip().lower().split()).rstrip(".!")
+        if not n:
+            return False
+        if SurvyAIAgent._is_negative_reply(n):
+            return True
+        starters = ("no", "nope", "nah", "don't", "do not", "please don't",
+                    "negative", "cancel", "stop")
+        if any(n == s or n.startswith(s + " ") or n.startswith(s + ",") for s in starters):
+            return True
+        denies = ("do not search", "don't search", "no internet", "without internet",
+                  "stay offline", "use offline")
+        return any(d in n for d in denies)
+
+    def _extract_last_assistant_turn(self, query: str) -> str:
+        """Return the most recent assistant message from injected GUI history."""
+        block = self._extract_history_block(query)
+        idx = block.rfind("Assistant:")
+        if idx == -1:
+            return ""
+        text = block[idx + len("Assistant:"):].strip()
+        for marker in ("\nUser:", "\n--- End of History", "\n--- Exchange"):
+            pos = text.find(marker)
+            if pos != -1:
+                text = text[:pos].strip()
+        return text
+
+    def _extract_offer_from_assistant_text(self, assistant_text: str) -> str:
+        """Pull the optional next-step offer from the last assistant turn."""
+        t = (assistant_text or "").strip()
+        if not t:
+            return ""
+        patterns = (
+            r"(?is)\bif you want,?\s+i can(?: also)?\s+[^.?\n]+[.?\n]",
+            r"(?is)\bi can next\s+[^.?\n]+[.?\n]",
+            r"(?is)\bwould you like me to\s+[^.?\n]+[.?\n]",
+            r"(?is)\bshall i\s+[^.?\n]+[.?\n]",
+        )
+        for pat in patterns:
+            m = re.search(pat, t)
+            if m:
+                return re.sub(r"\s+", " ", m.group(0)).strip()
+        return ""
+
+    def _is_bare_affirmative_reply(self, text: str) -> bool:
+        """True for short replies like 'yes' / 'go ahead' with no new task wording."""
+        t = " ".join((text or "").strip().lower().split())
+        if not t or len(t.split()) > 5:
+            return False
+        return self._is_affirmative_reply(t)
+
+    def _resolve_affirmative_to_last_offer(
+        self, raw_query: str, routing_query: str
+    ) -> Optional[str]:
+        """Expand bare 'yes' into the assistant's last optional offer (anti-context-loss)."""
+        rq = (routing_query or "").strip()
+        if not self._is_bare_affirmative_reply(rq):
+            return None
+        if self._last_assistant_asked_internet_permission(raw_query):
+            return None
+        if self._last_assistant_offered_session_docx_save(raw_query):
+            return None
+        if self._is_pdf_replot_affirmation(rq, raw_query):
+            return None
+        last = self._extract_last_assistant_turn(raw_query)
+        if not last:
+            return None
+        offer = self._extract_offer_from_assistant_text(last)
+        if offer:
+            return (
+                f"The user replied affirmatively ({rq!r}) to your last offer: {offer} "
+                "Proceed with ONLY that offer using the same files and workspace from the "
+                "immediately preceding exchange. Do NOT switch to unrelated workflows "
+                "(e.g. do not run volume/CutFill if the active task is coordinate conversion)."
+            )
+        return (
+            f"The user replied affirmatively ({rq!r}) to your immediately prior message. "
+            "Execute ONLY the optional next step you most recently offered there. "
+            "Do NOT resume older unrelated workflows from earlier in the session."
+        )
+
+    @staticmethod
+    def _extract_history_block(query: str) -> str:
+        """Return only the injected conversation-history portion of a GUI query
+        (everything before the current request marker)."""
+        marker = "NOW, the user wants you to continue with this new request:"
+        if marker in (query or ""):
+            return query.split(marker)[0]
+        return query or ""
+
+    def _last_assistant_asked_internet_permission(self, query: str) -> bool:
+        """True when the most recent assistant turn in the injected history asked
+        the user for permission to search the internet."""
+        block = self._extract_history_block(query)
+        idx = block.rfind("Assistant:")
+        if idx == -1:
+            return False
+        last_assistant = block[idx + len("Assistant:"):].lower()
+        markers = (
+            "search the internet", "search online", "browse the web",
+            "may i search", "you may search", "permission to search",
+            "need explicit permission", "(yes/no)", "up-to-date information",
+            "latest official appointment", "latest appointment",
+        )
+        return any(m in last_assistant for m in markers)
+
+    def _underlying_question_from_history(self, query: str) -> Optional[str]:
+        """Recover the real question the assistant was about to answer when it
+        asked for internet permission (the last substantive user turn), so an
+        affirmative "yes" resolves to that question rather than the bare "yes"."""
+        block = self._extract_history_block(query)
+        users: List[str] = []
+        for line in block.splitlines():
+            s = line.strip()
+            if s.startswith("User:"):
+                users.append(s[len("User:"):].strip())
+        for u in reversed(users):
+            if u and len(u) >= 8 and not self._is_affirmative_permission_reply(u) \
+                    and not self._is_negative_permission_reply(u):
+                return u
+        return users[0] if users else None
+
+    @staticmethod
+    def _extract_clean_question(text: str) -> str:
+        """Strip injected history, permission tags, and boilerplate to recover the
+        substantive question the user wants answered."""
+        q = (text or "").strip()
+        if not q:
+            return ""
+        marker = "NOW, the user wants you to continue with this new request:"
+        if marker in q:
+            q = q.split(marker)[-1].strip()
+        for tag in (
+            "[INTERNET_PERMISSION_GRANTED]",
+            "[internet_permission_granted]",
+            "[INTERNET_PERMISSION_DENIED]",
+            "[internet_permission_denied]",
+            "[INTERNET_PERMISSION_REQUEST]",
+        ):
+            q = q.replace(tag, "").strip()
+        # Drop a lone permission reply if it slipped through.
+        if SurvyAIAgent._is_affirmative_permission_reply(q) or SurvyAIAgent._is_negative_permission_reply(q):
+            return ""
+        return q.strip()
+
+    @staticmethod
+    def _is_current_fact_question(text: str) -> bool:
+        """True when the question needs live/up-to-date external facts (office holders, etc.)."""
+        import re as _re
+
+        ql = (text or "").strip().lower()
+        if not ql:
+            return False
+        patterns = (
+            r"\bwho(?:'s| is| are)\s+the\b",
+            r"\bwho(?:'s| is| are)\b.*\b(current|present|now|today|currently|sitting|incumbent)\b",
+            r"\b(current|present|sitting|incumbent)\s+(surveyor[\s-]?general|president|vice[\s-]?president|governor|minister|chairman|chairperson|ceo|director[\s-]?general|head|office\s*holder|commissioner|secretary)\b",
+            r"\bas of (today|now|this (year|month)|20\d{2})\b",
+            r"\b(latest|most recent|up[\s-]?to[\s-]?date)\b.*\b(who|name|appointed|appointment|holder|office)\b",
+            r"\bwho (won|leads|heads|holds|is leading|currently)\b",
+        )
+        return any(_re.search(p, ql) for p in patterns)
+
+    def _optimize_internet_search_queries(self, question: str) -> List[str]:
+        """Domain-agnostic search-query generation (rule-based, no LLM, no hard-coded topics).
+
+        Used as a cheap default and as the fallback for the LLM-based rewriter.
+        """
+        q = self._extract_clean_question(question) or (question or "").strip()
+        if not q:
+            return []
+        return _rule_based_query_variants(q, max_variants=6)
+
+    def _rewrite_search_queries_with_llm(
+        self,
+        question: str,
+        llm: Optional[BaseChatModel],
+        *,
+        max_queries: int = 5,
+    ) -> List[str]:
+        """Query understanding + rewriting, the way enterprise web assistants do it.
+
+        Generates several diverse, high-recall search intents from ONE question.
+        Fully domain-agnostic: the model is instructed to infer entities, synonyms,
+        and likely authoritative phrasings for whatever the topic is. Falls back to
+        deterministic rule-based variants if the LLM is unavailable or misbehaves.
+        """
+        clean = self._extract_clean_question(question) or (question or "").strip()
+        if not clean:
+            return []
+        rule_based = _rule_based_query_variants(clean, max_variants=max_queries)
+        if llm is None:
+            return rule_based
+
+        system = (
+            "You rewrite a user question into diverse web-search queries for a retrieval "
+            "engine. Output ONLY a compact JSON array of 3-5 short query strings (no prose). "
+            "Rules: cover different phrasings and likely authoritative sources; expand acronyms; "
+            "include the most specific entity/title; add a recency term (e.g. current year) ONLY "
+            "if the question asks for current/latest facts. Do NOT invent facts or names."
+        )
+        user = f"Question: {clean}\nReturn JSON array of search queries only."
+        try:
+            msg = self._run_with_timeout(
+                25, lambda: llm.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+            )[0]
+            text = msg.content if hasattr(msg, "content") else str(msg)
+            text = str(text or "").strip()
+            # Extract the JSON array even if wrapped in markdown/code fences.
+            m = re.search(r"\[.*\]", text, re.S)
+            arr = json.loads(m.group(0)) if m else json.loads(text)
+            llm_queries = [str(x).strip() for x in arr if str(x).strip()]
+        except Exception as exc:
+            logger.info("LLM query rewriting unavailable (%s) — using rule-based variants.", exc)
+            return rule_based
+
+        merged: List[str] = []
+        seen: set = set()
+        for cand in [clean] + llm_queries + rule_based:
+            cand = " ".join((cand or "").split()).strip().strip('"').strip()
+            if cand and cand.lower() not in seen:
+                seen.add(cand.lower())
+                merged.append(cand)
+        return merged[:max(3, max_queries)]
+
+    def _assess_prompt_action(
+        self,
+        *,
+        raw_query: str,
+        routing_query: str,
+        permission_granted: bool,
+    ) -> PromptActionAssessment:
+        """Deterministic pre-LLM assessment: what is this prompt and what should we do?"""
+        clean = self._extract_clean_question(routing_query) or self._extract_clean_question(raw_query)
+        routing = (routing_query or "").strip()
+        intent = self._classify_query_intent(clean or routing)
+
+        # 1) Short permission reply to a prior assistant internet ask.
+        if self._last_assistant_asked_internet_permission(raw_query):
+            if self._is_affirmative_permission_reply(routing) or self._is_affirmative_permission_reply(clean):
+                underlying = self._underlying_question_from_history(raw_query) or clean
+                search_q = (self._optimize_internet_search_queries(underlying) or [underlying])[0]
+                return PromptActionAssessment(
+                    kind="permission_affirm",
+                    effective_query=underlying,
+                    needs_internet=True,
+                    internet_search_query=search_q,
+                    min_complexity="average",
+                    reason="User affirmed a prior internet-permission request.",
+                )
+            if self._is_negative_permission_reply(routing) or self._is_negative_permission_reply(clean):
+                underlying = self._underlying_question_from_history(raw_query) or clean
+                return PromptActionAssessment(
+                    kind="permission_deny",
+                    effective_query=underlying,
+                    needs_internet=False,
+                    min_complexity="simple",
+                    reason="User declined a prior internet-permission request.",
+                )
+
+        # 2) Current-fact / office-holder lookup (needs web when interactive).
+        if clean and self._is_current_fact_question(clean):
+            search_q = (self._optimize_internet_search_queries(clean) or [clean])[0]
+            return PromptActionAssessment(
+                kind="current_fact_lookup",
+                effective_query=clean,
+                needs_internet=True,
+                internet_search_query=search_q,
+                min_complexity="average",
+                reason="Question asks for a current real-world fact likely requiring web sources.",
+            )
+
+        # 3) General knowledge (offline-capable unless permission already granted for web).
+        if intent == "knowledge" and clean:
+            return PromptActionAssessment(
+                kind="general_knowledge",
+                effective_query=clean,
+                needs_internet=permission_granted and self._is_current_fact_question(clean),
+                internet_search_query=clean if permission_granted else None,
+                min_complexity="average" if permission_granted else "simple",
+                reason="Informational question.",
+            )
+
+        if intent == "task" or looks_like_file_driven_task(clean or routing):
+            return PromptActionAssessment(
+                kind="file_task",
+                effective_query=clean or routing,
+                needs_internet=False,
+                min_complexity="complex" if looks_like_file_driven_task(clean or routing) else "average",
+                reason="File-driven or operational task.",
+            )
+        if intent == "continuation":
+            return PromptActionAssessment(
+                kind="continuation",
+                effective_query=clean or routing,
+                needs_internet=False,
+                min_complexity="average",
+                reason="In-session continuation of a prior task.",
+            )
+
+        if self._is_bare_affirmative_reply(clean or routing):
+            resolved = self._resolve_affirmative_to_last_offer(raw_query, routing) or (clean or routing)
+            return PromptActionAssessment(
+                kind="continuation",
+                effective_query=resolved,
+                needs_internet=False,
+                min_complexity="average",
+                reason="Affirmative reply bound to last assistant offer.",
+            )
+
+        return PromptActionAssessment(
+            kind="other",
+            effective_query=clean or routing,
+            needs_internet=False,
+            min_complexity="average",
+            reason="No specialised action detected.",
+        )
+
+    def _format_evidence_pack(self, evidence: List[Dict[str, Any]]) -> str:
+        """Render ranked, trust-scored evidence as a numbered, citable pack for the LLM."""
+        lines: List[str] = []
+        for i, e in enumerate(evidence, 1):
+            title = (e.get("title") or "").strip()
+            url = (e.get("url") or "").strip()
+            domain = (e.get("domain") or "").strip()
+            trust = e.get("trust")
+            body = (e.get("extracted") or e.get("snippet") or "").strip()
+            if not (title or body):
+                continue
+            trust_str = f"{trust:.2f}" if isinstance(trust, (int, float)) else "n/a"
+            lines.append(
+                f"[{i}] {title}\n"
+                f"    source: {url} (domain: {domain}, trust: {trust_str})\n"
+                f"    evidence: {body[:900]}"
+            )
+        return "\n".join(lines)
+
+    def _run_factual_web_lookup_pipeline(
+        self,
+        *,
+        question: str,
+        llm: BaseChatModel,
+        model_name_used: Optional[str],
+        search_queries: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Enterprise-style web answer: evidence retrieval → grounded synthesis.
+
+        Stages (all in `utils.internet.research`): query variants → multi-source
+        over-fetch → trust+relevance re-rank → page reading → evidence pack +
+        cross-source confidence. The LLM then synthesises ONLY from the evidence
+        and must cite sources. Total LLM cost: 1 rewrite call (cheap) + 1 synthesis.
+        """
+        effective = self._extract_clean_question(question) or (question or "").strip()
+        if not effective:
+            return {"success": False, "error": "empty_question", "response": ""}
+
+        # Stage 1: query understanding + rewriting (LLM, cheap; rule-based fallback).
+        variants = search_queries or self._rewrite_search_queries_with_llm(effective, llm)
+        if not variants:
+            variants = [effective]
+
+        # Stages 2-6: retrieval, ranking, page reading, evidence + confidence.
+        _max_sources = int(getattr(self.settings, "web_research_max_sources", 8) or 8)
+        _fetch_pages = int(getattr(self.settings, "web_research_fetch_pages", 4) or 0)
+        try:
+            pack = _web_research(
+                effective,
+                query_variants=variants,
+                max_sources=_max_sources,
+                fetch_pages=_fetch_pages,
+                read_pages=_fetch_pages > 0,
+            )
+        except Exception as exc:
+            logger.warning("Web research pipeline failed: %s", exc)
+            pack = {"success": False, "error": str(exc)}
+
+        evidence = pack.get("evidence") or []
+        if not pack.get("success") or not evidence:
+            return {
+                "success": False,
+                "error": pack.get("error", "no_web_results"),
+                "response": (
+                    "I searched the web across multiple sources but could not retrieve "
+                    "reliable evidence for that question. You can try rephrasing it or "
+                    "naming the specific entity/organisation."
+                ),
+            }
+
+        confidence = float(pack.get("confidence") or 0.0)
+        evidence_block = self._format_evidence_pack(evidence)
+        confidence_note = (
+            "Multiple independent, trustworthy sources corroborate the evidence."
+            if confidence >= 0.6 and pack.get("distinct_domains", 0) >= 2
+            else (
+                "Evidence is limited or comes from few sources — flag remaining "
+                "uncertainty explicitly and avoid overstating confidence."
+            )
+        )
+
+        # Stage 7-9: grounded synthesis with citation enforcement + verification mindset.
+        synth_system = (
+            "You are SurvyAI answering a factual question. You are given an EVIDENCE PACK: "
+            "numbered, trust-scored web sources with extracted on-page text. Follow STRICTLY:\n"
+            "1. Treat search as retrieval of EVIDENCE, not answers. Reason over the evidence.\n"
+            "2. Lead with a direct, concise answer (name/title/date/value as applicable).\n"
+            "3. EVERY factual claim must be grounded in the evidence and cite its source "
+            "number(s) inline like [1], [2]. Do NOT state facts that lack supporting evidence.\n"
+            "4. Prefer higher-trust sources (official/government/primary) over blogs/forums "
+            "when they conflict, and say so if sources disagree.\n"
+            "5. If the evidence is insufficient or only weakly supports an answer, say that "
+            "plainly rather than guessing.\n"
+            "6. End with a section titled exactly: 'Internet-sourced (external) information' "
+            "listing the URLs you actually relied on (matching your [n] citations).\n"
+            "7. NEVER ask for permission to search — the search is already complete. NEVER ask "
+            "the user to choose between options or restate the question."
+        )
+        synth_user = (
+            f"QUESTION:\n{effective}\n\n"
+            f"EVIDENCE PACK (ranked by relevance × trust):\n{evidence_block}\n\n"
+            f"RETRIEVAL CONFIDENCE: {confidence:.2f} — {confidence_note}\n\n"
+            "Write the grounded, cited answer now."
+        )
+        try:
+            report_msg = llm.invoke([
+                SystemMessage(content=synth_system),
+                HumanMessage(content=synth_user),
+            ])
+        except Exception as exc:
+            return {
+                "success": False,
+                "error": str(exc),
+                "response": f"Evidence was found but synthesis failed: {exc}",
+            }
+
+        body = report_msg.content if hasattr(report_msg, "content") else str(report_msg)
+        return {
+            "success": True,
+            "response": str(body or "").strip(),
+            "model_name": model_name_used,
+            "search_queries": variants,
+            "result_count": len(evidence),
+            "confidence": confidence,
+            "sources": pack.get("sources") or [],
+        }
+
     # ==========================================================================
     # COMPLEXITY DETECTION
     # ==========================================================================
@@ -5475,6 +7745,69 @@ class SurvyAIAgent:
             if re.search(pat, ql, flags=re.IGNORECASE):
                 return "simple"
         return None
+
+    def _classify_query_intent(self, current_query: str) -> str:
+        """Lightweight intent classifier for the CURRENT user turn.
+
+        Implements the "intent classification on the latest turn" pattern used by
+        modern assistants so that conversation history can NEVER, by itself, drive
+        tool selection or destructive operations.
+
+        Returns one of:
+        - "task"          : current message itself requests a file/CAD/GIS/report op
+        - "continuation"  : short follow-up that refines/continues the prior task
+                            (e.g. "add a road", "change the title", "now export it")
+        - "knowledge"     : a self-contained informational/explanatory question
+        - "other"         : anything that doesn't clearly match the above
+
+        This is heuristic and dependency-free (no extra LLM call) to keep latency
+        low; it is intentionally conservative — when unsure it returns "other",
+        which routes to the normal LLM path (never a destructive fast-path).
+        """
+        q = (current_query or "").strip()
+        ql = q.lower()
+        if not ql:
+            return "other"
+
+        # 1) Explicit task signals in the CURRENT message (paths / file types / verbs).
+        if looks_like_file_driven_task(q):
+            return "task"
+        task_verbs = (
+            "plot", "draw", "generate", "create plan", "create a plan", "cadastral",
+            "export", "convert", "compute volume", "cutfill", "cut fill", "idw",
+            "open the drawing", "open drawing", "batch", "replot",
+        )
+        if any(v in ql for v in task_verbs):
+            return "task"
+
+        # 2) Continuation / refinement: short, action-oriented follow-ups that lean
+        #    on the active task (anaphora or in-session CAD modification keywords).
+        mod_keywords = (
+            "add another road", "add a road", "add road", "add access road",
+            "change the title", "change title", "set title", "update title",
+            "modify the plan", "modify plan", "edit the plan", "edit plan",
+            "the other side", "change the plan title", "update the plan title",
+        )
+        word_count = len(ql.split())
+        anaphora = any(
+            p in f" {ql} " for p in (
+                " it ", " this ", " that ", " these ", " those ", " the same ",
+                " the plan", " the drawing", " the report", " the output", " above ",
+            )
+        )
+        if word_count <= 14 and (any(k in ql for k in mod_keywords) or anaphora):
+            return "continuation"
+
+        # 3) Knowledge / informational question (self-contained).
+        knowledge_starts = (
+            "what is", "what are", "who", "when", "where", "why", "how", "explain",
+            "describe", "tell me about", "give a brief", "give me a brief",
+            "history of", "summary of the history", "define", "compare",
+        )
+        if any(ql.startswith(s) or f" {s}" in f" {ql}" for s in knowledge_starts):
+            return "knowledge"
+
+        return "other"
 
     def _detect_task_complexity(self, query: str) -> Literal["simple", "average", "complex"]:
         """
@@ -5580,6 +7913,15 @@ class SurvyAIAgent:
         q = (query or "").strip()
         ql = q.lower()
 
+        clean_routing = self._extract_clean_question(q) or q
+        if self._is_bare_affirmative_reply(clean_routing) or self._is_bare_affirmative_reply(q):
+            return RAGRouteDecision(
+                route="llm_only",
+                use_vector=False,
+                use_internet=False,
+                reason="Bare affirmative reply; use last-exchange context only (no vector/internet).",
+            )
+
         # If query includes explicit input file paths, prefer tool/document pipelines over RAG.
         # (RAG is still allowed if user asks "based on our previous conversation" etc.)
         file_driven = looks_like_file_driven_task(q) or bool(self._extract_document_paths(q))
@@ -5627,10 +7969,27 @@ class SurvyAIAgent:
         ]
         wants_internet = any(s in ql for s in internet_signals)
 
+        # Current real-world facts (office holders, latest appointments, "as of now"
+        # / "who is the …") almost always need live data. Detect them so the
+        # deterministic permission dialog fires up-front instead of the LLM looping
+        # on free-text permission requests.
+        import re as _re
+        current_fact_patterns = (
+            r"\bwho(?:'s| is| are)\s+the\b",
+            r"\bwho(?:'s| is| are)\b.*\b(current|present|now|today|currently|sitting|incumbent)\b",
+            r"\b(current|present|sitting|incumbent)\s+(surveyor[\s-]?general|president|vice[\s-]?president|governor|minister|chairman|chairperson|ceo|director[\s-]?general|head|office\s*holder|commissioner|secretary)\b",
+            r"\bas of (today|now|this (year|month)|20\d{2})\b",
+            r"\b(latest|most recent|up[\s-]?to[\s-]?date)\b",
+            r"\bwho (won|leads|heads|holds|is leading|currently)\b",
+        )
+        if any(_re.search(p, ql) for p in current_fact_patterns):
+            wants_internet = True
+
         # Override: If this looks like CAD continuation, don't ask for internet
         # Also check if the query mentions continuation context
         has_continuation_context = (
             "=== CONTINUATION OF PREVIOUS WORK" in q or
+            "=== CONVERSATION CONTEXT" in q or
             "--- Exchange" in q or
             "PREVIOUS CONVERSATION" in q.upper()
         )
@@ -5713,34 +8072,12 @@ class SurvyAIAgent:
             reason="No strong signal for retrieval or web search.",
         )
 
-    def _format_internet_results_for_prompt(self, results: List[Dict[str, Any]]) -> str:
-        if not results:
-            return ""
-        lines = []
-        for r in results[:8]:
-            title = r.get("title", "").strip()
-            url = r.get("url", "").strip()
-            snippet = r.get("snippet", "").strip()
-            if not (title or url or snippet):
-                continue
-            lines.append(f"- {title}\n  - {url}\n  - {snippet}")
-        if not lines:
-            return ""
-        return (
-            "\n\n---\n"
-            "**INTERNET SEARCH RESULTS (EXTERNAL, PERMISSION GRANTED):**\n"
-            "If you use any of this information, you MUST include a section titled exactly:\n"
-            "\"Internet-sourced (external) information\" and include the URLs you relied on.\n\n"
-            + "\n".join(lines)
-            + "\n---\n"
-        )
-    
     def _get_model_tier(self, model_name: Optional[str]) -> str:
         """
         Determine the tier of a model (nano, mini, or complex).
         
         Args:
-            model_name: Model name (e.g., "gpt-5-nano", "gpt-5-mini", "gpt-5.1")
+            model_name: Model name (e.g., "gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.4")
             
         Returns:
             "nano", "mini", or "complex"
@@ -5769,9 +8106,9 @@ class SurvyAIAgent:
             Model name for next tier, or None if already at highest tier
         """
         if current_tier == "nano":
-            return getattr(self.settings, "openai_model_mini", "gpt-5-mini")
+            return getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
         elif current_tier == "mini":
-            return getattr(self.settings, "openai_model_complex", "gpt-5.1")
+            return getattr(self.settings, "openai_model_complex", "gpt-5.4")
         else:
             return None  # Already at highest tier
     
@@ -5834,8 +8171,9 @@ class SurvyAIAgent:
             
             logger.info(f"✓ Switched to {escalated_model} - retrying query")
             
-            # Retry with new model (preserve state via session_id)
-            thread_id = current_session_id
+            # Retry with new model; use a fresh per-invocation thread_id so the
+            # new graph starts from a clean checkpoint (no accumulated tool history).
+            thread_id = f"{current_session_id}:retry:{uuid.uuid4().hex}"
             max_iterations = getattr(self.settings, 'agent_max_iterations', 20)
             recursion_limit = getattr(self.settings, "agent_recursion_limit", max(50, (max_iterations * 3)))
             config = {
@@ -5907,7 +8245,7 @@ class SurvyAIAgent:
             complexity: Task complexity level ("simple", "average", or "complex")
             
         Returns:
-            Model name string (e.g., "gpt-5-nano", "gpt-5-mini", "gpt-5.1")
+            Model name string (e.g., "gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.4")
         """
         if not getattr(self.settings, "enable_tiered_models", True):
             # Fallback to legacy single model configuration
@@ -5915,22 +8253,70 @@ class SurvyAIAgent:
         
         # Map complexity to model tier
         model_mapping = {
-            "simple": getattr(self.settings, "openai_model_nano", "gpt-5-nano"),
-            "average": getattr(self.settings, "openai_model_mini", "gpt-5-mini"),
-            "complex": getattr(self.settings, "openai_model_complex", "gpt-5.1"),
+            "simple": getattr(self.settings, "openai_model_nano", "gpt-5.4-nano"),
+            "average": getattr(self.settings, "openai_model_mini", "gpt-5.4-mini"),
+            "complex": getattr(self.settings, "openai_model_complex", "gpt-5.4"),
         }
         
-        selected_model = model_mapping.get(complexity, getattr(self.settings, "openai_model_mini", "gpt-5-mini"))
+        selected_model = model_mapping.get(complexity, getattr(self.settings, "openai_model_mini", "gpt-5.4-mini"))
         
         # Fallback to legacy model if tiered model is not set
         if not selected_model or selected_model.strip() == "":
             selected_model = getattr(self.settings, "openai_model", "gpt-4o-mini")
         
         return selected_model
+
+    def _try_openai_tier_llm(
+        self,
+        complexity: Literal["simple", "average", "complex"],
+    ) -> Tuple[Optional[BaseChatModel], Optional[str]]:
+        """Initialize a tiered OpenAI model when enabled; otherwise return primary LLM."""
+        model_name: Optional[str] = None
+        try:
+            if self.settings.primary_llm == "openai" and getattr(
+                self.settings, "enable_tiered_models", True
+            ):
+                model_name = self._get_openai_model_for_complexity(complexity)
+                return self._initialize_llm("openai", model_name=model_name), model_name
+        except Exception:
+            pass
+        primary = getattr(self, "llm_primary", None)
+        if primary is not None:
+            model_name = getattr(self, "_current_openai_model", None) or getattr(
+                self.settings, "openai_model", "gpt-5.4-mini"
+            )
+            return primary, model_name
+        return None, None
     
     # ==========================================================================
     # LLM INITIALIZATION
     # ==========================================================================
+
+    def _make_cloud_proxy_llm(
+        self, llm_type: str, model_name: Optional[str] = None
+    ) -> BaseChatModel:
+        if llm_type == "openai":
+            resolved_model = model_name or getattr(self.settings, "openai_model", "gpt-4o-mini")
+        elif llm_type == "claude":
+            resolved_model = model_name or getattr(
+                self.settings, "claude_model", "claude-3-5-sonnet-20241022"
+            )
+        elif llm_type == "gemini":
+            resolved_model = model_name or getattr(
+                self.settings, "gemini_model", "gemini-2.0-flash"
+            )
+        else:
+            resolved_model = model_name or "deepseek-chat"
+        return SurvyAIProxyChatModel(
+            base_url=str(getattr(self.settings, "survyai_api_base_url", "") or "").strip(),
+            access_token=str(getattr(self.settings, "survyai_access_token", "") or "").strip(),
+            device_id=str(getattr(self.settings, "survyai_device_id", "") or "").strip(),
+            provider=llm_type,
+            model_name=str(resolved_model).strip(),
+            temperature=float(self.settings.agent_temperature),
+            max_tokens=int(self.settings.agent_max_tokens),
+            proxy_path=str(getattr(self.settings, "survyai_llm_proxy_path", "/v1/llm/chat") or "/v1/llm/chat").strip() or "/v1/llm/chat",
+        )
     
     def _initialize_llm(self, llm_type: str, model_name: Optional[str] = None) -> BaseChatModel:
         """
@@ -5954,6 +8340,9 @@ class SurvyAIAgent:
             Exception: If API connection fails
         """
         try:
+            if self._cloud_proxy_enabled and llm_type in {"openai", "claude", "gemini", "deepseek"}:
+                logger.info("Initializing %s via SurvyAI cloud LLM proxy", llm_type)
+                return self._make_cloud_proxy_llm(llm_type, model_name=model_name)
             if llm_type == "deepseek":
                 # DeepSeek uses an OpenAI-compatible API
                 # We use ChatOpenAI with a custom base_url
@@ -6089,34 +8478,6 @@ class SurvyAIAgent:
                     "gpt-5.5": 16384,
                 }
 
-                def _openai_output_cap(name: Optional[str]) -> int:
-                    if not name:
-                        return 4096
-                    key = name.strip()
-                    if key in openai_max_tokens_limits:
-                        return openai_max_tokens_limits[key]
-                    low = key.lower()
-                    # Longest-prefix wins for variant strings the API may return
-                    if low.startswith("gpt-5.4-nano"):
-                        return 8192
-                    if low.startswith("gpt-5.4-mini"):
-                        return 16384
-                    if low.startswith("gpt-5.4"):
-                        return 128000
-                    if low.startswith("gpt-5.1"):
-                        return 128000
-                    if low.startswith("gpt-5-nano"):
-                        return 8192
-                    if low.startswith("gpt-5-mini"):
-                        return 16384
-                    if low.startswith("gpt-5"):
-                        return 65536
-                    if low.startswith("gpt-4o-mini"):
-                        return 16384
-                    if low.startswith("gpt-4o"):
-                        return 16384
-                    return 4096
-                
                 # Cap max_tokens to model's actual API limit — INFO, not WARNING,
                 # because clamping is the expected, harmless behaviour.
                 model_max = openai_max_tokens_limits.get(model_name, 16384)
@@ -6155,9 +8516,31 @@ class SurvyAIAgent:
                 
                 logger.info(f"✓ OpenAI LLM ({model_name}) initialized successfully")
                 return llm
+
+            elif llm_type == "ollama":
+                base = (
+                    getattr(self.settings, "ollama_base_url", None) or "http://localhost:11434"
+                ).strip().rstrip("/")
+                model_name = getattr(self.settings, "ollama_model", "llama3.2:1b")
+                num_predict = int(getattr(self.settings, "ollama_num_predict", 512) or 512)
+                requested_tokens = int(self.settings.agent_max_tokens or num_predict)
+                actual_max_tokens = min(requested_tokens, num_predict)
+                logger.info(
+                    f"Initializing Ollama LLM with model: {model_name} at {base}/v1"
+                )
+                return ChatOpenAI(
+                    model=model_name,
+                    api_key="ollama",
+                    base_url=f"{base}/v1",
+                    temperature=self.settings.agent_temperature,
+                    max_tokens=actual_max_tokens,
+                )
                 
             else:
-                raise ValueError(f"Unknown LLM type: {llm_type}. Supported types: gemini, deepseek, claude, openai")
+                raise ValueError(
+                    f"Unknown LLM type: {llm_type}. "
+                    "Supported types: gemini, deepseek, claude, openai, ollama"
+                )
                 
         except Exception as e:
             logger.error(f"Error initializing {llm_type} LLM: {e}")
@@ -6875,11 +9258,11 @@ class SurvyAIAgent:
             # Always preflight cost/size first so the user is informed before expensive processing
             model_for_cost = None
             if self.settings.primary_llm == "openai":
-                model_for_cost = self._current_openai_model or getattr(self.settings, "openai_model_mini", "gpt-5-mini")
+                model_for_cost = self._current_openai_model or getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
             elif self.settings.primary_llm == "gemini":
                 model_for_cost = self._current_gemini_model or getattr(self.settings, "gemini_model", "gemini-2.0-flash")
             else:
-                model_for_cost = getattr(self.settings, "openai_model_mini", "gpt-5-mini")
+                model_for_cost = getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
 
             est = self.document_processor.get_resource_estimation(file_path, model_for_cost)
             if est.get("success") and est.get("warnings"):
@@ -7107,11 +9490,11 @@ class SurvyAIAgent:
             """
             if not model_name:
                 if self.settings.primary_llm == "openai":
-                    model_name = self._current_openai_model or getattr(self.settings, "openai_model_mini", "gpt-5-mini")
+                    model_name = self._current_openai_model or getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
                 elif self.settings.primary_llm == "gemini":
                     model_name = self._current_gemini_model or getattr(self.settings, "gemini_model", "gemini-2.0-flash")
                 else:
-                    model_name = getattr(self.settings, "openai_model_mini", "gpt-5-mini")
+                    model_name = getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
             
             result = self.document_processor.get_resource_estimation(file_path, model_name)
             return str(result)
@@ -9062,8 +11445,68 @@ class SurvyAIAgent:
     # LLM INVOCATION HELPERS
     # ==========================================================================
 
+    def _reset_pipeline_llm_cost(self) -> None:
+        """Reset per-query LLM cost accumulator (fast-path + direct invoke tracking)."""
+        self._pipeline_llm_cost_usd = 0.0
+
+    def _track_llm_invoke_result(self, msg: Any, model_name: Optional[str] = None) -> None:
+        """Add one direct LLM response (AIMessage) to the current query's cost tally."""
+        try:
+            from langchain_core.messages import AIMessage
+            from utils.cost_estimator import estimate_token_cost_usd, extract_message_token_usage
+        except ImportError:
+            return
+        if not isinstance(msg, AIMessage):
+            return
+        mn = (model_name or "").strip()
+        if not mn:
+            mn = (
+                getattr(self, "_current_openai_model", None)
+                or getattr(self.settings, "openai_model", None)
+                or getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
+            )
+        usage = extract_message_token_usage(msg)
+        if not usage:
+            return
+        cost = estimate_token_cost_usd(
+            str(mn),
+            int(usage.get("input_tokens") or 0),
+            int(usage.get("output_tokens") or 0),
+            cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
+        )
+        if cost > 0:
+            self._pipeline_llm_cost_usd = round(
+                float(self._pipeline_llm_cost_usd or 0.0) + float(cost), 6
+            )
+
+    def finalize_query_result_dict(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Attach llm_cost_usd for Credits & Usage when fast paths omit graph message totals.
+
+        Prefers an explicit graph estimate when present; otherwise uses the per-query
+        accumulator fed by ``_run_with_timeout`` / direct ``llm.invoke`` calls.
+        """
+        out = dict(result or {})
+        existing = float(out.get("llm_cost_usd") or 0.0)
+        tracked = float(self._pipeline_llm_cost_usd or 0.0)
+        if existing > 0:
+            out["llm_cost_usd"] = round(existing, 6)
+        elif tracked > 0:
+            out["llm_cost_usd"] = round(tracked, 6)
+        else:
+            out.setdefault("llm_cost_usd", 0.0)
+        return out
+
+    def _llm_run_with_timeout(self, model_name: Optional[str] = None) -> Callable[..., Any]:
+        """Return a ``run_with_timeout`` callable that tags LLM costs with ``model_name``."""
+
+        def _runner(timeout_seconds: int, fn: Callable[[], Any]) -> Tuple[Optional[Any], Optional[Exception], bool]:
+            return self._run_with_timeout(timeout_seconds, fn, llm_model_name=model_name)
+
+        return _runner
+
     def _run_with_timeout(
-        self, timeout_seconds: int, fn: Callable[[], Any]
+        self, timeout_seconds: int, fn: Callable[[], Any], *, llm_model_name: Optional[str] = None
     ) -> Tuple[Optional[Any], Optional[Exception], bool]:
         """
         Run a callable in a daemon thread with a timeout.
@@ -9083,11 +11526,21 @@ class SurvyAIAgent:
         t.daemon = True
         t.start()
         t.join(timeout=timeout_seconds)
-        return (result_container[0], err_container[0], t.is_alive())
+        timed_out = t.is_alive()
+        result = result_container[0]
+        error = err_container[0]
+        if result is not None and error is None and not timed_out:
+            try:
+                self._track_llm_invoke_result(result, llm_model_name)
+            except Exception:
+                pass
+        return (result, error, timed_out)
 
     def _invoke_llm_with_retry(self, messages: List[Any]) -> Any:
         """Invoke LLM with timeout protection; raises TimeoutError or the LLM exception on failure."""
-        timeout_seconds = 60
+        timeout_seconds = int(getattr(self.settings, "llm_invoke_timeout_seconds", 180) or 180)
+        if timeout_seconds < 60:
+            timeout_seconds = 60
         result, error, timed_out = self._run_with_timeout(
             timeout_seconds, lambda: self.llm_with_tools.invoke(messages)
         )
@@ -9167,7 +11620,7 @@ class SurvyAIAgent:
             # Ensure system prompt is at the start
             # This guides the LLM's behavior throughout the conversation
             if not messages or not isinstance(messages[0], SystemMessage):
-                messages = [SystemMessage(content=SYSTEM_PROMPT)] + messages
+                messages = [SystemMessage(content=self._system_prompt)] + messages
             
             # Get current model name for token estimation
             current_model = getattr(self, '_current_openai_model', None) or \
@@ -9406,6 +11859,7 @@ class SurvyAIAgent:
         """
         # Set interactive mode flag
         self._interactive_mode = interactive_mode
+        self._reset_pipeline_llm_cost()
 
         # Get or set session ID as early as possible so permission handling and
         # short continuation replies can remain anchored to the active conversation.
@@ -9415,11 +11869,28 @@ class SurvyAIAgent:
         
         # Reset model switch flag for new query
         self._model_switched_this_query = False
+        self._force_internet_search_this_query = False
 
         # Handle internet permission markers from interactive CLI
         # IMPORTANT: Extract and set permission BEFORE routing/processing
         q_upper = (query or "").upper()
         original_query = query
+
+        # Permission is per-request unless explicitly granted this turn (tag, dialog,
+        # or affirmative reply to a permission ask in the same conversation).
+        _perm_carry = (
+            "[INTERNET_PERMISSION_GRANTED]" in q_upper
+            or "[INTERNET_PERMISSION_DENIED]" in q_upper
+            or self._last_assistant_asked_internet_permission(query)
+            or current_session_id in self._pending_permission_requests
+        )
+        if not _perm_carry:
+            self._internet_permission_granted = False
+
+        # Stale pending requests from a prior deterministic dialog must not block
+        # conversational grant detection on this turn.
+        if "[INTERNET_PERMISSION_GRANTED]" in q_upper or "[INTERNET_PERMISSION_DENIED]" in q_upper:
+            self._pending_permission_requests.pop(current_session_id, None)
 
         pending_permission = self._pending_permission_requests.get(current_session_id)
         if pending_permission and isinstance(query, str):
@@ -9427,6 +11898,7 @@ class SurvyAIAgent:
             if self._is_affirmative_reply(stripped_reply):
                 if pending_permission.get("kind") == "internet":
                     self._internet_permission_granted = True
+                    self._force_internet_search_this_query = True
                     query = f"[INTERNET_PERMISSION_GRANTED]\n{pending_permission.get('query', '')}".strip()
                     q_upper = query.upper()
                     original_query = str(pending_permission.get("query") or original_query)
@@ -9444,7 +11916,11 @@ class SurvyAIAgent:
         # FIRST: Extract actual query if this is a continuation (has context markers)
         # This must happen BEFORE permission tag handling so we route correctly
         actual_query_for_routing = query
-        if "=== CONTINUATION OF PREVIOUS WORK" in query or "--- Exchange" in query:
+        if (
+            "=== CONTINUATION OF PREVIOUS WORK" in query
+            or "=== CONVERSATION CONTEXT" in query
+            or "--- Exchange" in query
+        ):
             # Extract the actual current query from the context-enhanced query
             if "NOW, the user wants you to continue with this new request:" in query:
                 parts = query.split("NOW, the user wants you to continue with this new request:")
@@ -9456,9 +11932,72 @@ class SurvyAIAgent:
                 parts = query.split("\n\n")
                 actual_query_for_routing = parts[-1].strip()
                 logger.info(f"🔍 Detected continuation query - using last part: {actual_query_for_routing[:100]}...")
-        
+
+        # ==================================================================
+        # CONVERSATIONAL INTERNET-PERMISSION GRANT (anti-loop)
+        # ------------------------------------------------------------------
+        # The LLM sometimes asks for internet permission in free text (outside
+        # the deterministic router path). In that case there is no pending
+        # permission request, so a bare "yes" was never recognised and the model
+        # kept re-asking forever. Here we detect that the PREVIOUS assistant turn
+        # asked for internet permission and the CURRENT user message affirms (or
+        # denies) it, then resolve the grant against the original question.
+        # ==================================================================
+        if (
+            not pending_permission
+            and "[INTERNET_PERMISSION_GRANTED]" not in q_upper
+            and "[INTERNET_PERMISSION_DENIED]" not in q_upper
+            and self._last_assistant_asked_internet_permission(query)
+        ):
+            current_msg = (actual_query_for_routing or query or "").strip()
+            if self._is_affirmative_permission_reply(current_msg):
+                underlying = self._underlying_question_from_history(query) or current_msg
+                query = f"[INTERNET_PERMISSION_GRANTED]\n{underlying}"
+                actual_query_for_routing = f"[INTERNET_PERMISSION_GRANTED]\n{underlying}"
+                q_upper = query.upper()
+                original_query = underlying
+                self._force_internet_search_this_query = True
+                logger.info(
+                    "✓ Affirmative reply to a conversational internet-permission "
+                    "request detected — granting permission and forcing search for: "
+                    f"{underlying[:120]}"
+                )
+            elif self._is_negative_permission_reply(current_msg):
+                underlying = self._underlying_question_from_history(query) or current_msg
+                query = f"[INTERNET_PERMISSION_DENIED]\n{underlying}"
+                actual_query_for_routing = f"[INTERNET_PERMISSION_DENIED]\n{underlying}"
+                q_upper = query.upper()
+                original_query = underlying
+                logger.info(
+                    "✓ Negative reply to a conversational internet-permission "
+                    "request detected — answering offline for: "
+                    f"{underlying[:120]}"
+                )
+
+        # Bare "yes" / "go ahead" → bind to the LAST assistant optional offer only.
+        if "[INTERNET_PERMISSION_GRANTED]" not in q_upper and "[INTERNET_PERMISSION_DENIED]" not in q_upper:
+            offer_resolution = self._resolve_affirmative_to_last_offer(query, actual_query_for_routing)
+            if offer_resolution:
+                actual_query_for_routing = offer_resolution
+                marker = "NOW, the user wants you to continue with this new request:"
+                if marker in query:
+                    query = (
+                        query.split(marker)[0].rstrip()
+                        + "\n"
+                        + marker
+                        + "\n"
+                        + offer_resolution
+                    )
+                else:
+                    query = offer_resolution
+                logger.info(
+                    "Affirmative reply resolved to last assistant offer: %s",
+                    offer_resolution[:180],
+                )
+
         if "[INTERNET_PERMISSION_GRANTED]" in q_upper:
             self._internet_permission_granted = True
+            self._force_internet_search_this_query = True
             self._pending_permission_requests.pop(current_session_id, None)
             # Clean the query to remove permission tags for cleaner processing
             query = query.replace("[INTERNET_PERMISSION_GRANTED]", "").replace("[internet_permission_granted]", "").strip()
@@ -9493,6 +12032,25 @@ class SurvyAIAgent:
                 early_rag_decision.use_internet = False
                 if early_rag_decision.route in ("internet", "hybrid"):
                     early_rag_decision.route = "vector" if early_rag_decision.use_vector else "llm_only"
+            # User already affirmed an internet-permission request this turn: force the
+            # search to run instead of letting the router (or the LLM) ask again.
+            if getattr(self, "_internet_permission_granted", False) and (
+                getattr(self, "_force_internet_search_this_query", False)
+                or early_rag_decision.use_internet
+                or self._is_current_fact_question(
+                    self._extract_clean_question(actual_query_for_routing) or actual_query_for_routing
+                )
+            ):
+                early_rag_decision.use_internet = True
+                clean_q = self._extract_clean_question(actual_query_for_routing) or actual_query_for_routing
+                if not getattr(early_rag_decision, "internet_query", None):
+                    variants = self._optimize_internet_search_queries(clean_q)
+                    early_rag_decision.internet_query = variants[0] if variants else clean_q
+                if early_rag_decision.route == "llm_only":
+                    early_rag_decision.route = "internet"
+                elif early_rag_decision.route == "vector":
+                    early_rag_decision.route = "hybrid"
+                logger.info("🔎 Forcing internet search — permission already granted.")
             if early_rag_decision.use_internet and not getattr(self, "_internet_permission_granted", False):
                 if interactive_mode:
                     logger.info("🔍 Router detected internet need - requesting permission BEFORE processing")
@@ -9520,22 +12078,87 @@ class SurvyAIAgent:
                     logger.warning("⚠ Internet needed but non-interactive mode - proceeding without internet search")
             
             logger.info(f"Current primary LLM setting: {self.settings.primary_llm}")
-            
+
+            # ==================================================================
+            # TASK-SCOPED ROUTING (context-leak prevention)
+            # ------------------------------------------------------------------
+            # CRITICAL: All intent/task classification (complexity, fast-paths,
+            # file-driven detection, tool selection) must run on the CURRENT user
+            # request only — never on the history-enriched `query` blob.
+            #
+            # The GUI prepends recent conversation history to `query` for
+            # continuity.  If we classify on that blob, stale context (e.g. a
+            # previous CAD plan + "add the road") leaks into routing and the agent
+            # fires a destructive tool pipeline on an unrelated new question.
+            # `actual_query_for_routing` already holds the extracted current
+            # request (see continuation-marker extraction above); fall back to the
+            # raw query when there is no injected history.
+            # ==================================================================
+            routing_query = (actual_query_for_routing or query or "").strip() or query
+
+            _pre_intent = self._classify_query_intent(routing_query)
+
+            # FAST PATH (early): survey plan PDF -> CAD DWG — current turn only (not knowledge).
+            if _pre_intent != "knowledge" and self._should_fastpath_pdf_survey_replot(query, routing_query):
+                logger.info("PDF survey replot fast-path triggered (early router)")
+                fast = self._run_pdf_survey_replot_pipeline(query)
+                llm_used = "fallback" if use_fallback else "primary"
+                return {
+                    "query": query,
+                    "response": fast.get("response") or fast.get("error") or str(fast),
+                    "llm_used": llm_used,
+                    "model_name": fast.get("model_name"),
+                    "complexity": "complex",
+                    "success": bool(fast.get("success")),
+                    "session_id": current_session_id,
+                    "context_retrieved": False,
+                    "output_path": fast.get("output_path"),
+                    "error": fast.get("error") if not fast.get("success") else None,
+                }
+
+            prompt_action = self._assess_prompt_action(
+                raw_query=query,
+                routing_query=routing_query,
+                permission_granted=bool(getattr(self, "_internet_permission_granted", False)),
+            )
+            logger.info(
+                "🎯 Prompt assessment: kind=%s needs_internet=%s effective_query='%s' reason=%s",
+                prompt_action.kind,
+                prompt_action.needs_internet,
+                (prompt_action.effective_query or "")[:120],
+                prompt_action.reason,
+            )
+
+            intent = self._classify_query_intent(routing_query)
+            if intent == "other" and _pre_intent != intent:
+                intent = _pre_intent
+            logger.info(f"🧭 Current-turn intent: {intent} | routing_query='{routing_query[:120]}'")
+
             # Tiered model selection: heuristics + explicit user phrasing + desktop fast-mode (non-file only)
-            complexity = self._detect_task_complexity(query)
-            tier_override = self._parse_user_model_tier_override(query)
+            complexity = self._detect_task_complexity(
+                prompt_action.effective_query or routing_query
+            )
+            tier_override = self._parse_user_model_tier_override(routing_query)
             if tier_override is not None:
                 complexity = tier_override
                 logger.info(f"Model tier from user request: {complexity}")
             elif (
                 getattr(self.settings, "fast_mode_non_file_prompts", False)
-                and not looks_like_file_driven_task(query)
-                and len(self._extract_document_paths(query)) == 0
+                and not looks_like_file_driven_task(routing_query)
+                and len(self._extract_document_paths(routing_query)) == 0
+                and prompt_action.kind not in ("current_fact_lookup", "permission_affirm")
             ):
                 complexity = "simple"
                 logger.info("Model tier: simple (fast_mode_non_file_prompts, non-file query)")
             else:
                 logger.info(f"Detected task complexity (heuristic): {complexity}")
+
+            # Assessment may require a stronger tier (e.g. factual web synthesis).
+            _tier_rank = {"simple": 0, "average": 1, "complex": 2}
+            if _tier_rank.get(prompt_action.min_complexity, 0) > _tier_rank.get(complexity, 0):
+                complexity = prompt_action.min_complexity
+                logger.info("Model tier raised by prompt assessment: %s", complexity)
+
             logger.info(f"Final task complexity for model selection: {complexity}")
             
             # Determine which LLM and model to use
@@ -9578,9 +12201,58 @@ class SurvyAIAgent:
                         model_name_used = self.settings.primary_llm
                     logger.info(f"✓ Using primary LLM: {self.settings.primary_llm} (model: {model_name_used})")
 
-            # FAST PATH: separate PRE/POST CSV + DWG boundary -> IDW/CutFill volume
-            if self._should_fastpath_pre_post_csv_dwg_cutfill(query):
-                fast = self._run_pre_post_csv_dwg_cutfill_pipeline(query)
+            # FAST PATH: factual web lookup (current office holders, who-is questions)
+            # Runs after permission is granted — one search + one synthesis call, no tool loop.
+            if (
+                getattr(self, "_internet_permission_granted", False)
+                and prompt_action.needs_internet
+                and prompt_action.kind in ("current_fact_lookup", "permission_affirm", "general_knowledge")
+                and llm_to_use is not None
+            ):
+                # search_queries=None → the pipeline runs LLM-based query rewriting
+                # (with rule-based fallback) for the best, domain-agnostic retrieval.
+                fast = self._run_factual_web_lookup_pipeline(
+                    question=prompt_action.effective_query or routing_query,
+                    llm=llm_to_use,
+                    model_name_used=model_name_used,
+                    search_queries=None,
+                )
+                llm_used = "fallback" if use_fallback else "primary"
+                if fast.get("success"):
+                    return {
+                        "query": query,
+                        "response": fast.get("response", ""),
+                        "llm_used": llm_used,
+                        "model_name": fast.get("model_name", model_name_used),
+                        "complexity": complexity,
+                        "success": True,
+                        "session_id": current_session_id,
+                        "context_retrieved": False,
+                        "internet_searched": True,
+                    }
+                # Permission was granted — do NOT fall through to the LangGraph loop
+                # (it would ask for permission again). Return the search failure plainly.
+                if prompt_action.kind in ("permission_affirm", "current_fact_lookup"):
+                    return {
+                        "query": query,
+                        "response": fast.get("response", "Web search returned no usable results."),
+                        "llm_used": llm_used,
+                        "model_name": model_name_used,
+                        "complexity": complexity,
+                        "success": False,
+                        "error": fast.get("error", "no_web_results"),
+                        "session_id": current_session_id,
+                        "context_retrieved": False,
+                    }
+                logger.warning(
+                    "Factual web lookup fast-path did not return results: %s",
+                    fast.get("error"),
+                )
+
+            # FAST PATH: multi-DWG survey plan extract → Word (per-file loaders, no agent loop)
+            if self._should_fastpath_dwg_plan_extract_to_docx(routing_query):
+                logger.info("DWG plan extract → Word fast-path triggered")
+                fast = self._run_dwg_plan_extract_to_docx_pipeline(query)
                 llm_used = "fallback" if use_fallback else "primary"
                 return {
                     "query": query,
@@ -9591,39 +12263,40 @@ class SurvyAIAgent:
                     "success": bool(fast.get("success")),
                     "session_id": self.get_session_id(),
                     "context_retrieved": False,
-                    "output_path": fast.get("output_csv"),
+                    "output_path": fast.get("output_path"),
                     "error": fast.get("error") if not fast.get("success") else None,
                 }
 
-            # FAST PATH: novel file-driven ArcGIS workflow -> generate ArcPy, execute deterministically, repair/retry
-            if self._should_fastpath_dynamic_arcgis_workflow(query):
-                fast = self._run_dynamic_arcgis_workflow_pipeline(
+            # FAST PATH: save prior session answer (essay/report) to .docx
+            if self._should_fastpath_save_session_docx(routing_query, query):
+                fast = self._run_save_session_docx_pipeline(
                     query=query,
+                    routing_query=routing_query,
                     llm=llm_to_use,
-                    model_name_used=model_name_used or getattr(self.settings, "openai_model_mini", "gpt-5-mini"),
+                    model_name_used=model_name_used,
                 )
                 llm_used = "fallback" if use_fallback else "primary"
                 return {
                     "query": query,
                     "response": fast.get("response", ""),
                     "llm_used": llm_used,
-                    "model_name": model_name_used,
+                    "model_name": fast.get("model_name", model_name_used),
                     "complexity": complexity,
                     "success": bool(fast.get("success")),
                     "session_id": self.get_session_id(),
                     "context_retrieved": False,
-                    "output_path": fast.get("output_csv"),
+                    "output_path": fast.get("output_path"),
                     "error": fast.get("error") if not fast.get("success") else None,
                 }
 
             # FAST PATH: report generation to .docx (avoids LangGraph recursion/tool loops)
-            if self._should_fastpath_docx_report(query):
+            if self._should_fastpath_docx_report(routing_query):
                 out_candidate = self._extract_any_output_docx(query) or "Report.docx"
                 fast = self._run_docx_report_pipeline(
                     query=query,
                     output_doc_path=out_candidate,
                     llm=llm_to_use,
-                    model_name_used=model_name_used or getattr(self.settings, "openai_model_mini", "gpt-5-mini"),
+                    model_name_used=model_name_used or getattr(self.settings, "openai_model_mini", "gpt-5.4-mini"),
                 )
                 llm_used = "fallback" if use_fallback else "primary"
                 return {
@@ -9640,7 +12313,7 @@ class SurvyAIAgent:
                 }
 
             # FAST PATH: cadastral CAD prompt (template DWG -> output DWG with parcel replot)
-            if self._should_fastpath_cadastral_cad_batch(query):
+            if self._should_fastpath_cadastral_cad_batch(routing_query):
                 fast = self._run_cadastral_cad_batch_pipeline(query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if fast.get("success"):
@@ -9685,7 +12358,7 @@ class SurvyAIAgent:
                     "error": fast.get("error") if isinstance(fast, dict) else "Batch cadastral pipeline failed",
                 }
 
-            if self._should_fastpath_cadastral_cad(query):
+            if self._should_fastpath_cadastral_cad(routing_query):
                 fast = self._run_cadastral_cad_prompt_pipeline(query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if fast.get("success"):
@@ -9745,8 +12418,13 @@ class SurvyAIAgent:
 
             # FAST PATH: in-session CAD plan modifications (add road, change title, etc.)
             # Template remains read-only; modifications apply to the output plan file (even if open).
-            if self._should_fastpath_cad_modification(query):
-                mod = self._run_cad_modification_pipeline(query)
+            # CRITICAL: gate on routing_query (current request only) so injected
+            # conversation history can no longer trigger this.  This is the exact
+            # path that previously fired on a knowledge question because the
+            # injected history contained "add the road".  The `intent != knowledge`
+            # check is belt-and-suspenders against clearly informational questions.
+            if intent != "knowledge" and self._should_fastpath_cad_modification(routing_query):
+                mod = self._run_cad_modification_pipeline(routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if mod.get("success"):
                     resp_lines = [
@@ -9781,8 +12459,10 @@ class SurvyAIAgent:
                 }
 
             # AUTOMATIC DOCUMENT PRE-PROCESSING: Detect document paths and get resource estimation
-            # This prevents the agent from trying to process large documents without knowing the cost/size
-            document_paths = self._extract_document_paths(query)
+            # This prevents the agent from trying to process large documents without knowing the cost/size.
+            # Use routing_query so only documents referenced in the CURRENT request are
+            # pre-processed (prevents stale docs from prior turns leaking in).
+            document_paths = self._extract_document_paths(routing_query)
             document_preflight_info = []
             
             if document_paths:
@@ -9791,7 +12471,7 @@ class SurvyAIAgent:
                     try:
                         path_obj = Path(doc_path)
                         file_size_mb = path_obj.stat().st_size / (1024 * 1024) if path_obj.exists() else 0
-                        model_for_est = model_name_used or getattr(self.settings, "openai_model_mini", "gpt-5-mini")
+                        model_for_est = model_name_used or getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
                         est = self.document_processor.get_resource_estimation(doc_path, model_for_est)
                         if est.get("success"):
                             doc_info = {
@@ -9844,7 +12524,7 @@ class SurvyAIAgent:
                         document_preflight_info,
                         key=lambda d: (int(d.get("estimated_tokens") or 0), float(d.get("file_size_mb") or 0))
                     )
-                    if self._should_fastpath_large_doc_summary(query, primary_doc):
+                    if self._should_fastpath_large_doc_summary(routing_query, primary_doc):
                         input_doc = primary_doc["path"]
                         output_doc = self._extract_requested_output_docx(query, input_doc) or str(
                             (Path(input_doc).parent / f"Summary_{Path(input_doc).stem}.docx").resolve()
@@ -9855,7 +12535,7 @@ class SurvyAIAgent:
                             input_doc_path=input_doc,
                             output_doc_path=output_doc,
                             llm=llm_to_use,
-                            model_name_used=model_name_used or getattr(self.settings, "openai_model_mini", "gpt-5-mini")
+                            model_name_used=model_name_used or getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
                         )
                         if fast_result.get("success"):
                             # Store conversation for future context
@@ -9888,18 +12568,43 @@ class SurvyAIAgent:
                 # Permission should already be granted (checked above), but double-check
                 if getattr(self, "_internet_permission_granted", False):
                     try:
-                        logger.info(f"🔍 Executing internet search for: {rag_decision.internet_query or query}")
-                        res = _internet_search(rag_decision.internet_query or query)
-                        if res.get("success"):
-                            internet_block = self._format_internet_results_for_prompt(res.get("results") or [])
+                        search_question = self._extract_clean_question(
+                            rag_decision.internet_query or actual_query_for_routing or query
+                        ) or (rag_decision.internet_query or query)
+                        logger.info(f"🔍 Executing multi-stage web research for: {search_question}")
+                        variants = self._rewrite_search_queries_with_llm(search_question, llm_to_use)
+                        _max_sources = int(getattr(self.settings, "web_research_max_sources", 8) or 8)
+                        _fetch_pages = int(getattr(self.settings, "web_research_fetch_pages", 4) or 0)
+                        pack = _web_research(
+                            search_question,
+                            query_variants=variants,
+                            max_sources=_max_sources,
+                            fetch_pages=_fetch_pages,
+                            read_pages=_fetch_pages > 0,
+                        )
+                        if pack.get("success") and (pack.get("evidence") or []):
+                            internet_block = self._format_evidence_pack(pack.get("evidence") or [])
+                            internet_block = (
+                                "\n\n---\n**INTERNET EVIDENCE PACK (EXTERNAL, PERMISSION GRANTED — "
+                                f"retrieval confidence {float(pack.get('confidence') or 0.0):.2f}):**\n"
+                                "Ground every external claim in these numbered sources and cite [n]. "
+                                "Add a section titled exactly: \"Internet-sourced (external) information\" "
+                                "listing the URLs used.\n\n"
+                                + internet_block
+                                + "\n---\n"
+                            )
                             internet_already_searched = True
-                            # Mark that internet was already searched (for tool safety check)
                             self._internet_already_searched_this_query = True
-                            logger.info(f"✓ Internet search completed: {len(res.get('results', []))} results")
+                            logger.info(
+                                "✓ Web research completed: %d evidence items, %d domains, confidence %.2f",
+                                len(pack.get("evidence") or []),
+                                pack.get("distinct_domains", 0),
+                                float(pack.get("confidence") or 0.0),
+                            )
                         else:
-                            logger.warning(f"⚠ Internet search returned no results: {res.get('error', 'Unknown error')}")
+                            logger.warning(f"⚠ Web research returned no usable evidence: {pack.get('error', 'Unknown error')}")
                     except Exception as e:
-                        logger.warning(f"⚠ Internet search failed during routing: {e}")
+                        logger.warning(f"⚠ Web research failed during routing: {e}")
                 else:
                     # This shouldn't happen (we checked above), but log it
                     logger.warning("⚠ Internet needed but permission not granted - this should have been caught earlier")
@@ -9915,7 +12620,7 @@ class SurvyAIAgent:
             context_retrieved = bool(retrieved_context)
             
             # Build enhanced system prompt with routed augmentation + document pre-flight info
-            enhanced_system_prompt = SYSTEM_PROMPT
+            enhanced_system_prompt = self._system_prompt
             if document_preflight_info:
                 doc_context = "\n\n---\n**DOCUMENT PRE-FLIGHT ANALYSIS (AUTOMATIC):**\n"
                 doc_context += "The following document(s) were detected in the user's query. Resource estimation has been performed:\n\n"
@@ -9971,25 +12676,65 @@ class SurvyAIAgent:
             # Strong ArcGIS routing augmentation for the common "two files + DWG mask + IDW/CutFill" case.
             ql_for_arcgis = (actual_query_for_routing or query or "").lower()
             tabular_pair = ql_for_arcgis.count(".csv") >= 2 or ql_for_arcgis.count(".xlsx") >= 2
+            wants_cutfill = "cutfill" in ql_for_arcgis or "cut fill" in ql_for_arcgis
+            wants_tin = "tin" in ql_for_arcgis
+            wants_idw = "idw" in ql_for_arcgis
+            wants_volume = "volume" in ql_for_arcgis
             needs_custom_arcgis_workflow = (
                 tabular_pair
                 and ".dwg" in ql_for_arcgis
-                and ("idw" in ql_for_arcgis)
-                and ("cutfill" in ql_for_arcgis or "cut fill" in ql_for_arcgis)
+                and (wants_cutfill or wants_volume or wants_tin or wants_idw)
             )
             if needs_custom_arcgis_workflow:
+                tin_hint = (
+                    "- The user asked for **TIN** surfaces: prefer `arcgis_pre_post_csv_dwg_tin_volume` "
+                    "(CreateTin + CutFill; falls back to IDW if TIN fails).\n"
+                    if wants_tin
+                    else ""
+                )
+                idw_hint = (
+                    "- Prefer `arcgis_pre_post_csv_dwg_cutfill` for separate PRE/POST .csv or .xlsx "
+                    "plus a boundary .dwg when IDW/CutFill is requested.\n"
+                    if wants_idw or (wants_cutfill and not wants_tin)
+                    else ""
+                )
                 enhanced_system_prompt += (
                     "\n\n---\n"
                     "**CRITICAL ARCGIS ROUTING FOR THIS QUERY:**\n"
-                    "- The user provided separate PRE and POST tabular sources plus a DWG polygon/boundary and wants IDW/CutFill/volume-style output.\n"
-                    "- Prefer `arcgis_pre_post_csv_dwg_cutfill` when inputs are separate PRE/POST .csv or .xlsx plus a boundary .dwg — it is the verified end-to-end workflow.\n"
-                    "- Do NOT use `arcgis_fill_volume_idw_cutfill` when PRE and POST are in separate files or when a DWG defines the mask/extent.\n"
-                    "- Only use `arcgis_execute_python_code` if the request truly does not match that verified tool (e.g. unusual outputs, extra steps).\n"
-                    "- If you use `arcgis_execute_python_code`, follow the same pattern: headless ArcPy, RESULT_* stdout, save project; omit `project_path` to auto-create a workspace project if needed.\n"
+                    "- The user provided separate PRE and POST tabular sources plus a DWG polygon/boundary "
+                    "and wants surface/volume output in ArcGIS Pro.\n"
+                    f"{tin_hint}{idw_hint}"
+                    "- Do NOT use `arcgis_fill_volume_idw_cutfill` when PRE and POST are in separate files "
+                    "or when a DWG defines the mask/extent.\n"
+                    "- You MUST call a tool — do NOT claim success without verified tool output and on-disk files.\n"
+                    "- Only use `arcgis_execute_python_code` if no verified tool matches (e.g. unusual outputs).\n"
+                    "- If you use `arcgis_execute_python_code`, follow the same pattern: headless ArcPy, RESULT_* stdout, save project.\n"
                     "- If ArcGIS returns `ERROR 010092: Invalid output extent`, repair extent/mask from the boundary and retry.\n"
                     "---\n"
                 )
                 logger.info("✓ ArcGIS custom-workflow routing instructions injected into system prompt")
+
+            offer_text = (actual_query_for_routing or routing_query or "").lower()
+            if any(
+                k in offer_text
+                for k in (
+                    "coordinate conversion", "crs", "epsg", "transformation",
+                    "pyproj", "converted_points", "wgs84", "wgs 84",
+                )
+            ) and not any(
+                k in offer_text for k in ("cutfill", "cut fill", "pre/post", "pre and post", "volume workflow")
+            ):
+                enhanced_system_prompt += (
+                    "\n\n---\n"
+                    "**ACTIVE WORKFLOW: COORDINATE CONVERSION / CRS METADATA**\n"
+                    "- Continue the coordinate-conversion thread only.\n"
+                    "- Do NOT call `arcgis_fill_volume_idw_cutfill`, `arcgis_pre_post_csv_dwg_cutfill`, "
+                    "or other volume/CutFill tools — converted XY files are not PRE/POST elevation surfaces.\n"
+                    "- To document transformation parameters, use pyproj/CRS introspection or update the "
+                    "existing Excel output — do not invent elevation columns.\n"
+                    "---\n"
+                )
+                logger.info("✓ Coordinate-conversion workflow guard injected into system prompt")
             
             # Bind tools to the selected LLM and rebuild graph
             # CRITICAL: If internet was already searched, conditionally remove internet_search tool
@@ -10004,9 +12749,15 @@ class SurvyAIAgent:
             self._ensure_app_bound(llm_to_use, model_name_used, tools_to_bind)
             
             try:
-                # Use session_id as thread_id to maintain conversation state across queries
-                # This ensures LangGraph remembers the conversation history
-                thread_id = current_session_id
+                # Use a per-invocation thread_id so LangGraph's MemorySaver does NOT
+                # accumulate tool-call history across separate queries.  Accumulated
+                # history causes (a) massive input-token counts that slow every
+                # subsequent query and (b) the LLM replaying an old tool workflow
+                # instead of answering the new question.
+                # Cross-query conversation continuity is already provided by
+                # _build_continuation_query in the GUI layer (injected via the system
+                # prompt), so per-query isolation here is safe.
+                thread_id = f"{current_session_id}:q:{uuid.uuid4().hex}"
                 # Increase recursion_limit to avoid premature GRAPH_RECURSION_LIMIT on complex tool workflows.
                 max_iterations = getattr(self.settings, 'agent_max_iterations', 20)
                 recursion_limit = getattr(self.settings, "agent_recursion_limit", max(50, (max_iterations * 3)))
@@ -10159,6 +12910,21 @@ class SurvyAIAgent:
                 
                 # Extract the final response from messages
                 response_text = self._extract_response(result)
+                tools_used = self._graph_result_used_tools(result)
+                graph_success = True
+                if self._response_looks_like_unverified_task_completion(
+                    routing_query, response_text, tools_used
+                ):
+                    logger.warning(
+                        "Blocked unverified task completion (file-driven task, no tools invoked)"
+                    )
+                    graph_success = False
+                    response_text = (
+                        "I could not verify that the requested file operations completed because "
+                        "no automation tools were executed. I will not report a fabricated result.\n\n"
+                        "Please retry this request — I should run the appropriate ArcGIS, CAD, Excel, "
+                        "or document tools and confirm outputs exist on disk before reporting success."
+                    )
                 llm_cost_usd = self._estimate_llm_cost_usd_from_graph_result(
                     result,
                     model_name_used,
@@ -10186,10 +12952,11 @@ class SurvyAIAgent:
                     "llm_used": llm_used,
                     "model_name": model_name_used,  # Include actual model name
                     "complexity": complexity,  # Include detected complexity
-                    "success": True,
+                    "success": graph_success,
                     "session_id": current_session_id,
                     "context_retrieved": context_retrieved,
                     "llm_cost_usd": llm_cost_usd,
+                    "error": "unverified_completion" if not graph_success else None,
                 }
                 
             except Exception as e:
@@ -10309,78 +13076,69 @@ class SurvyAIAgent:
         """
         Best-effort USD cost for the graph run (Credits & Usage / local tracking).
 
-        Prefers token usage from LangChain AIMessage.usage_metadata / response_metadata.
-        Falls back to pre-flight input estimate plus response length when providers omit usage.
+        Raw provider cost: per AIMessage usage with cached-input pricing, summed across
+        the run. The desktop UI applies credit_markup_multiplier (default 2×) at display.
         """
-        from utils.cost_estimator import estimate_cost, estimate_tokens
-
-        total_in = 0
-        total_out = 0
-        msgs = list((result or {}).get("messages") or [])
-        for m in msgs:
-            if not isinstance(m, AIMessage):
-                continue
-            um = getattr(m, "usage_metadata", None) or {}
-            if isinstance(um, dict) and um:
-                total_in += int(
-                    um.get("input_tokens")
-                    or um.get("prompt_tokens")
-                    or um.get("input_token_count")
-                    or 0
-                )
-                total_out += int(
-                    um.get("output_tokens")
-                    or um.get("completion_tokens")
-                    or um.get("output_token_count")
-                    or 0
-                )
-                continue
-            rm = getattr(m, "response_metadata", None) or {}
-            if isinstance(rm, dict):
-                tu = rm.get("token_usage") or rm.get("usage") or {}
-                if isinstance(tu, dict):
-                    total_in += int(
-                        tu.get("prompt_tokens") or tu.get("input_tokens") or 0
-                    )
-                    total_out += int(
-                        tu.get("completion_tokens") or tu.get("output_tokens") or 0
-                    )
+        from utils.cost_estimator import estimate_graph_llm_cost_usd
 
         mn = (model_name or "").strip() or getattr(
-            self.settings, "openai_model_mini", "gpt-5-mini"
+            self.settings, "openai_model_mini", "gpt-5.4-mini"
         )
-        if total_in + total_out > 0:
-            try:
-                ec = estimate_cost(
-                    mn,
-                    max(total_in, 1),
-                    output_tokens=max(total_out, 0),
-                )
-                return float(ec.get("total_cost") or 0.0)
-            except Exception:
-                pass
-
         try:
-            tool_rounds = sum(
-                1
-                for m in msgs
-                if isinstance(m, AIMessage) and getattr(m, "tool_calls", None)
-            )
-            in_est = max(int(initial_messages_token_hint or 0), 100)
-            in_est = min(in_est + tool_rounds * 2500, 500_000)
-            out_est = max(
-                int(estimate_tokens(response_text or "", method="characters")),
-                400,
-            )
-            ec = estimate_cost(
+            return estimate_graph_llm_cost_usd(
+                list((result or {}).get("messages") or []),
                 mn,
-                in_est,
-                output_tokens=min(out_est, 128_000),
+                response_text=response_text or "",
+                initial_messages_token_hint=initial_messages_token_hint,
             )
-            return float(max(0.0, ec.get("total_cost") or 0.0))
         except Exception:
             return 0.0
     
+    @staticmethod
+    def _graph_result_used_tools(result: Dict) -> bool:
+        """True if the LangGraph run invoked at least one tool."""
+        for message in (result or {}).get("messages") or []:
+            if isinstance(message, ToolMessage):
+                return True
+        return False
+
+    def _response_looks_like_unverified_task_completion(
+        self,
+        routing_query: str,
+        response: str,
+        tools_used: bool,
+    ) -> bool:
+        """
+        Detect when the LLM claims a file/GIS/CAD task finished without running tools.
+        """
+        if tools_used:
+            return False
+        if self._classify_query_intent(routing_query) != "task":
+            return False
+        if not looks_like_file_driven_task(routing_query):
+            return False
+
+        rl = (response or "").lower()
+        if not rl.strip():
+            return True
+
+        completion_phrases = (
+            "saved to", "saved as", "saved essay", "output:", "created the",
+            "successfully created", "successfully saved", "successfully exported",
+            "successfully generated", "successfully computed", "successfully calculated",
+            "volume:", "cut fill", "cutfill", "task complete", "done.",
+            "exported to", "written to", "file has been",
+        )
+        if any(p in rl for p in completion_phrases):
+            return True
+
+        action_verbs = ("saved", "created", "exported", "generated", "computed", "calculated")
+        evidence_tokens = ("output", "path", "file", "volume", "result", ".csv", ".dwg", ".docx", ".xlsx")
+        if any(v in rl for v in action_verbs) and any(t in rl for t in evidence_tokens):
+            return True
+
+        return False
+
     def _extract_response(self, result: Dict) -> str:
         """
         Extract the final text response from the graph result.
