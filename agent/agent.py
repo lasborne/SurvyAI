@@ -1462,6 +1462,67 @@ class SurvyAIAgent:
         except Exception as e:
             logger.debug(f"Failed to infer output path from {input_path}: {e}")
             return None
+
+    def _extract_explicit_output_folder(self, query: str) -> Optional[Path]:
+        """Return a user-named output directory from the prompt, if present."""
+        q = query or ""
+        patterns = (
+            r"(?:in|into|to)\s+(?:the\s+)?(?:folder|directory)\s+['\"]([^'\"]+)['\"]",
+            r"(?:save|saved|export|create|write|store|generate)\s+(?:\w+\s+){0,10}(?:in|into|to)\s+(?:the\s+)?(?:folder|directory)\s+['\"]([^'\"]+)['\"]",
+            r"(?:save|saved|export|create|write)\s+(?:to|in|into)\s+(?:the\s+)?(?:folder|directory)\s+['\"]([^'\"]+)['\"]",
+        )
+        for pat in patterns:
+            m = re.search(pat, q, flags=re.IGNORECASE)
+            if not m:
+                continue
+            raw = (m.group(1) or "").strip().strip("\"'").rstrip(").,;")
+            if not raw:
+                continue
+            folder = Path(raw)
+            if folder.suffix.lower() in {
+                ".dwg", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".pdf", ".aprx", ".gdb", ".shp",
+            }:
+                folder = folder.parent
+            try:
+                return folder.resolve()
+            except Exception:
+                return folder
+        return None
+
+    def _resolve_user_output_path(
+        self,
+        query: str,
+        output_ref: str,
+        *,
+        fallback_dir: Optional[Path] = None,
+    ) -> Path:
+        """
+        Resolve an output file path from the user's prompt.
+
+        Priority: absolute path in output_ref > explicit folder in query + filename >
+        active workspace (fallback_dir or Path.cwd()).
+        """
+        ws = (fallback_dir or Path.cwd()).resolve()
+        ref = (output_ref or "").strip().strip("\"'").rstrip(").,;")
+        if not ref:
+            return ws
+
+        p = Path(ref)
+        if p.is_absolute():
+            return p.resolve()
+
+        if len(p.parts) > 1 or ("/" in ref) or ("\\" in ref):
+            return (ws / p).resolve()
+
+        explicit_folder = self._extract_explicit_output_folder(query or "")
+        if explicit_folder is not None:
+            try:
+                explicit_folder.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            return (explicit_folder / p.name).resolve()
+
+        return (ws / p.name).resolve()
     
     def _extract_requested_output_docx(self, query: str, input_doc_path: str) -> Optional[str]:
         """
@@ -1874,17 +1935,19 @@ class SurvyAIAgent:
         ws = (workspace or Path.cwd()).resolve()
         out = self._extract_any_output_docx(routing_query)
         if out:
-            p = Path(out)
-            if p.is_absolute():
-                return p if p.suffix.lower() == ".docx" else p.with_suffix(".docx")
-            return ws / (p.name if p.suffix else f"{p.name}.docx")
+            resolved = self._resolve_user_output_path(routing_query, out, fallback_dir=ws)
+            return resolved if resolved.suffix.lower() == ".docx" else resolved.with_suffix(".docx")
         m = re.search(r"['\"]([^'\"]+\.docx)['\"]", routing_query or "", flags=re.IGNORECASE)
         if m:
-            return ws / Path(m.group(1)).name
+            return self._resolve_user_output_path(routing_query, m.group(1), fallback_dir=ws)
         m2 = re.search(r"\b(essay\d*)\b", routing_query or "", flags=re.IGNORECASE)
         if m2:
             name = m2.group(1)
-            return ws / (name if name.lower().endswith(".docx") else f"{name}.docx")
+            return self._resolve_user_output_path(
+                routing_query,
+                name if name.lower().endswith(".docx") else f"{name}.docx",
+                fallback_dir=ws,
+            )
         return ws / "essay1.docx"
 
     def _run_save_session_docx_pipeline(
@@ -3260,9 +3323,7 @@ class SurvyAIAgent:
             template_p = (Path.cwd() / template_p).resolve()
         if not template_p.exists():
             return {"success": False, "error": f"Template DWG not found: {str(template_p)}"}
-        out_p = Path(output)
-        if not out_p.is_absolute():
-            out_p = (Path.cwd() / out_p.name).resolve()
+        out_p = self._resolve_user_output_path(q, output or "")
 
         profile_dir = self._cad_template_profiles_dir()
         profile_dir.mkdir(parents=True, exist_ok=True)
@@ -3529,7 +3590,7 @@ class SurvyAIAgent:
 
         outp = Path(output_dwg_path)
         if not outp.is_absolute():
-            outp = (Path.cwd() / outp).resolve()
+            outp = self._resolve_user_output_path("", str(outp)).resolve()
 
         # Connect early. Do NOT close the user's drawing: if the output DWG is already open in AutoCAD,
         # skip overwriting it from disk (locked file) and edit that session in place instead (better UX).
@@ -6681,9 +6742,7 @@ class SurvyAIAgent:
         """
         from pathlib import Path
 
-        output_path = Path(output_doc_path)
-        if not output_path.is_absolute():
-            output_path = (Path.cwd() / output_path.name).resolve()
+        output_path = self._resolve_user_output_path(query, output_doc_path)
 
         # Internet sourcing (permissioned)
         internet_block = ""
@@ -12621,6 +12680,17 @@ class SurvyAIAgent:
             
             # Build enhanced system prompt with routed augmentation + document pre-flight info
             enhanced_system_prompt = self._system_prompt
+            active_workspace = Path.cwd().resolve()
+            enhanced_system_prompt += (
+                "\n\n---\n"
+                "**ACTIVE SURVYAI WORKSPACE (DEFAULT OUTPUT LOCATION):**\n"
+                f"- Path: `{active_workspace}`\n"
+                "- Use this when the user does not name another folder or full output file path.\n"
+                "- If the user names an explicit folder (e.g. \"in the folder 'C:/path/to/dir'\") or a full "
+                "output path, that overrides this workspace.\n"
+                "- If output location is ambiguous, prefer this workspace.\n"
+                "---\n"
+            )
             if document_preflight_info:
                 doc_context = "\n\n---\n**DOCUMENT PRE-FLIGHT ANALYSIS (AUTOMATIC):**\n"
                 doc_context += "The following document(s) were detected in the user's query. Resource estimation has been performed:\n\n"
@@ -12703,6 +12773,8 @@ class SurvyAIAgent:
                     "**CRITICAL ARCGIS ROUTING FOR THIS QUERY:**\n"
                     "- The user provided separate PRE and POST tabular sources plus a DWG polygon/boundary "
                     "and wants surface/volume output in ArcGIS Pro.\n"
+                    f"- Put CSV copies, ArcGIS project/GDB, and volume result CSV under the active workspace: "
+                    f"`{active_workspace}` (or omit workspace_folder so tools default to Path.cwd()).\n"
                     f"{tin_hint}{idw_hint}"
                     "- Do NOT use `arcgis_fill_volume_idw_cutfill` when PRE and POST are in separate files "
                     "or when a DWG defines the mask/extent.\n"

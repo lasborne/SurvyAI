@@ -56,6 +56,7 @@ UsedFiles/
 *.xls
 *.docx
 *.pdf
+*.csv
 
 # ArcGIS
 *.mxd
@@ -80,6 +81,9 @@ scripts/*
 
 # Runtime-generated ArcGIS project output
 Adibawa_BorrowPit_Volume/
+
+# Python files
+gen_JWT_SECRET.py
 
 
 

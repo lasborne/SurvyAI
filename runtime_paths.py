@@ -47,9 +47,31 @@ def prefer_user_data_path(*parts: str) -> Path:
     return resource_path(*parts)
 
 
+def default_documents_folder() -> Path:
+    """Return the user's primary Documents folder (Windows shell folder when available)."""
+    if os.name == "nt":
+        try:
+            import winreg
+
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+            ) as key:
+                personal, _ = winreg.QueryValueEx(key, "Personal")
+            docs = Path(os.path.expandvars(str(personal))).resolve()
+            if docs.is_dir():
+                return docs
+        except Exception:
+            pass
+    docs = (Path.home() / "Documents").resolve()
+    docs.mkdir(parents=True, exist_ok=True)
+    return docs
+
+
 __all__ = [
     "APP_NAME",
     "bundled_root",
+    "default_documents_folder",
     "is_frozen_app",
     "prefer_user_data_path",
     "project_root",

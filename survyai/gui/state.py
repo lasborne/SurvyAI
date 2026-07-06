@@ -20,8 +20,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from runtime_paths import default_documents_folder
 from survyai.device_identity import compute_machine_fingerprint
 from survyai.gui.secret_store import DesktopSecretStore
+
+
+DEFAULT_CLOUD_API_BASE_URL = "https://survyai-api.onrender.com"
 
 
 def _utc_now() -> str:
@@ -229,7 +233,7 @@ class AppStateStore:
         self.default_data_dir.mkdir(parents=True, exist_ok=True)
 
     def default_workspace_path(self) -> str:
-        return str(Path.cwd())
+        return str(default_documents_folder())
 
     def load(self) -> DesktopState:
         raw_data: Dict[str, Any] = {}
@@ -483,6 +487,7 @@ __all__ = [
     "AppStateStore",
     "Conversation",
     "ConversationMessage",
+    "DEFAULT_CLOUD_API_BASE_URL",
     "DesktopState",
     "TaskHistoryEntry",
 ]

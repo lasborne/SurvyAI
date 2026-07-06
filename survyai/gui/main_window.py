@@ -95,6 +95,7 @@ from survyai.gui.state import (
     AccountProfile,
     AppStateStore,
     Conversation,
+    DEFAULT_CLOUD_API_BASE_URL,
     DesktopState,
     TaskHistoryEntry,
 )
@@ -3079,7 +3080,7 @@ class MainWindow(QMainWindow):
         self._credits_period_note.setText(
             f"{period_label}. \"Used\" is the total of every hosted-model run in this window "
             f"(from the 1st of the month through today for free/annual accounts), billed at "
-            f"raw LLM API cost × {markup:g} SurvyAI markup. Lifetime total is at the bottom."
+            f"SurvyAI markup. Lifetime total is at the bottom."
         )
 
         self._credits_total_label.setText(f"${budget:,.2f}")
@@ -4223,6 +4224,16 @@ class MainWindow(QMainWindow):
     def _cloud_base_and_token(self) -> tuple[str, str]:
         return self._state.cloud_api_base_url.strip(), self._state.cloud_access_token.strip()
 
+    def _default_cloud_api_base_url(self) -> str:
+        """Prefill for sign-in: saved URL, then .env, then production default."""
+        saved = self._state.cloud_api_base_url.strip()
+        if saved:
+            return saved
+        from_settings = str(getattr(self._settings, "survyai_api_base_url", "") or "").strip()
+        if from_settings:
+            return from_settings
+        return DEFAULT_CLOUD_API_BASE_URL
+
     def _preflight_cloud_api(self, base: str, *, require_database: bool = True) -> bool:
         """Reachability (+ optional DB) check before cloud-backed actions."""
         try:
@@ -4235,7 +4246,8 @@ class MainWindow(QMainWindow):
                     f"Could not reach the cloud API at:\n{base}\n\n"
                     f"{user_facing_cloud_message(exc)}\n\n"
                     "• Start the API: python -m survyai_cloud\n"
-                    "• Sign in with the same base URL (default http://127.0.0.1:8088)"
+                    "• Sign in with the same base URL (default "
+                    f"{DEFAULT_CLOUD_API_BASE_URL})"
                 ),
             )
             return False
@@ -4271,8 +4283,9 @@ class MainWindow(QMainWindow):
                     f"Could not reach the cloud API at:\n{base}\n\n"
                     f"{user_facing_cloud_message(exc)}\n\n"
                     "• Start the API in a terminal: python -m survyai_cloud\n"
-                    "• Sign in with the same base URL (default http://127.0.0.1:8088)\n"
-                    "• Open http://127.0.0.1:8088/health in a browser — database_ok should be true"
+                    "• Sign in with the same base URL (default "
+                    f"{DEFAULT_CLOUD_API_BASE_URL})\n"
+                    f"• Open {DEFAULT_CLOUD_API_BASE_URL}/health in a browser — database_ok should be true"
                 ),
             )
             return False
@@ -4586,11 +4599,12 @@ class MainWindow(QMainWindow):
         Cloud sign-in: optional register -> login -> store tokens -> /v1/me, entitlements, bootstrap
         -> rebuild agent service with injected platform keys + model tiers.
         """
+        default_base = self._default_cloud_api_base_url()
         base_url, ok = QInputDialog.getText(
             self,
             "Cloud API base URL",
-            "Enter cloud API base URL (e.g. http://127.0.0.1:8088)",
-            text=self._state.cloud_api_base_url.strip() or "http://127.0.0.1:8088",
+            f"Enter cloud API base URL (e.g. {DEFAULT_CLOUD_API_BASE_URL})",
+            text=default_base,
         )
         if not ok:
             return
