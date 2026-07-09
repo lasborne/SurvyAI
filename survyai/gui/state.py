@@ -89,7 +89,7 @@ class Conversation:
 class DesktopState:
     onboarding_complete: bool = False
     profile: AccountProfile = field(default_factory=AccountProfile)
-    cloud_api_base_url: str = ""
+    cloud_api_base_url: str = DEFAULT_CLOUD_API_BASE_URL
     cloud_access_token: str = ""
     cloud_refresh_token: str = ""
     cloud_access_token_expires_at: str = ""
@@ -112,7 +112,7 @@ class DesktopState:
     ollama_last_prompted_at: str = ""
     ollama_prompt_dismissed: bool = False
     # Performance toggles (desktop-only UX; injected into Settings overrides)
-    fast_mode_non_file_prompts: bool = False
+    fast_mode_non_file_prompts: bool = True
     # UI theme: "light" (default) or "dark"
     theme: str = "light"
     # Credits accounting (synced from cloud entitlements / usage)
@@ -163,7 +163,7 @@ class DesktopState:
             ollama_model=str(raw.get("ollama_model", "")),
             ollama_last_prompted_at=str(raw.get("ollama_last_prompted_at", "")),
             ollama_prompt_dismissed=bool(raw.get("ollama_prompt_dismissed", False)),
-            fast_mode_non_file_prompts=bool(raw.get("fast_mode_non_file_prompts", False)),
+            fast_mode_non_file_prompts=bool(raw.get("fast_mode_non_file_prompts", True)),
             theme=str(raw.get("theme", "light") or "light"),
             monthly_credits_usd=float(raw.get("monthly_credits_usd", 0.0)),
             monthly_credits_used_usd=float(raw.get("monthly_credits_used_usd", 0.0)),
@@ -239,6 +239,7 @@ class AppStateStore:
         raw_data: Dict[str, Any] = {}
         if not self.state_path.is_file():
             state = DesktopState(
+                cloud_api_base_url=DEFAULT_CLOUD_API_BASE_URL,
                 workspace_path=self.default_workspace_path(),
                 data_folder=str(self.default_data_dir),
             )
@@ -251,6 +252,8 @@ class AppStateStore:
         except Exception:
             state = DesktopState()
         self._hydrate_secrets(state, raw_data)
+        if not state.cloud_api_base_url.strip():
+            state.cloud_api_base_url = DEFAULT_CLOUD_API_BASE_URL
         if not state.workspace_path:
             state.workspace_path = self.default_workspace_path()
         if not state.data_folder:

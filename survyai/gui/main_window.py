@@ -326,6 +326,30 @@ def _is_clearly_new_topic(raw_query: str, last_exchange_messages: list) -> bool:
     return False
 
 
+def _is_standalone_knowledge_question(raw_query: str) -> bool:
+    """True for self-contained explanatory questions that should not inherit task context."""
+    q = (raw_query or "").strip().lower()
+    if not q:
+        return False
+    if re.search(r"[a-z]:\\|/[^ \n]+\.(dwg|dxf|docx|pdf|xlsx?|csv|txt|json)\b", q, flags=re.I):
+        return False
+    task_markers = (
+        "plot", "draw", "modify", "open autocad", "cad", "dwg", "dxf",
+        "save", "export", "create a file", "generate a plan", "replot",
+        "use this", "template", "summarize this document", "attached",
+    )
+    if any(marker in q for marker in task_markers):
+        return False
+    question_markers = (
+        "what is", "what are", "explain", "describe", "define", "principle",
+        "history of", "brief history", "difference between", "compare",
+        "how does", "why does", "as a surveyor", "surveying",
+    )
+    if any(marker in q for marker in question_markers):
+        return True
+    return bool(q.endswith("?") and len(q.split()) >= 6)
+
+
 def _should_inject_conversation_context(raw: str, prior_user_assistant_text: str) -> bool:
     """True when the new message is likely a follow-up to the last exchange, not a brand-new task."""
     raw = (raw or "").strip()
@@ -605,17 +629,17 @@ class _OllamaSetupDialog(QDialog):
 
 
 class PaystackPlanPickerDialog(QDialog):
-    """Subscribe flow: show every plan option at once (no single-line combo)."""
+    """Manual access purchase flow: show every plan option at once."""
 
     def __init__(self, parent: QWidget | None, plans: list[dict]) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Subscribe with Paystack")
+        self.setWindowTitle("Buy or extend Pro access")
         self.setMinimumWidth(520)
         self._plan_codes: list[str] = []
         root = QVBoxLayout(self)
         intro = QLabel(
-            "Choose daily, weekly, monthly, or annual billing. All plans are listed below. "
-            "You will complete payment securely in your browser."
+            "Choose daily, weekly, monthly, or annual Pro access. This is a manual one-time "
+            "checkout; SurvyAI will not renew or debit your card automatically."
         )
         intro.setWordWrap(True)
         root.addWidget(intro)
@@ -656,18 +680,18 @@ class PaystackPlanPickerDialog(QDialog):
 
 
 class PaystackManageSubscriptionDialog(QDialog):
-    """Manage flow: show plan summaries and open Paystack portal (no cramped dropdown)."""
+    """Legacy recurring subscription management flow."""
 
     def __init__(self, parent: QWidget | None, plans: list[dict], portal_url: str) -> None:
         super().__init__(parent)
         self._portal_url = portal_url
-        self.setWindowTitle("Manage subscription")
+        self.setWindowTitle("Manage old Paystack subscription")
         self.setMinimumWidth(520)
         root = QVBoxLayout(self)
         intro = QLabel(
-            "Billing is handled on Paystack. Your current plan options are shown below. "
-            "Use the button to open the customer portal (payment method, invoices, cancellation). "
-            "To switch plans, use Subscribe to Pro… and complete a new checkout."
+            "SurvyAI now uses manual one-time Paystack checkout. Use this portal only for "
+            "older recurring subscriptions that need card updates, invoices, or cancellation. "
+            "To buy or extend access, use Buy / extend Pro… and complete a new checkout."
         )
         intro.setWordWrap(True)
         root.addWidget(intro)
@@ -1494,16 +1518,16 @@ class MainWindow(QMainWindow):
         pay_outer.addWidget(self._billing_banner)
         pay_row = QHBoxLayout()
         pay_row.setSpacing(8)
-        self._paystack_subscribe_btn = QPushButton("Subscribe to Pro…")
+        self._paystack_subscribe_btn = QPushButton("Buy / extend Pro…")
         self._paystack_subscribe_btn.clicked.connect(self._on_paystack_subscribe)
         self._paystack_subscribe_btn.setToolTip(
-            "Choose daily, weekly, monthly, or annual billing, then complete checkout in your browser."
+            "Choose daily, weekly, monthly, or annual access, then complete a manual checkout in your browser."
         )
         pay_row.addWidget(self._paystack_subscribe_btn)
-        self._paystack_manage_btn = QPushButton("Manage subscription…")
+        self._paystack_manage_btn = QPushButton("Manage old subscription…")
         self._paystack_manage_btn.setObjectName("secondaryButton")
         self._paystack_manage_btn.clicked.connect(self._on_paystack_manage_subscription)
-        self._paystack_manage_btn.setToolTip("Open Paystack portal for card updates, invoices, cancellation.")
+        self._paystack_manage_btn.setToolTip("Open Paystack portal only for older recurring subscriptions.")
         pay_row.addWidget(self._paystack_manage_btn)
         self._paystack_verify_btn = QPushButton("Verify payment reference…")
         self._paystack_verify_btn.setObjectName("secondaryButton")
@@ -1892,16 +1916,16 @@ class MainWindow(QMainWindow):
 
         account_menu.addSeparator()
 
-        pay_sub = QAction("Paystack: Subscribe to Pro…", self)
+        pay_sub = QAction("Paystack: Buy / extend Pro…", self)
         pay_sub.triggered.connect(self._on_paystack_subscribe)
         self._describe_menu_action(
             pay_sub,
-            "Opens Paystack checkout in your browser to subscribe or upgrade to Pro (hosted models and "
+            "Opens Paystack checkout in your browser to buy or extend Pro access (hosted models and "
             "periodic API credits). Choose daily, weekly, monthly, or annual billing.",
         )
         account_menu.addAction(pay_sub)
 
-        pay_manage = QAction("Paystack: Manage subscription…", self)
+        pay_manage = QAction("Paystack: Manage old subscription…", self)
         pay_manage.triggered.connect(self._on_paystack_manage_subscription)
         self._describe_menu_action(
             pay_manage,
@@ -2286,10 +2310,6 @@ class MainWindow(QMainWindow):
 
     def _effective_settings(self):
         overrides = {}
-        if self._state.preferred_primary_llm:
-            overrides["primary_llm"] = self._state.preferred_primary_llm
-        if self._state.preferred_fallback_llm:
-            overrides["fallback_llm"] = self._state.preferred_fallback_llm
         data_dir = Path(self._state.data_folder or self._state_store.default_data_dir)
         data_dir.mkdir(parents=True, exist_ok=True)
         overrides["vector_store_path"] = str(data_dir / "vectordb")
@@ -2351,6 +2371,13 @@ class MainWindow(QMainWindow):
                     ]:
                         if k in agent_cfg and agent_cfg.get(k) is not None:
                             overrides[k] = agent_cfg.get(k)
+        # User-selected runtime providers win over cloud defaults. The cloud
+        # bootstrap supplies hosted model credentials/config, but Apply Settings
+        # must still honor the user's selected primary/fallback provider.
+        if self._state.preferred_primary_llm:
+            overrides["primary_llm"] = self._state.preferred_primary_llm
+        if self._state.preferred_fallback_llm:
+            overrides["fallback_llm"] = self._state.preferred_fallback_llm
         if self._state.safe_mode:
             overrides["vector_store_enabled"] = False
             overrides["auto_context_retrieval"] = False
@@ -2670,7 +2697,7 @@ class MainWindow(QMainWindow):
         self._license_settings_label.setText(license_text)
 
         self._paystack_subscribe_btn.setEnabled(cloud_ok)
-        self._paystack_subscribe_btn.setVisible(not has_pro)
+        self._paystack_subscribe_btn.setVisible(cloud_ok)
         self._paystack_manage_btn.setEnabled(cloud_ok and bool(me.get("can_manage_paystack_subscription")))
         self._paystack_verify_btn.setEnabled(cloud_ok)
         self._cloud_refresh_license_btn.setEnabled(cloud_ok)
@@ -3710,6 +3737,8 @@ class MainWindow(QMainWindow):
 
         turns = [m for m in prior if m.role in ("user", "assistant")]
         if not turns:
+            return raw_query
+        if _is_standalone_knowledge_question(raw_query):
             return raw_query
 
         # Use a lightweight heuristic to decide whether to include the *full* recent

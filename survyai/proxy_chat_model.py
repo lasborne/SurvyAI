@@ -82,7 +82,9 @@ class SurvyAIProxyChatModel(BaseChatModel):
             "model_name": data.get("model"),
             "billing": data.get("billing") if isinstance(data.get("billing"), dict) else {},
         }
-        usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        usage = self._normalize_usage_metadata(
+            data.get("usage") if isinstance(data.get("usage"), dict) else {}
+        )
         ai = AIMessage(
             content=data.get("content", ""),
             tool_calls=tool_calls,
@@ -90,6 +92,27 @@ class SurvyAIProxyChatModel(BaseChatModel):
             usage_metadata=usage,
         )
         return ChatResult(generations=[ChatGeneration(message=ai)])
+
+    @staticmethod
+    def _normalize_usage_metadata(raw: dict[str, Any]) -> dict[str, Any]:
+        """Return LangChain-compatible AIMessage usage_metadata.
+
+        LangChain Core now requires `total_tokens`.  The SurvyAI proxy also sends
+        billing-only fields (e.g. cost_usd) that must not be placed inside
+        usage_metadata.
+        """
+        input_tokens = int(raw.get("input_tokens") or 0)
+        output_tokens = int(raw.get("output_tokens") or 0)
+        total_tokens = int(raw.get("total_tokens") or (input_tokens + output_tokens))
+        out: dict[str, Any] = {
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": total_tokens,
+        }
+        cached = int(raw.get("cached_input_tokens") or 0)
+        if cached:
+            out["input_token_details"] = {"cache_read": cached}
+        return out
 
     def _serialize_message(self, message: BaseMessage) -> dict[str, Any]:
         if isinstance(message, SystemMessage):

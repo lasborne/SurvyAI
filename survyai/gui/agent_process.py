@@ -42,7 +42,7 @@ def _payload_signature(settings_payload: Dict[str, Any], ff_payload: Dict[str, A
     """
     # Bump _WORKER_CODE_REV when agent routing/pipelines change so a running app
     # picks up new fast-path logic after restart (warm process rebuilds on mismatch).
-    _WORKER_CODE_REV = "20260614-pdf-replot-v10"
+    _WORKER_CODE_REV = "20260707-proxy-fastpath-v1"
     try:
         return json.dumps([settings_payload, ff_payload, _WORKER_CODE_REV], sort_keys=True, default=str)
     except Exception:

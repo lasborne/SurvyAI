@@ -60,6 +60,9 @@ from pydantic import Field
 from runtime_paths import is_frozen_app, user_data_path
 
 
+PRODUCTION_CLOUD_API_BASE_URL = "https://survyai-api.onrender.com"
+
+
 def _default_log_file() -> str:
     if is_frozen_app():
         path = user_data_path("logs", "survyai.log")
@@ -307,20 +310,20 @@ class Settings(BaseSettings):
     )
     
     primary_llm: Literal["deepseek", "gemini", "claude", "openai", "ollama"] = Field(
-        default="openai",
+        default="ollama",
         env="PRIMARY_LLM",
         description=(
             "Which LLM to use as primary. Options:\n"
-            "  - openai: Use OpenAI (GPT-4/4o/5) - Default\n"
+            "  - openai: Use OpenAI (GPT-4/4o/5)\n"
             "  - claude: Use Anthropic Claude (Opus/Sonnet/Haiku)\n"
             "  - gemini: Use Google Gemini\n"
             "  - deepseek: Use DeepSeek\n"
-            "  - ollama: Use local Ollama models (offline-capable; requires Ollama installed)"
+            "  - ollama: Use local Ollama models (offline-capable; default for installed desktop builds)"
         )
     )
     
     fallback_llm: Literal["deepseek", "gemini", "claude", "openai", "ollama"] = Field(
-        default="gemini",
+        default="ollama",
         env="FALLBACK_LLM",
         description="Which LLM to use if primary fails. Same options as PRIMARY_LLM."
     )
@@ -351,7 +354,7 @@ class Settings(BaseSettings):
     # ==========================================================================
 
     fast_mode_non_file_prompts: bool = Field(
-        default=False,
+        default=True,
         env="FAST_MODE_NON_FILE_PROMPTS",
         description=(
             "If True, generic non-file prompts bypass the full agent graph/tool planning and run a single LLM call. "
@@ -734,10 +737,12 @@ class Settings(BaseSettings):
     )
     
     # ==========================================================================
-    # SurvyAI Desktop / Cloud (Phase 1 placeholders)
+    # SurvyAI Desktop / Cloud
     # ==========================================================================
-    # Used by the packaged Windows app when billing/licensing calls your backend.
-    # Empty values keep current behavior: local .env + direct LLM provider keys.
+    # Used by the packaged Windows app for auth, billing, bootstrap config, and
+    # the hosted LLM proxy. Fresh end-user installs do not have a project .env,
+    # so the production backend URL must be a real default while tokens remain
+    # empty until the user signs in.
     
     survyai_access_token: str = Field(
         default="",
@@ -749,11 +754,11 @@ class Settings(BaseSettings):
     )
     
     survyai_api_base_url: str = Field(
-        default="",
+        default=PRODUCTION_CLOUD_API_BASE_URL,
         env="SURVYAI_API_BASE_URL",
         description=(
-            "Optional base URL for SurvyAI cloud API (e.g. https://api.example.com). "
-            "Phase 1: reserved for upcoming proxy; not yet used by the agent."
+            "Base URL for SurvyAI cloud API. The installed desktop app defaults "
+            "to the production backend; development can override via .env."
         ),
     )
 

@@ -85,5 +85,7 @@ Adibawa_BorrowPit_Volume/
 # Python files
 gen_JWT_SECRET.py
 
-
-
+# Others
+survyai-diagnostics.zip
+survyai.log
+testApp/

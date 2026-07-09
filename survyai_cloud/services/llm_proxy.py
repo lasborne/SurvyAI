@@ -16,6 +16,7 @@ from survyai_cloud.schemas import LlmMessageIn, LlmProxyChatIn, LlmProxyChatOut,
 from survyai_cloud.services.entitlements import (
     ensure_usage_month_rolled,
     has_platform_credit_remaining,
+    resolve_platform_llm_provider,
     subscription_allows_platform_llm,
 )
 from utils.cost_estimator import estimate_token_cost_usd, estimate_tokens, extract_message_token_usage
@@ -51,7 +52,7 @@ async def run_proxy_chat(
             detail="Subscription API credit balance exhausted for this period",
         )
 
-    llm, resolved_model = _build_server_chat_model(body, settings)
+    llm, resolved_model, resolved_provider = _build_server_chat_model(body, settings)
     llm_to_invoke = llm.bind_tools(list(body.tools or [])) if body.tools else llm
     messages = [_to_langchain_message(msg) for msg in body.messages]
     response = await asyncio.to_thread(llm_to_invoke.invoke, messages)
@@ -82,7 +83,7 @@ async def run_proxy_chat(
         db.add(user)
 
     event_meta = {
-        "provider": body.provider,
+        "provider": resolved_provider,
         "model": str(resolved_model or body.model or ""),
         "input_tokens": int(usage.get("input_tokens") or 0),
         "output_tokens": int(usage.get("output_tokens") or 0),
@@ -122,7 +123,7 @@ async def run_proxy_chat(
     }
     usage["cost_usd"] = billed_cost_usd
     return LlmProxyChatOut(
-        provider=body.provider,
+        provider=resolved_provider,
         model=str(resolved_model or body.model or ""),
         content=ai_message.content,
         tool_calls=tool_calls,
@@ -131,9 +132,16 @@ async def run_proxy_chat(
     )
 
 
-def _build_server_chat_model(body: LlmProxyChatIn, settings: CloudSettings) -> tuple[Any, str]:
+def _build_server_chat_model(body: LlmProxyChatIn, settings: CloudSettings) -> tuple[Any, str, str]:
     provider = str(body.provider or "").strip().lower()
+    requested_provider = provider
+    if provider and not _provider_has_platform_key(provider, settings):
+        fallback = resolve_platform_llm_provider(settings)
+        if fallback != provider and _provider_has_platform_key(fallback, settings):
+            provider = fallback
     model = str(body.model or "").strip()
+    if provider != requested_provider:
+        model = ""
     if provider == "openai":
         if not settings.platform_openai_api_key.strip():
             raise HTTPException(status_code=503, detail="Server missing platform OpenAI configuration")
@@ -143,7 +151,7 @@ def _build_server_chat_model(body: LlmProxyChatIn, settings: CloudSettings) -> t
             api_key=settings.platform_openai_api_key,
             temperature=body.temperature,
             max_tokens=body.max_tokens,
-        ), resolved_model
+        ), resolved_model, provider
     if provider == "deepseek":
         if not settings.platform_deepseek_api_key.strip():
             raise HTTPException(status_code=503, detail="Server missing platform DeepSeek configuration")
@@ -154,7 +162,7 @@ def _build_server_chat_model(body: LlmProxyChatIn, settings: CloudSettings) -> t
             base_url=settings.platform_deepseek_base_url,
             temperature=body.temperature,
             max_tokens=body.max_tokens,
-        ), resolved_model
+        ), resolved_model, provider
     if provider == "claude":
         if not settings.platform_anthropic_api_key.strip():
             raise HTTPException(status_code=503, detail="Server missing platform Anthropic configuration")
@@ -164,7 +172,7 @@ def _build_server_chat_model(body: LlmProxyChatIn, settings: CloudSettings) -> t
             anthropic_api_key=settings.platform_anthropic_api_key,
             temperature=body.temperature,
             max_tokens=body.max_tokens,
-        ), resolved_model
+        ), resolved_model, provider
     if provider == "gemini":
         if not settings.platform_google_api_key.strip():
             raise HTTPException(status_code=503, detail="Server missing platform Google configuration")
@@ -174,8 +182,21 @@ def _build_server_chat_model(body: LlmProxyChatIn, settings: CloudSettings) -> t
             google_api_key=settings.platform_google_api_key,
             temperature=body.temperature,
             max_output_tokens=body.max_tokens,
-        ), resolved_model
+        ), resolved_model, provider
     raise HTTPException(status_code=400, detail=f"Unsupported provider: {body.provider}")
+
+
+def _provider_has_platform_key(provider: str, settings: CloudSettings) -> bool:
+    provider = str(provider or "").strip().lower()
+    if provider == "openai":
+        return bool(settings.platform_openai_api_key.strip())
+    if provider == "claude":
+        return bool(settings.platform_anthropic_api_key.strip())
+    if provider == "gemini":
+        return bool(settings.platform_google_api_key.strip())
+    if provider == "deepseek":
+        return bool(settings.platform_deepseek_api_key.strip())
+    return False
 
 
 def _to_langchain_message(msg: LlmMessageIn) -> Any:
@@ -206,9 +227,12 @@ def _to_langchain_message(msg: LlmMessageIn) -> Any:
 def _usage_dict_from_message(message: AIMessage, body: LlmProxyChatIn) -> dict[str, Any]:
     usage = extract_message_token_usage(message)
     if usage:
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
         return {
-            "input_tokens": int(usage.get("input_tokens") or 0),
-            "output_tokens": int(usage.get("output_tokens") or 0),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens": int(usage.get("total_tokens") or (input_tokens + output_tokens)),
             "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
         }
     input_tokens = 0
@@ -218,6 +242,7 @@ def _usage_dict_from_message(message: AIMessage, body: LlmProxyChatIn) -> dict[s
     return {
         "input_tokens": int(input_tokens),
         "output_tokens": int(output_tokens),
+        "total_tokens": int(input_tokens + output_tokens),
         "cached_input_tokens": 0,
         "estimated": True,
     }

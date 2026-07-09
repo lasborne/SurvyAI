@@ -18,8 +18,10 @@ from survyai_cloud.services.entitlements import (
     apply_free_defaults,
     apply_pro_defaults,
     credit_budget_and_interval_from_paystack_payload,
+    manual_payment_period_anchor,
     subscription_period_end_from_anchor,
 )
+from survyai_cloud.services.paystack import PaystackError, disable_subscription
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 
@@ -162,8 +164,9 @@ async def _resolve_user_for_paystack_event(
 
 
 def _apply_charge_success_entitlements(user: User, data: dict[str, Any], settings: CloudSettings) -> None:
-    now = datetime.now(timezone.utc)
     budget_usd, bill_interval = credit_budget_and_interval_from_paystack_payload(data, settings)
+    paid_at = _ts_parse(data.get("paid_at") if isinstance(data, dict) else None)
+    anchor = manual_payment_period_anchor(user, paid_at)
     apply_pro_defaults(
         user,
         settings,
@@ -172,8 +175,6 @@ def _apply_charge_success_entitlements(user: User, data: dict[str, Any], setting
     )
     user.subscription_status = SubscriptionStatus.active
 
-    paid_at = _ts_parse(data.get("paid_at") if isinstance(data, dict) else None)
-    anchor = paid_at or now
     period_hint = _renewal_hint_from_invoice_or_subscription(data)
     user.subscription_current_period_end = period_hint or subscription_period_end_from_anchor(
         anchor, bill_interval
@@ -184,10 +185,19 @@ def _apply_charge_success_entitlements(user: User, data: dict[str, Any], setting
         if cust.get("customer_code"):
             user.paystack_customer_code = str(cust.get("customer_code"))
     sub_code = data.get("subscription_code")
-    if sub_code:
-        user.paystack_subscription_code = str(sub_code)
     email_token = data.get("email_token")
-    if email_token:
+    if sub_code and email_token:
+        try:
+            disable_subscription(subscription_code=str(sub_code), email_token=str(email_token), settings=settings)
+            user.paystack_subscription_code = None
+            user.paystack_email_token = None
+            user.subscription_status = SubscriptionStatus.non_renewing
+        except PaystackError:
+            user.paystack_subscription_code = str(sub_code)
+            user.paystack_email_token = str(email_token)
+    elif sub_code:
+        user.paystack_subscription_code = str(sub_code)
+    elif email_token:
         user.paystack_email_token = str(email_token)
     reference = data.get("reference")
     if reference:
@@ -236,8 +246,20 @@ async def paystack_webhook(
             db.add(user)
 
         elif event_type == "subscription.disable":
-            apply_free_defaults(user, settings)
-            user.subscription_status = SubscriptionStatus.canceled
+            now = datetime.now(timezone.utc)
+            current_end = user.subscription_current_period_end
+            if isinstance(current_end, datetime):
+                if current_end.tzinfo is None:
+                    current_end = current_end.replace(tzinfo=timezone.utc)
+                else:
+                    current_end = current_end.astimezone(timezone.utc)
+            if user.subscription_status in (SubscriptionStatus.active, SubscriptionStatus.non_renewing) and isinstance(current_end, datetime) and current_end > now:
+                user.subscription_status = SubscriptionStatus.non_renewing
+                user.paystack_subscription_code = None
+                user.paystack_email_token = None
+            else:
+                apply_free_defaults(user, settings)
+                user.subscription_status = SubscriptionStatus.canceled
             db.add(user)
 
         elif event_type == "subscription.create":
@@ -249,6 +271,13 @@ async def paystack_webhook(
                 email_token = data.get("email_token")
                 if email_token:
                     user.paystack_email_token = str(email_token)
+                if sub_code and email_token:
+                    try:
+                        disable_subscription(subscription_code=str(sub_code), email_token=str(email_token), settings=settings)
+                        user.paystack_subscription_code = None
+                        user.paystack_email_token = None
+                    except PaystackError:
+                        pass
                 cust = _customer_dict(data)
                 if cust and cust.get("customer_code"):
                     user.paystack_customer_code = str(cust.get("customer_code"))
@@ -261,12 +290,9 @@ async def paystack_webhook(
             db.add(user)
 
         elif event_type == "invoice.create":
-            # Advance notice (~3 days before charge); refresh renewal display when Paystack sends dates.
-            if isinstance(data, dict):
-                hint = _renewal_hint_from_invoice_or_subscription(data)
-                if hint is not None:
-                    user.subscription_current_period_end = hint
-                db.add(user)
+            # SurvyAI uses manual one-time renewals. Invoice events belong to
+            # Paystack subscriptions and must not extend access or trigger renewals.
+            db.add(user)
 
         elif event_type == "subscription.not_renew":
             user.subscription_status = SubscriptionStatus.non_renewing
@@ -281,7 +307,7 @@ async def paystack_webhook(
             if _paystack_invoice_indicates_paid(data):
                 paid_at = _ts_parse(data.get("paid_at") if isinstance(data.get("paid_at"), str) else None)
                 now = datetime.now(timezone.utc)
-                anchor = paid_at or now
+                anchor = manual_payment_period_anchor(user, paid_at or now)
                 budget_usd, bill_interval = credit_budget_and_interval_from_paystack_payload(data, settings)
                 apply_pro_defaults(
                     user,
@@ -298,10 +324,19 @@ async def paystack_webhook(
                 if cust and cust.get("customer_code"):
                     user.paystack_customer_code = str(cust.get("customer_code"))
                 sub_code = data.get("subscription_code")
-                if sub_code:
-                    user.paystack_subscription_code = str(sub_code)
                 et = data.get("email_token")
-                if et:
+                if sub_code and et:
+                    try:
+                        disable_subscription(subscription_code=str(sub_code), email_token=str(et), settings=settings)
+                        user.paystack_subscription_code = None
+                        user.paystack_email_token = None
+                        user.subscription_status = SubscriptionStatus.non_renewing
+                    except PaystackError:
+                        user.paystack_subscription_code = str(sub_code)
+                        user.paystack_email_token = str(et)
+                elif sub_code:
+                    user.paystack_subscription_code = str(sub_code)
+                elif et:
                     user.paystack_email_token = str(et)
                 db.add(user)
 

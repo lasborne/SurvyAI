@@ -54,7 +54,7 @@ def environment_validation_report(settings: Settings) -> str:
     else:
         lines.append("DeepSeek API key: missing")
 
-    any_key = any(
+    any_direct_provider_key = any(
         [
             settings.openai_api_key.strip(),
             settings.google_api_key.strip(),
@@ -65,8 +65,21 @@ def environment_validation_report(settings: Settings) -> str:
     lines.append("")
     lines.append("Primary LLM: " + str(settings.primary_llm))
     lines.append("Fallback LLM: " + str(settings.fallback_llm))
+    lines.append("Ollama URL: " + str(getattr(settings, "ollama_base_url", "http://localhost:11434")))
+    lines.append("Ollama model: " + str(getattr(settings, "ollama_model", "llama3.2:1b")))
+    lines.append("SurvyAI cloud API: " + str(getattr(settings, "survyai_api_base_url", "") or "not configured"))
     lines.append("Vector store: " + ("enabled" if settings.vector_store_enabled else "disabled"))
-    lines.append("Overall readiness: " + ("ready" if any_key else "needs at least one API key"))
+    local_ready = str(settings.primary_llm).lower() == "ollama" or str(settings.fallback_llm).lower() == "ollama"
+    cloud_ready = bool(str(getattr(settings, "survyai_api_base_url", "") or "").strip())
+    ready = any_direct_provider_key or local_ready or cloud_ready
+    lines.append(
+        "Overall readiness: "
+        + (
+            "ready (local Ollama/cloud sign-in/direct keys supported)"
+            if ready
+            else "needs Ollama, cloud sign-in, or a direct provider API key"
+        )
+    )
     return "\n".join(lines)
 
 

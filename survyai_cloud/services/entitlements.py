@@ -71,6 +71,25 @@ def subscription_period_end_from_anchor(anchor: datetime, interval: str) -> date
     return anchor + timedelta(days=billing_interval_period_days(interval))
 
 
+def manual_payment_period_anchor(user: User, paid_at: datetime | None = None) -> datetime:
+    """Anchor a manual renewal at current expiry when the account is still active."""
+    now = datetime.now(timezone.utc)
+    anchor = paid_at or now
+    if anchor.tzinfo is None:
+        anchor = anchor.replace(tzinfo=timezone.utc)
+    else:
+        anchor = anchor.astimezone(timezone.utc)
+    current_end = getattr(user, "subscription_current_period_end", None)
+    if isinstance(current_end, datetime):
+        if current_end.tzinfo is None:
+            current_end = current_end.replace(tzinfo=timezone.utc)
+        else:
+            current_end = current_end.astimezone(timezone.utc)
+        if current_end > anchor and user.subscription_status in ACTIVE_LLM_STATUSES:
+            return current_end
+    return anchor
+
+
 def interval_from_paystack_plan_code(plan_code: str, settings: CloudSettings) -> str:
     """Map a Paystack plan code to a SurvyAI billing interval slug."""
     pc = (plan_code or "").strip()
@@ -116,6 +135,12 @@ def credit_budget_and_interval_from_paystack_payload(
     pl = data.get("plan")
     if isinstance(pl, dict):
         plan_code = str(pl.get("plan_code") or pl.get("code") or "").strip()
+    elif isinstance(pl, str):
+        plan_code = pl.strip()
+    if not plan_code:
+        meta = data.get("metadata")
+        if isinstance(meta, dict):
+            plan_code = str(meta.get("survyai_selected_plan_code") or meta.get("plan_code") or "").strip()
     interval = interval_from_paystack_plan_code(plan_code, settings)
 
     if interval == "daily":
@@ -211,6 +236,7 @@ def has_platform_credit_remaining(
 
 def entitlements_for_user(user: User, settings: CloudSettings | None = None) -> EntitlementsOut:
     settings = settings or get_cloud_settings()
+    primary = resolve_platform_llm_provider(settings)
     return EntitlementsOut(
         plan_slug=user.plan_slug,
         subscription_status=user.subscription_status.value,
@@ -222,8 +248,31 @@ def entitlements_for_user(user: User, settings: CloudSettings | None = None) -> 
         credit_markup_multiplier=settings.credit_markup_multiplier,
         credits_billing_interval=str(user.credits_billing_interval or "monthly"),
         can_use_platform_llm=can_use_platform_llm(user, settings),
-        primary_llm=settings.platform_primary_llm,
+        primary_llm=primary,
     )
+
+
+def resolve_platform_llm_provider(settings: CloudSettings) -> str:
+    """Return the configured hosted provider that should be advertised to desktop.
+
+    Production safety: if PLATFORM_PRIMARY_LLM points to a provider whose key is
+    missing, fall back to the first configured provider. This prevents paid users
+    from being blocked by a stale env var such as PLATFORM_PRIMARY_LLM=gemini
+    when only PLATFORM_OPENAI_API_KEY is configured.
+    """
+    preferred = str(settings.platform_primary_llm or "openai").strip().lower()
+    configured = {
+        "openai": bool(settings.platform_openai_api_key.strip()),
+        "claude": bool(settings.platform_anthropic_api_key.strip()),
+        "gemini": bool(settings.platform_google_api_key.strip()),
+        "deepseek": bool(settings.platform_deepseek_api_key.strip()),
+    }
+    if configured.get(preferred):
+        return preferred
+    for provider in ("openai", "claude", "gemini", "deepseek"):
+        if configured.get(provider):
+            return provider
+    return preferred
 
 
 def build_bootstrap_payload(user: User, settings: CloudSettings | None = None) -> BootstrapOut:
@@ -231,12 +280,12 @@ def build_bootstrap_payload(user: User, settings: CloudSettings | None = None) -
     if not can_use_platform_llm(user, settings):
         raise HTTPException(status_code=403, detail="Active Pro subscription required for platform keys")
 
-    primary = settings.platform_primary_llm
+    primary = resolve_platform_llm_provider(settings)
     agent_cfg = resolve_agent_runtime_config(
         local_config_path=str(settings.platform_agent_config_path or ""),
         cloud_config_json=json.dumps(
             {
-                "primary_llm": settings.platform_primary_llm,
+                "primary_llm": primary,
                 "openai_model": settings.platform_openai_model,
                 "openai_model_nano": settings.platform_openai_model_nano,
                 "openai_model_mini": settings.platform_openai_model_mini,

@@ -48,7 +48,9 @@ def _reject_amount_confused_with_plan_code(plan_code: str) -> None:
 def _amount_kobo_for_plan(settings: CloudSettings, plan_code: str) -> int:
     """
     Paystack /transaction/initialize requires ``amount`` in the currency subunit.
-    For NGN that is kobo (1 Naira = 100 kobo). Plan slug still selects recurring billing.
+    For NGN that is kobo (1 Naira = 100 kobo). The plan code is used only as
+    SurvyAI's catalog selector; it must not be sent as Paystack's ``plan`` field
+    because that creates a recurring subscription authorization.
     """
     pc = (plan_code or "").strip()
     daily = (settings.paystack_plan_code_pro_daily or "").strip()
@@ -86,10 +88,7 @@ def initialize_transaction(
     metadata: dict[str, Any],
     settings: Optional[CloudSettings] = None,
 ) -> PaystackInitializeResult:
-    """
-    Initialize a Paystack transaction for a subscription (plan-based).
-    Returns authorization_url + reference for redirect.
-    """
+    """Initialize a one-time Paystack transaction for manual Pro access purchase."""
     settings = settings or get_cloud_settings()
     _reject_amount_confused_with_plan_code(plan_code)
     url = f"{PAYSTACK_BASE_URL}/transaction/initialize"
@@ -98,9 +97,12 @@ def initialize_transaction(
         "email": email,
         "amount": amount_kobo,
         "currency": "NGN",
-        "plan": plan_code,
         "callback_url": callback_url,
-        "metadata": metadata,
+        "metadata": {
+            **metadata,
+            "survyai_selected_plan_code": plan_code,
+            "survyai_payment_mode": "manual_one_time",
+        },
     }
     resp = requests.post(url, headers=_headers(settings), data=json.dumps(payload), timeout=25)
     try:
@@ -131,6 +133,40 @@ def verify_transaction(
         msg = body.get("message") or f"HTTP {resp.status_code}"
         raise PaystackError(f"Paystack verify failed: {msg}")
     return body.get("data") or {}
+
+
+def disable_subscription(
+    *,
+    subscription_code: str,
+    email_token: str,
+    settings: Optional[CloudSettings] = None,
+) -> bool:
+    """Disable a Paystack subscription if one was accidentally created.
+
+    This is a guardrail for older checkouts that used Paystack's recurring
+    ``plan`` field. New SurvyAI checkouts are one-time transactions and should
+    not create subscription codes at all.
+    """
+    settings = settings or get_cloud_settings()
+    code = (subscription_code or "").strip()
+    token = (email_token or "").strip()
+    if not code or not token:
+        return False
+    url = f"{PAYSTACK_BASE_URL}/subscription/disable"
+    resp = requests.post(
+        url,
+        headers=_headers(settings),
+        data=json.dumps({"code": code, "token": token}),
+        timeout=25,
+    )
+    try:
+        body = resp.json()
+    except Exception as exc:
+        raise PaystackError(f"Paystack subscription disable failed (non-JSON): {resp.status_code}") from exc
+    if not resp.ok or not body.get("status"):
+        msg = body.get("message") or f"HTTP {resp.status_code}"
+        raise PaystackError(f"Paystack subscription disable failed: {msg}")
+    return True
 
 
 def fetch_subscription_manage_link(

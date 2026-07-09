@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Annotated, Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -22,10 +22,12 @@ from survyai_cloud.schemas import (
 from survyai_cloud.services.entitlements import (
     apply_pro_defaults,
     credit_budget_and_interval_from_paystack_payload,
+    manual_payment_period_anchor,
     subscription_period_end_from_anchor,
 )
 from survyai_cloud.services.paystack import (
     PaystackError,
+    disable_subscription,
     fetch_subscription_manage_link,
     initialize_transaction,
     verify_transaction,
@@ -131,6 +133,7 @@ async def paystack_initialize(
             metadata={
                 "survyai_user_id": str(user.id),
                 "plan_slug": settings.pro_plan_slug,
+                "requested_plan_code": plan,
             },
         )
     except PaystackError as exc:
@@ -189,8 +192,16 @@ async def paystack_verify(
                 detail="Cannot verify ownership of this transaction (missing metadata; reference must match your last checkout)",
             )
 
-    now = datetime.now(timezone.utc)
     budget_usd, bill_interval = credit_budget_and_interval_from_paystack_payload(data, settings)
+    paid_at = data.get("paid_at")
+    paid_anchor: datetime | None = None
+    if isinstance(paid_at, str):
+        try:
+            dt = paid_at[:-1] + "+00:00" if paid_at.endswith("Z") else paid_at
+            paid_anchor = datetime.fromisoformat(dt)
+        except Exception:
+            paid_anchor = None
+    anchor = manual_payment_period_anchor(user, paid_anchor)
     apply_pro_defaults(
         user,
         settings,
@@ -198,14 +209,6 @@ async def paystack_verify(
         credits_billing_interval=bill_interval,
     )
     user.subscription_status = SubscriptionStatus.active
-    paid_at = data.get("paid_at")
-    anchor = now
-    if isinstance(paid_at, str):
-        try:
-            dt = paid_at[:-1] + "+00:00" if paid_at.endswith("Z") else paid_at
-            anchor = datetime.fromisoformat(dt)
-        except Exception:
-            anchor = now
     user.subscription_current_period_end = subscription_period_end_from_anchor(anchor, bill_interval)
 
     if isinstance(data.get("customer"), dict):
@@ -214,10 +217,19 @@ async def paystack_verify(
         if cc:
             user.paystack_customer_code = str(cc)
     sub_code = data.get("subscription_code")
-    if sub_code:
-        user.paystack_subscription_code = str(sub_code)
     email_token = data.get("email_token")
-    if email_token:
+    if sub_code and email_token:
+        try:
+            disable_subscription(subscription_code=str(sub_code), email_token=str(email_token), settings=settings)
+            user.paystack_subscription_code = None
+            user.paystack_email_token = None
+            user.subscription_status = SubscriptionStatus.non_renewing
+        except PaystackError:
+            user.paystack_subscription_code = str(sub_code)
+            user.paystack_email_token = str(email_token)
+    elif sub_code:
+        user.paystack_subscription_code = str(sub_code)
+    elif email_token:
         user.paystack_email_token = str(email_token)
     user.last_payment_reference = ref
 

@@ -1166,28 +1166,34 @@ class SurvyAIAgent:
             and str(getattr(self.settings, "survyai_access_token", "") or "").strip()
         )
         
-        # If primary is OpenAI, ensure API key is configured
+        # Provider keys are validated lazily inside _initialize_llm().  Do not
+        # fail construction here: packaged desktop installs do not ship provider
+        # API keys, and should still start on Ollama or the SurvyAI cloud proxy.
+        #
+        # We keep these log messages as diagnostics only.  The actual startup
+        # selection below tries the configured provider, then fallback, then
+        # Ollama, and records the provider that really became active.
         if self.settings.primary_llm == "openai":
             if not self._cloud_proxy_enabled and (
                 not self.settings.openai_api_key or not self.settings.openai_api_key.strip()
             ):
-                raise ValueError(
-                    "Primary LLM is set to 'openai' but OPENAI_API_KEY is not configured. "
-                    "Please set OPENAI_API_KEY in your .env file or environment variables."
+                logger.warning(
+                    "Primary LLM is openai but OPENAI_API_KEY is not configured; "
+                    "startup will try fallback/Ollama instead."
                 )
             model_name = getattr(self.settings, "openai_model", "gpt-4o-mini")
-            logger.info(f"✓ OpenAI configured as primary LLM (model: {model_name})")
+            logger.info(f"OpenAI configured as primary LLM (model: {model_name})")
         
         # If primary is Claude, ensure API key is configured
         elif self.settings.primary_llm == "claude":
             if not self._cloud_proxy_enabled and (
                 not self.settings.anthropic_api_key or not self.settings.anthropic_api_key.strip()
             ):
-                raise ValueError(
-                    "Primary LLM is set to 'claude' but ANTHROPIC_API_KEY is not configured. "
-                    "Please set ANTHROPIC_API_KEY in your .env file or environment variables."
+                logger.warning(
+                    "Primary LLM is claude but ANTHROPIC_API_KEY is not configured; "
+                    "startup will try fallback/Ollama instead."
                 )
-            logger.info("✓ Claude configured as primary LLM")
+            logger.info("Claude configured as primary LLM")
         
         # ------------------------------------------------------------------
         # Step 2: Initialize application processors
@@ -1258,25 +1264,69 @@ class SurvyAIAgent:
         # We have a primary LLM (default: OpenAI) and a fallback (default: Gemini)
         # If the primary fails, we automatically try the fallback
         
-        logger.info(f"Initializing primary LLM: {self.settings.primary_llm}")
-        logger.info(f"Initializing fallback LLM: {self.settings.fallback_llm}")
-        
-        try:
-            self.llm_primary = self._initialize_llm(self.settings.primary_llm)
-            logger.info(f"✓ Primary LLM ({self.settings.primary_llm}) initialized successfully")
-        except Exception as e:
-            logger.error(f"✗ Failed to initialize primary LLM ({self.settings.primary_llm}): {e}")
+        requested_primary = str(self.settings.primary_llm or "ollama").strip().lower()
+        requested_fallback = str(self.settings.fallback_llm or "ollama").strip().lower()
+        logger.info(f"Initializing primary LLM: {requested_primary}")
+        logger.info(f"Initializing fallback LLM: {requested_fallback}")
+
+        self.llm_primary: Optional[BaseChatModel] = None
+        self.llm_fallback: Optional[BaseChatModel] = None
+
+        def _startup_candidates(preferred: str) -> List[str]:
+            """Provider order for installed desktop startup.
+
+            A fresh installed app has no provider .env.  It should still start
+            with Ollama (or cloud proxy after sign-in) instead of crashing.
+            """
+            out: List[str] = []
+            for item in (preferred, requested_fallback, "ollama"):
+                item = str(item or "").strip().lower()
+                if item and item not in out:
+                    out.append(item)
+            return out
+
+        selected_primary = ""
+        last_primary_error: Optional[Exception] = None
+        for candidate in _startup_candidates(requested_primary):
+            try:
+                self.llm_primary = self._initialize_llm(candidate)
+                selected_primary = candidate
+                logger.info(f"✓ Primary LLM active: {candidate}")
+                break
+            except Exception as e:
+                last_primary_error = e
+                logger.warning(f"⚠ Could not initialize startup LLM '{candidate}': {e}")
+
+        if self.llm_primary is None or not selected_primary:
             raise ValueError(
-                f"Failed to initialize primary LLM '{self.settings.primary_llm}'. "
-                f"Please check your API key configuration. Error: {e}"
+                "Could not initialize any LLM backend. Install/start Ollama, sign in "
+                "for the SurvyAI cloud proxy, or configure a provider API key. "
+                f"Last error: {last_primary_error}"
             )
-        
-        try:
-            self.llm_fallback = self._initialize_llm(self.settings.fallback_llm)
-            logger.info(f"✓ Fallback LLM ({self.settings.fallback_llm}) initialized successfully")
-        except Exception as e:
-            logger.warning(f"⚠ Fallback LLM ({self.settings.fallback_llm}) initialization failed: {e}")
-            # Fallback initialization failure is not critical, but log it
+
+        if selected_primary != requested_primary:
+            self.settings = self.settings.model_copy(update={"primary_llm": selected_primary})
+
+        selected_fallback = ""
+        for candidate in _startup_candidates(requested_fallback):
+            if candidate == selected_primary:
+                self.llm_fallback = self.llm_primary
+                selected_fallback = candidate
+                break
+            try:
+                self.llm_fallback = self._initialize_llm(candidate)
+                selected_fallback = candidate
+                logger.info(f"✓ Fallback LLM active: {candidate}")
+                break
+            except Exception as e:
+                logger.warning(f"⚠ Could not initialize fallback LLM '{candidate}': {e}")
+
+        if self.llm_fallback is None:
+            self.llm_fallback = self.llm_primary
+            selected_fallback = selected_primary
+
+        if selected_fallback and selected_fallback != requested_fallback:
+            self.settings = self.settings.model_copy(update={"fallback_llm": selected_fallback})
         
         # ------------------------------------------------------------------
         # Step 4: Create tools
@@ -2751,6 +2801,57 @@ class SurvyAIAgent:
         )
         return bool(has_coords)
 
+    def _should_fastpath_cadastral_template_registration(self, query: str) -> bool:
+        """True when the user is only asking SurvyAI to remember a CAD template."""
+        q = (query or "").lower()
+        if ".dwg" not in q or "template" not in q:
+            return False
+        if self._should_fastpath_cadastral_cad(query):
+            return False
+        return any(
+            k in q
+            for k in (
+                "use this",
+                "valid cad template",
+                "cad template",
+                "remember",
+                "learn",
+                "use as",
+            )
+        )
+
+    def _run_cadastral_template_registration_pipeline(self, query: str) -> Dict[str, Any]:
+        """Learn and remember a cadastral CAD template without invoking the LLM."""
+        from pathlib import Path
+
+        template_path = self._extract_dwg_path_from_query(query)
+        if not template_path:
+            return {"success": False, "error": "No .dwg template path was found in the request."}
+        template_p = Path(template_path).resolve()
+        if not template_p.exists():
+            return {"success": False, "error": f"Template DWG not found: {template_p}"}
+
+        profile_path = (self._cad_template_profiles_dir() / f"{template_p.stem}.json").resolve()
+        learned = self._learn_cadastral_template_profile(
+            str(template_p),
+            profile_output=str(profile_path),
+        )
+        if not learned.get("success"):
+            return learned
+
+        self._register_cad_template_memory(str(template_p), str(profile_path))
+        return {
+            "success": True,
+            "response": (
+                "✅ CAD template learned and remembered.\n"
+                f"- Template: {template_p}\n"
+                f"- Profile: {profile_path}\n\n"
+                "You can now generate cadastral plans without repeating the template path."
+            ),
+            "template_path": str(template_p),
+            "profile_path": str(profile_path),
+        }
+
     def _should_fastpath_cadastral_cad_batch(self, query: str) -> bool:
         """
         True when the user asks to plot multiple cadastral plans in one request.
@@ -3209,12 +3310,14 @@ class SurvyAIAgent:
         fences: List[Dict[str, str]] = parse_fence_specs_from_text(q)
 
         extras_scope = (user_scope_for_extras or q).strip()
+        # Keep normal cadastral plotting deterministic and fast. The semantic
+        # assessment is only needed when the prompt asks for extras but the
+        # regex parsers did not already extract explicit roads/fences.
         run_intent_assessment = (
             getattr(self.settings, "cadastral_intent_assessment_enabled", True)
-            and (
-                not skip_intent_assessment
-                or self._scope_requests_cadastral_extras(extras_scope)
-            )
+            and not skip_intent_assessment
+            and self._scope_requests_cadastral_extras(extras_scope)
+            and not (access_roads or fences)
         )
         intent_title: Optional[str] = None
         if run_intent_assessment:
@@ -3226,7 +3329,7 @@ class SurvyAIAgent:
             )
         else:
             logger.info(
-                "Cadastral intent assessment skipped (PDF-derived subprompt; no extra road/fence request)"
+                "Cadastral intent assessment skipped (deterministic extras parser sufficient or no extras request)"
             )
 
         cad_future.result()
@@ -7868,6 +7971,73 @@ class SurvyAIAgent:
 
         return "other"
 
+    def _should_direct_answer_non_file_prompt(self, routing_query: str, prompt_action: Any, intent: str) -> bool:
+        """Bypass LangGraph/tools for self-contained non-file knowledge prompts."""
+        q = (routing_query or "").strip()
+        if not q:
+            return False
+        if looks_like_file_driven_task(q) or self._extract_document_paths(q):
+            return False
+        if prompt_action.kind in ("current_fact_lookup", "permission_affirm"):
+            return False
+        return bool(getattr(self.settings, "fast_mode_non_file_prompts", False) and intent == "knowledge")
+
+    def _run_direct_knowledge_answer(
+        self,
+        *,
+        question: str,
+        llm: Any,
+        model_name_used: Optional[str],
+        timeout_seconds: int = 60,
+    ) -> Dict[str, Any]:
+        """Single LLM call for explanatory Q&A; no tools, no graph, no stale task state."""
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        system = (
+            "You are SurvyAI, a professional surveying, geospatial, and CAD assistant. "
+            "Answer only the user's current question. Do not continue previous CAD/file tasks, "
+            "do not propose file operations, and do not mention unrelated prior work. "
+            "For surveying history/principles, be accurate, practical, and concise."
+        )
+        user = (question or "").strip()
+        msg, err, timed_out = self._run_with_timeout(
+            timeout_seconds,
+            lambda: llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]),
+            llm_model_name=model_name_used,
+        )
+        if timed_out:
+            return {
+                "success": False,
+                "error": f"Direct knowledge LLM call timed out after {timeout_seconds} seconds.",
+            }
+        if err:
+            return {"success": False, "error": str(err)}
+        raw = getattr(msg, "content", msg)
+        if isinstance(raw, list):
+            raw = "\n".join(
+                str(part.get("text", "")) if isinstance(part, dict) else str(part)
+                for part in raw
+            )
+        return {
+            "success": True,
+            "response": str(raw or "").strip(),
+            "model_name": model_name_used,
+        }
+
+    @staticmethod
+    def _is_retry_request(current_query: str) -> bool:
+        q = (current_query or "").strip().lower().strip(".! ")
+        return q in {
+            "try again",
+            "retry",
+            "rerun",
+            "run it again",
+            "do it again",
+            "try once more",
+            "repeat the last request",
+            "repeat last request",
+        }
+
     def _detect_task_complexity(self, query: str) -> Literal["simple", "average", "complex"]:
         """
         Analyze query to determine task complexity level.
@@ -12154,13 +12324,16 @@ class SurvyAIAgent:
             # raw query when there is no injected history.
             # ==================================================================
             routing_query = (actual_query_for_routing or query or "").strip() or query
+            tool_routing_query = query if self._is_retry_request(routing_query) else routing_query
+            if tool_routing_query != routing_query:
+                logger.info("Explicit retry request detected; allowing tool routing against reference history.")
 
             _pre_intent = self._classify_query_intent(routing_query)
 
             # FAST PATH (early): survey plan PDF -> CAD DWG — current turn only (not knowledge).
-            if _pre_intent != "knowledge" and self._should_fastpath_pdf_survey_replot(query, routing_query):
+            if _pre_intent != "knowledge" and self._should_fastpath_pdf_survey_replot(tool_routing_query, routing_query):
                 logger.info("PDF survey replot fast-path triggered (early router)")
-                fast = self._run_pdf_survey_replot_pipeline(query)
+                fast = self._run_pdf_survey_replot_pipeline(tool_routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 return {
                     "query": query,
@@ -12260,6 +12433,48 @@ class SurvyAIAgent:
                         model_name_used = self.settings.primary_llm
                     logger.info(f"✓ Using primary LLM: {self.settings.primary_llm} (model: {model_name_used})")
 
+            # FAST PATH: standalone knowledge/explanation prompts.
+            # This is intentionally before any tool-enabled graph execution to avoid
+            # stale CAD/file context and multi-minute planner loops for simple Q&A.
+            if self._should_direct_answer_non_file_prompt(routing_query, prompt_action, intent):
+                direct = self._run_direct_knowledge_answer(
+                    question=prompt_action.effective_query or routing_query,
+                    llm=llm_to_use,
+                    model_name_used=model_name_used,
+                    timeout_seconds=60,
+                )
+                llm_used = "fallback" if use_fallback else "primary"
+                return {
+                    "query": query,
+                    "response": direct.get("response", "") or direct.get("error", ""),
+                    "llm_used": llm_used,
+                    "model_name": direct.get("model_name", model_name_used),
+                    "complexity": complexity,
+                    "success": bool(direct.get("success")),
+                    "session_id": current_session_id,
+                    "context_retrieved": False,
+                    "error": direct.get("error") if not direct.get("success") else None,
+                }
+
+            # FAST PATH: learn/register a cadastral CAD template only.
+            # This must not go through the LLM; users often do this once after a
+            # fresh install so later plan-generation prompts can omit the path.
+            if self._should_fastpath_cadastral_template_registration(tool_routing_query):
+                fast = self._run_cadastral_template_registration_pipeline(tool_routing_query)
+                llm_used = "fallback" if use_fallback else "primary"
+                return {
+                    "query": query,
+                    "response": fast.get("response", str(fast)),
+                    "llm_used": llm_used,
+                    "model_name": model_name_used,
+                    "complexity": complexity,
+                    "success": bool(fast.get("success")),
+                    "session_id": current_session_id,
+                    "context_retrieved": False,
+                    "output_path": fast.get("template_path"),
+                    "error": fast.get("error") if not fast.get("success") else None,
+                }
+
             # FAST PATH: factual web lookup (current office holders, who-is questions)
             # Runs after permission is granted — one search + one synthesis call, no tool loop.
             if (
@@ -12309,9 +12524,9 @@ class SurvyAIAgent:
                 )
 
             # FAST PATH: multi-DWG survey plan extract → Word (per-file loaders, no agent loop)
-            if self._should_fastpath_dwg_plan_extract_to_docx(routing_query):
+            if self._should_fastpath_dwg_plan_extract_to_docx(tool_routing_query):
                 logger.info("DWG plan extract → Word fast-path triggered")
-                fast = self._run_dwg_plan_extract_to_docx_pipeline(query)
+                fast = self._run_dwg_plan_extract_to_docx_pipeline(tool_routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 return {
                     "query": query,
@@ -12327,7 +12542,7 @@ class SurvyAIAgent:
                 }
 
             # FAST PATH: save prior session answer (essay/report) to .docx
-            if self._should_fastpath_save_session_docx(routing_query, query):
+            if self._should_fastpath_save_session_docx(tool_routing_query, query):
                 fast = self._run_save_session_docx_pipeline(
                     query=query,
                     routing_query=routing_query,
@@ -12349,10 +12564,10 @@ class SurvyAIAgent:
                 }
 
             # FAST PATH: report generation to .docx (avoids LangGraph recursion/tool loops)
-            if self._should_fastpath_docx_report(routing_query):
-                out_candidate = self._extract_any_output_docx(query) or "Report.docx"
+            if self._should_fastpath_docx_report(tool_routing_query):
+                out_candidate = self._extract_any_output_docx(tool_routing_query) or "Report.docx"
                 fast = self._run_docx_report_pipeline(
-                    query=query,
+                    query=tool_routing_query,
                     output_doc_path=out_candidate,
                     llm=llm_to_use,
                     model_name_used=model_name_used or getattr(self.settings, "openai_model_mini", "gpt-5.4-mini"),
@@ -12372,8 +12587,8 @@ class SurvyAIAgent:
                 }
 
             # FAST PATH: cadastral CAD prompt (template DWG -> output DWG with parcel replot)
-            if self._should_fastpath_cadastral_cad_batch(routing_query):
-                fast = self._run_cadastral_cad_batch_pipeline(query)
+            if self._should_fastpath_cadastral_cad_batch(tool_routing_query):
+                fast = self._run_cadastral_cad_batch_pipeline(tool_routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if fast.get("success"):
                     res = fast.get("results") or []
@@ -12417,8 +12632,8 @@ class SurvyAIAgent:
                     "error": fast.get("error") if isinstance(fast, dict) else "Batch cadastral pipeline failed",
                 }
 
-            if self._should_fastpath_cadastral_cad(routing_query):
-                fast = self._run_cadastral_cad_prompt_pipeline(query)
+            if self._should_fastpath_cadastral_cad(tool_routing_query):
+                fast = self._run_cadastral_cad_prompt_pipeline(tool_routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if fast.get("success"):
                     self._last_cadastral_output_dwg = fast.get("output_dwg")
@@ -12482,8 +12697,8 @@ class SurvyAIAgent:
             # path that previously fired on a knowledge question because the
             # injected history contained "add the road".  The `intent != knowledge`
             # check is belt-and-suspenders against clearly informational questions.
-            if intent != "knowledge" and self._should_fastpath_cad_modification(routing_query):
-                mod = self._run_cad_modification_pipeline(routing_query)
+            if intent != "knowledge" and self._should_fastpath_cad_modification(tool_routing_query):
+                mod = self._run_cad_modification_pipeline(tool_routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if mod.get("success"):
                     resp_lines = [
@@ -12521,7 +12736,7 @@ class SurvyAIAgent:
             # This prevents the agent from trying to process large documents without knowing the cost/size.
             # Use routing_query so only documents referenced in the CURRENT request are
             # pre-processed (prevents stale docs from prior turns leaking in).
-            document_paths = self._extract_document_paths(routing_query)
+            document_paths = self._extract_document_paths(tool_routing_query)
             document_preflight_info = []
             
             if document_paths:
@@ -12583,14 +12798,14 @@ class SurvyAIAgent:
                         document_preflight_info,
                         key=lambda d: (int(d.get("estimated_tokens") or 0), float(d.get("file_size_mb") or 0))
                     )
-                    if self._should_fastpath_large_doc_summary(routing_query, primary_doc):
+                    if self._should_fastpath_large_doc_summary(tool_routing_query, primary_doc):
                         input_doc = primary_doc["path"]
                         output_doc = self._extract_requested_output_docx(query, input_doc) or str(
                             (Path(input_doc).parent / f"Summary_{Path(input_doc).stem}.docx").resolve()
                         )
                         logger.info("Using fast-path large document summary pipeline")
                         fast_result = self._run_large_doc_summary_pipeline(
-                            query=query,
+                            query=tool_routing_query,
                             input_doc_path=input_doc,
                             output_doc_path=output_doc,
                             llm=llm_to_use,
@@ -13041,6 +13256,36 @@ class SurvyAIAgent:
                     "tokens per minute" in error_str or
                     "tpm" in error_str
                 )
+
+                active_provider = self.settings.fallback_llm if use_fallback else self.settings.primary_llm
+                is_ollama_connection_error = (
+                    str(active_provider).lower() == "ollama"
+                    and (
+                        "connection error" in error_str
+                        or "connection refused" in error_str
+                        or "failed to establish" in error_str
+                        or "localhost:11434" in error_str
+                        or "ollama" in error_str
+                    )
+                )
+                if is_ollama_connection_error:
+                    return {
+                        "query": query,
+                        "response": (
+                            "Local Ollama is selected, but SurvyAI could not reach the Ollama server.\n\n"
+                            "What to do:\n"
+                            "1. Open Ollama and make sure it is running.\n"
+                            f"2. Confirm the model is installed: `ollama pull {getattr(self.settings, 'ollama_model', 'llama3.2:1b')}`\n"
+                            f"3. Confirm the server URL is `{getattr(self.settings, 'ollama_base_url', 'http://localhost:11434')}`.\n\n"
+                            "CAD fast-path tasks can still run without an LLM once the request is parsed, "
+                            "but general chat/model reasoning needs a running local model or a signed-in cloud proxy."
+                        ),
+                        "success": False,
+                        "error": "ollama_connection_error",
+                        "llm_used": "fallback" if use_fallback else "primary",
+                        "model_name": getattr(self.settings, "ollama_model", "llama3.2:1b"),
+                        "complexity": complexity if 'complexity' in locals() else None,
+                    }
 
                 if is_tpm_error:
                     current_model = model_name_used or self._current_openai_model or getattr(self.settings, "openai_model", "unknown")
