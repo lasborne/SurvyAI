@@ -34,6 +34,37 @@ import uuid
 from typing import Any, Dict, Optional
 
 
+# Windows SetThreadExecutionState flags (keep system + display awake during runs).
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def _windows_acquire_run_awake() -> bool:
+    """Ask Windows not to sleep/hibernate while a SurvyAI task is active."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED
+        return bool(ctypes.windll.kernel32.SetThreadExecutionState(flags))
+    except Exception:
+        return False
+
+
+def _windows_release_run_awake() -> None:
+    """Clear the keep-awake request so normal power policy resumes."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+    except Exception:
+        pass
+
+
 def _payload_signature(settings_payload: Dict[str, Any], ff_payload: Dict[str, Any]) -> str:
     """Stable fingerprint of the inputs the agent is built from.
 
@@ -116,14 +147,19 @@ def _agent_worker_loop(in_queue: "multiprocessing.Queue", out_queue: "multiproce
                 out_queue.put({"kind": "warmed", "req_id": req_id})
                 continue
 
-            result = svc.run_task(
-                req.get("query") or "",
-                use_fallback_llm=bool(req.get("use_fallback_llm", False)),
-                session_id=req.get("session_id"),
-                interactive=bool(req.get("interactive", False)),
-            )
-            out_queue.put({"kind": "result", "req_id": req_id, "payload": result.raw})
+            _windows_acquire_run_awake()
+            try:
+                result = svc.run_task(
+                    req.get("query") or "",
+                    use_fallback_llm=bool(req.get("use_fallback_llm", False)),
+                    session_id=req.get("session_id"),
+                    interactive=bool(req.get("interactive", False)),
+                )
+                out_queue.put({"kind": "result", "req_id": req_id, "payload": result.raw})
+            finally:
+                _windows_release_run_awake()
         except Exception:
+            _windows_release_run_awake()
             out_queue.put({"kind": "error", "req_id": req_id, "payload": traceback.format_exc()})
 
 

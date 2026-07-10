@@ -59,20 +59,23 @@ async def run_proxy_chat(
     ai_message = response if isinstance(response, AIMessage) else AIMessage(content=str(response))
 
     usage = _usage_dict_from_message(ai_message, body)
-    billed_cost_usd = round(
-        estimate_token_cost_usd(
-            str(
-                resolved_model
-                or body.model
-                or ai_message.response_metadata.get("model_name")
-                or ""
+    usage_is_reported = not bool(usage.get("estimated"))
+    billed_cost_usd = 0.0
+    if usage_is_reported:
+        billed_cost_usd = round(
+            estimate_token_cost_usd(
+                str(
+                    resolved_model
+                    or body.model
+                    or ai_message.response_metadata.get("model_name")
+                    or ""
+                ),
+                int(usage.get("input_tokens") or 0),
+                int(usage.get("output_tokens") or 0),
+                cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
             ),
-            int(usage.get("input_tokens") or 0),
-            int(usage.get("output_tokens") or 0),
-            cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
-        ),
-        6,
-    )
+            6,
+        )
     markup_cost_usd = round(billed_cost_usd * settings.credit_markup_multiplier, 6)
     budget = float(user.monthly_credits_usd or 0.0)
     used_before = float(user.monthly_credits_used_usd or 0.0)
@@ -88,8 +91,11 @@ async def run_proxy_chat(
         "input_tokens": int(usage.get("input_tokens") or 0),
         "output_tokens": int(usage.get("output_tokens") or 0),
         "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
-        "billing_basis": "llm_proxy_server_usage",
+        "billing_basis": "llm_proxy_provider_reported_usage"
+        if usage_is_reported
+        else "llm_proxy_estimated_usage_not_billed",
         "markup_cost_usd": markup_cost_usd,
+        "usage_estimated": bool(usage.get("estimated")),
     }
     db.add(
         UsageEvent(

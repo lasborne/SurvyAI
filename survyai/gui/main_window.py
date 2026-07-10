@@ -1701,9 +1701,9 @@ class MainWindow(QMainWindow):
         credits_title = QLabel("Credits & usage")
         credits_title.setObjectName("pageTitle")
         credits_sub = QLabel(
-            "Track API spend for runs in this desktop app. \"Used\" updates after each task "
-            "(including PDF replot and other fast paths). Displayed USD = raw API cost × SurvyAI markup. "
-            "Pro hosted plans: sign in and use Refresh from cloud to sync your subscription pool."
+            "Track API spend for runs in this desktop app. Credit pool is your subscription USD "
+            "equivalent. Used is provider-reported LLM cost × SurvyAI markup inside the active "
+            "paid window. Pro hosted plans: sign in and use Refresh from cloud to sync."
         )
         credits_sub.setObjectName("pageSubtitle")
         credits_sub.setWordWrap(True)
@@ -1732,7 +1732,7 @@ class MainWindow(QMainWindow):
         self._credits_remaining_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         summary_form.addRow("Credit pool (subscription USD)", self._credits_total_label)
-        summary_form.addRow("Used (USD)", self._credits_used_label)
+        summary_form.addRow("Used (marked-up LLM cost)", self._credits_used_label)
         summary_form.addRow("Remaining", self._credits_remaining_label)
         summary_form.addRow("", self._credits_pct_label)
         summary_outer.addLayout(summary_form)
@@ -2502,6 +2502,8 @@ class MainWindow(QMainWindow):
         self._state.monthly_credits_used_usd = 0.0
         self._state.can_use_platform_llm = False
         self._state.credits_billing_interval = ""
+        self._state.usage_period_anchor = ""
+        self._state.subscription_current_period_end = ""
         self._state.credit_banner_anchor_budget_usd = -1.0
         self._state.credit_banner_anchor_used_usd = -1.0
         self._state.credit_banner_dismissed_half = False
@@ -2696,7 +2698,18 @@ class MainWindow(QMainWindow):
             )
         self._license_settings_label.setText(license_text)
 
+        if has_pro:
+            self._paystack_subscribe_btn.setText("Extend Pro access…")
+            self._paystack_subscribe_btn.setToolTip(
+                "Add another Paystack access period to your active Pro account."
+            )
+        else:
+            self._paystack_subscribe_btn.setText("Buy Pro access…")
+            self._paystack_subscribe_btn.setToolTip(
+                "Choose daily, weekly, monthly, or annual access, then complete checkout in your browser."
+            )
         self._paystack_subscribe_btn.setEnabled(cloud_ok)
+        # Pro users can intentionally buy another period; the label makes that explicit.
         self._paystack_subscribe_btn.setVisible(cloud_ok)
         self._paystack_manage_btn.setEnabled(cloud_ok and bool(me.get("can_manage_paystack_subscription")))
         self._paystack_verify_btn.setEnabled(cloud_ok)
@@ -2972,10 +2985,12 @@ class MainWindow(QMainWindow):
         plan = str(me.get("plan_slug") or "").strip().lower()
         status = str(me.get("subscription_status") or "").strip().lower()
         has_pro = plan == "pro" and status in {"active", "trialing", "non_renewing"}
-        return has_pro and interval in {"daily", "weekly", "monthly"}
+        return has_pro and interval in {"daily", "weekly", "monthly", "annual"}
 
     def _billing_period_days(self, interval: str) -> int:
-        return {"daily": 1, "weekly": 7, "monthly": 30}.get(interval.strip().lower(), 30)
+        return {"daily": 1, "weekly": 7, "monthly": 30, "annual": 365}.get(
+            interval.strip().lower(), 30
+        )
 
     def _is_monthly_pro_billing_period(self) -> bool:
         """Backward-compatible alias for monthly rolling Pro billing."""
@@ -2994,8 +3009,8 @@ class MainWindow(QMainWindow):
         """
         Return (start inclusive, end exclusive, human label) for the current usage window.
 
-        - Daily / weekly / monthly Paystack Pro: activation anchor → period end from cloud.
-        - Free, annual, or no subscription: 1st of calendar month (local time) → 1st of next month.
+        Prefer the exact cloud paid window (usage_period_anchor → subscription_current_period_end).
+        Free / unsigned-in: calendar month local time.
         """
         if self._is_rolling_pro_billing_period():
             me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
@@ -3005,17 +3020,27 @@ class MainWindow(QMainWindow):
                 or "monthly"
             ).strip().lower()
             period_days = self._billing_period_days(interval)
-            period_end = self._parse_datetime_value(me.get("subscription_current_period_end"))
-            if period_end is not None:
+            period_end = self._parse_datetime_value(
+                self._state.subscription_current_period_end
+                or me.get("subscription_current_period_end")
+            )
+            period_start = self._parse_datetime_value(
+                self._state.usage_period_anchor or me.get("usage_period_anchor")
+            )
+            if period_start is None and period_end is not None:
+                # Legacy fallback when cloud has not yet sent the paid-window anchor.
                 period_start = period_end - timedelta(days=period_days)
+            if period_start is not None and period_end is not None:
                 interval_label = {
                     "daily": "daily",
                     "weekly": "weekly",
                     "monthly": "monthly",
+                    "annual": "annual",
                 }.get(interval, "billing")
                 label = (
-                    f"Current {interval_label} billing period "
-                    f"({period_start.strftime('%d %b %Y')} – {period_end.strftime('%d %b %Y')} UTC)"
+                    f"Current {interval_label} paid window "
+                    f"({period_start.strftime('%d %b %Y %H:%M')} – "
+                    f"{period_end.strftime('%d %b %Y %H:%M')} UTC)"
                 )
                 return period_start, period_end, label
 
@@ -3105,9 +3130,9 @@ class MainWindow(QMainWindow):
         markup = self._credit_markup_multiplier()
         _, _, period_label = self._credits_usage_period_bounds()
         self._credits_period_note.setText(
-            f"{period_label}. \"Used\" is the total of every hosted-model run in this window "
-            f"(from the 1st of the month through today for free/annual accounts), billed at "
-            f"SurvyAI markup. Lifetime total is at the bottom."
+            f"{period_label}. Credit pool is subscription USD. Used is provider-reported "
+            f"LLM cost × SurvyAI markup ({markup:g}×) inside this paid window. "
+            f"Lifetime total is at the bottom."
         )
 
         self._credits_total_label.setText(f"${budget:,.2f}")
@@ -3493,6 +3518,43 @@ class MainWindow(QMainWindow):
         self._state.credit_markup_multiplier = float(ent.get("credit_markup_multiplier") or 2.0)
         self._state.can_use_platform_llm = bool(ent.get("can_use_platform_llm"))
         self._state.credits_billing_interval = str(ent.get("credits_billing_interval") or "").strip().lower()
+
+        def _as_iso(value: object) -> str:
+            if value is None:
+                return ""
+            if hasattr(value, "isoformat"):
+                try:
+                    return str(value.isoformat())
+                except Exception:
+                    return str(value)
+            text = str(value).strip()
+            return text
+
+        anchor = _as_iso(ent.get("usage_period_anchor"))
+        period_end = _as_iso(ent.get("subscription_current_period_end"))
+        if anchor:
+            self._state.usage_period_anchor = anchor
+        if period_end:
+            self._state.subscription_current_period_end = period_end
+
+        # Keep cloud_me period fields fresh even on entitlements-only refresh.
+        me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
+        me = dict(me)
+        if ent.get("plan_slug") is not None:
+            me["plan_slug"] = ent.get("plan_slug")
+        if ent.get("subscription_status") is not None:
+            me["subscription_status"] = ent.get("subscription_status")
+        if self._state.credits_billing_interval:
+            me["credits_billing_interval"] = self._state.credits_billing_interval
+        if self._state.usage_period_anchor:
+            me["usage_period_anchor"] = self._state.usage_period_anchor
+        if self._state.subscription_current_period_end:
+            me["subscription_current_period_end"] = self._state.subscription_current_period_end
+        me["monthly_credits_usd"] = self._state.monthly_credits_usd
+        me["monthly_credits_used_usd"] = self._state.monthly_credits_used_usd
+        me["can_use_platform_llm"] = self._state.can_use_platform_llm
+        self._state.cloud_me = me
+
         self._reconcile_credits_used_from_history()
         self._update_credit_usage_notice()
 
@@ -3501,10 +3563,21 @@ class MainWindow(QMainWindow):
             list((result.raw or {}).get("messages") or []),
             str(result.model_name or ""),
             response_text=result.response or "",
+            infer_missing_cached=False,
         )
-        raw_cost = float(usage.get("cost_usd") or result.llm_cost_usd or 0.0)
+        usage_estimated = bool(usage.get("estimated"))
+        raw_cost = (
+            float(result.llm_cost_usd or 0.0)
+            if usage_estimated
+            else float(usage.get("cost_usd") or result.llm_cost_usd or 0.0)
+        )
         if raw_cost <= 0:
             return None, 0.0
+        if usage_estimated:
+            # Local fast paths may carry provider-reported cost without token
+            # breakdown. Count it locally, but don't report estimated tokens as
+            # billable cloud usage.
+            return None, raw_cost
         event: dict[str, object] = {
             "kind": "agent_run",
             "quantity": 1,

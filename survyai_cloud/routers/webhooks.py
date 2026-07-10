@@ -172,6 +172,7 @@ def _apply_charge_success_entitlements(user: User, data: dict[str, Any], setting
         settings,
         credit_budget_usd=budget_usd,
         credits_billing_interval=bill_interval,
+        paid_at=paid_at,
     )
     user.subscription_status = SubscriptionStatus.active
 
@@ -314,6 +315,7 @@ async def paystack_webhook(
                     settings,
                     credit_budget_usd=budget_usd,
                     credits_billing_interval=bill_interval,
+                    paid_at=paid_at or now,
                 )
                 user.subscription_status = SubscriptionStatus.active
                 period_hint = _renewal_hint_from_invoice_or_subscription(data)

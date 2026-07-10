@@ -22,33 +22,46 @@ ACTIVE_LLM_STATUSES = frozenset(
 )
 
 
-def _month_start_utc(dt: datetime) -> datetime:
-    """
-    First instant of the calendar month in UTC, timezone-aware.
-
-    SQLite often returns **naive** datetimes; ``datetime.now(timezone.utc)`` is
-    aware. Comparing naive vs aware raises ``TypeError`` (HTTP 500 on /v1/me).
-    """
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    else:
-        dt = dt.astimezone(timezone.utc)
-    return dt.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-
-
 def _pro_monthly_credit_budget_usd(settings: CloudSettings) -> float:
     """Convert the Pro monthly NGN price to a USD credit balance."""
     return round(settings.paystack_pro_monthly_amount_ngn * settings.ngn_to_usd_rate, 4)
 
 
 def _pro_weekly_credit_budget_usd(settings: CloudSettings) -> float:
-    """Pro weekly credit pool = monthly pool ÷ 4."""
-    return round(_pro_monthly_credit_budget_usd(settings) / 4, 4)
+    """Pro weekly credit pool from the weekly NGN catalog price."""
+    return round(settings.paystack_pro_weekly_amount_ngn * settings.ngn_to_usd_rate, 4)
 
 
 def _pro_daily_credit_budget_usd(settings: CloudSettings) -> float:
-    """Pro daily credit pool = monthly pool ÷ 30."""
-    return round(_pro_monthly_credit_budget_usd(settings) / 30, 4)
+    """Pro daily credit pool from the daily NGN catalog price."""
+    return round(settings.paystack_pro_daily_amount_ngn * settings.ngn_to_usd_rate, 4)
+
+
+def _aware_utc(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _subscription_period_still_open(user: User, now: datetime | None = None) -> bool:
+    """True when subscription_current_period_end is missing (legacy) or still in the future."""
+    now = now or datetime.now(timezone.utc)
+    period_end = _aware_utc(getattr(user, "subscription_current_period_end", None))
+    if period_end is None:
+        return True
+    return period_end > now
+
+
+def _is_active_early_renewal(user: User, settings: CloudSettings, now: datetime | None = None) -> bool:
+    """Active/trialing Pro with an unexpired paid window — remaining credits should carry forward."""
+    now = now or datetime.now(timezone.utc)
+    if user.plan_slug != settings.pro_plan_slug:
+        return False
+    if user.subscription_status not in ACTIVE_LLM_STATUSES:
+        return False
+    return _subscription_period_still_open(user, now)
 
 
 def _pro_annual_credit_budget_usd(settings: CloudSettings) -> float:
@@ -143,69 +156,58 @@ def credit_budget_and_interval_from_paystack_payload(
             plan_code = str(meta.get("survyai_selected_plan_code") or meta.get("plan_code") or "").strip()
     interval = interval_from_paystack_plan_code(plan_code, settings)
 
-    if interval == "daily":
-        return _pro_daily_credit_budget_usd(settings), interval
-    if interval == "weekly":
-        return _pro_weekly_credit_budget_usd(settings), interval
-    if interval == "annual":
-        return _pro_annual_credit_budget_usd(settings), interval
-    if interval == "monthly":
-        amount_raw = data.get("amount")
-        try:
-            if isinstance(amount_raw, (int, float)) and float(amount_raw) > 0:
-                ngn = float(amount_raw) / 100.0
-                return round(ngn * settings.ngn_to_usd_rate, 4), interval
-        except Exception:
-            pass
-        return _pro_monthly_credit_budget_usd(settings), interval
-
     amount_raw = data.get("amount")
-    credit_usd: Optional[float] = None
+    paid_usd: Optional[float] = None
     try:
         if isinstance(amount_raw, (int, float)) and float(amount_raw) > 0:
             ngn = float(amount_raw) / 100.0
-            credit_usd = round(ngn * settings.ngn_to_usd_rate, 4)
+            paid_usd = round(ngn * settings.ngn_to_usd_rate, 4)
     except Exception:
-        credit_usd = None
-    return credit_usd, interval
+        paid_usd = None
+
+    if interval == "daily":
+        return (paid_usd if paid_usd is not None else _pro_daily_credit_budget_usd(settings)), interval
+    if interval == "weekly":
+        return (paid_usd if paid_usd is not None else _pro_weekly_credit_budget_usd(settings)), interval
+    if interval == "annual":
+        return (paid_usd if paid_usd is not None else _pro_annual_credit_budget_usd(settings)), interval
+    if interval == "monthly":
+        return (paid_usd if paid_usd is not None else _pro_monthly_credit_budget_usd(settings)), interval
+
+    return paid_usd, interval
 
 
 async def ensure_usage_month_rolled(user: User, db: AsyncSession) -> None:
-    """Reset usage counters when the subscriber's billing period rolls."""
-    settings = get_cloud_settings()
+    """
+    Keep ``usage_period_anchor`` aligned with the paid subscription window.
+
+    Credit counters are **not** auto-reset just because calendar time elapsed —
+    that would grant a free pool without payment. Fresh / carried budgets are
+    applied on verified payment via ``apply_pro_defaults``.
+    """
     now = datetime.now(timezone.utc)
     interval = str(user.credits_billing_interval or "monthly").strip().lower()
-    if (
-        user.plan_slug == settings.pro_plan_slug
-        and interval in ("daily", "weekly")
-    ):
-        period_days = billing_interval_period_days(interval)
-        anchor = user.usage_period_anchor
-        if anchor is None:
-            user.usage_period_anchor = now
-            db.add(user)
-            return
-        if anchor.tzinfo is None:
-            anchor = anchor.replace(tzinfo=timezone.utc)
+    period_days = billing_interval_period_days(interval)
+    period_end = _aware_utc(getattr(user, "subscription_current_period_end", None))
+    anchor = _aware_utc(user.usage_period_anchor)
+
+    if anchor is None:
+        if period_end is not None:
+            # Back-derive the paid-window start from the known period end.
+            user.usage_period_anchor = period_end - timedelta(days=period_days)
         else:
-            anchor = anchor.astimezone(timezone.utc)
-        if now >= anchor + timedelta(days=period_days):
-            user.monthly_agent_runs_used = 0
-            user.monthly_credits_used_usd = 0.0
             user.usage_period_anchor = now
-            db.add(user)
+        db.add(user)
         return
 
-    anchor = user.usage_period_anchor
-    if anchor is None:
-        user.usage_period_anchor = _month_start_utc(now)
-        db.add(user)
+    # While the paid window is still open (including early-renewal extensions),
+    # preserve used credits and the original anchor so remaining balance carries.
+    if period_end is not None and now < period_end:
         return
-    if _month_start_utc(anchor) < _month_start_utc(now):
-        user.monthly_agent_runs_used = 0
-        user.monthly_credits_used_usd = 0.0
-        user.usage_period_anchor = _month_start_utc(now)
-        db.add(user)
+
+    # Expired window without a new payment: leave counters as-is so the UI still
+    # reflects consumption in the last paid period. Hosted LLM access is blocked
+    # separately by ``subscription_allows_platform_llm``.
 
 
 def can_use_platform_llm(user: User, settings: CloudSettings | None = None) -> bool:
@@ -220,7 +222,10 @@ def subscription_allows_platform_llm(
     settings = settings or get_cloud_settings()
     if user.plan_slug != settings.pro_plan_slug:
         return False
-    return user.subscription_status in ACTIVE_LLM_STATUSES
+    if user.subscription_status not in ACTIVE_LLM_STATUSES:
+        return False
+    # Paid hosted access requires an unexpired subscription window when set.
+    return _subscription_period_still_open(user)
 
 
 def has_platform_credit_remaining(
@@ -247,6 +252,8 @@ def entitlements_for_user(user: User, settings: CloudSettings | None = None) -> 
         monthly_credits_used_usd=user.monthly_credits_used_usd,
         credit_markup_multiplier=settings.credit_markup_multiplier,
         credits_billing_interval=str(user.credits_billing_interval or "monthly"),
+        usage_period_anchor=getattr(user, "usage_period_anchor", None),
+        subscription_current_period_end=getattr(user, "subscription_current_period_end", None),
         can_use_platform_llm=can_use_platform_llm(user, settings),
         primary_llm=primary,
     )
@@ -344,13 +351,24 @@ def apply_pro_defaults(
     *,
     credit_budget_usd: Optional[float] = None,
     credits_billing_interval: Optional[str] = None,
+    paid_at: Optional[datetime] = None,
 ) -> None:
     """
     Set Pro plan quotas. Credit **budget** is the subscriber's USD pool (from payment NGN×rate or catalog).
 
     API usage is charged at raw provider cost × ``credit_markup_multiplier`` against that pool.
+
+    Early renewal (still inside an active paid window): add the new plan USD to the
+    existing pool, preserve ``monthly_credits_used_usd``, and keep the original
+    ``usage_period_anchor`` so remaining credits carry forward.
+
+    Purchase after expiry: budget = new plan USD, used = 0, anchor = paid time.
     """
     settings = settings or get_cloud_settings()
+    now = datetime.now(timezone.utc)
+    paid_anchor = _aware_utc(paid_at) or now
+    early_renewal = _is_active_early_renewal(user, settings, now)
+
     user.plan_slug = settings.pro_plan_slug
     user.max_devices = settings.default_max_devices_pro
 
@@ -362,10 +380,18 @@ def apply_pro_defaults(
     user.monthly_agent_runs_quota = pro_agent_runs_quota_for_interval(settings, raw_interval)
 
     if credit_budget_usd is not None and float(credit_budget_usd) >= 0:
-        user.monthly_credits_usd = round(float(credit_budget_usd), 4)
-        user.monthly_agent_runs_used = 0
-        user.monthly_credits_used_usd = 0.0
-        user.usage_period_anchor = datetime.now(timezone.utc)
+        new_budget = round(float(credit_budget_usd), 4)
+        if early_renewal:
+            existing = float(getattr(user, "monthly_credits_usd", 0.0) or 0.0)
+            user.monthly_credits_usd = round(existing + new_budget, 4)
+            # Preserve used credits and the original paid-window anchor.
+            if user.usage_period_anchor is None:
+                user.usage_period_anchor = paid_anchor
+        else:
+            user.monthly_credits_usd = new_budget
+            user.monthly_agent_runs_used = 0
+            user.monthly_credits_used_usd = 0.0
+            user.usage_period_anchor = paid_anchor
     elif user.credits_billing_interval == "annual":
         user.monthly_credits_usd = _pro_annual_credit_budget_usd(settings)
     elif user.credits_billing_interval == "weekly":

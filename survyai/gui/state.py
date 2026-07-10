@@ -122,6 +122,9 @@ class DesktopState:
     # Pro platform keys (server decides); used client-side to gate paid LLM when credits hit zero.
     can_use_platform_llm: bool = False
     credits_billing_interval: str = ""  # "daily" | "weekly" | "monthly" | "annual" from cloud
+    # Exact paid usage window from cloud (preferred over deriving start from period_end - days).
+    usage_period_anchor: str = ""
+    subscription_current_period_end: str = ""
     # Soft credit-usage reminders (console strip); reset when budget/period changes (see main_window).
     credit_banner_anchor_budget_usd: float = -1.0
     credit_banner_anchor_used_usd: float = -1.0
@@ -170,6 +173,8 @@ class DesktopState:
             credit_markup_multiplier=float(raw.get("credit_markup_multiplier", 2.0)),
             can_use_platform_llm=bool(raw.get("can_use_platform_llm", False)),
             credits_billing_interval=str(raw.get("credits_billing_interval", "") or ""),
+            usage_period_anchor=str(raw.get("usage_period_anchor", "") or ""),
+            subscription_current_period_end=str(raw.get("subscription_current_period_end", "") or ""),
             credit_banner_anchor_budget_usd=float(raw.get("credit_banner_anchor_budget_usd", -1.0)),
             credit_banner_anchor_used_usd=float(raw.get("credit_banner_anchor_used_usd", -1.0)),
             credit_banner_dismissed_half=bool(raw.get("credit_banner_dismissed_half", False)),
@@ -476,6 +481,8 @@ class AppStateStore:
             "monthly_credits_used_usd": state.monthly_credits_used_usd,
             "can_use_platform_llm": state.can_use_platform_llm,
             "credits_billing_interval": state.credits_billing_interval,
+            "usage_period_anchor": state.usage_period_anchor,
+            "subscription_current_period_end": state.subscription_current_period_end,
             "secret_storage_enabled": bool(self.secret_store.secret_path.exists() or os.name == "nt"),
             "secret_storage_path": str(self.secret_store.secret_path),
             "machine_fingerprint_sha256": compute_machine_fingerprint(),

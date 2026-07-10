@@ -48,7 +48,8 @@ async def ingest_usage(
     for ev in body.events:
         meta = dict(ev.meta or {})
         computed_cost_usd = float(ev.cost_usd or 0.0)
-        if ev.kind == "agent_run" and ev.model_name:
+        usage_is_estimated = bool(meta.get("usage_estimated"))
+        if ev.kind == "agent_run" and ev.model_name and not usage_is_estimated:
             computed_cost_usd = round(
                 estimate_token_cost_usd(
                     ev.model_name,
@@ -65,6 +66,15 @@ async def ingest_usage(
             meta["cached_input_tokens"] = int(ev.cached_input_tokens)
             if float(ev.cost_usd or 0.0) > 0:
                 meta["client_cost_usd"] = round(float(ev.cost_usd), 6)
+        elif ev.kind == "agent_run" and usage_is_estimated:
+            computed_cost_usd = 0.0
+            meta["billing_basis"] = "estimated_usage_not_billed"
+            meta["model_name"] = ev.model_name
+            meta["input_tokens"] = int(ev.input_tokens)
+            meta["output_tokens"] = int(ev.output_tokens)
+            meta["cached_input_tokens"] = int(ev.cached_input_tokens)
+            if float(ev.cost_usd or 0.0) > 0:
+                meta["client_estimated_cost_usd"] = round(float(ev.cost_usd), 6)
         else:
             meta["billing_basis"] = "client_cost_usd"
         batch_cost_usd += computed_cost_usd

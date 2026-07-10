@@ -3310,14 +3310,15 @@ class SurvyAIAgent:
         fences: List[Dict[str, str]] = parse_fence_specs_from_text(q)
 
         extras_scope = (user_scope_for_extras or q).strip()
-        # Keep normal cadastral plotting deterministic and fast. The semantic
-        # assessment is only needed when the prompt asks for extras but the
-        # regex parsers did not already extract explicit roads/fences.
+        extras_requested = self._scope_requests_cadastral_extras(extras_scope)
+        # Keep normal cadastral plotting deterministic and fast when regex already
+        # extracted roads/fences. Run semantic assessment when skipping is disabled
+        # (direct cadastral prompts) OR when the user scope still asks for extras
+        # (e.g. PDF replot sub-prompts that omit natural-language road/fence text).
         run_intent_assessment = (
             getattr(self.settings, "cadastral_intent_assessment_enabled", True)
-            and not skip_intent_assessment
-            and self._scope_requests_cadastral_extras(extras_scope)
             and not (access_roads or fences)
+            and (not skip_intent_assessment or extras_requested)
         )
         intent_title: Optional[str] = None
         if run_intent_assessment:
@@ -3329,7 +3330,8 @@ class SurvyAIAgent:
             )
         else:
             logger.info(
-                "Cadastral intent assessment skipped (deterministic extras parser sufficient or no extras request)"
+                "Cadastral intent assessment skipped "
+                "(regex extras sufficient, assessment disabled, or skipped with no extras in user scope)"
             )
 
         cad_future.result()
@@ -8038,6 +8040,55 @@ class SurvyAIAgent:
             "repeat last request",
         }
 
+    @classmethod
+    def _is_retry_request_from_routing_context(
+        cls,
+        *,
+        raw_query: str,
+        extracted_query: str,
+        routing_query: str,
+    ) -> bool:
+        """
+        Detect short retry follow-ups without losing the history blob needed to rerun.
+
+        The GUI may wrap the current user message in continuation/history text.
+        Routing normally uses the extracted current request, but retry detection
+        should also inspect marker tails and final user/request lines in case the
+        extraction was empty or trimmed differently.
+        """
+        candidates: List[str] = []
+        for item in (routing_query, extracted_query):
+            if item:
+                candidates.append(item)
+
+        raw = raw_query or ""
+        marker = "NOW, the user wants you to continue with this new request:"
+        if marker in raw:
+            candidates.append(raw.split(marker)[-1])
+        elif raw:
+            candidates.append(raw)
+
+        # Common transcript/context line forms: "User: retry" or "New request: retry".
+        for line in reversed([ln.strip() for ln in raw.splitlines() if ln.strip()]):
+            m = re.match(
+                r"^(?:user|human|current\s+user|new\s+request|request)\s*:\s*(.+)$",
+                line,
+                flags=re.IGNORECASE,
+            )
+            if m:
+                candidates.append(m.group(1))
+                break
+        if raw:
+            tail_lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            if tail_lines:
+                candidates.append(tail_lines[-1])
+
+        for candidate in candidates:
+            text = str(candidate or "").strip().strip("'\"")
+            if cls._is_retry_request(text):
+                return True
+        return False
+
     def _detect_task_complexity(self, query: str) -> Literal["simple", "average", "complex"]:
         """
         Analyze query to determine task complexity level.
@@ -12324,7 +12375,12 @@ class SurvyAIAgent:
             # raw query when there is no injected history.
             # ==================================================================
             routing_query = (actual_query_for_routing or query or "").strip() or query
-            tool_routing_query = query if self._is_retry_request(routing_query) else routing_query
+            retry_requested = self._is_retry_request_from_routing_context(
+                raw_query=query,
+                extracted_query=actual_query_for_routing,
+                routing_query=routing_query,
+            )
+            tool_routing_query = query if retry_requested else routing_query
             if tool_routing_query != routing_query:
                 logger.info("Explicit retry request detected; allowing tool routing against reference history.")
 
@@ -13391,23 +13447,28 @@ class SurvyAIAgent:
         initial_messages_token_hint: Optional[int] = None,
     ) -> float:
         """
-        Best-effort USD cost for the graph run (Credits & Usage / local tracking).
+        Provider-reported USD cost for the graph run (Credits & Usage / local tracking).
 
         Raw provider cost: per AIMessage usage with cached-input pricing, summed across
-        the run. The desktop UI applies credit_markup_multiplier (default 2×) at display.
+        the run. If the provider omits usage metadata, return 0 so customer credits
+        are not debited from estimates.
         """
-        from utils.cost_estimator import estimate_graph_llm_cost_usd
+        from utils.cost_estimator import summarize_graph_llm_usage
 
         mn = (model_name or "").strip() or getattr(
             self.settings, "openai_model_mini", "gpt-5.4-mini"
         )
         try:
-            return estimate_graph_llm_cost_usd(
+            usage = summarize_graph_llm_usage(
                 list((result or {}).get("messages") or []),
                 mn,
                 response_text=response_text or "",
                 initial_messages_token_hint=initial_messages_token_hint,
+                infer_missing_cached=False,
             )
+            if usage.get("estimated"):
+                return 0.0
+            return float(usage.get("cost_usd") or 0.0)
         except Exception:
             return 0.0
     

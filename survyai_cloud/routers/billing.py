@@ -207,6 +207,7 @@ async def paystack_verify(
         settings,
         credit_budget_usd=budget_usd,
         credits_billing_interval=bill_interval,
+        paid_at=paid_anchor,
     )
     user.subscription_status = SubscriptionStatus.active
     user.subscription_current_period_end = subscription_period_end_from_anchor(anchor, bill_interval)

@@ -38,6 +38,7 @@ class MeOut(BaseModel):
     plan_slug: str
     subscription_status: str
     subscription_current_period_end: Optional[datetime] = None
+    usage_period_anchor: Optional[datetime] = None
     can_manage_paystack_subscription: bool = False
     max_devices: int
     monthly_agent_runs_quota: int
@@ -129,6 +130,8 @@ class EntitlementsOut(BaseModel):
     monthly_credits_used_usd: float = 0.0
     credit_markup_multiplier: float = 2.0
     credits_billing_interval: str = "monthly"
+    usage_period_anchor: Optional[datetime] = None
+    subscription_current_period_end: Optional[datetime] = None
     can_use_platform_llm: bool
     primary_llm: Optional[str] = None
 

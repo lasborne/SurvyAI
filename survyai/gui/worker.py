@@ -11,6 +11,7 @@ child process immediately when the user clicks Cancel.
 
 from __future__ import annotations
 
+import os
 import traceback
 from typing import Any, Optional
 
@@ -19,6 +20,36 @@ from PySide6.QtCore import QThread, Signal
 from survyai.agent_service import SurvyAIAgentService
 from survyai.gui.agent_process import get_shared_agent_process
 from survyai.types import AgentRunResult
+
+# Windows SetThreadExecutionState flags (keep system + display awake during runs).
+_ES_CONTINUOUS = 0x80000000
+_ES_SYSTEM_REQUIRED = 0x00000001
+_ES_DISPLAY_REQUIRED = 0x00000002
+
+
+def _windows_acquire_run_awake() -> bool:
+    """Ask Windows not to sleep/hibernate while a SurvyAI task is active."""
+    if os.name != "nt":
+        return False
+    try:
+        import ctypes
+
+        flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED
+        return bool(ctypes.windll.kernel32.SetThreadExecutionState(flags))
+    except Exception:
+        return False
+
+
+def _windows_release_run_awake() -> None:
+    """Clear the keep-awake request so normal power policy resumes."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
+    except Exception:
+        pass
 
 
 class AgentRunThread(QThread):
@@ -66,6 +97,9 @@ class AgentRunThread(QThread):
 
     def run(self) -> None:
         proc = get_shared_agent_process()
+        awake = _windows_acquire_run_awake()
+        if awake:
+            self.progress_text.emit("Keeping this PC awake while the task runs.")
         try:
             if self._working_directory:
                 self.progress_text.emit(f"Workspace active: {self._working_directory}")
@@ -124,3 +158,5 @@ class AgentRunThread(QThread):
                     return
         except Exception:
             self.failed.emit(traceback.format_exc())
+        finally:
+            _windows_release_run_awake()

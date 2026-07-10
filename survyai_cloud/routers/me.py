@@ -28,6 +28,7 @@ async def get_me(
         plan_slug=ent.plan_slug,
         subscription_status=ent.subscription_status,
         subscription_current_period_end=user.subscription_current_period_end,
+        usage_period_anchor=user.usage_period_anchor,
         can_manage_paystack_subscription=bool(user.paystack_subscription_code),
         max_devices=ent.max_devices,
         monthly_agent_runs_quota=ent.monthly_agent_runs_quota,
