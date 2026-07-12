@@ -72,6 +72,15 @@ SurvyAI detects and uses these when they are installed; none are bundled:
 - When credits run out, SurvyAI automatically switches to a free local model and
   notifies you so work can continue. Top up to resume hosted models.
 
+### Account password
+
+- Cloud passwords must be at least **10 characters**, with upper and lower case,
+  a digit, and a special character.
+- Use **Forgot password…** on the sign-in screen to receive a one-time email code
+  and set a new password.
+- When signed in, open **Settings → Change password…** to update your password
+  (other devices are signed out).
+
 ---
 
 ## Updates

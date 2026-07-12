@@ -74,13 +74,17 @@ from survyai.cloud_user_message import user_facing_cloud_message
 from survyai.cloud_api import (
     CloudApiError,
     access_token_expires_at_iso,
+    change_password as cloud_change_password,
     cloud_health,
+    forgot_password as cloud_forgot_password,
     get_billing_plans,
     get_bootstrap,
     get_entitlements,
     get_me,
     get_update_manifest,
     login,
+    logout as cloud_logout,
+    password_policy_hint,
     paystack_initialize,
     paystack_subscription_manage_url,
     paystack_verify,
@@ -88,6 +92,8 @@ from survyai.cloud_api import (
     refresh_tokens,
     register_device,
     register as cloud_register,
+    reset_password as cloud_reset_password,
+    validate_password_strength,
 )
 from survyai.device_identity import compute_machine_fingerprint
 from survyai.plan_policy import policy_for_plan
@@ -1481,7 +1487,8 @@ class MainWindow(QMainWindow):
         account_outer = QVBoxLayout(account_group)
         account_hint = QLabel(
             "Sign in from the account menu (top right). Your name and email are shown here after "
-            "you connect to SurvyAI Cloud. Company may be set during onboarding."
+            "you connect to SurvyAI Cloud. Company may be set during onboarding. "
+            f"Passwords: {password_policy_hint()}"
         )
         account_hint.setWordWrap(True)
         account_hint.setObjectName("hintLabel")
@@ -1499,6 +1506,13 @@ class MainWindow(QMainWindow):
         account_form.addRow("Email", self._account_email_value)
         account_form.addRow("Company", self._account_company_value)
         account_outer.addLayout(account_form)
+        self._change_password_btn = QPushButton("Change password…")
+        self._change_password_btn.setObjectName("secondaryButton")
+        self._change_password_btn.setToolTip(
+            "Update your SurvyAI Cloud password. Requires your current password."
+        )
+        self._change_password_btn.clicked.connect(self._on_change_password)
+        account_outer.addWidget(self._change_password_btn)
         page_layout.addWidget(account_group)
 
         pay_group = QGroupBox("Pro subscription (Paystack)")
@@ -2642,6 +2656,14 @@ class MainWindow(QMainWindow):
         self._account_name_value.setText(name_disp)
         self._account_email_value.setText(email_disp)
         self._account_company_value.setText(company_disp)
+        cloud_ok = bool(self._state.cloud_access_token.strip() and self._state.cloud_api_base_url.strip())
+        if hasattr(self, "_change_password_btn"):
+            self._change_password_btn.setEnabled(cloud_ok)
+            self._change_password_btn.setToolTip(
+                "Update your SurvyAI Cloud password."
+                if cloud_ok
+                else "Sign in to SurvyAI Cloud to change your password."
+            )
         self._refresh_user_menu()
 
     def _refresh_license_card(self) -> None:
@@ -3131,7 +3153,7 @@ class MainWindow(QMainWindow):
         _, _, period_label = self._credits_usage_period_bounds()
         self._credits_period_note.setText(
             f"{period_label}. Credit pool is subscription USD. Used is provider-reported "
-            f"LLM cost × SurvyAI markup ({markup:g}×) inside this paid window. "
+            f"LLM cost + SurvyAI markup inside this paid window. "
             f"Lifetime total is at the bottom."
         )
 
@@ -4719,16 +4741,20 @@ class MainWindow(QMainWindow):
         choice.setWindowTitle("SurvyAI cloud")
         choice.setText("Do you already have a cloud account, or do you want to create one?")
         choice.setInformativeText(
-            "Create account registers you on the server (password at least 8 characters). "
-            "You can subscribe to Pro afterward."
+            f"Create account registers you on the server ({password_policy_hint()}). "
+            "You can subscribe to Pro afterward. Use Forgot password if you cannot sign in."
         )
         choice.setIcon(QMessageBox.Question)
         choice.addButton("Sign in", QMessageBox.AcceptRole)
         btn_create = choice.addButton("Create account", QMessageBox.ActionRole)
+        btn_forgot = choice.addButton("Forgot password…", QMessageBox.ActionRole)
         btn_cancel = choice.addButton(QMessageBox.Cancel)
         choice.exec()
         clicked = choice.clickedButton()
         if clicked is None or clicked == btn_cancel:
+            return
+        if clicked == btn_forgot:
+            self._on_forgot_password(base_url=base_url)
             return
         is_register = clicked == btn_create
 
@@ -4743,7 +4769,7 @@ class MainWindow(QMainWindow):
         password, ok = QInputDialog.getText(
             self,
             "Cloud account" if is_register else "Cloud sign-in",
-            "Password (min. 8 characters)" if is_register else "Password",
+            f"Password ({password_policy_hint()})" if is_register else "Password",
             QLineEdit.EchoMode.Password,
         )
         if not ok or not password:
@@ -4764,12 +4790,9 @@ class MainWindow(QMainWindow):
             )
             company_for_profile = (co or "").strip() if ok_co else ""
         if is_register:
-            if len(password) < 8:
-                QMessageBox.warning(
-                    self,
-                    "Create account",
-                    "Password must be at least 8 characters (cloud server requirement).",
-                )
+            policy_err = validate_password_strength(password, email=email.strip())
+            if policy_err:
+                QMessageBox.warning(self, "Create account", policy_err)
                 return
             confirm, ok = QInputDialog.getText(
                 self,
@@ -4912,10 +4935,178 @@ class MainWindow(QMainWindow):
         )
         if answer != QMessageBox.Yes:
             return
+        base = self._state.cloud_api_base_url.strip()
+        refresh = self._state.cloud_refresh_token.strip()
+        if base and refresh:
+            try:
+                cloud_logout(base_url=base, refresh_token=refresh)
+            except Exception:
+                pass
         self._state.profile = AccountProfile()
         self._clear_cloud_session()
         self._refresh_account_views()
         self._refresh_diagnostics()
+
+    def _on_forgot_password(self, *, base_url: str | None = None) -> None:
+        """Request a one-time email code, then set a new password."""
+        base = (base_url or self._default_cloud_api_base_url()).strip()
+        if not base:
+            base, ok = QInputDialog.getText(
+                self,
+                "Cloud API base URL",
+                f"Enter cloud API base URL (e.g. {DEFAULT_CLOUD_API_BASE_URL})",
+                text=self._default_cloud_api_base_url(),
+            )
+            if not ok or not base.strip():
+                return
+            base = base.strip()
+        if not self._preflight_cloud_api(base):
+            return
+
+        email, ok = QInputDialog.getText(
+            self,
+            "Forgot password",
+            "Account email",
+            text=self._state.profile.email.strip(),
+        )
+        if not ok or not email.strip():
+            return
+        try:
+            cloud_forgot_password(base_url=base, email=email.strip())
+        except CloudApiError as exc:
+            QMessageBox.warning(self, "Forgot password", user_facing_cloud_message(exc))
+            return
+        except Exception as exc:
+            QMessageBox.warning(self, "Forgot password", user_facing_cloud_message(exc))
+            return
+
+        QMessageBox.information(
+            self,
+            "Check your email",
+            "If an account exists for that email, a one-time reset code was sent. "
+            "Enter the code and choose a new password next.",
+        )
+        code, ok = QInputDialog.getText(self, "Reset password", "Reset code from email")
+        if not ok or not code.strip():
+            return
+        new_password, ok = QInputDialog.getText(
+            self,
+            "Reset password",
+            f"New password ({password_policy_hint()})",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not new_password:
+            return
+        policy_err = validate_password_strength(new_password, email=email.strip())
+        if policy_err:
+            QMessageBox.warning(self, "Reset password", policy_err)
+            return
+        confirm, ok = QInputDialog.getText(
+            self,
+            "Reset password",
+            "Confirm new password",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok:
+            return
+        if confirm != new_password:
+            QMessageBox.warning(self, "Reset password", "Passwords do not match.")
+            return
+        try:
+            cloud_reset_password(
+                base_url=base,
+                email=email.strip(),
+                code=code.strip(),
+                new_password=new_password,
+            )
+        except CloudApiError as exc:
+            QMessageBox.warning(self, "Reset password failed", user_facing_cloud_message(exc))
+            return
+        except Exception as exc:
+            QMessageBox.warning(self, "Reset password failed", user_facing_cloud_message(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Password updated",
+            "Your password was changed. Sign in with your new password.",
+        )
+
+    @Slot()
+    def _on_change_password(self) -> None:
+        base, token = self._cloud_base_and_token()
+        if not base or not token:
+            QMessageBox.warning(
+                self,
+                "Sign in required",
+                "Sign in from the account menu (top right) before changing your password.",
+            )
+            return
+        if not self._ensure_cloud_token_valid():
+            return
+        base, token = self._cloud_base_and_token()
+        email = (
+            str((self._state.cloud_me or {}).get("email") or "").strip()
+            or self._state.profile.email.strip()
+        )
+        current, ok = QInputDialog.getText(
+            self,
+            "Change password",
+            "Current password",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not current:
+            return
+        new_password, ok = QInputDialog.getText(
+            self,
+            "Change password",
+            f"New password ({password_policy_hint()})",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok or not new_password:
+            return
+        policy_err = validate_password_strength(new_password, email=email or None)
+        if policy_err:
+            QMessageBox.warning(self, "Change password", policy_err)
+            return
+        confirm, ok = QInputDialog.getText(
+            self,
+            "Change password",
+            "Confirm new password",
+            QLineEdit.EchoMode.Password,
+        )
+        if not ok:
+            return
+        if confirm != new_password:
+            QMessageBox.warning(self, "Change password", "Passwords do not match.")
+            return
+        try:
+            tokens = cloud_change_password(
+                base_url=base,
+                access_token=token,
+                current_password=current,
+                new_password=new_password,
+            )
+        except CloudApiError as exc:
+            QMessageBox.warning(self, "Change password failed", user_facing_cloud_message(exc))
+            return
+        except Exception as exc:
+            QMessageBox.warning(self, "Change password failed", user_facing_cloud_message(exc))
+            return
+        if tokens.access_token:
+            self._state.cloud_access_token = tokens.access_token
+        if tokens.refresh_token:
+            self._state.cloud_refresh_token = tokens.refresh_token
+        if tokens.expires_in:
+            self._state.cloud_access_token_expires_at = access_token_expires_at_iso(
+                expires_in_seconds=tokens.expires_in
+            )
+        self._state_store.save(self._state)
+        self.statusBar().showMessage("Password updated.", 5000)
+        QMessageBox.information(
+            self,
+            "Password updated",
+            "Your password was changed. Other signed-in devices were signed out.",
+        )
 
     @Slot()
     def _run_onboarding(self) -> None:

@@ -106,6 +106,25 @@ async def enforce_user_route_limit(
         await _check_memory(key, limit, window_sec)
 
 
+async def enforce_ip_route_limit(
+    *,
+    request: Request,
+    route_key: str,
+    limit: int,
+    window_sec: int,
+) -> None:
+    """Unauthenticated fixed-window limit keyed by client IP."""
+    if limit <= 0:
+        return
+    ip = _client_ip(request)
+    b = _bucket(window_sec)
+    key = f"survyai:rl:v1:{route_key}:ip:{ip}:{b}"
+    if await _redis_client() is not None:
+        await _check_redis(key, limit, window_sec)
+    else:
+        await _check_memory(key, limit, window_sec)
+
+
 def rate_limit_user_dependency(route_key: str, settings_attr: str) -> Callable[..., Any]:
     """
     Return a FastAPI dependency (plain async function) so OpenAPI generation works.
@@ -131,3 +150,25 @@ def rate_limit_user_dependency(route_key: str, settings_attr: str) -> Callable[.
         return user
 
     return _rate_limited_user
+
+
+def rate_limit_ip_dependency(
+    route_key: str,
+    settings_attr: str,
+    *,
+    window_seconds: int | None = None,
+) -> Callable[..., Any]:
+    """Rate-limit a public route by client IP using a CloudSettings limit field."""
+
+    async def _rate_limited_ip(request: Request) -> None:
+        settings = get_cloud_settings()
+        limit = int(getattr(settings, settings_attr, 0) or 0)
+        window = int(window_seconds if window_seconds is not None else settings.rate_limit_window_seconds)
+        await enforce_ip_route_limit(
+            request=request,
+            route_key=route_key,
+            limit=limit,
+            window_sec=window,
+        )
+
+    return _rate_limited_ip

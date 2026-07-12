@@ -96,6 +96,44 @@ class CloudSettings(BaseSettings):
     refresh_token_expire_days: int = Field(default=30, ge=1, le=365)
     bcrypt_rounds: int = Field(default=12, ge=4, le=31)
 
+    # Transactional email (Resend) — password reset
+    resend_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("RESEND_API_KEY", "resend_api_key"),
+        description="Resend API key for transactional email (password reset).",
+    )
+    email_from: str = Field(
+        default="SurvyAI <noreply@survyai.app>",
+        validation_alias=AliasChoices("EMAIL_FROM", "email_from"),
+        description="Verified Resend From address, e.g. SurvyAI <noreply@yourdomain.com>.",
+    )
+    password_reset_ttl_minutes: int = Field(default=30, ge=5, le=1440)
+    password_reset_code_length: int = Field(default=8, ge=6, le=16)
+    rate_limit_auth_login_per_window: int = Field(
+        default=20,
+        ge=0,
+        le=10_000,
+        description="Max POST /v1/auth/login per IP per 15 min window; 0 disables.",
+    )
+    rate_limit_auth_forgot_per_window: int = Field(
+        default=5,
+        ge=0,
+        le=10_000,
+        description="Max POST /v1/auth/forgot-password per IP per hour; 0 disables.",
+    )
+    rate_limit_auth_reset_per_window: int = Field(
+        default=10,
+        ge=0,
+        le=10_000,
+        description="Max POST /v1/auth/reset-password per IP per hour; 0 disables.",
+    )
+    rate_limit_auth_change_password_per_window: int = Field(
+        default=10,
+        ge=0,
+        le=10_000,
+        description="Max POST /v1/auth/change-password per user+IP per window; 0 disables.",
+    )
+
     # CORS (comma-separated origins; * for dev only)
     cors_origins: str = Field(default="*")
 

@@ -17,6 +17,33 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
     if "email already registered" in low:
         return "An account with this email already exists. Try signing in instead."
 
+    if "current password is incorrect" in low:
+        return "Your current password is incorrect. Please try again."
+
+    if "invalid or expired reset code" in low:
+        return (
+            "That reset code is invalid or has expired. "
+            "Request a new code with Forgot password, then try again."
+        )
+
+    if "new password must be different" in low:
+        return "Choose a new password that is different from your current password."
+
+    if any(
+        x in low
+        for x in (
+            "password must be at least",
+            "password must include",
+            "password must not contain",
+            "too common",
+            "at most 128 characters",
+        )
+    ):
+        return raw if raw else (
+            "That password does not meet SurvyAI's requirements. "
+            "Use at least 10 characters with upper and lower case, a digit, and a special character."
+        )
+
     if "missing cloud api base url" in low:
         return "Enter your cloud API address when signing in."
 
@@ -68,10 +95,14 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
             "connecttimeout",
         )
     ) or ("timed out" in low or "timeout" in low):
-        return (
+        """return (
             "The cloud API did not respond in time. If http://127.0.0.1:8088/health opens but "
             "database_ok is false, the server is waiting on a database that is down or unreachable. "
             "Fix DATABASE_URL, restart python -m survyai_cloud, then try again."
+        )"""
+        return (
+            "The cloud API did not respond in time. Database_ok is false, the server is waiting on a database that is down or unreachable."
+            "Try again."
         )
 
     if any(

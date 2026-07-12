@@ -10,8 +10,66 @@ from pydantic import BaseModel, EmailStr, Field, field_validator
 # --- Auth ---
 class UserCreate(BaseModel):
     email: EmailStr
-    password: str = Field(min_length=8, max_length=128)
+    password: str = Field(min_length=10, max_length=128)
     display_name: Optional[str] = Field(default=None, max_length=200)
+
+    @field_validator("password")
+    @classmethod
+    def _password_strength(cls, v: str, info) -> str:
+        from survyai_cloud.security import validate_password_strength
+
+        email = None
+        if info.data and "email" in info.data:
+            email = str(info.data.get("email") or "")
+        err = validate_password_strength(v, email=email)
+        if err:
+            raise ValueError(err)
+        return v
+
+
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+
+class ForgotPasswordOut(BaseModel):
+    detail: str = (
+        "If an account exists for that email, a one-time reset code has been sent. "
+        "Check your inbox and enter the code in SurvyAI."
+    )
+
+
+class ResetPasswordIn(BaseModel):
+    email: EmailStr
+    code: str = Field(min_length=6, max_length=32)
+    new_password: str = Field(min_length=10, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def _password_strength(cls, v: str, info) -> str:
+        from survyai_cloud.security import validate_password_strength
+
+        email = None
+        if info.data and "email" in info.data:
+            email = str(info.data.get("email") or "")
+        err = validate_password_strength(v, email=email)
+        if err:
+            raise ValueError(err)
+        return v
+
+
+class ChangePasswordIn(BaseModel):
+    current_password: str = Field(min_length=1, max_length=128)
+    new_password: str = Field(min_length=10, max_length=128)
+
+    @field_validator("new_password")
+    @classmethod
+    def _password_strength(cls, v: str) -> str:
+        from survyai_cloud.security import validate_password_strength
+
+        err = validate_password_strength(v)
+        if err:
+            raise ValueError(err)
+        return v
 
 
 class UserOut(BaseModel):

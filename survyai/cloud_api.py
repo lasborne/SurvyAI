@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
@@ -153,6 +154,166 @@ def refresh_tokens(*, base_url: str, refresh_token: str, timeout_s: int = 20) ->
     body = _parse_json(resp, what="Token refresh")
     if not resp.ok:
         raise CloudApiError(str(body.get("detail") or body))
+    return CloudTokenPair(
+        access_token=str(body.get("access_token") or ""),
+        refresh_token=str(body.get("refresh_token") or ""),
+        expires_in=int(body.get("expires_in") or 0),
+    )
+
+
+# Mirrors survyai_cloud.security password policy for desktop UX (no cloud import).
+_PASSWORD_MIN_LENGTH = 10
+_PASSWORD_MAX_LENGTH = 128
+_PASSWORD_SPECIAL_CHARS = r"!@#$%^&*()_+\-=\[\]{}|;:,.<>?"
+_PASSWORD_SPECIAL_RE = re.compile(rf"[{_PASSWORD_SPECIAL_CHARS}]")
+_COMMON_PASSWORDS = frozenset(
+    {
+        "password",
+        "password1",
+        "password1!",
+        "password123",
+        "password123!",
+        "passw0rd",
+        "passw0rd!",
+        "1234567890",
+        "1234567890!",
+        "qwerty1234",
+        "qwerty1234!",
+        "welcome123",
+        "welcome123!",
+        "letmein123",
+        "letmein123!",
+        "admin12345",
+        "admin12345!",
+        "survyai123",
+        "survyai123!",
+        "changeme12",
+        "changeme12!",
+        "iloveyou12",
+        "iloveyou12!",
+        "password12",
+        "Password1!",
+        "Password12",
+        "Password12!",
+        "P@ssw0rd",
+        "P@ssw0rd1",
+        "P@ssword1",
+    }
+)
+
+
+def validate_password_strength(password: str, *, email: str | None = None) -> Optional[str]:
+    """Return an error message if password fails policy, else None."""
+    plain = password or ""
+    if len(plain) < _PASSWORD_MIN_LENGTH:
+        return f"Password must be at least {_PASSWORD_MIN_LENGTH} characters."
+    if len(plain) > _PASSWORD_MAX_LENGTH:
+        return f"Password must be at most {_PASSWORD_MAX_LENGTH} characters."
+    if not re.search(r"[a-z]", plain):
+        return "Password must include at least one lowercase letter."
+    if not re.search(r"[A-Z]", plain):
+        return "Password must include at least one uppercase letter."
+    if not re.search(r"[0-9]", plain):
+        return "Password must include at least one digit."
+    if not _PASSWORD_SPECIAL_RE.search(plain):
+        return (
+            "Password must include at least one special character "
+            f"({_PASSWORD_SPECIAL_CHARS})."
+        )
+    if plain.lower() in _COMMON_PASSWORDS or plain in _COMMON_PASSWORDS:
+        return "That password is too common. Please choose a stronger password."
+    if email:
+        local = str(email).split("@", 1)[0].strip().lower()
+        if local and len(local) >= 3 and local in plain.lower():
+            return "Password must not contain your email username."
+    return None
+
+def password_policy_hint() -> str:
+    return (
+        f"At least {_PASSWORD_MIN_LENGTH} characters, with upper and lower case, "
+        "a digit, and a special character."
+    )
+
+
+def logout(*, base_url: str, refresh_token: str, timeout_s: int = 20) -> None:
+    """POST /v1/auth/logout — revoke the refresh token (best-effort)."""
+    base = _norm_base(base_url)
+    if not base or not (refresh_token or "").strip():
+        return
+    resp = _cloud_post(
+        f"{base}/v1/auth/logout",
+        json={"refresh_token": refresh_token.strip()},
+        timeout=timeout_s,
+    )
+    if resp.status_code not in (200, 204) and resp.status_code >= 400:
+        body = _parse_json(resp, what="Logout") if resp.content else {}
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
+
+
+def forgot_password(*, base_url: str, email: str, timeout_s: int = 30) -> dict[str, Any]:
+    base = _norm_base(base_url)
+    if not base:
+        raise CloudApiError("Missing cloud API base URL")
+    resp = _cloud_post(
+        f"{base}/v1/auth/forgot-password",
+        json={"email": email.strip()},
+        timeout=timeout_s,
+    )
+    body = _parse_json(resp, what="Forgot password")
+    if not resp.ok:
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
+    return body if isinstance(body, dict) else {}
+
+
+def reset_password(
+    *,
+    base_url: str,
+    email: str,
+    code: str,
+    new_password: str,
+    timeout_s: int = 30,
+) -> dict[str, Any]:
+    base = _norm_base(base_url)
+    if not base:
+        raise CloudApiError("Missing cloud API base URL")
+    resp = _cloud_post(
+        f"{base}/v1/auth/reset-password",
+        json={
+            "email": email.strip(),
+            "code": code.strip(),
+            "new_password": new_password,
+        },
+        timeout=timeout_s,
+    )
+    body = _parse_json(resp, what="Reset password")
+    if not resp.ok:
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
+    return body if isinstance(body, dict) else {}
+
+
+def change_password(
+    *,
+    base_url: str,
+    access_token: str,
+    current_password: str,
+    new_password: str,
+    timeout_s: int = 30,
+) -> CloudTokenPair:
+    base = _norm_base(base_url)
+    if not base:
+        raise CloudApiError("Missing cloud API base URL")
+    resp = _cloud_post(
+        f"{base}/v1/auth/change-password",
+        headers={"Authorization": f"Bearer {access_token}"},
+        json={
+            "current_password": current_password,
+            "new_password": new_password,
+        },
+        timeout=timeout_s,
+    )
+    body = _parse_json(resp, what="Change password")
+    if not resp.ok:
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
     return CloudTokenPair(
         access_token=str(body.get("access_token") or ""),
         refresh_token=str(body.get("refresh_token") or ""),

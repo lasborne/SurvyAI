@@ -285,9 +285,41 @@ async def _sqlite_migrate(conn) -> None:
         alter.append(
             "ALTER TABLE users ADD COLUMN credits_billing_interval VARCHAR(16) NOT NULL DEFAULT 'monthly'"
         )
+    if "password_changed_at" not in cols:
+        alter.append("ALTER TABLE users ADD COLUMN password_changed_at DATETIME")
 
     for stmt in alter:
         await conn.execute(text(stmt))
+
+    # Password reset tokens (local SQLite / create_all may already have created this).
+    await conn.execute(
+        text(
+            """
+            CREATE TABLE IF NOT EXISTS password_reset_tokens (
+              id CHAR(32) NOT NULL PRIMARY KEY,
+              user_id CHAR(32) NOT NULL,
+              token_hash VARCHAR(64) NOT NULL UNIQUE,
+              expires_at DATETIME NOT NULL,
+              used_at DATETIME,
+              request_ip VARCHAR(64),
+              created_at DATETIME NOT NULL DEFAULT (CURRENT_TIMESTAMP),
+              FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+            """
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_password_reset_tokens_token_hash "
+            "ON password_reset_tokens (token_hash)"
+        )
+    )
+    await conn.execute(
+        text(
+            "CREATE INDEX IF NOT EXISTS ix_password_reset_tokens_user_id "
+            "ON password_reset_tokens (user_id)"
+        )
+    )
 
     # Usage events table: add cost column if missing.
     res = await conn.execute(text("PRAGMA table_info(usage_events)"))
