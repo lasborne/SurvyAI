@@ -1,0 +1,13 @@
+# Cloudflare Workers + static assets for survyai.com marketing site.
+# Dashboard settings:
+#   Root directory:  /   (repo root)
+#   Build command:   exit 0
+#   Deploy command:  npx wrangler deploy
+#
+# Docs: https://developers.cloudflare.com/workers/static-assets/
+
+name = "survyai"
+compatibility_date = "2025-07-14"
+
+[assets]
+directory = "./website"
