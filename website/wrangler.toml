@@ -1,0 +1,17 @@
+# Cloudflare Workers + static assets (SurvyAI marketing site).
+#
+# Cloudflare dashboard (required):
+#   Root directory:   website
+#   Build command:    exit 0
+#   Deploy command:   npx wrangler deploy
+#
+# Optional (if Root is ever "/" and Python install starts again):
+#   Settings → Variables → SKIP_DEPENDENCY_INSTALL = 1
+#
+# Docs: https://developers.cloudflare.com/workers/static-assets/
+
+name = "survyai"
+compatibility_date = "2025-07-14"
+
+[assets]
+directory = "."
