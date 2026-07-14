@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="SurvyAI">
+  <defs>
+    <linearGradient id="plate" x1="8" y1="8" x2="56" y2="56" gradientUnits="userSpaceOnUse">
+      <stop offset="0%" stop-color="#5b9aff"/>
+      <stop offset="35%" stop-color="#2563eb"/>
+      <stop offset="100%" stop-color="#1d4ed8"/>
+    </linearGradient>
+    <radialGradient id="gloss" cx="38%" cy="28%" r="55%">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.28"/>
+      <stop offset="55%" stop-color="#ffffff" stop-opacity="0.07"/>
+      <stop offset="100%" stop-color="#ffffff" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="4" y="5" width="56" height="56" rx="16" fill="#000000" opacity="0.12"/>
+  <rect x="4" y="4" width="56" height="56" rx="16" fill="url(#plate)" stroke="#1e40af" stroke-width="2"/>
+  <rect x="8" y="7" width="40" height="27" rx="11" fill="url(#gloss)"/>
+  <g fill="none" stroke="#ffffff" stroke-opacity="0.11" stroke-width="1.1">
+    <circle cx="32" cy="32" r="18.5"/>
+    <path d="M13.5 32h37M32 13.5v37"/>
+  </g>
+  <text x="32" y="41" text-anchor="middle"
+        font-family="Segoe UI Variable, Segoe UI, IBM Plex Sans, sans-serif"
+        font-size="34" font-weight="600" fill="#ffffff" letter-spacing="-1">S</text>
+</svg>

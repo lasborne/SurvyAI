@@ -79,10 +79,7 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
         )
     ):
         return (
-            "The cloud API process is up, but it cannot reach the database. "
-            "Open http://127.0.0.1:8088/health — if database_ok is false, fix DATABASE_URL in .env "
-            "and restart python -m survyai_cloud. Local dev: docker compose up -d then use "
-            "postgresql+asyncpg://survyai:survyai@localhost:5432/survyai."
+            "The cloud API process is up, but it cannot reach the backend database server."
         )
 
     if any(
@@ -96,9 +93,9 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
         )
     ) or ("timed out" in low or "timeout" in low):
         """return (
-            "The cloud API did not respond in time. If http://127.0.0.1:8088/health opens but "
-            "database_ok is false, the server is waiting on a database that is down or unreachable. "
-            "Fix DATABASE_URL, restart python -m survyai_cloud, then try again."
+            "The cloud API did not respond in time."
+            "if database_ok is false, the backendserver is waiting on a database that is down or unreachable. "
+            "contact Admin to Fix DATABASE_URL, then try again."
         )"""
         return (
             "The cloud API did not respond in time. Database_ok is false, the server is waiting on a database that is down or unreachable."
@@ -161,8 +158,8 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
     if "database unavailable" in low:
         return (
             "The cloud API is running but the database is not ready. "
-            "Open http://127.0.0.1:8088/health — if database_ok is false, fix DATABASE_URL in .env "
-            "and restart python -m survyai_cloud."
+            "Open the backend server/health — if database_ok is false, fix DATABASE_URL in environment variables or .env "
+            "and restart cloud service."
         )
 
     if any(
@@ -178,8 +175,8 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
         or ("503" in raw and "database" not in low)
     ):
         return (
-            "The cloud API returned a server error. Restart python -m survyai_cloud, run "
-            "python -m alembic upgrade head if you recently updated the app, then try signing in again."
+            "The cloud API returned a server error. Contact Admin to Restart cloud service, and run "
+            "python -m alembic upgrade head if the app was recently updated, then try signing in again."
         )
 
     if "429" in raw or "too many requests" in low:

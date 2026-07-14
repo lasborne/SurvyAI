@@ -1,0 +1,15 @@
+# Cache static assets aggressively; keep HTML fresh after deploys.
+/
+  Cache-Control: public, max-age=0, must-revalidate
+
+/assets/*
+  Cache-Control: public, max-age=31536000, immutable
+
+# Windows installers should download as attachments.
+/updates/*.exe
+  Content-Type: application/octet-stream
+  Content-Disposition: attachment
+  Cache-Control: public, max-age=300
+
+/get/*
+  Cache-Control: public, max-age=60

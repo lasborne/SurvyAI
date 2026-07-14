@@ -43,6 +43,9 @@ logs/
 .DS_Store
 Thumbs.db
 
+# Website installer binaries (publish via Cloudflare R2 / direct upload / Git LFS)
+website/updates/*.exe
+
 # Project specific
 data/
 output/

@@ -1,0 +1,4 @@
+# Stable download aliases — update the target filename when you ship a new build.
+/get/latest          /updates/SurvyAI-Setup-1.0.0.exe   302
+/updates/latest      /updates/SurvyAI-Setup-1.0.0.exe   302
+/downloads/latest    /updates/SurvyAI-Setup-1.0.0.exe   302

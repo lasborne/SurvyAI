@@ -89,7 +89,7 @@ def _parse_json(resp: requests.Response, *, what: str) -> Any:
             raise CloudApiError(
                 f"{what}: empty response (HTTP {resp.status_code}). "
                 "Is the SurvyAI cloud server running? Check the base URL "
-                "(e.g. http://127.0.0.1:8088 with no trailing path)."
+                "(e.g. https://survyai-api.onrender.com orhttp://127.0.0.1:8088 with no trailing path)."
             ) from exc
         preview = text[:500].replace("\n", " ")
         raise CloudApiError(

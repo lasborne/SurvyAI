@@ -283,7 +283,7 @@ def _is_save_session_docx_request(raw_query: str) -> bool:
         operational = (
             "arcgis", "arcpy", "cutfill", "cut fill", "tin", "idw", "volume",
             "point feature", "create a copy", "copy each", "calculate", "compute",
-            "borrow pit", "exported result",
+            "borrow pit", "exported result", "perform analysis", "geospatial analysis",
         )
         has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.I))
         explicit_essay = any(
@@ -735,7 +735,7 @@ def _paystack_user_message(server_message: str) -> str:
     if "not configured" in low and "paystack" in low:
         return (
             f"{s}\n\n"
-            "On the machine running the cloud API, set PAYSTACK_SECRET_KEY in .env.cloud "
+            "On the machine running the cloud API, set PAYSTACK_SECRET_KEY in backend server environment variables or .env.cloud "
             "(and PAYSTACK_PUBLIC_KEY if your server expects it), then restart the API process."
         )
     return s
@@ -1716,7 +1716,7 @@ class MainWindow(QMainWindow):
         credits_title.setObjectName("pageTitle")
         credits_sub = QLabel(
             "Track API spend for runs in this desktop app. Credit pool is your subscription USD "
-            "equivalent. Used is provider-reported LLM cost × SurvyAI markup inside the active "
+            "equivalent. Used is provider-reported LLM cost + SurvyAI markup inside the active "
             "paid window. Pro hosted plans: sign in and use Refresh from cloud to sync."
         )
         credits_sub.setObjectName("pageSubtitle")
@@ -4421,7 +4421,7 @@ class MainWindow(QMainWindow):
                 (
                     f"The cloud API at {base} is running, but it cannot connect to its database.\n\n"
                     f"{detail or 'See the cloud terminal for errors.'}\n\n"
-                    "Fix DATABASE_URL in .env, restart python -m survyai_cloud, then try again."
+                    "Fix DATABASE_URL in backend server environment variables or .env, restart the backend server or cloud service, then try again."
                 ),
             )
             return False
@@ -4431,7 +4431,7 @@ class MainWindow(QMainWindow):
                 "Billing not configured on server",
                 (
                     "This cloud API has no Paystack plan codes.\n\n"
-                    "On the machine running python -m survyai_cloud, add to .env or .env.cloud:\n"
+                    "On the machine running the backend server or cloud service, add to environment variables in the backend server or .env or .env.cloud:\n"
                     "  PAYSTACK_PLAN_CODE_PRO_DAILY=PLN_…\n"
                     "  PAYSTACK_PLAN_CODE_PRO_WEEKLY=PLN_…\n"
                     "  PAYSTACK_PLAN_CODE_PRO_MONTHLY=PLN_…\n"
@@ -4447,8 +4447,8 @@ class MainWindow(QMainWindow):
                 "Paystack not configured on server",
                 (
                     "This cloud API is missing PAYSTACK_SECRET_KEY.\n\n"
-                    "Add your Paystack test or live secret key to .env or .env.cloud, "
-                    "then restart python -m survyai_cloud and try again."
+                    "Add your Paystack test or live secret key to environment variables in the backend server or .env or .env.cloud, "
+                    "then restart the backend server or cloud service and try again."
                 ),
             )
             return False
@@ -4487,8 +4487,8 @@ class MainWindow(QMainWindow):
                     "The cloud API returned no billing plans.\n\n"
                     "Set PAYSTACK_PLAN_CODE_PRO_DAILY, PAYSTACK_PLAN_CODE_PRO_WEEKLY, "
                     "PAYSTACK_PLAN_CODE_PRO_MONTHLY, and/or PAYSTACK_PLAN_CODE_PRO_ANNUAL "
-                    "in .env.cloud (plan codes PLN_… from Paystack Dashboard), then restart "
-                    "python -m survyai_cloud."
+                    "in environment variables in the backend server or .env.cloud (plan codes PLN_… from Paystack Dashboard), then restart the backend server or cloud service "
+                    "and try again."
                 ),
             )
             return
@@ -4521,8 +4521,8 @@ class MainWindow(QMainWindow):
             self,
             "Complete payment",
             "Finish payment in your browser. Then open Settings from the account menu and click "
-            "“Refresh cloud account” (or use the Account menu). If your server has no webhooks yet, use "
-            "“Verify payment reference…” with the Paystack reference.",
+            "“Refresh cloud account” (or use the Account menu). You can also use "
+            "“Verify payment reference…” with the Paystack reference (where server webhooks failed).",
         )
 
     @Slot()
@@ -4558,7 +4558,7 @@ class MainWindow(QMainWindow):
                 box.setText(
                     "There’s no Paystack subscription linked to this account yet.\n\n"
                     "If you haven’t paid, start a new checkout.\n"
-                    "If you already paid, verify the Paystack reference (or refresh after webhooks)."
+                    "If you already paid, verify the Paystack reference (or, click on 'Refresh cloud account')."
                 )
                 subscribe_btn = box.addButton("Subscribe to Pro…", QMessageBox.ButtonRole.AcceptRole)
                 verify_btn = box.addButton(
@@ -4929,7 +4929,7 @@ class MainWindow(QMainWindow):
         answer = QMessageBox.question(
             self,
             "Sign out",
-            "Clear the local desktop account profile and cloud session for this app?",
+            "Do you wish to sign out?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )

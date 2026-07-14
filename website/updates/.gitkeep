@@ -1,0 +1,4 @@
+# Drop Windows installers here (Git LFS or Cloudflare R2 recommended for large .exe).
+# Expected beta filename: SurvyAI-Setup-1.0.0.exe
+# Manifest download_url: https://survyai.com/updates/SurvyAI-Setup-1.0.0.exe
+# After renaming a new version, update website/_redirects "latest" targets.

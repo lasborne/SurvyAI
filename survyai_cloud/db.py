@@ -78,8 +78,8 @@ async def get_db() -> AsyncGenerator[AsyncSession, None]:
             status_code=503,
             detail=(
                 f"Database unavailable: {_database_detail or 'unknown error'}. "
-                "Check DATABASE_URL in .env and restart python -m survyai_cloud. "
-                "Open http://127.0.0.1:8088/health for details."
+                "Check DATABASE_URL in the backend server environment variables or .env and restart the backend cloud service. "
+                "Open https://survyai-api.onrender.com (production)or http://127.0.0.1:8088/health for details."
             ),
         )
     async with async_session_factory() as session:
@@ -234,7 +234,7 @@ async def init_db() -> None:
                 "  ► For Supabase:   confirm the project is active (not paused) at\n"
                 "    https://supabase.com/dashboard and copy the correct connection string.\n"
                 "  \n"
-                "  Restart python -m survyai_cloud after fixing .env.",
+                "  Restart backend service (python -m survyai_cloud) after fixing backend server environment variables or .env.",
                 detail,
             )
         return
