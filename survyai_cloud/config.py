@@ -103,7 +103,7 @@ class CloudSettings(BaseSettings):
         description="Resend API key for transactional email (password reset).",
     )
     email_from: str = Field(
-        default="SurvyAI <noreply@survyai.app>",
+        default="SurvyAI <noreply@survyai.com>",
         validation_alias=AliasChoices("EMAIL_FROM", "email_from"),
         description="Verified Resend From address, e.g. SurvyAI <noreply@yourdomain.com>.",
     )
