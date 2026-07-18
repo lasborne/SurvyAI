@@ -44,6 +44,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QInputDialog,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -81,7 +82,6 @@ from survyai.cloud_api import (
     get_bootstrap,
     get_entitlements,
     get_me,
-    get_update_manifest,
     login,
     logout as cloud_logout,
     password_policy_hint,
@@ -116,7 +116,11 @@ from survyai.gui.cloud_sync import (
     CloudCreditsSyncPayload,
     CloudCreditsSyncResult,
 )
-from survyai.gui.cloud_worker import CloudAccountSyncThread, CloudCreditsSyncThread
+from survyai.gui.cloud_worker import (
+    CloudAccountSyncThread,
+    CloudCreditsSyncThread,
+    UpdateCheckThread,
+)
 from survyai.ollama_support import (
     OLLAMA_DOWNLOAD_PAGE,
     install_ollama_with_winget,
@@ -126,7 +130,13 @@ from survyai.ollama_support import (
     try_connect_ollama,
 )
 from survyai.types import AgentRunResult
-from survyai.updater import UpdateManager, UpdateManifest
+from survyai.updater import (
+    UPDATE_CHECK_INTERVAL_HOURS,
+    UpdateManager,
+    UpdateManifest,
+    launch_staged_installer,
+    update_check_due,
+)
 from survyai.version import __version__
 from runtime_paths import resource_path
 from utils.cost_estimator import summarize_graph_llm_usage
@@ -812,6 +822,13 @@ class MainWindow(QMainWindow):
         self._desktop_state_save_timer.setSingleShot(True)
         self._desktop_state_save_timer.setInterval(200)
         self._desktop_state_save_timer.timeout.connect(self._flush_desktop_state_save)
+
+        self._update_check_thread: Optional[UpdateCheckThread] = None
+        self._update_check_interactive = False
+        self._update_prompt_open = False
+        self._update_check_timer = QTimer(self)
+        self._update_check_timer.setInterval(int(UPDATE_CHECK_INTERVAL_HOURS * 60 * 60 * 1000))
+        self._update_check_timer.timeout.connect(self._maybe_auto_check_updates)
 
         QTimer.singleShot(0, self._finish_startup)
         # Credit strip lays out after first frame; refresh once the prompt row has geometry.
@@ -1607,6 +1624,40 @@ class MainWindow(QMainWindow):
         runtime_form.addRow("", save_runtime)
         page_layout.addWidget(runtime_group)
 
+        updates_group = QGroupBox("Updates")
+        updates_outer = QVBoxLayout(updates_group)
+        updates_outer.setSpacing(10)
+        updates_hint = QLabel(
+            "When enabled, SurvyAI periodically asks the SurvyAI Cloud for a newer Windows "
+            "installer (about every 12 hours) and notifies you here. Downloads are verified "
+            "before install. You can always use Help → Check for updates…."
+        )
+        updates_hint.setWordWrap(True)
+        updates_hint.setObjectName("hintLabel")
+        updates_outer.addWidget(updates_hint)
+        self._auto_check_updates_cb = QCheckBox(
+            "Automatically check for updates (recommended)"
+        )
+        self._auto_check_updates_cb.setToolTip(
+            "Requires your consent. SurvyAI only contacts the configured cloud API for version metadata."
+        )
+        self._auto_check_updates_cb.toggled.connect(self._on_auto_check_updates_toggled)
+        updates_outer.addWidget(self._auto_check_updates_cb)
+        updates_row = QHBoxLayout()
+        updates_row.setSpacing(8)
+        self._check_updates_now_btn = QPushButton("Check for updates now…")
+        self._check_updates_now_btn.setObjectName("secondaryButton")
+        self._check_updates_now_btn.clicked.connect(self._check_for_updates)
+        self._check_updates_now_btn.setToolTip("Check immediately, even if automatic checks are off.")
+        updates_row.addWidget(self._check_updates_now_btn)
+        updates_row.addStretch()
+        updates_outer.addLayout(updates_row)
+        self._updates_status_label = QLabel("")
+        self._updates_status_label.setWordWrap(True)
+        self._updates_status_label.setObjectName("hintLabel")
+        updates_outer.addWidget(self._updates_status_label)
+        page_layout.addWidget(updates_group)
+
         llm_status = QGroupBox("Active LLMs")
         llm_form = QFormLayout(llm_status)
         llm_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
@@ -2221,6 +2272,9 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(200, self._prewarm_agent)
         # Non-blocking post-start prompts (e.g. local models setup).
         QTimer.singleShot(650, self._maybe_prompt_ollama_install)
+        self._sync_update_check_timer()
+        # Consent-gated background update check after the UI settles.
+        QTimer.singleShot(2800, self._maybe_auto_check_updates)
         if self._startup_initial_query:
             self._input.setPlainText(self._startup_initial_query)
             if self._startup_auto_run:
@@ -2621,6 +2675,11 @@ class MainWindow(QMainWindow):
         self._apply_theme()
         self._fast_mode_cb.setChecked(bool(getattr(self._state, "fast_mode_non_file_prompts", False)))
         self._refresh_fast_mode_indicator()
+        if hasattr(self, "_auto_check_updates_cb"):
+            self._auto_check_updates_cb.blockSignals(True)
+            self._auto_check_updates_cb.setChecked(bool(getattr(self._state, "auto_check_updates", False)))
+            self._auto_check_updates_cb.blockSignals(False)
+            self._refresh_updates_status_label()
         self._set_combo_value(
             self._primary_llm_combo,
             self._state.preferred_primary_llm or self._settings.primary_llm,
@@ -5251,37 +5310,152 @@ class MainWindow(QMainWindow):
         if folder.exists():
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
 
-    @Slot()
-    def _check_for_updates(self) -> None:
-        base = (self._state.cloud_api_base_url or getattr(self._settings, "survyai_api_base_url", "") or "").strip()
-        if not base:
-            QMessageBox.information(
-                self,
-                "Updates unavailable",
-                "No SurvyAI cloud API base URL is configured for update checks yet.",
-            )
+    def _cloud_api_base_for_updates(self) -> str:
+        return (
+            self._state.cloud_api_base_url
+            or getattr(self._settings, "survyai_api_base_url", "")
+            or ""
+        ).strip()
+
+    def _update_channel(self) -> str:
+        return str(getattr(self._state, "update_channel", "") or "stable").strip() or "stable"
+
+    def _refresh_updates_status_label(self) -> None:
+        label = getattr(self, "_updates_status_label", None)
+        if label is None:
+            return
+        if not bool(getattr(self._state, "auto_check_updates", False)):
+            label.setText("Automatic checks are off. Use “Check for updates now…” anytime.")
+            return
+        last = str(getattr(self._state, "last_update_check_at", "") or "").strip()
+        if not last:
+            label.setText("Automatic checks are on. SurvyAI has not checked yet in this session.")
             return
         try:
-            manifest_dict = get_update_manifest(
-                base_url=base,
-                current_version=__version__,
-                channel="stable",
-                platform="windows-x64",
-                timeout_s=10,
-            )
-            manifest = UpdateManifest.from_dict(manifest_dict)
-        except CloudApiError as exc:
-            QMessageBox.warning(self, "Update check failed", str(exc))
-            return
+            dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+            label.setText(f"Automatic checks are on. Last checked: {dt.astimezone().strftime('%Y-%m-%d %H:%M')}.")
+        except Exception:
+            label.setText("Automatic checks are on.")
 
-        if not manifest.is_newer_than(__version__):
+    def _sync_update_check_timer(self) -> None:
+        if bool(getattr(self._state, "auto_check_updates", False)):
+            if not self._update_check_timer.isActive():
+                self._update_check_timer.start()
+        else:
+            self._update_check_timer.stop()
+
+    @Slot(bool)
+    def _on_auto_check_updates_toggled(self, checked: bool) -> None:
+        self._state.auto_check_updates = bool(checked)
+        self._state_store.save(self._state)
+        self._sync_update_check_timer()
+        self._refresh_updates_status_label()
+        self.statusBar().showMessage(
+            "Automatic update checks enabled." if checked else "Automatic update checks disabled.",
+            3000,
+        )
+        if checked:
+            QTimer.singleShot(400, self._maybe_auto_check_updates)
+
+    def _mark_update_check_completed(self) -> None:
+        self._state.last_update_check_at = datetime.now(timezone.utc).isoformat()
+        self._state_store.save(self._state)
+        self._refresh_updates_status_label()
+
+    @Slot()
+    def _maybe_auto_check_updates(self) -> None:
+        if not bool(getattr(self._state, "auto_check_updates", False)):
+            return
+        if not update_check_due(
+            str(getattr(self._state, "last_update_check_at", "") or ""),
+            interval_hours=UPDATE_CHECK_INTERVAL_HOURS,
+        ):
+            return
+        self._start_update_check(interactive=False)
+
+    @Slot()
+    def _check_for_updates(self) -> None:
+        self._start_update_check(interactive=True)
+
+    def _start_update_check(self, *, interactive: bool) -> None:
+        if self._update_check_thread is not None and self._update_check_thread.isRunning():
+            if interactive:
+                self.statusBar().showMessage("Update check already in progress…", 3000)
+            return
+        base = self._cloud_api_base_for_updates()
+        if not base:
+            if interactive:
+                QMessageBox.information(
+                    self,
+                    "Updates unavailable",
+                    "No SurvyAI cloud API base URL is configured for update checks yet.",
+                )
+            return
+        self._update_check_interactive = interactive
+        if interactive:
+            self.statusBar().showMessage("Checking for updates…", 4000)
+        thread = UpdateCheckThread(
+            base_url=base,
+            channel=self._update_channel(),
+            platform="windows-x64",
+            current_version=__version__,
+            parent=self,
+        )
+        thread.update_available.connect(self._on_update_check_available)
+        thread.up_to_date.connect(self._on_update_check_up_to_date)
+        thread.failed.connect(self._on_update_check_failed)
+        thread.finished.connect(self._on_update_check_finished)
+        self._update_check_thread = thread
+        thread.start()
+
+    @Slot()
+    def _on_update_check_finished(self) -> None:
+        self._update_check_thread = None
+
+    @Slot(object)
+    def _on_update_check_up_to_date(self, manifest: object) -> None:
+        self._mark_update_check_completed()
+        channel = getattr(manifest, "channel", self._update_channel())
+        if self._update_check_interactive:
             QMessageBox.information(
                 self,
                 "Up to date",
-                f"SurvyAI {__version__} is the latest available build on the {manifest.channel} channel.",
+                f"SurvyAI {__version__} is the latest available build on the {channel} channel.",
+            )
+        else:
+            self.statusBar().showMessage(f"SurvyAI {__version__} is up to date.", 4000)
+
+    @Slot(str)
+    def _on_update_check_failed(self, message: str) -> None:
+        # Still record the attempt so a flaky network does not spam every few seconds.
+        self._mark_update_check_completed()
+        if self._update_check_interactive:
+            QMessageBox.warning(self, "Update check failed", message)
+        else:
+            self.statusBar().showMessage("Update check failed (will retry later).", 5000)
+
+    @Slot(object)
+    def _on_update_check_available(self, manifest: object) -> None:
+        self._mark_update_check_completed()
+        if not isinstance(manifest, UpdateManifest):
+            return
+        if self._update_prompt_open:
+            return
+        dismissed = str(getattr(self._state, "dismissed_update_version", "") or "").strip()
+        required = manifest.is_required_for(__version__)
+        if (
+            not self._update_check_interactive
+            and not required
+            and dismissed == manifest.latest_version
+        ):
+            self.statusBar().showMessage(
+                f"Update {manifest.latest_version} available (reminded later).",
+                5000,
             )
             return
+        self._prompt_update_available(manifest, interactive=self._update_check_interactive)
 
+    def _prompt_update_available(self, manifest: UpdateManifest, *, interactive: bool) -> None:
         extra_lines = [
             f"Current version: {__version__}",
             f"Available version: {manifest.latest_version}",
@@ -5294,6 +5468,8 @@ class MainWindow(QMainWindow):
             extra_lines.append(
                 "This update raises the minimum supported version, so a full installer upgrade is required."
             )
+        if manifest.mandatory:
+            extra_lines.append("This is a mandatory update.")
         if not manifest.download_url or not manifest.sha256:
             QMessageBox.information(
                 self,
@@ -5302,15 +5478,86 @@ class MainWindow(QMainWindow):
             )
             return
 
-        answer = QMessageBox.question(
+        required = manifest.is_required_for(__version__)
+        self._update_prompt_open = True
+        try:
+            if required:
+                answer = QMessageBox.warning(
+                    self,
+                    "Required update",
+                    "\n".join(
+                        extra_lines
+                        + [
+                            "",
+                            "A required SurvyAI update is available.",
+                            "Download and install it now to continue with a supported build?",
+                        ]
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if answer != QMessageBox.Yes:
+                    if interactive:
+                        return
+                    # Soft-block non-interactive mandatory prompts: remind next interval.
+                    return
+            else:
+                answer = QMessageBox.question(
+                    self,
+                    "Update available",
+                    "\n".join(
+                        extra_lines
+                        + [
+                            "",
+                            "Download and install this update now?",
+                            "Choose No to be reminded later.",
+                        ]
+                    ),
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes,
+                )
+                if answer != QMessageBox.Yes:
+                    self._state.dismissed_update_version = manifest.latest_version
+                    self._state_store.save(self._state)
+                    self.statusBar().showMessage(
+                        f"Update {manifest.latest_version} postponed.",
+                        4000,
+                    )
+                    return
+        finally:
+            self._update_prompt_open = False
+
+        self._download_and_launch_update(manifest)
+
+    def _download_and_launch_update(self, manifest: UpdateManifest) -> None:
+        progress = QProgressDialog(
+            f"Downloading SurvyAI {manifest.latest_version}…",
+            "Cancel",
+            0,
+            0,
             self,
-            "Update available",
-            "\n".join(extra_lines + ["\nDownload and stage this installer now?"]),
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
         )
-        if answer != QMessageBox.Yes:
-            return
+        progress.setWindowTitle("Downloading update")
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        cancelled = {"flag": False}
+
+        def _on_cancel() -> None:
+            cancelled["flag"] = True
+
+        progress.canceled.connect(_on_cancel)
+
+        def _progress(downloaded: int, total: Optional[int]) -> None:
+            if cancelled["flag"]:
+                raise RuntimeError("Update download cancelled.")
+            if total and total > 0:
+                progress.setMaximum(total)
+                progress.setValue(min(downloaded, total))
+            else:
+                progress.setMaximum(0)
+                progress.setValue(0)
+            QApplication.processEvents()
 
         try:
             manager = UpdateManager()
@@ -5318,32 +5565,48 @@ class MainWindow(QMainWindow):
                 manifest,
                 current_version=__version__,
                 current_executable=sys.executable,
+                progress_callback=_progress,
             )
         except Exception as exc:
+            progress.close()
+            if "cancelled" in str(exc).lower():
+                self.statusBar().showMessage("Update download cancelled.", 4000)
+                return
             QMessageBox.critical(self, "Update download failed", str(exc))
             return
+        progress.close()
+
+        self._state.dismissed_update_version = ""
+        self._state_store.save(self._state)
 
         launch = QMessageBox.question(
             self,
             "Installer ready",
             "The verified installer was downloaded successfully.\n\n"
             f"Path: {staged_path}\n\n"
-            "Launch it now? Close SurvyAI first if the installer requests it.",
+            "SurvyAI will quit so the installer can replace the installed files.\n"
+            "Launch the installer now?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
-        if launch == QMessageBox.Yes:
+        if launch != QMessageBox.Yes:
+            self.statusBar().showMessage(f"Installer saved: {staged_path}", 8000)
+            return
+        try:
+            launch_staged_installer(Path(staged_path))
+        except Exception as exc:
             try:
-                if os.name == "nt":
-                    os.startfile(str(staged_path))  # type: ignore[attr-defined]
-                else:
-                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(staged_path)))
-            except Exception as exc:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(staged_path)))
+            except Exception:
                 QMessageBox.warning(
                     self,
                     "Installer not launched",
                     f"The installer is ready but could not be opened automatically:\n\n{exc}",
                 )
+                return
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(350, app.quit)
 
     @Slot()
     def _open_readme_docs(self) -> None:

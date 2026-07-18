@@ -4,10 +4,10 @@
       "platform": "windows-x64",
       "latest_version": "1.0.0",
       "min_supported_version": "1.0.0",
-      "download_url": "https://downloads.survyai.com/SurvyAI-Setup-1.0.0.exe",
+      "download_url": "https://survyai.com/updates/SurvyAI-Setup-1.0.0.exe",
       "sha256": "FC1B816D32FE945B62A43C8469A99A49CF477EB2F76BB745DD4845BCFA501C89",
       "artifact_kind": "full-installer",
-      "signing_scheme": "authenticode",
+      "signing_scheme": "",
       "signature": "",
       "mandatory": false,
       "release_notes_url": "https://survyai.com/#updates"

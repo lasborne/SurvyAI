@@ -6,10 +6,12 @@
   "bundled_resources": [
     "README.md",
     "agent/agent_config.json",
-    "agent/system_prompt.txt"
+    "agent/system_prompt.txt",
+    "bundled_templates/survey_plan_template3.dwg",
+    "bundled_templates/survey_plan_template3.json"
   ],
   "user_generated_not_bundled": [
-    "template_profiles/*.json (learned per-user at runtime into %APPDATA%/SurvyAI; dev profiles contain machine-specific DWG paths and must NOT ship)"
+    "template_profiles/*.json under the project root (dev-learned profiles with machine-specific DWG paths must NOT ship; runtime copies land in %APPDATA%/SurvyAI/template_profiles)"
   ],
   "desktop_only_modules": [
     "survyai",

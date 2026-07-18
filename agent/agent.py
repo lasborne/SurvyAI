@@ -2180,25 +2180,28 @@ class SurvyAIAgent:
     def _cad_template_profiles_seed_dirs(self):
         """Read-only directories scanned to seed/bootstrap template memory.
 
-        Order: bundled resources (shipped with the app) and, in dev only, the
-        project-root template_profiles/ folder.  These are never written to.
+        Order: shipped default templates (bundled_templates/), other bundled
+        template_profiles/, and in dev only the project-root template_profiles/
+        folder.  These are never written to.
         """
         from pathlib import Path
 
         seeds = []
-        try:
-            bundled = resource_path("template_profiles").resolve()
-            if bundled.exists():
-                seeds.append(bundled)
-        except Exception:
-            pass
-        if not is_frozen_app():
+        for rel in ("bundled_templates", "template_profiles"):
             try:
-                dev_dir = (project_root() / "template_profiles").resolve()
-                if dev_dir.exists():
-                    seeds.append(dev_dir)
+                bundled = resource_path(rel).resolve()
+                if bundled.exists():
+                    seeds.append(bundled)
             except Exception:
                 pass
+        if not is_frozen_app():
+            for rel in ("bundled_templates", "template_profiles"):
+                try:
+                    dev_dir = (project_root() / rel).resolve()
+                    if dev_dir.exists():
+                        seeds.append(dev_dir)
+                except Exception:
+                    pass
         # De-duplicate while preserving order, and never include the writable dir here.
         out = []
         seen = set()
@@ -2210,6 +2213,55 @@ class SurvyAIAgent:
                 out.append(s)
         return out
 
+    def _resolve_cad_template_file_path(
+        self,
+        path_raw: str,
+        *,
+        profile_file: Optional[Any] = None,
+    ):
+        """Resolve a template DWG path from a profile (absolute, relative, or bundled)."""
+        from pathlib import Path
+
+        raw = str(path_raw or "").strip()
+        if not raw:
+            return None
+        p = Path(raw)
+        name = p.name if p.suffix else f"{p.name}.dwg"
+        if not name.lower().endswith((".dwg", ".dxf")):
+            name = f"{Path(name).stem}.dwg"
+
+        candidates = []
+        if p.is_absolute():
+            candidates.append(p)
+        else:
+            if profile_file is not None:
+                try:
+                    prof_parent = Path(profile_file).resolve().parent
+                    candidates.append(prof_parent / p)
+                    candidates.append(prof_parent / name)
+                except Exception:
+                    pass
+            candidates.append(resource_path("bundled_templates", name))
+            candidates.append(resource_path(name))
+            if not is_frozen_app():
+                candidates.append(project_root() / "bundled_templates" / name)
+                candidates.append(project_root() / name)
+        # Absolute paths that vanished on another machine: fall back by filename.
+        if p.is_absolute():
+            candidates.append(resource_path("bundled_templates", name))
+            if not is_frozen_app():
+                candidates.append(project_root() / "bundled_templates" / name)
+                candidates.append(project_root() / name)
+
+        for c in candidates:
+            try:
+                cr = Path(c).resolve()
+                if cr.is_file():
+                    return cr
+            except Exception:
+                continue
+        return None
+
     def _cad_template_memory_path(self):
         from pathlib import Path
         if self._cad_template_memory_file:
@@ -2220,6 +2272,8 @@ class SurvyAIAgent:
 
     def _load_cad_template_memory(self) -> Dict[str, Any]:
         import json as _json
+        from pathlib import Path
+
         mem_path = self._cad_template_memory_path()
         data: Dict[str, Any] = {"templates": []}
         if not mem_path.exists():
@@ -2231,6 +2285,19 @@ class SurvyAIAgent:
         except Exception:
             data = {"templates": []}
         if not (data.get("templates") or []):
+            data = self._bootstrap_cad_template_memory_from_profiles(data)
+            return data
+        # Fresh installs / moved machines may keep stale absolute paths. If nothing
+        # on disk is usable, re-seed from bundled defaults (merge, don't wipe).
+        any_available = False
+        for ent in data.get("templates") or []:
+            try:
+                if Path(str(ent.get("path") or "")).exists():
+                    any_available = True
+                    break
+            except Exception:
+                continue
+        if not any_available:
             data = self._bootstrap_cad_template_memory_from_profiles(data)
         return data
 
@@ -2281,11 +2348,36 @@ class SurvyAIAgent:
                     tp_raw = str(template_meta.get("path") or "").strip()
                     if not tp_raw:
                         continue
-                    tp = Path(tp_raw).resolve()
-                    tp_res = str(tp)
+                    tp = self._resolve_cad_template_file_path(tp_raw, profile_file=prof_path)
+                    if tp is None:
+                        continue
+                    tp_res = str(tp.resolve())
                     learned_at = str(template_meta.get("learned_at") or "")
                     sig = template_meta.get("signature") or {}
                     stat = tp.stat() if tp.exists() else None
+                    # Prefer a writable profile copy so learning/apply never writes
+                    # into the read-only install bundle.
+                    writable_prof = (self._cad_template_profiles_dir() / prof_path.name).resolve()
+                    if not writable_prof.exists():
+                        try:
+                            seeded = dict(raw)
+                            tmpl = dict(seeded.get("template") or {})
+                            tmpl["path"] = tp_res
+                            tmpl["name"] = tp.name
+                            seeded["template"] = tmpl
+                            drawing = seeded.get("drawing_info")
+                            if isinstance(drawing, dict):
+                                drawing = dict(drawing)
+                                drawing["path"] = tp_res
+                                drawing["name"] = tp.name
+                                seeded["drawing_info"] = drawing
+                            writable_prof.write_text(
+                                _json.dumps(seeded, indent=2),
+                                encoding="utf-8",
+                            )
+                        except Exception:
+                            writable_prof = prof_path.resolve()
+                    profile_for_entry = writable_prof if writable_prof.exists() else prof_path.resolve()
                     entry = by_path.get(tp_res) or {
                         "id": tp.stem,
                         "path": tp_res,
@@ -2293,7 +2385,7 @@ class SurvyAIAgent:
                         "aliases": self._candidate_template_aliases(tp_res),
                         "use_count": 0,
                     }
-                    entry["profile_path"] = str(prof_path.resolve())
+                    entry["profile_path"] = str(profile_for_entry)
                     entry["last_used_at"] = str(entry.get("last_used_at") or learned_at or "")
                     entry["is_available"] = bool(tp.exists())
                     entry["signature"] = {
@@ -2403,8 +2495,20 @@ class SurvyAIAgent:
 
         for ent in entries:
             try:
-                tp = Path(str(ent.get("path") or "")).resolve()
-                exists = tp.exists()
+                tp_raw = str(ent.get("path") or "")
+                tp = Path(tp_raw).resolve() if tp_raw else None
+                if tp is None or not tp.exists():
+                    # Recover relocated / bundled default templates by filename.
+                    recovered = self._resolve_cad_template_file_path(
+                        tp_raw or str(ent.get("name") or ent.get("id") or ""),
+                        profile_file=ent.get("profile_path"),
+                    )
+                    if recovered is not None and recovered.exists():
+                        ent["path"] = str(recovered.resolve())
+                        ent["name"] = recovered.name
+                        tp = recovered
+                        dirty = True
+                exists = bool(tp is not None and tp.exists())
                 if bool(ent.get("is_available")) != bool(exists):
                     ent["is_available"] = bool(exists)
                     dirty = True
@@ -2422,7 +2526,18 @@ class SurvyAIAgent:
                 pass
 
         if not valid_entries:
-            return None
+            # Last resort: seed bundled defaults, then retry once.
+            data = self._bootstrap_cad_template_memory_from_profiles(data)
+            entries = list(data.get("templates") or [])
+            for ent in entries:
+                try:
+                    tp = Path(str(ent.get("path") or "")).resolve()
+                    if tp.exists():
+                        valid_entries.append(ent)
+                except Exception:
+                    continue
+            if not valid_entries:
+                return None
 
         def _score(ent: Dict[str, Any]) -> Tuple[int, str]:
             score = 0
@@ -3451,9 +3566,13 @@ class SurvyAIAgent:
                 data = _json.loads(profile_path.read_text(encoding="utf-8"))
                 prof_tp = str((data.get("template") or {}).get("path") or "")
                 try:
-                    prof_tp_res = str(Path(prof_tp).resolve()) if prof_tp else ""
+                    resolved_prof = self._resolve_cad_template_file_path(
+                        prof_tp,
+                        profile_file=profile_path,
+                    )
+                    prof_tp_res = str(resolved_prof.resolve()) if resolved_prof is not None else ""
                 except Exception:
-                    prof_tp_res = prof_tp
+                    prof_tp_res = ""
                 cur_tp_res = str(template_p.resolve())
                 sig = (data.get("template") or {}).get("signature") or {}
                 cur_stat = template_p.stat()
@@ -3686,9 +3805,21 @@ class SurvyAIAgent:
             return {"success": False, "error": f"Profile not found: {str(prof)}"}
         profile = _json.loads(prof.read_text(encoding="utf-8"))
         template_src = template_override_path or profile.get("template", {}).get("path", "")
-        template = Path(str(template_src or "")).resolve()
-        if not template.exists():
-            return {"success": False, "error": f"Template not found: {str(template)}"}
+        template = None
+        if template_override_path:
+            try:
+                candidate = Path(str(template_override_path)).resolve()
+                if candidate.is_file():
+                    template = candidate
+            except Exception:
+                template = None
+        if template is None:
+            template = self._resolve_cad_template_file_path(
+                str(template_src or ""),
+                profile_file=prof,
+            )
+        if template is None or not template.exists():
+            return {"success": False, "error": f"Template not found: {str(template_src)}"}
 
         # ABSOLUTE RULE: The survey template DWG is never modified, regardless of user prompt.
         # We only read from it (or copy from it). All edits are made to the output drawing copy.

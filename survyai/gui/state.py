@@ -115,6 +115,12 @@ class DesktopState:
     fast_mode_non_file_prompts: bool = True
     # UI theme: "light" (default) or "dark"
     theme: str = "light"
+    # App updates (opt-in). When enabled, SurvyAI checks the cloud manifest
+    # on a 12-hour cadence and notifies when a newer installer is available.
+    auto_check_updates: bool = False
+    update_channel: str = "stable"
+    last_update_check_at: str = ""
+    dismissed_update_version: str = ""
     # Credits accounting (synced from cloud entitlements / usage)
     monthly_credits_usd: float = 0.0
     monthly_credits_used_usd: float = 0.0
@@ -168,6 +174,10 @@ class DesktopState:
             ollama_prompt_dismissed=bool(raw.get("ollama_prompt_dismissed", False)),
             fast_mode_non_file_prompts=bool(raw.get("fast_mode_non_file_prompts", True)),
             theme=str(raw.get("theme", "light") or "light"),
+            auto_check_updates=bool(raw.get("auto_check_updates", False)),
+            update_channel=str(raw.get("update_channel", "stable") or "stable"),
+            last_update_check_at=str(raw.get("last_update_check_at", "") or ""),
+            dismissed_update_version=str(raw.get("dismissed_update_version", "") or ""),
             monthly_credits_usd=float(raw.get("monthly_credits_usd", 0.0)),
             monthly_credits_used_usd=float(raw.get("monthly_credits_used_usd", 0.0)),
             credit_markup_multiplier=float(raw.get("credit_markup_multiplier", 2.0)),
@@ -486,6 +496,9 @@ class AppStateStore:
             "secret_storage_enabled": bool(self.secret_store.secret_path.exists() or os.name == "nt"),
             "secret_storage_path": str(self.secret_store.secret_path),
             "machine_fingerprint_sha256": compute_machine_fingerprint(),
+            "auto_check_updates": bool(state.auto_check_updates),
+            "update_channel": state.update_channel,
+            "last_update_check_at": state.last_update_check_at,
             "history_count": len(state.output_history),
             "conversation_count": len(state.conversations),
             "active_conversation_id": state.active_conversation_id,

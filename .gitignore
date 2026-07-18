@@ -53,6 +53,8 @@ temp/
 UsedFiles/
 *.dwg
 *.dxf
+# Ship the default CAD template with the desktop installer.
+!bundled_templates/survey_plan_template3.dwg
 *.bak
 *.ini
 *.xlsx

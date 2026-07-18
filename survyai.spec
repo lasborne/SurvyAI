@@ -31,6 +31,9 @@ datas = [
     ("agent/agent_config.json", "agent"),
     ("agent/system_prompt.txt", "agent"),
     ("survyai/packaging_manifest.json", "survyai"),
+    # Default cadastral DWG + seed profile so CAD plotting works on first install.
+    ("bundled_templates/survey_plan_template3.dwg", "bundled_templates"),
+    ("bundled_templates/survey_plan_template3.json", "bundled_templates"),
 ]
 
 binaries = []

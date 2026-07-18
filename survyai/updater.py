@@ -5,13 +5,16 @@ import json
 import os
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import requests
 
 from runtime_paths import user_data_path
+
+# Default interval between automatic (consent-gated) update checks.
+UPDATE_CHECK_INTERVAL_HOURS = 12
 
 
 def _version_tuple(value: str) -> tuple[int, ...]:
@@ -20,6 +23,35 @@ def _version_tuple(value: str) -> tuple[int, ...]:
         digits = "".join(ch for ch in part if ch.isdigit())
         parts.append(int(digits or 0))
     return tuple(parts or [0])
+
+
+def update_check_due(
+    last_check_iso: str,
+    *,
+    interval_hours: float = UPDATE_CHECK_INTERVAL_HOURS,
+) -> bool:
+    """Return True when no prior check exists or the interval has elapsed."""
+    raw = str(last_check_iso or "").strip()
+    if not raw:
+        return True
+    try:
+        last = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+    except Exception:
+        return True
+    return datetime.now(timezone.utc) >= last + timedelta(hours=float(interval_hours))
+
+
+def launch_staged_installer(installer_path: Path) -> None:
+    """Open a staged Windows installer with the OS shell."""
+    target = Path(installer_path)
+    if not target.is_file():
+        raise FileNotFoundError(f"Staged installer not found: {target}")
+    if os.name == "nt":
+        os.startfile(str(target))  # type: ignore[attr-defined]
+        return
+    raise RuntimeError("Automatic installer launch is only supported on Windows.")
 
 
 @dataclass(frozen=True)
@@ -62,6 +94,10 @@ class UpdateManifest:
             return False
         return _version_tuple(current_version) < _version_tuple(self.min_supported_version)
 
+    def is_required_for(self, current_version: str) -> bool:
+        """True when the update is mandatory or below the supported floor."""
+        return bool(self.mandatory) or self.requires_upgrade_from(current_version)
+
 
 def _opt_str(value: Any) -> Optional[str]:
     raw = str(value or "").strip()
@@ -81,11 +117,17 @@ class UpdateManager:
         *,
         current_version: str,
         current_executable: str,
+        progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
     ) -> Path:
         if not manifest.download_url or not manifest.sha256:
             raise RuntimeError("Update manifest is missing download_url or sha256.")
         target = self.download_dir / self._download_filename(manifest)
-        self._download_with_sha256(manifest.download_url, target, manifest.sha256)
+        self._download_with_sha256(
+            manifest.download_url,
+            target,
+            manifest.sha256,
+            progress_callback=progress_callback,
+        )
         self._verify_signature_if_configured(target, manifest)
         rollback_plan = {
             "created_at": datetime.now(timezone.utc).isoformat(),
@@ -115,16 +157,33 @@ class UpdateManager:
         suffix = Path((manifest.download_url or "").split("?")[0]).suffix or ".bin"
         return f"SurvyAI-{manifest.latest_version}-{manifest.platform}{suffix}"
 
-    def _download_with_sha256(self, url: str, target: Path, expected_sha256: str) -> None:
+    def _download_with_sha256(
+        self,
+        url: str,
+        target: Path,
+        expected_sha256: str,
+        *,
+        progress_callback: Optional[Callable[[int, Optional[int]], None]] = None,
+    ) -> None:
         digest = hashlib.sha256()
+        downloaded = 0
         with requests.get(url, stream=True, timeout=120) as resp:
             resp.raise_for_status()
+            total_header = resp.headers.get("Content-Length")
+            total: Optional[int]
+            try:
+                total = int(total_header) if total_header else None
+            except (TypeError, ValueError):
+                total = None
             with target.open("wb") as fh:
                 for chunk in resp.iter_content(chunk_size=1024 * 256):
                     if not chunk:
                         continue
                     fh.write(chunk)
                     digest.update(chunk)
+                    downloaded += len(chunk)
+                    if progress_callback is not None:
+                        progress_callback(downloaded, total)
         actual = digest.hexdigest().lower()
         if actual != expected_sha256.strip().lower():
             target.unlink(missing_ok=True)
@@ -176,4 +235,10 @@ class UpdateManager:
             )
 
 
-__all__ = ["UpdateManager", "UpdateManifest"]
+__all__ = [
+    "UPDATE_CHECK_INTERVAL_HOURS",
+    "UpdateManager",
+    "UpdateManifest",
+    "launch_staged_installer",
+    "update_check_due",
+]
