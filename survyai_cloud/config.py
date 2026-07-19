@@ -186,8 +186,11 @@ class CloudSettings(BaseSettings):
         description="Display/label only; actual charge is set on the Paystack plan (default ₦162,000/yr).",
     )
     paystack_callback_url: str = Field(
-        default="https://survyai-api.onrender.com/survyai/paystack/callback", #"http://127.0.0.1/survyai/paystack/callback",
-        description="Shown after Paystack checkout; desktop can deep-link or just show success.",
+        default="https://survyai.com/payments/paystack-success",
+        description=(
+            "Browser redirect after Paystack checkout (static success page). "
+            "Use https://survyai.com/payments/paystack-success; www is handled by the site."
+        ),
     )
     paystack_webhook_enabled: bool = Field(default=True)
 
