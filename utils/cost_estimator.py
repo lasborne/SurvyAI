@@ -166,6 +166,28 @@ def estimate_tokens(text: str, method: str = "characters") -> int:
         return int(word_count / 0.75)
 
 
+def is_local_free_model(model_name: str) -> bool:
+    """True for Ollama / local open-weight tags that must never bill credits."""
+    model_lower = (model_name or "").lower().strip()
+    if not model_lower:
+        return False
+    if model_lower in {"ollama", "local"} or model_lower.startswith("ollama/"):
+        return True
+    return any(
+        model_lower.startswith(m) or f"-{m}" in model_lower or m in model_lower
+        for m in (
+            "llama",
+            "qwen",
+            "mistral",
+            "phi",
+            "gemma",
+            "deepseek-r1",
+            "codellama",
+            "tinyllama",
+        )
+    )
+
+
 def get_model_pricing(model_name: str) -> Dict[str, float]:
     """
     Get pricing for a specific model.
@@ -179,6 +201,10 @@ def get_model_pricing(model_name: str) -> Dict[str, float]:
     model_lower = (model_name or "").lower().strip()
     if not model_lower:
         return OPENAI_PRICING["default"]
+
+    # Local / Ollama models are free for pricing purposes (no cloud bill).
+    if is_local_free_model(model_name):
+        return {"input": 0.0, "output": 0.0, "cached_input": 0.0}
 
     if model_lower in OPENAI_PRICING:
         return OPENAI_PRICING[model_lower]

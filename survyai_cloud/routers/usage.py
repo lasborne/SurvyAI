@@ -14,6 +14,7 @@ from survyai_cloud.schemas import UsageBatchIn, UsageBatchOut
 from survyai_cloud.services.entitlements import (
     can_use_platform_llm,
     ensure_usage_month_rolled,
+    reconcile_pro_access,
     subscription_allows_platform_llm,
 )
 from utils.cost_estimator import estimate_token_cost_usd
@@ -119,6 +120,8 @@ async def ingest_usage(
         user.monthly_agent_runs_used += agent_run_delta
         db.add(user)
 
+    credits_usd_out = float(user.monthly_credits_usd or 0.0)
+    credits_used_out = float(user.monthly_credits_used_usd or 0.0)
     if batch_cost_usd > 0:
         marked_up = batch_cost_usd * settings.credit_markup_multiplier
         if (
@@ -131,12 +134,15 @@ async def ingest_usage(
                 detail="Subscription API credit balance exhausted for this period",
             )
         user.monthly_credits_used_usd = round(user.monthly_credits_used_usd + marked_up, 6)
+        credits_usd_out = float(user.monthly_credits_usd or 0.0)
+        credits_used_out = float(user.monthly_credits_used_usd or 0.0)
         db.add(user)
+        reconcile_pro_access(user, settings, db=db)
 
     return UsageBatchOut(
         accepted=len(body.events),
         monthly_agent_runs_used=user.monthly_agent_runs_used,
         monthly_agent_runs_quota=user.monthly_agent_runs_quota,
-        monthly_credits_used_usd=user.monthly_credits_used_usd,
-        monthly_credits_usd=user.monthly_credits_usd,
+        monthly_credits_used_usd=credits_used_out,
+        monthly_credits_usd=credits_usd_out,
     )

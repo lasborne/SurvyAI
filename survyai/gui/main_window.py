@@ -66,6 +66,11 @@ from survyai.capabilities import format_capabilities_summary, scan_machine_capab
 from survyai.credit_gate import credit_limit_enforcement_enabled
 from survyai.feature_flags import FeatureFlags
 from survyai.gui.branding import SurvyLogoWidget, make_app_icon
+from survyai.gui.cad_prompt_defaults import (
+    SYSTEM_DEFAULT_CAD_PROMPT,
+    is_system_default_text,
+    resolve_active_cad_prompt,
+)
 from survyai.gui.manage_pcs_dialog import ManagePcsDialog
 from survyai.gui.theme_toggle import ThemeToggle
 from survyai.gui.styles import THEME_DARK, THEME_LIGHT, get_stylesheet
@@ -407,11 +412,12 @@ def _should_inject_conversation_context(raw: str, prior_user_assistant_text: str
     return nt < 1 and nw < 8
 
 
-# Central stack: main tabs (Console + History), then full-page Settings, Diagnostics, Credits
+# Central stack: main tabs (Console + History), then full-page Settings, Diagnostics, Credits, CAD prompt
 _PAGE_MAIN = 0
 _PAGE_SETTINGS = 1
 _PAGE_DIAGNOSTICS = 2
 _PAGE_CREDITS = 3
+_PAGE_CAD_PROMPT = 4
 
 
 def _cloud_entitlements_allow_platform_llm(me: dict, ent: dict) -> bool:
@@ -738,6 +744,201 @@ class PaystackManageSubscriptionDialog(QDialog):
         return self._portal_url
 
 
+class _PasswordLineEdit(QWidget):
+    """Password field with a compact show/hide eye toggle."""
+
+    textChanged = Signal(str)
+
+    def __init__(self, parent: QWidget | None = None, *, placeholder: str = "") -> None:
+        super().__init__(parent)
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._edit = QLineEdit()
+        self._edit.setEchoMode(QLineEdit.EchoMode.Password)
+        if placeholder:
+            self._edit.setPlaceholderText(placeholder)
+        self._toggle = QToolButton()
+        self._toggle.setObjectName("secondaryButton")
+        # Compact eye-style control (Unicode U+25C9 looks like a pupil/eye on Windows fonts).
+        self._toggle.setText("\u25c9")
+        self._toggle.setCheckable(True)
+        self._toggle.setToolTip("Show password")
+        self._toggle.setFixedSize(34, 28)
+        self._toggle.setAutoRaise(True)
+        self._toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._toggle.toggled.connect(self._on_toggled)
+        self._edit.textChanged.connect(self.textChanged.emit)
+        row.addWidget(self._edit, 1)
+        row.addWidget(self._toggle, 0)
+
+    def _on_toggled(self, checked: bool) -> None:
+        self._edit.setEchoMode(
+            QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password
+        )
+        # Filled vs hollow circle reads as visible / hidden without emoji fonts.
+        self._toggle.setText("\u25ce" if checked else "\u25c9")
+        self._toggle.setToolTip("Hide password" if checked else "Show password")
+
+    def text(self) -> str:
+        return self._edit.text()
+
+    def setText(self, value: str) -> None:  # noqa: N802
+        self._edit.setText(value)
+
+    def setFocus(self, reason: Qt.FocusReason = Qt.FocusReason.OtherFocusReason) -> None:  # noqa: N802
+        self._edit.setFocus(reason)
+
+
+class _PasswordPromptDialog(QDialog):
+    """Single password prompt with eye toggle (sign-in / current password)."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        title: str,
+        label: str,
+        minimum_width: int = 420,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumWidth(minimum_width)
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel(label))
+        self._password = _PasswordLineEdit(self)
+        root.addWidget(self._password)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._password.setFocus()
+
+    def password(self) -> str:
+        return self._password.text()
+
+
+class _NewPasswordDialog(QDialog):
+    """New password + confirm with live policy hint and disabled OK until valid."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        title: str,
+        email: str | None = None,
+        minimum_width: int = 460,
+    ) -> None:
+        super().__init__(parent)
+        self._email = (email or "").strip() or None
+        self.setWindowTitle(title)
+        self.setMinimumWidth(minimum_width)
+        root = QVBoxLayout(self)
+        hint = QLabel(password_policy_hint())
+        hint.setWordWrap(True)
+        hint.setObjectName("hintLabel")
+        root.addWidget(hint)
+        root.addWidget(QLabel("New password"))
+        self._password = _PasswordLineEdit(self)
+        root.addWidget(self._password)
+        root.addWidget(QLabel("Confirm password"))
+        self._confirm = _PasswordLineEdit(self)
+        root.addWidget(self._confirm)
+        self._warn = QLabel("")
+        self._warn.setWordWrap(True)
+        self._warn.setStyleSheet("color: #b45309; font-size: 12px;")
+        root.addWidget(self._warn)
+        self._buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        self._ok = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+        self._ok.setEnabled(False)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        root.addWidget(self._buttons)
+        self._password.textChanged.connect(self._revalidate)
+        self._confirm.textChanged.connect(self._revalidate)
+        self._password.setFocus()
+        self._revalidate()
+
+    def _revalidate(self, *_args: object) -> None:
+        password = self._password.text()
+        confirm = self._confirm.text()
+        if not password:
+            self._warn.setText("Enter a password that meets the requirements above.")
+            self._ok.setEnabled(False)
+            return
+        policy_err = validate_password_strength(password, email=self._email)
+        if policy_err:
+            self._warn.setText(policy_err)
+            self._ok.setEnabled(False)
+            return
+        if confirm != password:
+            self._warn.setText("Passwords do not match.")
+            self._ok.setEnabled(False)
+            return
+        self._warn.setText("")
+        self._ok.setEnabled(True)
+
+    def password(self) -> str:
+        return self._password.text()
+
+
+class _CloudAuthChoiceDialog(QDialog):
+    """Sign-in / create / forgot choice with room for the Forgot password label."""
+
+    CHOICE_SIGN_IN = "sign_in"
+    CHOICE_CREATE = "create"
+    CHOICE_FORGOT = "forgot"
+
+    def __init__(self, parent: QWidget | None, *, policy_hint: str) -> None:
+        super().__init__(parent)
+        self._choice = ""
+        self.setWindowTitle("SurvyAI cloud")
+        self.setMinimumWidth(520)
+        root = QVBoxLayout(self)
+        title = QLabel("Do you already have a cloud account, or do you want to create one?")
+        title.setWordWrap(True)
+        root.addWidget(title)
+        info = QLabel(
+            f"Create account registers you on the server ({policy_hint}). "
+            "You can subscribe to Pro afterward. Use Forgot password if you cannot sign in."
+        )
+        info.setWordWrap(True)
+        info.setObjectName("hintLabel")
+        root.addWidget(info)
+        row = QHBoxLayout()
+        row.setSpacing(8)
+        btn_sign_in = QPushButton("Sign in")
+        btn_create = QPushButton("Create account")
+        btn_create.setObjectName("secondaryButton")
+        btn_forgot = QPushButton("Forgot password…")
+        btn_forgot.setObjectName("secondaryButton")
+        btn_forgot.setMinimumWidth(150)
+        btn_cancel = QPushButton("Cancel")
+        btn_cancel.setObjectName("secondaryButton")
+        row.addWidget(btn_sign_in)
+        row.addWidget(btn_create)
+        row.addWidget(btn_forgot)
+        row.addStretch(1)
+        row.addWidget(btn_cancel)
+        root.addLayout(row)
+
+        def _pick(value: str) -> None:
+            self._choice = value
+            self.accept()
+
+        btn_sign_in.clicked.connect(lambda: _pick(self.CHOICE_SIGN_IN))
+        btn_create.clicked.connect(lambda: _pick(self.CHOICE_CREATE))
+        btn_forgot.clicked.connect(lambda: _pick(self.CHOICE_FORGOT))
+        btn_cancel.clicked.connect(self.reject)
+
+    def choice(self) -> str:
+        return self._choice
+
+
 def _paystack_user_message(server_message: str) -> str:
     """Append setup hint when checkout fails because Paystack is not configured on the server."""
     s = (server_message or "").strip()
@@ -758,6 +959,190 @@ def _cloud_error_text_for_user(exc: BaseException) -> str:
     if "not configured" in low and "paystack" in low:
         return _paystack_user_message(raw)
     return user_facing_cloud_message(exc)
+
+
+class _CadFileConflictDialog(QDialog):
+    """Professional confirmation when an existing CAD drawing would be overwritten or modified."""
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        path: str,
+        *,
+        mode: str = "overwrite",
+        dark: bool = False,
+    ) -> None:
+        super().__init__(parent)
+        self.setObjectName("cadConflictDialog")
+        self.setModal(True)
+        self.setWindowModality(Qt.WindowModality.ApplicationModal)
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        mode_l = (mode or "overwrite").strip().lower()
+        is_modify = mode_l == "modify"
+        self.setWindowTitle(
+            "Modify existing drawing" if is_modify else "Drawing already exists"
+        )
+        self.setMinimumWidth(460)
+        self.setMaximumWidth(560)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(14)
+
+        header = QHBoxLayout()
+        header.setSpacing(12)
+        icon = QLabel()
+        icon.setFixedSize(40, 40)
+        icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        icon.setObjectName("cadConflictIcon")
+        # Soft warning glyph (no emoji dependency).
+        icon.setText("!")
+        header.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
+
+        titles = QVBoxLayout()
+        titles.setSpacing(4)
+        title = QLabel(
+            "Modify this drawing?" if is_modify else "This drawing already exists"
+        )
+        title.setObjectName("cadConflictTitle")
+        title.setWordWrap(True)
+        subtitle = QLabel(
+            "SurvyAI is about to change an existing AutoCAD file at this path. "
+            "Confirm to continue, or cancel to leave the file as it is."
+            if is_modify
+            else "A drawing with this name is already in the folder. "
+            "Overwrite it with a new plan from the template, or keep the current file."
+        )
+        subtitle.setObjectName("cadConflictSubtitle")
+        subtitle.setWordWrap(True)
+        titles.addWidget(title)
+        titles.addWidget(subtitle)
+        header.addLayout(titles, 1)
+        root.addLayout(header)
+
+        path_box = QFrame()
+        path_box.setObjectName("cadConflictPathBox")
+        path_layout = QVBoxLayout(path_box)
+        path_layout.setContentsMargins(12, 10, 12, 10)
+        path_layout.setSpacing(4)
+        path_label = QLabel("File path")
+        path_label.setObjectName("cadConflictPathLabel")
+        path_value = QLabel(path or "—")
+        path_value.setObjectName("cadConflictPathValue")
+        path_value.setWordWrap(True)
+        path_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        path_layout.addWidget(path_label)
+        path_layout.addWidget(path_value)
+        root.addWidget(path_box)
+
+        hint = QLabel(
+            "The survey plan template is never overwritten."
+        )
+        hint.setObjectName("cadConflictHint")
+        hint.setWordWrap(True)
+        root.addWidget(hint)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(10)
+        btn_row.addStretch(1)
+        keep_btn = QPushButton("Keep existing" if not is_modify else "Cancel")
+        keep_btn.setObjectName("secondaryButton")
+        keep_btn.setMinimumWidth(120)
+        keep_btn.clicked.connect(self.reject)
+        go_btn = QPushButton("Overwrite" if not is_modify else "Apply changes")
+        go_btn.setObjectName("sendButton")
+        go_btn.setMinimumWidth(130)
+        go_btn.setDefault(True)
+        go_btn.clicked.connect(self.accept)
+        btn_row.addWidget(keep_btn)
+        btn_row.addWidget(go_btn)
+        root.addLayout(btn_row)
+
+        # Inline theme so the dialog reads clearly even when the parent theme is dense.
+        if dark:
+            self.setStyleSheet(
+                """
+                QDialog#cadConflictDialog {
+                    background: #18181b;
+                    border: 1px solid #3f3f46;
+                    border-radius: 14px;
+                }
+                QLabel#cadConflictIcon {
+                    background: #422006;
+                    color: #fbbf24;
+                    border: 1px solid #78350f;
+                    border-radius: 20px;
+                    font-size: 18pt;
+                    font-weight: 800;
+                }
+                QLabel#cadConflictTitle {
+                    color: #fafafa;
+                    font-size: 13.5pt;
+                    font-weight: 700;
+                }
+                QLabel#cadConflictSubtitle, QLabel#cadConflictHint {
+                    color: #a1a1aa;
+                    font-size: 9.5pt;
+                }
+                QFrame#cadConflictPathBox {
+                    background: #27272a;
+                    border: 1px solid #3f3f46;
+                    border-radius: 10px;
+                }
+                QLabel#cadConflictPathLabel {
+                    color: #71717a;
+                    font-size: 8.5pt;
+                    font-weight: 600;
+                }
+                QLabel#cadConflictPathValue {
+                    color: #e4e4e7;
+                    font-family: "Cascadia Mono", "Consolas", monospace;
+                    font-size: 9pt;
+                }
+                """
+            )
+        else:
+            self.setStyleSheet(
+                """
+                QDialog#cadConflictDialog {
+                    background: #ffffff;
+                    border: 1px solid #e2e8f0;
+                    border-radius: 14px;
+                }
+                QLabel#cadConflictIcon {
+                    background: #fff7ed;
+                    color: #c2410c;
+                    border: 1px solid #fdba74;
+                    border-radius: 20px;
+                    font-size: 18pt;
+                    font-weight: 800;
+                }
+                QLabel#cadConflictTitle {
+                    color: #0f172a;
+                    font-size: 13.5pt;
+                    font-weight: 700;
+                }
+                QLabel#cadConflictSubtitle, QLabel#cadConflictHint {
+                    color: #64748b;
+                    font-size: 9.5pt;
+                }
+                QFrame#cadConflictPathBox {
+                    background: #f8fafc;
+                    border: 1px solid #e2e8f0;
+                    border-radius: 10px;
+                }
+                QLabel#cadConflictPathLabel {
+                    color: #94a3b8;
+                    font-size: 8.5pt;
+                    font-weight: 600;
+                }
+                QLabel#cadConflictPathValue {
+                    color: #1e293b;
+                    font-family: "Cascadia Mono", "Consolas", monospace;
+                    font-size: 9pt;
+                }
+                """
+            )
 
 
 class MainWindow(QMainWindow):
@@ -799,6 +1184,8 @@ class MainWindow(QMainWindow):
         self._active_conversation_id = active_conversation.conversation_id
         self._last_query = ""
         self._pending_plain_query: Optional[str] = None
+        # CAD prompt page staging: None | "user" | "system"
+        self._cad_prompt_pending: Optional[str] = None
         self._run_started_at = 0.0
         self._run_stage = -1
         self._conversation_list_sync = False
@@ -829,6 +1216,13 @@ class MainWindow(QMainWindow):
         self._update_check_timer = QTimer(self)
         self._update_check_timer.setInterval(int(UPDATE_CHECK_INTERVAL_HOURS * 60 * 60 * 1000))
         self._update_check_timer.timeout.connect(self._maybe_auto_check_updates)
+
+        self._payment_watch_timer = QTimer(self)
+        self._payment_watch_timer.setInterval(4000)
+        self._payment_watch_timer.timeout.connect(self._on_payment_watch_tick)
+        self._payment_watch_baseline: Optional[dict] = None
+        self._payment_watch_attempts = 0
+        self._payment_watch_max_attempts = 75  # ~5 minutes at 4s
 
         QTimer.singleShot(0, self._finish_startup)
         # Credit strip lays out after first frame; refresh once the prompt row has geometry.
@@ -881,8 +1275,8 @@ class MainWindow(QMainWindow):
         f = QFont(self.font())
         f.setPointSizeF(pt)
 
-        btn_min_h = max(22, int(24 * scale + 6))
-        for name in ("_send_btn", "_cancel_btn", "_retry_btn"):
+        btn_min_h = max(20, int(22 * scale + 4))
+        for name in ("_send_btn", "_cancel_btn", "_retry_btn", "_cad_prompt_btn"):
             w = getattr(self, name, None)
             if w is None:
                 continue
@@ -1068,39 +1462,122 @@ class MainWindow(QMainWindow):
         *,
         success_status: str,
         missing_auth_message: str = "Sign in from the account menu (top right) first.",
+        silent: bool = False,
+        on_success: Optional[object] = None,
     ) -> bool:
         if self._cloud_network_busy():
-            self.statusBar().showMessage("Cloud update already in progress…", 3000)
+            if not silent:
+                self.statusBar().showMessage("Cloud update already in progress…", 3000)
             return False
         base, token = self._cloud_base_and_token()
         if not base or not token:
-            QMessageBox.warning(self, "Sign in required", missing_auth_message)
+            if not silent:
+                QMessageBox.warning(self, "Sign in required", missing_auth_message)
             return False
 
-        self._begin_cloud_busy("Refreshing cloud account…")
+        if not silent:
+            self._begin_cloud_busy("Refreshing cloud account…")
         thread = CloudAccountSyncThread(self._make_cloud_account_sync_payload(), parent=self)
         self._cloud_account_sync_thread = thread
 
         def _done() -> None:
-            self._end_cloud_busy()
+            if not silent:
+                self._end_cloud_busy()
             if self._cloud_account_sync_thread is thread:
                 self._cloud_account_sync_thread = None
 
         def _on_ok(result_obj: object) -> None:
             result = result_obj if isinstance(result_obj, CloudAccountSyncResult) else None
             if result is None:
-                QMessageBox.warning(self, "Couldn't refresh account", "Unexpected sync response.")
+                if not silent:
+                    QMessageBox.warning(self, "Couldn't refresh account", "Unexpected sync response.")
                 return
             self._apply_cloud_account_sync_result(result, success_status=success_status)
+            if callable(on_success):
+                try:
+                    on_success(result)
+                except Exception:
+                    pass
 
         def _on_fail(msg: str) -> None:
-            QMessageBox.warning(self, "Couldn't refresh account", msg)
+            if not silent:
+                QMessageBox.warning(self, "Couldn't refresh account", msg)
 
         thread.succeeded.connect(_on_ok)
         thread.failed.connect(_on_fail)
         thread.finished.connect(_done)
         thread.start()
         return True
+
+    def _payment_watch_snapshot(self) -> dict:
+        me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
+        return {
+            "plan_slug": str(me.get("plan_slug") or "").strip().lower(),
+            "subscription_status": str(me.get("subscription_status") or "").strip().lower(),
+            "period_end": str(me.get("subscription_current_period_end") or "").strip(),
+            "credits_usd": round(float(self._state.monthly_credits_usd or 0.0), 6),
+            "credits_used": round(float(self._state.monthly_credits_used_usd or 0.0), 6),
+        }
+
+    def _start_payment_refresh_watch(self) -> None:
+        """Poll cloud account until webhook-applied Pro changes appear (or timeout)."""
+        self._payment_watch_baseline = self._payment_watch_snapshot()
+        self._payment_watch_attempts = 0
+        if not self._payment_watch_timer.isActive():
+            self._payment_watch_timer.start()
+        self.statusBar().showMessage("Waiting for payment confirmation…", 5000)
+
+    def _stop_payment_refresh_watch(self) -> None:
+        self._payment_watch_timer.stop()
+        self._payment_watch_baseline = None
+        self._payment_watch_attempts = 0
+
+    def _payment_watch_detected_upgrade(self, before: dict, after: dict) -> bool:
+        if not before or not after:
+            return False
+        if after.get("plan_slug") == "pro" and before.get("plan_slug") != "pro":
+            return True
+        if after.get("period_end") and after.get("period_end") != before.get("period_end"):
+            return True
+        if float(after.get("credits_usd") or 0) > float(before.get("credits_usd") or 0) + 1e-6:
+            return True
+        # Exhausted → repurchase: used reset while budget restored.
+        if (
+            after.get("plan_slug") == "pro"
+            and float(after.get("credits_used") or 0) + 1e-6 < float(before.get("credits_used") or 0)
+            and float(after.get("credits_usd") or 0) + 1e-6 >= float(before.get("credits_usd") or 0)
+        ):
+            return True
+        return False
+
+    @Slot()
+    def _on_payment_watch_tick(self) -> None:
+        if self._payment_watch_baseline is None:
+            self._stop_payment_refresh_watch()
+            return
+        self._payment_watch_attempts += 1
+        if self._payment_watch_attempts > self._payment_watch_max_attempts:
+            self._stop_payment_refresh_watch()
+            self.statusBar().showMessage(
+                "Payment not confirmed yet. Use Refresh cloud account or Verify payment reference…",
+                8000,
+            )
+            return
+        if self._cloud_network_busy():
+            return
+        baseline = dict(self._payment_watch_baseline)
+
+        def _after(result: object) -> None:
+            after = self._payment_watch_snapshot()
+            if self._payment_watch_detected_upgrade(baseline, after):
+                self._stop_payment_refresh_watch()
+                self.statusBar().showMessage("Payment confirmed — Pro access updated.", 8000)
+
+        self._start_cloud_account_sync(
+            success_status="Checking payment status…",
+            silent=True,
+            on_success=_after,
+        )
 
     # ------------------------------------------------------------------
     # UI construction
@@ -1240,9 +1717,11 @@ class MainWindow(QMainWindow):
         self._settings_page = self._build_settings_page()
         self._diagnostics_page = self._build_diagnostics_page()
         self._credits_page = self._build_credits_page()
+        self._cad_prompt_page = self._build_cad_prompt_page()
         self._central_stack.addWidget(self._settings_page)
         self._central_stack.addWidget(self._diagnostics_page)
         self._central_stack.addWidget(self._credits_page)
+        self._central_stack.addWidget(self._cad_prompt_page)
 
     def _build_console_tab(self) -> None:
         tab = QWidget()
@@ -1330,7 +1809,7 @@ class MainWindow(QMainWindow):
 
         controls = QVBoxLayout()
         controls.setContentsMargins(0, 0, 0, 0)
-        controls.setSpacing(4)
+        controls.setSpacing(3)
         controls.addStretch(1)
         self._send_btn = QPushButton("Send")
         self._send_btn.setObjectName("sendButton")
@@ -1360,6 +1839,19 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
         )
         controls.addWidget(self._retry_btn)
+
+        self._cad_prompt_btn = QPushButton("Input CAD plan prompt")
+        self._cad_prompt_btn.setObjectName("secondaryButton")
+        self._cad_prompt_btn.clicked.connect(self._insert_cad_plan_prompt)
+        self._cad_prompt_btn.setToolTip(
+            "Insert your current default CAD survey-plan prompt into the input box "
+            "(from Account → Edit Default CAD Prompt). Existing text is kept; "
+            "the template starts on a new line."
+        )
+        self._cad_prompt_btn.setSizePolicy(
+            QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
+        )
+        controls.addWidget(self._cad_prompt_btn)
 
         self._fallback_cb = QCheckBox("Use fallback LLM")
         self._fallback_cb.toggled.connect(self._on_fallback_toggled)
@@ -1528,8 +2020,12 @@ class MainWindow(QMainWindow):
         self._change_password_btn.setToolTip(
             "Update your SurvyAI Cloud password. Requires your current password."
         )
+        self._change_password_btn.setMaximumWidth(168)
         self._change_password_btn.clicked.connect(self._on_change_password)
-        account_outer.addWidget(self._change_password_btn)
+        change_pw_row = QHBoxLayout()
+        change_pw_row.addWidget(self._change_password_btn, 0)
+        change_pw_row.addStretch(1)
+        account_outer.addLayout(change_pw_row)
         page_layout.addWidget(account_group)
 
         pay_group = QGroupBox("Pro subscription (Paystack)")
@@ -1537,7 +2033,8 @@ class MainWindow(QMainWindow):
         pay_outer.setSpacing(10)
         pay_hint = QLabel(
             "After you sign in, subscribe or manage billing below. "
-            "Use Refresh cloud account after payment if your server has no webhooks yet. "
+            "Successful Paystack payments refresh your plan automatically when webhooks are configured. "
+            "Use Refresh cloud account or Verify payment reference… only if the update does not appear. "
             "Use Manage PCs… to remove old computers from your device slots."
         )
         pay_hint.setWordWrap(True)
@@ -1767,8 +2264,8 @@ class MainWindow(QMainWindow):
         credits_title.setObjectName("pageTitle")
         credits_sub = QLabel(
             "Track API spend for runs in this desktop app. Credit pool is your subscription USD "
-            "equivalent. Used is provider-reported LLM cost + SurvyAI markup inside the active "
-            "paid window. Pro hosted plans: sign in and use Refresh from cloud to sync."
+            "equivalent. Used is the billed cost of hosted model runs inside the active paid window. "
+            "Local models (Ollama) are free. Pro hosted plans: sign in and use Refresh from cloud to sync."
         )
         credits_sub.setObjectName("pageSubtitle")
         credits_sub.setWordWrap(True)
@@ -1797,7 +2294,7 @@ class MainWindow(QMainWindow):
         self._credits_remaining_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
         summary_form.addRow("Credit pool (subscription USD)", self._credits_total_label)
-        summary_form.addRow("Used (marked-up LLM cost)", self._credits_used_label)
+        summary_form.addRow("Used", self._credits_used_label)
         summary_form.addRow("Remaining", self._credits_remaining_label)
         summary_form.addRow("", self._credits_pct_label)
         summary_outer.addLayout(summary_form)
@@ -1842,6 +2339,71 @@ class MainWindow(QMainWindow):
         self._credits_lifetime_label.setAlignment(Qt.AlignRight)
         self._credits_lifetime_label.setStyleSheet("color: #9ca3af; font-size: 11px;")
         page_layout.addWidget(self._credits_lifetime_label)
+
+        page_layout.addStretch()
+        return tab
+
+    def _build_cad_prompt_page(self) -> QWidget:
+        """Full-page editor for the default CAD survey-plan prompt template."""
+        tab, page_layout = self._begin_app_scroll_page()
+
+        title = QLabel("Edit Default CAD Prompt")
+        title.setObjectName("pageTitle")
+        subtitle = QLabel(
+            "Customize the default field layout used when creating new AutoCAD (.dwg) survey "
+            "plans — surveyor name and address, plan number, location, state or country, "
+            "coordinates, roads, fences, and related metadata. The accepted template is "
+            "inserted into the console via the CAD plan prompt button. You can still type "
+            "any valid generation prompt manually in the console."
+        )
+        subtitle.setObjectName("pageSubtitle")
+        subtitle.setWordWrap(True)
+        page_layout.addWidget(title)
+        page_layout.addWidget(subtitle)
+
+        editor_group = QGroupBox("CAD prompt template")
+        editor_layout = QVBoxLayout(editor_group)
+        self._cad_prompt_editor = QPlainTextEdit()
+        self._cad_prompt_editor.setObjectName("chatInput")
+        self._cad_prompt_editor.setMinimumHeight(280)
+        self._cad_prompt_editor.setPlaceholderText("Enter your default CAD survey-plan prompt…")
+        editor_layout.addWidget(self._cad_prompt_editor)
+
+        self._cad_prompt_status = QLabel("")
+        self._cad_prompt_status.setObjectName("hintLabel")
+        self._cad_prompt_status.setWordWrap(True)
+        editor_layout.addWidget(self._cad_prompt_status)
+        page_layout.addWidget(editor_group)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        self._cad_prompt_user_btn = QPushButton("Apply User-defined Prompt")
+        self._cad_prompt_user_btn.setObjectName("secondaryButton")
+        self._cad_prompt_user_btn.setToolTip(
+            "Stage the text in the editor as your custom default CAD prompt. "
+            "Click Apply Change to confirm and save."
+        )
+        self._cad_prompt_user_btn.clicked.connect(self._on_cad_prompt_apply_user_defined)
+        btn_row.addWidget(self._cad_prompt_user_btn)
+
+        self._cad_prompt_restore_btn = QPushButton("Restore System-defined Prompt")
+        self._cad_prompt_restore_btn.setObjectName("secondaryButton")
+        self._cad_prompt_restore_btn.setToolTip(
+            "Replace the editor with the packaged SurvyAI system CAD prompt. "
+            "Click Apply Change to confirm and save."
+        )
+        self._cad_prompt_restore_btn.clicked.connect(self._on_cad_prompt_restore_system)
+        btn_row.addWidget(self._cad_prompt_restore_btn)
+
+        self._cad_prompt_apply_btn = QPushButton("Apply Change")
+        self._cad_prompt_apply_btn.setToolTip(
+            "Confirm and save the pending CAD prompt change to this computer."
+        )
+        self._cad_prompt_apply_btn.clicked.connect(self._on_cad_prompt_apply_change)
+        btn_row.addWidget(self._cad_prompt_apply_btn)
+        btn_row.addStretch()
+        page_layout.addLayout(btn_row)
 
         page_layout.addStretch()
         return tab
@@ -1969,6 +2531,15 @@ class MainWindow(QMainWindow):
             "and estimated runs remaining.",
         )
         account_menu.addAction(act_credits)
+
+        act_cad_prompt = QAction("Edit Default CAD Prompt…", self)
+        act_cad_prompt.triggered.connect(self._show_cad_prompt_page)
+        self._describe_menu_action(
+            act_cad_prompt,
+            "Edit the default CAD survey-plan prompt template used when inserting via "
+            "CAD plan prompt — surveyor details, plan number, location, and related fields.",
+        )
+        account_menu.addAction(act_cad_prompt)
 
         act_diag = QAction("Diagnostics…", self)
         act_diag.triggered.connect(self._show_diagnostics_page)
@@ -2103,6 +2674,113 @@ class MainWindow(QMainWindow):
         self._back_workspace_btn.setVisible(True)
 
     @Slot()
+    def _show_cad_prompt_page(self) -> None:
+        self._load_cad_prompt_editor_from_state()
+        self._central_stack.setCurrentIndex(_PAGE_CAD_PROMPT)
+        self._back_workspace_btn.setVisible(True)
+
+    def _load_cad_prompt_editor_from_state(self) -> None:
+        """Reload the CAD prompt editor from the last saved active template."""
+        text = resolve_active_cad_prompt(self._state.default_cad_prompt)
+        self._cad_prompt_editor.setPlainText(text)
+        self._cad_prompt_pending = None
+        if (self._state.default_cad_prompt or "").strip():
+            self._cad_prompt_status.setText("Current: your user-defined CAD prompt is active.")
+        else:
+            self._cad_prompt_status.setText("Current: the packaged system CAD prompt is active.")
+
+    @Slot()
+    def _on_cad_prompt_apply_user_defined(self) -> None:
+        text = self._cad_prompt_editor.toPlainText().strip()
+        if not text:
+            QMessageBox.warning(
+                self,
+                "Empty prompt",
+                "Enter a CAD survey-plan prompt before applying a user-defined template.",
+            )
+            return
+        self._cad_prompt_pending = "user"
+        self._cad_prompt_status.setText(
+            "Ready to apply your custom CAD prompt — click Apply Change to confirm and save."
+        )
+
+    @Slot()
+    def _on_cad_prompt_restore_system(self) -> None:
+        self._cad_prompt_editor.setPlainText(SYSTEM_DEFAULT_CAD_PROMPT)
+        self._cad_prompt_pending = "system"
+        self._cad_prompt_status.setText(
+            "Ready to restore the packaged system CAD prompt — click Apply Change to confirm and save."
+        )
+
+    @Slot()
+    def _on_cad_prompt_apply_change(self) -> None:
+        editor_text = self._cad_prompt_editor.toPlainText()
+        saved_active = resolve_active_cad_prompt(self._state.default_cad_prompt)
+        has_pending = self._cad_prompt_pending in ("user", "system")
+        draft_changed = editor_text.strip() != saved_active.strip()
+        if not has_pending and not draft_changed:
+            QMessageBox.information(
+                self,
+                "No changes",
+                "There are no pending CAD prompt changes to apply.",
+            )
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Apply Change",
+            "Apply this CAD prompt as your default survey-plan template on this computer?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No
+            | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer == QMessageBox.StandardButton.Cancel:
+            return
+        if answer == QMessageBox.StandardButton.No:
+            self._load_cad_prompt_editor_from_state()
+            return
+
+        # Yes — persist. System restore (or text matching system) stores empty = use packaged default.
+        if self._cad_prompt_pending == "system" or is_system_default_text(editor_text):
+            self._state.default_cad_prompt = ""
+        else:
+            self._state.default_cad_prompt = editor_text.strip()
+        self._state_store.save(self._state)
+        self._cad_prompt_pending = None
+        if (self._state.default_cad_prompt or "").strip():
+            self._cad_prompt_status.setText("Saved: your user-defined CAD prompt is now active.")
+        else:
+            self._cad_prompt_status.setText("Saved: the packaged system CAD prompt is now active.")
+        self.statusBar().showMessage("Default CAD prompt updated.", 4000)
+
+    @Slot()
+    def _insert_cad_plan_prompt(self) -> None:
+        """Insert the active default CAD prompt into the console input box."""
+        if self._thread is not None and self._thread.isRunning():
+            if self._active_conversation_id == self._running_conversation_id:
+                QMessageBox.information(
+                    self,
+                    "Task in progress",
+                    "Wait for the current task to finish before inserting a CAD plan prompt.",
+                )
+                return
+        template = resolve_active_cad_prompt(self._state.default_cad_prompt)
+        existing = self._input.toPlainText()
+        if existing.strip():
+            # Keep existing text; start the template on a new line.
+            if existing.endswith("\n"):
+                self._input.setPlainText(existing + template)
+            else:
+                self._input.setPlainText(existing + "\n" + template)
+        else:
+            self._input.setPlainText(template)
+        self._input.setFocus(Qt.FocusReason.OtherFocusReason)
+        cursor = self._input.textCursor()
+        cursor.movePosition(QTextCursor.MoveOperation.End)
+        self._input.setTextCursor(cursor)
+
+    @Slot()
     def _back_to_workspace(self) -> None:
         self._central_stack.setCurrentIndex(_PAGE_MAIN)
         self._back_workspace_btn.setVisible(False)
@@ -2150,6 +2828,15 @@ class MainWindow(QMainWindow):
                 "Your subscription credit pool in USD, how much has been used, and what remains for hosted models.",
             )
             self._user_menu.addAction(act_credits)
+
+            act_cad_prompt = QAction("Edit Default CAD Prompt", self)
+            act_cad_prompt.triggered.connect(self._show_cad_prompt_page)
+            self._describe_menu_action(
+                act_cad_prompt,
+                "Edit the default CAD survey-plan prompt template (surveyor details, plan number, "
+                "location, and related fields) used by the CAD plan prompt button.",
+            )
+            self._user_menu.addAction(act_cad_prompt)
 
             act_ollama = QAction("Local models (Ollama)…", self)
             act_ollama.triggered.connect(self._open_ollama_setup)
@@ -2216,6 +2903,14 @@ class MainWindow(QMainWindow):
                 "After sign-in, shows your subscription pool and usage — meaningful once connected to cloud.",
             )
             self._user_menu.addAction(act_credits)
+
+            act_cad_prompt = QAction("Edit Default CAD Prompt", self)
+            act_cad_prompt.triggered.connect(self._show_cad_prompt_page)
+            self._describe_menu_action(
+                act_cad_prompt,
+                "Edit the default CAD survey-plan prompt template used by the CAD plan prompt button.",
+            )
+            self._user_menu.addAction(act_cad_prompt)
 
             act_ollama = QAction("Local models (Ollama)…", self)
             act_ollama.triggered.connect(self._open_ollama_setup)
@@ -2725,6 +3420,43 @@ class MainWindow(QMainWindow):
             )
         self._refresh_user_menu()
 
+    def _cloud_pro_still_entitled(self, me: dict | None = None) -> bool:
+        """True when cloud plan is Pro with an open period and remaining credits."""
+        me = me if isinstance(me, dict) else (
+            self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
+        )
+        plan_low = str(me.get("plan_slug") or "").strip().lower()
+        st_low = str(me.get("subscription_status") or "").strip().lower()
+        if plan_low != "pro" or st_low not in {"active", "trialing", "non_renewing"}:
+            return False
+        if me.get("can_use_platform_llm") is False:
+            return False
+        period_end = self._parse_datetime_value(
+            me.get("subscription_current_period_end")
+            or self._state.subscription_current_period_end
+        )
+        if period_end is not None and period_end <= datetime.now(timezone.utc):
+            return False
+        # Local state is updated on each run; prefer it, fall back to last /me payload.
+        budget = float(self._state.monthly_credits_usd or 0.0)
+        used = float(self._state.monthly_credits_used_usd or 0.0)
+        if budget <= 0 and me.get("monthly_credits_usd") is not None:
+            try:
+                budget = float(me.get("monthly_credits_usd") or 0.0)
+                used = float(me.get("monthly_credits_used_usd") or 0.0)
+            except (TypeError, ValueError):
+                budget = 0.0
+                used = 0.0
+        elif me.get("monthly_credits_used_usd") is not None:
+            # If either side shows the pool spent, treat as exhausted.
+            try:
+                used = max(used, float(me.get("monthly_credits_used_usd") or 0.0))
+            except (TypeError, ValueError):
+                pass
+        if budget <= 0 or used + 1e-6 >= budget:
+            return False
+        return True
+
     def _refresh_license_card(self) -> None:
         runtime_flags = self._feature_flags
         display_flags = self._display_feature_flags
@@ -2732,6 +3464,21 @@ class MainWindow(QMainWindow):
         me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
         if me.get("plan_slug"):
             plan = str(me.get("plan_slug") or plan)
+        # Mirror server reconcile: expired / exhausted Pro should read as Free in Settings.
+        cloud_ok = bool(self._state.cloud_api_base_url.strip() and self._state.cloud_access_token.strip())
+        st_low = str(me.get("subscription_status") or "").lower()
+        plan_low = str(me.get("plan_slug") or "").lower()
+        has_pro = self._cloud_pro_still_entitled(me) if cloud_ok and me else False
+        if (
+            cloud_ok
+            and me
+            and plan_low == "pro"
+            and not has_pro
+            and st_low in {"active", "trialing", "non_renewing"}
+        ):
+            plan = "free"
+            plan_low = "free"
+            st_low = "none"
         source = (
             "Cloud session (API + bootstrap)"
             if getattr(self._settings, "survyai_access_token", "").strip()
@@ -2750,11 +3497,11 @@ class MainWindow(QMainWindow):
         if runtime_flags.effective_allow_vector_store:
             enabled.append("Vector store")
         status = "Troubleshooting (safe mode)" if self._state.safe_mode else "Active"
-        sub_status = str(me.get("subscription_status") or "").strip()
+        sub_status = st_low if st_low else str(me.get("subscription_status") or "").strip()
         if sub_status:
             status = f"{status} | Cloud subscription: {sub_status}"
         period = me.get("subscription_current_period_end")
-        if period:
+        if period and has_pro:
             status = f"{status} | Renewal / period end: {period}"
         license_text = (
             f"Plan: {plan}\n"
@@ -2762,11 +3509,6 @@ class MainWindow(QMainWindow):
             f"Source: {source}\n"
             f"Enabled integrations: {', '.join(enabled) if enabled else 'Core assistant only'}"
         )
-        cloud_ok = bool(self._state.cloud_api_base_url.strip() and self._state.cloud_access_token.strip())
-        pro_like = {"active", "trialing", "non_renewing"}
-        st_low = str(me.get("subscription_status") or "").lower()
-        plan_low = str(me.get("plan_slug") or "").lower()
-        has_pro = plan_low == "pro" and st_low in pro_like
         warn_states = {"past_due", "unpaid", "incomplete"}
         if cloud_ok and st_low in warn_states:
             license_text += (
@@ -3063,10 +3805,12 @@ class MainWindow(QMainWindow):
             or me.get("credits_billing_interval")
             or ""
         ).strip().lower()
-        plan = str(me.get("plan_slug") or "").strip().lower()
-        status = str(me.get("subscription_status") or "").strip().lower()
-        has_pro = plan == "pro" and status in {"active", "trialing", "non_renewing"}
-        return has_pro and interval in {"daily", "weekly", "monthly", "annual"}
+        return self._cloud_pro_still_entitled(me) and interval in {
+            "daily",
+            "weekly",
+            "monthly",
+            "annual",
+        }
 
     def _billing_period_days(self, interval: str) -> int:
         return {"daily": 1, "weekly": 7, "monthly": 30, "annual": 365}.get(
@@ -3081,10 +3825,7 @@ class MainWindow(QMainWindow):
             or me.get("credits_billing_interval")
             or ""
         ).strip().lower()
-        plan = str(me.get("plan_slug") or "").strip().lower()
-        status = str(me.get("subscription_status") or "").strip().lower()
-        has_pro = plan == "pro" and status in {"active", "trialing", "non_renewing"}
-        return has_pro and interval == "monthly"
+        return self._cloud_pro_still_entitled(me) and interval == "monthly"
 
     def _credits_usage_period_bounds(self) -> tuple[datetime, Optional[datetime], str]:
         """
@@ -3161,7 +3902,11 @@ class MainWindow(QMainWindow):
         period_start: Optional[datetime] = None,
         period_end: Optional[datetime] = None,
     ) -> float:
-        """Sum of marked-up run costs; optionally limited to a billing window."""
+        """Sum of billed run costs; optionally limited to a billing window."""
+        try:
+            from utils.cost_estimator import is_local_free_model
+        except Exception:
+            is_local_free_model = lambda _n: False  # type: ignore
         total = 0.0
         for entry in self._state.output_history:
             if period_start is not None:
@@ -3171,6 +3916,8 @@ class MainWindow(QMainWindow):
                     period_end=period_end,
                 ):
                     continue
+            if is_local_free_model(str(getattr(entry, "model_name", "") or "")):
+                continue
             raw = float(getattr(entry, "llm_cost_usd", 0.0) or 0.0)
             if raw > 0:
                 total += self._billed_cost_usd(raw)
@@ -3208,12 +3955,10 @@ class MainWindow(QMainWindow):
         budget = self._state.monthly_credits_usd
         used = self._period_credits_used_usd()
         remaining = max(budget - used, 0.0)
-        markup = self._credit_markup_multiplier()
         _, _, period_label = self._credits_usage_period_bounds()
         self._credits_period_note.setText(
-            f"{period_label}. Credit pool is subscription USD. Used is provider-reported "
-            f"LLM cost + SurvyAI markup inside this paid window. "
-            f"Lifetime total is at the bottom."
+            f"{period_label}. Credit pool is subscription USD. Used is billed hosted-model "
+            f"usage inside this paid window. Lifetime total is at the bottom."
         )
 
         self._credits_total_label.setText(f"${budget:,.2f}")
@@ -3256,10 +4001,17 @@ class MainWindow(QMainWindow):
             ):
                 continue
             cost_val = float(getattr(entry, "llm_cost_usd", 0.0) or 0.0)
+            model = entry.model_name or "?"
+            try:
+                from utils.cost_estimator import is_local_free_model
+
+                if is_local_free_model(str(model)):
+                    continue
+            except Exception:
+                pass
             if cost_val <= 0:
                 continue
             billed_usd = self._billed_cost_usd(cost_val)
-            model = entry.model_name or "?"
             ts = self._format_history_timestamp(entry.created_at)
             q_preview = (entry.query or "")[:60].replace("\n", " ")
             lines.append(f"[{ts}]  ${billed_usd:,.2f}  ({model})  {q_preview}")
@@ -3406,6 +4158,10 @@ class MainWindow(QMainWindow):
 
     def _average_run_cost(self) -> float:
         """Average billed USD per run in the current billing window."""
+        try:
+            from utils.cost_estimator import is_local_free_model
+        except Exception:
+            is_local_free_model = lambda _n: False  # type: ignore
         period_start, period_end, _ = self._credits_usage_period_bounds()
         costs: list[float] = []
         for entry in self._state.output_history[:20]:
@@ -3414,6 +4170,8 @@ class MainWindow(QMainWindow):
                 period_start=period_start,
                 period_end=period_end,
             ):
+                continue
+            if is_local_free_model(str(getattr(entry, "model_name", "") or "")):
                 continue
             c = float(getattr(entry, "llm_cost_usd", 0.0) or 0.0)
             if c > 0:
@@ -3558,6 +4316,15 @@ class MainWindow(QMainWindow):
         cost = float(result.llm_cost_usd or 0.0)
         if cost <= 0:
             _, cost = self._usage_event_for_result(result)
+        try:
+            from utils.cost_estimator import is_local_free_model
+
+            if is_local_free_model(str(result.model_name or "")) or str(
+                result.llm_used or ""
+            ).strip().lower() in {"ollama", "local"}:
+                cost = 0.0
+        except Exception:
+            pass
         entry = TaskHistoryEntry(
             run_id=str(uuid.uuid4()),
             created_at=datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
@@ -3640,9 +4407,20 @@ class MainWindow(QMainWindow):
         self._update_credit_usage_notice()
 
     def _usage_event_for_result(self, result: AgentRunResult) -> tuple[dict[str, object] | None, float]:
+        try:
+            from utils.cost_estimator import is_local_free_model
+        except Exception:
+            is_local_free_model = lambda _n: False  # type: ignore
+        model_name = str(result.model_name or "")
+        # Local / Ollama runs never bill credits (even if a mis-tagged cost leaked in).
+        if is_local_free_model(model_name) or str(result.llm_used or "").strip().lower() in {
+            "ollama",
+            "local",
+        }:
+            return None, 0.0
         usage = summarize_graph_llm_usage(
             list((result.raw or {}).get("messages") or []),
-            str(result.model_name or ""),
+            model_name,
             response_text=result.response or "",
             infer_missing_cached=False,
         )
@@ -3707,6 +4485,7 @@ class MainWindow(QMainWindow):
             self._reconcile_credits_used_from_history()
             self._state_store.save(self._state)
             self._refresh_credits_page()
+            self._refresh_license_card()
             blocked, _msg = self._platform_credit_wall_should_block()
             if blocked:
                 self._auto_switch_to_ollama_after_credit_exhaustion()
@@ -3725,6 +4504,7 @@ class MainWindow(QMainWindow):
         if usage_event is not None:
             self._report_cost_to_cloud(usage_event)
         self._refresh_credits_page()
+        self._refresh_license_card()
         self._update_credit_usage_notice()
 
     def _report_cost_to_cloud(self, usage_event: dict[str, object]) -> None:
@@ -3745,10 +4525,12 @@ class MainWindow(QMainWindow):
             self._reconcile_credits_used_from_history()
             self._state_store.save(self._state)
             self._refresh_credits_page()
+            self._refresh_license_card()
         except CloudApiError as exc:
             if "credit balance exhausted" in str(exc).lower():
                 self._silent_pull_entitlements_from_cloud()
                 self._refresh_credits_page()
+                self._refresh_license_card()
         except Exception:
             pass
 
@@ -3969,11 +4751,28 @@ class MainWindow(QMainWindow):
         self._settings_workspace.setText(self._state.workspace_path)
         self._state_store.save(self._state)
 
+        # Host RAM hard-cap before starting a local Ollama run (avoids PC lock/hibernate).
+        if self._effective_run_llm_id() == "ollama":
+            from survyai.ollama_support import ollama_ram_policy
+
+            model = (
+                self._state.ollama_model.strip()
+                or str(getattr(self._settings, "ollama_model", "") or "").strip()
+                or "llama3.2:1b"
+            )
+            ok, ram_err, _num_ctx = ollama_ram_policy(model)
+            if not ok:
+                QMessageBox.warning(self, "Not enough free memory", ram_err)
+                self._append_activity(ram_err)
+                self.statusBar().showMessage("Blocked: not enough free memory for Ollama")
+                return
+
         self._running_conversation_id = self._active_conversation_id
         self._send_btn.setEnabled(False)
         self._fallback_cb.setEnabled(False)
         self._cancel_btn.setEnabled(True)
         self._retry_btn.setEnabled(False)
+        self._cad_prompt_btn.setEnabled(False)
         self._run_started_at = time.monotonic()
         self._run_stage = -1
         self._progress_timer.start()
@@ -4002,8 +4801,35 @@ class MainWindow(QMainWindow):
         self._thread.progress_text.connect(self._on_worker_progress)
         self._thread.cancelled.connect(self._on_agent_cancelled)
         self._thread.finished.connect(self._on_thread_finished)
+        self._thread.confirm_overwrite.connect(self._on_cad_file_conflict)
         self._thread.start()
         self.statusBar().showMessage("Working…")
+
+    @Slot(object)
+    def _on_cad_file_conflict(self, payload: object) -> None:
+        """Show a foreground SurvyAI dialog for CAD overwrite/modify confirmation."""
+        data = payload if isinstance(payload, dict) else {}
+        path = str(data.get("path") or "").strip()
+        mode = str(data.get("mode") or "overwrite").strip().lower()
+        thread = self._thread
+        try:
+            # Bring SurvyAI forward so the dialog is visible (not only a taskbar flash).
+            self.showNormal()
+            self.raise_()
+            self.activateWindow()
+            app = QApplication.instance()
+            if app is not None:
+                app.alert(self, 0)
+                app.setActiveWindow(self)
+            dark = str(getattr(self._state, "theme", "") or "").lower() == "dark"
+            dlg = _CadFileConflictDialog(self, path, mode=mode, dark=dark)
+            dlg.raise_()
+            dlg.activateWindow()
+            accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        except Exception:
+            accepted = False
+        if thread is not None:
+            thread.provide_confirm_result(accepted)
 
     @Slot(object)
     def _on_agent_result(self, result: object) -> None:
@@ -4134,6 +4960,7 @@ class MainWindow(QMainWindow):
         self._fallback_cb.setEnabled(True)
         self._cancel_btn.setEnabled(False)
         self._retry_btn.setEnabled(bool(self._last_query.strip()))
+        self._cad_prompt_btn.setEnabled(True)
         self._run_status_label.setText("Ready")
         self._session_settings_label.setText(f"{self._session_id}\nStatus: Ready")
         self.statusBar().showMessage("Ready.")
@@ -4230,6 +5057,7 @@ class MainWindow(QMainWindow):
         self._send_btn.setEnabled(not is_running_conv)
         self._cancel_btn.setEnabled(is_running_conv)
         self._fallback_cb.setEnabled(not is_running_conv)
+        self._cad_prompt_btn.setEnabled(not is_running_conv)
         if not is_running_conv:
             self._retry_btn.setEnabled(bool(self._last_query.strip()))
 
@@ -4576,12 +5404,14 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Paystack checkout failed", "Missing authorization_url from server.")
             return
         QDesktopServices.openUrl(QUrl(url))
+        self._start_payment_refresh_watch()
         QMessageBox.information(
             self,
             "Complete payment",
-            "Finish payment in your browser. Then open Settings from the account menu and click "
-            "“Refresh cloud account” (or use the Account menu). You can also use "
-            "“Verify payment reference…” with the Paystack reference (where server webhooks failed).",
+            "Finish payment in your browser. SurvyAI will refresh your plan automatically "
+            "once Paystack confirms the payment with the server (usually within a few seconds). "
+            "If nothing changes after a few minutes, use “Refresh cloud account” or "
+            "“Verify payment reference…” with the Paystack reference.",
         )
 
     @Slot()
@@ -4678,6 +5508,7 @@ class MainWindow(QMainWindow):
                 str(result.get("detail") or "Paystack reported a non-success status for this reference."),
             )
             return
+        self._stop_payment_refresh_watch()
         QMessageBox.information(self, "Verified", "Payment verified. Refreshing your cloud session…")
         self._on_refresh_cloud_license()
 
@@ -4796,26 +5627,19 @@ class MainWindow(QMainWindow):
             return
         display_name_for_profile = ""
         company_for_profile = ""
-        choice = QMessageBox(self)
-        choice.setWindowTitle("SurvyAI cloud")
-        choice.setText("Do you already have a cloud account, or do you want to create one?")
-        choice.setInformativeText(
-            f"Create account registers you on the server ({password_policy_hint()}). "
-            "You can subscribe to Pro afterward. Use Forgot password if you cannot sign in."
-        )
-        choice.setIcon(QMessageBox.Question)
-        choice.addButton("Sign in", QMessageBox.AcceptRole)
-        btn_create = choice.addButton("Create account", QMessageBox.ActionRole)
-        btn_forgot = choice.addButton("Forgot password…", QMessageBox.ActionRole)
-        btn_cancel = choice.addButton(QMessageBox.Cancel)
-        choice.exec()
-        clicked = choice.clickedButton()
-        if clicked is None or clicked == btn_cancel:
+        choice = _CloudAuthChoiceDialog(self, policy_hint=password_policy_hint())
+        if choice.exec() != QDialog.DialogCode.Accepted:
             return
-        if clicked == btn_forgot:
+        picked = choice.choice()
+        if picked == _CloudAuthChoiceDialog.CHOICE_FORGOT:
             self._on_forgot_password(base_url=base_url)
             return
-        is_register = clicked == btn_create
+        if picked not in (
+            _CloudAuthChoiceDialog.CHOICE_SIGN_IN,
+            _CloudAuthChoiceDialog.CHOICE_CREATE,
+        ):
+            return
+        is_register = picked == _CloudAuthChoiceDialog.CHOICE_CREATE
 
         email, ok = QInputDialog.getText(
             self,
@@ -4825,14 +5649,26 @@ class MainWindow(QMainWindow):
         )
         if not ok or not email.strip():
             return
-        password, ok = QInputDialog.getText(
-            self,
-            "Cloud account" if is_register else "Cloud sign-in",
-            f"Password ({password_policy_hint()})" if is_register else "Password",
-            QLineEdit.EchoMode.Password,
-        )
-        if not ok or not password:
-            return
+        if is_register:
+            pwd_dlg = _NewPasswordDialog(
+                self,
+                title="Create account",
+                email=email.strip(),
+            )
+            if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            password = pwd_dlg.password()
+        else:
+            pwd_dlg = _PasswordPromptDialog(
+                self,
+                title="Cloud sign-in",
+                label="Password",
+            )
+            if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            password = pwd_dlg.password()
+            if not password:
+                return
         if not is_register:
             nm, ok_nm = QInputDialog.getText(
                 self,
@@ -4849,21 +5685,6 @@ class MainWindow(QMainWindow):
             )
             company_for_profile = (co or "").strip() if ok_co else ""
         if is_register:
-            policy_err = validate_password_strength(password, email=email.strip())
-            if policy_err:
-                QMessageBox.warning(self, "Create account", policy_err)
-                return
-            confirm, ok = QInputDialog.getText(
-                self,
-                "Create account",
-                "Confirm password",
-                QLineEdit.EchoMode.Password,
-            )
-            if not ok:
-                return
-            if confirm != password:
-                QMessageBox.warning(self, "Create account", "Passwords do not match.")
-                return
             display_name, dok = QInputDialog.getText(
                 self,
                 "Create account",
@@ -5048,29 +5869,14 @@ class MainWindow(QMainWindow):
         code, ok = QInputDialog.getText(self, "Reset password", "Reset code from email")
         if not ok or not code.strip():
             return
-        new_password, ok = QInputDialog.getText(
+        pwd_dlg = _NewPasswordDialog(
             self,
-            "Reset password",
-            f"New password ({password_policy_hint()})",
-            QLineEdit.EchoMode.Password,
+            title="Reset password",
+            email=email.strip(),
         )
-        if not ok or not new_password:
+        if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        policy_err = validate_password_strength(new_password, email=email.strip())
-        if policy_err:
-            QMessageBox.warning(self, "Reset password", policy_err)
-            return
-        confirm, ok = QInputDialog.getText(
-            self,
-            "Reset password",
-            "Confirm new password",
-            QLineEdit.EchoMode.Password,
-        )
-        if not ok:
-            return
-        if confirm != new_password:
-            QMessageBox.warning(self, "Reset password", "Passwords do not match.")
-            return
+        new_password = pwd_dlg.password()
         try:
             cloud_reset_password(
                 base_url=base,
@@ -5107,37 +5913,24 @@ class MainWindow(QMainWindow):
             str((self._state.cloud_me or {}).get("email") or "").strip()
             or self._state.profile.email.strip()
         )
-        current, ok = QInputDialog.getText(
+        current_dlg = _PasswordPromptDialog(
             self,
-            "Change password",
-            "Current password",
-            QLineEdit.EchoMode.Password,
+            title="Change password",
+            label="Current password",
         )
-        if not ok or not current:
+        if current_dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        new_password, ok = QInputDialog.getText(
+        current = current_dlg.password()
+        if not current:
+            return
+        pwd_dlg = _NewPasswordDialog(
             self,
-            "Change password",
-            f"New password ({password_policy_hint()})",
-            QLineEdit.EchoMode.Password,
+            title="Change password",
+            email=email or None,
         )
-        if not ok or not new_password:
+        if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
             return
-        policy_err = validate_password_strength(new_password, email=email or None)
-        if policy_err:
-            QMessageBox.warning(self, "Change password", policy_err)
-            return
-        confirm, ok = QInputDialog.getText(
-            self,
-            "Change password",
-            "Confirm new password",
-            QLineEdit.EchoMode.Password,
-        )
-        if not ok:
-            return
-        if confirm != new_password:
-            QMessageBox.warning(self, "Change password", "Passwords do not match.")
-            return
+        new_password = pwd_dlg.password()
         try:
             tokens = cloud_change_password(
                 base_url=base,

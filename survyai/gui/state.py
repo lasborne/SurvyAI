@@ -140,6 +140,8 @@ class DesktopState:
     output_history: List[TaskHistoryEntry] = field(default_factory=list)
     conversations: List[Conversation] = field(default_factory=list)
     active_conversation_id: str = ""
+    # User-accepted default CAD survey-plan prompt. Empty string = use packaged system default.
+    default_cad_prompt: str = ""
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "DesktopState":
@@ -230,6 +232,7 @@ class DesktopState:
                 if isinstance(item, dict)
             ],
             active_conversation_id=str(raw.get("active_conversation_id", "")),
+            default_cad_prompt=str(raw.get("default_cad_prompt", "") or ""),
         )
 
     def to_dict(self) -> Dict[str, Any]:

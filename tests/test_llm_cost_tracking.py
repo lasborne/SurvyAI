@@ -213,6 +213,74 @@ def test_purchase_after_expiry_starts_fresh_credit_period():
     assert user.usage_period_anchor == now
 
 
+def test_reconcile_pro_access_downgrades_on_expiry_or_exhausted_credits():
+    from datetime import datetime, timedelta, timezone
+    from types import SimpleNamespace
+
+    from survyai_cloud.config import CloudSettings
+    from survyai_cloud.models import SubscriptionStatus
+    from survyai_cloud.services.entitlements import (
+        apply_pro_defaults,
+        manual_payment_period_anchor,
+        reconcile_pro_access,
+        subscription_period_end_from_anchor,
+    )
+
+    settings = CloudSettings(pro_plan_slug="pro", default_max_devices_pro=2, pro_monthly_agent_runs=300)
+    now = datetime.now(timezone.utc)
+    expired = SimpleNamespace(
+        plan_slug="pro",
+        subscription_status=SubscriptionStatus.active,
+        subscription_current_period_end=now - timedelta(minutes=1),
+        max_devices=2,
+        monthly_agent_runs_quota=10,
+        monthly_agent_runs_used=1,
+        monthly_credits_usd=1.0,
+        monthly_credits_used_usd=0.1,
+        credits_billing_interval="daily",
+        usage_period_anchor=now - timedelta(days=1),
+        paystack_subscription_code="SUB_x",
+        paystack_email_token="tok",
+    )
+    assert reconcile_pro_access(expired, settings) is True
+    assert expired.plan_slug == "free"
+    assert expired.subscription_status == SubscriptionStatus.none
+
+    exhausted = SimpleNamespace(
+        plan_slug="pro",
+        subscription_status=SubscriptionStatus.non_renewing,
+        subscription_current_period_end=now + timedelta(hours=12),
+        max_devices=2,
+        monthly_agent_runs_quota=10,
+        monthly_agent_runs_used=2,
+        monthly_credits_usd=0.6,
+        monthly_credits_used_usd=0.6,
+        credits_billing_interval="daily",
+        usage_period_anchor=now - timedelta(hours=6),
+        paystack_subscription_code=None,
+        paystack_email_token=None,
+    )
+    period_end_before = exhausted.subscription_current_period_end
+    assert reconcile_pro_access(exhausted, settings) is True
+    assert exhausted.plan_slug == "free"
+    # Fresh purchase after Free: period starts at payment time (not stacked).
+    paid_at = now
+    anchor = manual_payment_period_anchor(exhausted, paid_at, settings)
+    assert anchor == paid_at
+    apply_pro_defaults(
+        exhausted,
+        settings,
+        credit_budget_usd=0.6,
+        credits_billing_interval="weekly",
+        paid_at=paid_at,
+    )
+    exhausted.subscription_current_period_end = subscription_period_end_from_anchor(anchor, "weekly")
+    assert exhausted.plan_slug == "pro"
+    assert exhausted.usage_period_anchor == paid_at
+    assert exhausted.subscription_current_period_end == paid_at + timedelta(days=7)
+    assert exhausted.subscription_current_period_end != period_end_before + timedelta(days=7)
+
+
 def test_expired_subscription_blocks_hosted_llm_even_if_status_active():
     from datetime import datetime, timedelta, timezone
     from types import SimpleNamespace

@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,8 @@ from survyai_cloud.routers import (
     usage,
     webhooks,
 )
+
+_ADMIN_UI_PATH = Path(__file__).resolve().parent / "static" / "admin.html"
 
 
 @asynccontextmanager
@@ -104,8 +107,24 @@ def create_app() -> FastAPI:
                 "health": "/health",
                 "docs": "/docs",
                 "openapi": "/openapi.json",
+                "admin_ui": "/admin/ui",
             },
         }
+
+    @app.get("/admin/ui", include_in_schema=False)
+    async def admin_ui() -> FileResponse:
+        """
+        Lightweight support dashboard (Phase 8).
+        API calls still require X-SurvyAI-Admin-Key; the key is never embedded here.
+        """
+        if not _ADMIN_UI_PATH.is_file():
+            raise HTTPException(status_code=404, detail="Admin UI not found on server")
+        return FileResponse(
+            _ADMIN_UI_PATH,
+            media_type="text/html; charset=utf-8",
+            filename="admin.html",
+            content_disposition_type="inline",
+        )
 
     app.include_router(health.router)
     app.include_router(auth.router, prefix="/v1")

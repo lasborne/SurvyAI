@@ -19,6 +19,7 @@ from survyai_cloud.services.entitlements import (
     apply_pro_defaults,
     credit_budget_and_interval_from_paystack_payload,
     manual_payment_period_anchor,
+    reconcile_pro_access,
     subscription_period_end_from_anchor,
 )
 from survyai_cloud.services.paystack import PaystackError, disable_subscription
@@ -166,7 +167,9 @@ async def _resolve_user_for_paystack_event(
 def _apply_charge_success_entitlements(user: User, data: dict[str, Any], settings: CloudSettings) -> None:
     budget_usd, bill_interval = credit_budget_and_interval_from_paystack_payload(data, settings)
     paid_at = _ts_parse(data.get("paid_at") if isinstance(data, dict) else None)
-    anchor = manual_payment_period_anchor(user, paid_at)
+    # Reconcile first so exhausted/expired Pro is Free before early-renewal stacking.
+    reconcile_pro_access(user, settings)
+    anchor = manual_payment_period_anchor(user, paid_at, settings)
     apply_pro_defaults(
         user,
         settings,
@@ -308,7 +311,8 @@ async def paystack_webhook(
             if _paystack_invoice_indicates_paid(data):
                 paid_at = _ts_parse(data.get("paid_at") if isinstance(data.get("paid_at"), str) else None)
                 now = datetime.now(timezone.utc)
-                anchor = manual_payment_period_anchor(user, paid_at or now)
+                reconcile_pro_access(user, settings)
+                anchor = manual_payment_period_anchor(user, paid_at or now, settings)
                 budget_usd, bill_interval = credit_budget_and_interval_from_paystack_payload(data, settings)
                 apply_pro_defaults(
                     user,

@@ -16,6 +16,7 @@ from survyai_cloud.schemas import LlmMessageIn, LlmProxyChatIn, LlmProxyChatOut,
 from survyai_cloud.services.entitlements import (
     ensure_usage_month_rolled,
     has_platform_credit_remaining,
+    reconcile_pro_access,
     resolve_platform_llm_provider,
     subscription_allows_platform_llm,
 )
@@ -80,10 +81,14 @@ async def run_proxy_chat(
     budget = float(user.monthly_credits_usd or 0.0)
     used_before = float(user.monthly_credits_used_usd or 0.0)
     used_after = used_before
+    credit_exhausted = bool(budget > 0 and used_before >= budget - 1e-6)
     if budget > 0 and markup_cost_usd > 0:
         used_after = round(min(budget, used_before + markup_cost_usd), 6)
         user.monthly_credits_used_usd = used_after
+        credit_exhausted = used_after >= budget - 1e-6
         db.add(user)
+        # Flip Pro → Free as soon as the pool is spent so /me and desktop agree.
+        reconcile_pro_access(user, settings, db=db)
 
     event_meta = {
         "provider": resolved_provider,
@@ -123,9 +128,9 @@ async def run_proxy_chat(
     billing = {
         "cost_usd": billed_cost_usd,
         "markup_cost_usd": markup_cost_usd,
-        "monthly_credits_used_usd": round(float(user.monthly_credits_used_usd or 0.0), 6),
+        "monthly_credits_used_usd": round(float(used_after), 6),
         "monthly_credits_usd": budget,
-        "credit_exhausted": bool(budget > 0 and user.monthly_credits_used_usd >= budget - 1e-6),
+        "credit_exhausted": credit_exhausted,
     }
     usage["cost_usd"] = billed_cost_usd
     return LlmProxyChatOut(

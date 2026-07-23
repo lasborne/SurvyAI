@@ -1,0 +1,469 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SurvyAI Support Admin</title>
+  <style>
+    :root {
+      --bg: #f4f1ea;
+      --card: #fffdf8;
+      --ink: #1c1917;
+      --muted: #57534e;
+      --line: #d6d3d1;
+      --accent: #0f766e;
+      --danger: #b91c1c;
+      --ok: #166534;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      color: var(--ink);
+      background: linear-gradient(180deg, #efe8dc 0%, var(--bg) 40%, #e7e5e4 100%);
+      min-height: 100vh;
+    }
+    header {
+      padding: 1.25rem 1.5rem;
+      border-bottom: 1px solid var(--line);
+      background: rgba(255,253,248,0.9);
+    }
+    h1 { margin: 0 0 0.25rem; font-size: 1.35rem; }
+    p.sub { margin: 0; color: var(--muted); font-size: 0.9rem; }
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 1.25rem 1.5rem 3rem;
+      display: grid;
+      gap: 1rem;
+    }
+    section {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 1rem 1.1rem;
+    }
+    h2 { margin: 0 0 0.75rem; font-size: 1.05rem; }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin-bottom: 0.25rem; }
+    input, select, textarea, button {
+      font: inherit;
+    }
+    input, select, textarea {
+      width: 100%;
+      padding: 0.5rem 0.6rem;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      background: #fff;
+    }
+    .row {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 0.5rem;
+      align-items: end;
+    }
+    .grid2 {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 0.75rem;
+    }
+    @media (max-width: 720px) {
+      .grid2 { grid-template-columns: 1fr; }
+      .row { grid-template-columns: 1fr; }
+    }
+    button {
+      border: 0;
+      border-radius: 6px;
+      padding: 0.55rem 0.9rem;
+      background: var(--accent);
+      color: #fff;
+      cursor: pointer;
+    }
+    button.secondary { background: #44403c; }
+    button.danger { background: var(--danger); }
+    button:disabled { opacity: 0.55; cursor: not-allowed; }
+    .msg {
+      margin-top: 0.6rem;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+    }
+    .msg.err { color: var(--danger); }
+    .msg.ok { color: var(--ok); }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.88rem;
+    }
+    th, td {
+      text-align: left;
+      padding: 0.45rem 0.35rem;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    th { color: var(--muted); font-weight: 600; }
+    .mono { font-family: ui-monospace, Consolas, monospace; font-size: 0.82rem; }
+    .kv { display: grid; grid-template-columns: 220px 1fr; gap: 0.35rem 0.75rem; font-size: 0.9rem; }
+    .kv div:nth-child(odd) { color: var(--muted); }
+    .hidden { display: none; }
+    .checks { display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem; margin: 0.5rem 0 0.75rem; }
+    .checks label { display: flex; gap: 0.35rem; align-items: center; color: var(--ink); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SurvyAI Support Admin</h1>
+    <p class="sub">Subscriptions, devices, usage, diagnostics, and billing overrides. Requires <code>X-SurvyAI-Admin-Key</code>.</p>
+  </header>
+  <main>
+    <section>
+      <h2>1. Admin key</h2>
+      <div class="row">
+        <div>
+          <label for="adminKey">Admin API key (session only)</label>
+          <input id="adminKey" type="password" autocomplete="off" placeholder="CLOUD_ADMIN_API_KEY value" />
+        </div>
+        <button type="button" id="saveKeyBtn">Save key</button>
+      </div>
+      <div id="keyMsg" class="msg"></div>
+    </section>
+
+    <section>
+      <h2>2. Lookup user</h2>
+      <div class="row">
+        <div>
+          <label for="email">Customer email</label>
+          <input id="email" type="email" placeholder="user@example.com" />
+        </div>
+        <button type="button" id="lookupBtn">Lookup</button>
+      </div>
+      <div id="lookupMsg" class="msg"></div>
+    </section>
+
+    <section id="userSection" class="hidden">
+      <h2>3. Subscription snapshot</h2>
+      <div id="snapshot" class="kv"></div>
+    </section>
+
+    <section id="overrideSection" class="hidden">
+      <h2>4. Overrides</h2>
+      <div class="checks">
+        <label><input type="checkbox" id="applyPro" /> Apply Pro defaults</label>
+        <label><input type="checkbox" id="applyFree" /> Apply Free defaults</label>
+        <label><input type="checkbox" id="resetCredits" /> Reset credits used</label>
+        <label><input type="checkbox" id="clearGrace" /> Clear grace</label>
+        <label><input type="checkbox" id="clearPeriod" /> Clear period end</label>
+        <label><input type="checkbox" id="touchReactivated" /> Touch reactivated now</label>
+      </div>
+      <div class="grid2">
+        <div>
+          <label for="planSlug">plan_slug</label>
+          <input id="planSlug" placeholder="free / pro" />
+        </div>
+        <div>
+          <label for="subStatus">subscription_status</label>
+          <input id="subStatus" placeholder="active / none / ..." />
+        </div>
+        <div>
+          <label for="creditsUsd">monthly_credits_usd</label>
+          <input id="creditsUsd" type="number" min="0" step="0.01" />
+        </div>
+        <div>
+          <label for="creditsUsed">monthly_credits_used_usd</label>
+          <input id="creditsUsed" type="number" min="0" step="0.01" />
+        </div>
+        <div>
+          <label for="maxDevices">max_devices</label>
+          <input id="maxDevices" type="number" min="1" max="50" step="1" />
+        </div>
+        <div>
+          <label for="periodEnd">subscription_current_period_end (ISO)</label>
+          <input id="periodEnd" placeholder="2026-08-01T00:00:00+00:00" />
+        </div>
+        <div>
+          <label for="graceEnd">grace_period_ends_at (ISO)</label>
+          <input id="graceEnd" placeholder="optional" />
+        </div>
+      </div>
+      <p style="margin: 0.75rem 0 0;">
+        <button type="button" id="applyOverrideBtn">Apply overrides</button>
+      </p>
+      <div id="overrideMsg" class="msg"></div>
+    </section>
+
+    <section id="devicesSection" class="hidden">
+      <h2>5. Devices</h2>
+      <div id="devicesWrap"></div>
+      <div id="devicesMsg" class="msg"></div>
+    </section>
+
+    <section id="usageSection" class="hidden">
+      <h2>6. Recent usage</h2>
+      <div id="usageWrap"></div>
+    </section>
+
+    <section id="diagSection" class="hidden">
+      <h2>7. Diagnostics uploads</h2>
+      <div id="diagWrap"></div>
+    </section>
+  </main>
+
+  <script>
+    const KEY_STORAGE = "survyai_admin_key";
+    let currentUserId = null;
+
+    function apiBase() {
+      // Same origin as this page (e.g. https://host/admin/ui → https://host)
+      return window.location.origin;
+    }
+
+    function getKey() {
+      return (sessionStorage.getItem(KEY_STORAGE) || document.getElementById("adminKey").value || "").trim();
+    }
+
+    function setMsg(id, text, ok) {
+      const el = document.getElementById(id);
+      el.textContent = text || "";
+      el.className = "msg " + (ok === true ? "ok" : ok === false ? "err" : "");
+    }
+
+    function show(id, on) {
+      document.getElementById(id).classList.toggle("hidden", !on);
+    }
+
+    async function api(path, options = {}) {
+      const key = getKey();
+      if (!key) throw new Error("Set and save the admin key first.");
+      const headers = Object.assign(
+        { "X-SurvyAI-Admin-Key": key },
+        options.headers || {}
+      );
+      const res = await fetch(apiBase() + path, Object.assign({}, options, { headers }));
+      if (res.status === 204) return null;
+      let body = null;
+      const text = await res.text();
+      try { body = text ? JSON.parse(text) : null; } catch (_) { body = text; }
+      if (!res.ok) {
+        const detail = body && body.detail ? (typeof body.detail === "string" ? body.detail : JSON.stringify(body.detail)) : text;
+        throw new Error(res.status + " " + (detail || res.statusText));
+      }
+      return body;
+    }
+
+    function fmt(v) {
+      if (v === null || v === undefined || v === "") return "—";
+      if (typeof v === "object") return JSON.stringify(v);
+      return String(v);
+    }
+
+    function renderSnapshot(u) {
+      currentUserId = u.id;
+      const pairs = [
+        ["id", u.id],
+        ["email", u.email],
+        ["display_name", u.display_name],
+        ["plan_slug", u.plan_slug],
+        ["subscription_status", u.subscription_status],
+        ["period_end", u.subscription_current_period_end],
+        ["grace_ends", u.grace_period_ends_at],
+        ["credits_usd", u.monthly_credits_usd],
+        ["credits_used_usd", u.monthly_credits_used_usd],
+        ["billing_interval", u.credits_billing_interval],
+        ["max_devices", u.max_devices],
+        ["device_count", u.device_count],
+        ["agent_runs", u.monthly_agent_runs_used + " / " + u.monthly_agent_runs_quota],
+        ["paystack_customer", u.paystack_customer_code],
+        ["paystack_subscription", u.paystack_subscription_code],
+        ["last_payment_ref", u.last_payment_reference],
+        ["created_at", u.created_at],
+        ["updated_at", u.updated_at],
+      ];
+      const box = document.getElementById("snapshot");
+      box.innerHTML = pairs.map(([k, v]) => "<div>" + k + "</div><div class='mono'>" + fmt(v) + "</div>").join("");
+      document.getElementById("planSlug").value = u.plan_slug || "";
+      document.getElementById("subStatus").value = u.subscription_status || "";
+      document.getElementById("creditsUsd").value = u.monthly_credits_usd ?? "";
+      document.getElementById("creditsUsed").value = u.monthly_credits_used_usd ?? "";
+      document.getElementById("maxDevices").value = u.max_devices ?? "";
+      document.getElementById("periodEnd").value = u.subscription_current_period_end || "";
+      document.getElementById("graceEnd").value = u.grace_period_ends_at || "";
+      show("userSection", true);
+      show("overrideSection", true);
+      show("devicesSection", true);
+      show("usageSection", true);
+      show("diagSection", true);
+    }
+
+    function renderDevices(rows) {
+      if (!rows || !rows.length) {
+        document.getElementById("devicesWrap").innerHTML = "<p class='sub'>No devices registered.</p>";
+        return;
+      }
+      let html = "<table><thead><tr><th>Label</th><th>Fingerprint</th><th>Last seen</th><th>Created</th><th></th></tr></thead><tbody>";
+      for (const d of rows) {
+        html += "<tr>"
+          + "<td>" + fmt(d.label) + "</td>"
+          + "<td class='mono'>" + fmt(d.fingerprint) + "</td>"
+          + "<td class='mono'>" + fmt(d.last_seen_at) + "</td>"
+          + "<td class='mono'>" + fmt(d.created_at) + "</td>"
+          + "<td><button type='button' class='danger' data-device-id='" + d.id + "'>Delete</button></td>"
+          + "</tr>";
+      }
+      html += "</tbody></table>";
+      document.getElementById("devicesWrap").innerHTML = html;
+      document.querySelectorAll("#devicesWrap button[data-device-id]").forEach((btn) => {
+        btn.addEventListener("click", () => deleteDevice(btn.getAttribute("data-device-id")));
+      });
+    }
+
+    function renderUsage(rows) {
+      if (!rows || !rows.length) {
+        document.getElementById("usageWrap").innerHTML = "<p class='sub'>No usage events.</p>";
+        return;
+      }
+      let html = "<table><thead><tr><th>When</th><th>Kind</th><th>Qty</th><th>Cost USD</th><th>Meta</th></tr></thead><tbody>";
+      for (const e of rows) {
+        html += "<tr>"
+          + "<td class='mono'>" + fmt(e.created_at) + "</td>"
+          + "<td>" + fmt(e.kind) + "</td>"
+          + "<td>" + fmt(e.quantity) + "</td>"
+          + "<td>" + fmt(e.cost_usd) + "</td>"
+          + "<td class='mono'>" + fmt(e.meta) + "</td>"
+          + "</tr>";
+      }
+      html += "</tbody></table>";
+      document.getElementById("usageWrap").innerHTML = html;
+    }
+
+    function renderDiag(rows) {
+      if (!rows || !rows.length) {
+        document.getElementById("diagWrap").innerHTML = "<p class='sub'>No diagnostics uploads.</p>";
+        return;
+      }
+      let html = "<table><thead><tr><th>When</th><th>File</th><th>Size</th><th>Client</th><th>Notes</th></tr></thead><tbody>";
+      for (const d of rows) {
+        html += "<tr>"
+          + "<td class='mono'>" + fmt(d.created_at) + "</td>"
+          + "<td class='mono'>" + fmt(d.filename) + "</td>"
+          + "<td>" + fmt(d.byte_size) + "</td>"
+          + "<td>" + fmt(d.client_version) + "</td>"
+          + "<td>" + fmt(d.notes) + "</td>"
+          + "</tr>";
+      }
+      html += "</tbody></table>";
+      document.getElementById("diagWrap").innerHTML = html;
+    }
+
+    async function loadRelated() {
+      if (!currentUserId) return;
+      const [devices, usage, diag] = await Promise.all([
+        api("/v1/admin/users/" + currentUserId + "/devices"),
+        api("/v1/admin/users/" + currentUserId + "/usage?limit=50"),
+        api("/v1/admin/users/" + currentUserId + "/diagnostics?limit=50"),
+      ]);
+      renderDevices(devices);
+      renderUsage(usage);
+      renderDiag(diag);
+    }
+
+    async function lookup() {
+      setMsg("lookupMsg", "");
+      try {
+        const email = document.getElementById("email").value.trim();
+        if (!email) throw new Error("Enter an email.");
+        const user = await api("/v1/admin/users?email=" + encodeURIComponent(email));
+        renderSnapshot(user);
+        await loadRelated();
+        setMsg("lookupMsg", "Loaded " + user.email, true);
+      } catch (e) {
+        setMsg("lookupMsg", e.message || String(e), false);
+      }
+    }
+
+    async function deleteDevice(deviceId) {
+      if (!currentUserId || !deviceId) return;
+      if (!confirm("Force-delete this device seat?")) return;
+      setMsg("devicesMsg", "");
+      try {
+        await api("/v1/admin/users/" + currentUserId + "/devices/" + deviceId, { method: "DELETE" });
+        setMsg("devicesMsg", "Device deleted.", true);
+        const user = await api("/v1/admin/users/" + currentUserId);
+        renderSnapshot(user);
+        await loadRelated();
+      } catch (e) {
+        setMsg("devicesMsg", e.message || String(e), false);
+      }
+    }
+
+    function optionalNumber(id) {
+      const v = document.getElementById(id).value;
+      if (v === "" || v === null || v === undefined) return undefined;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : undefined;
+    }
+
+    function optionalString(id) {
+      const v = document.getElementById(id).value.trim();
+      return v ? v : undefined;
+    }
+
+    async function applyOverrides() {
+      if (!currentUserId) return;
+      setMsg("overrideMsg", "");
+      const body = {};
+      if (document.getElementById("applyPro").checked) body.apply_pro_defaults = true;
+      if (document.getElementById("applyFree").checked) body.apply_free_defaults = true;
+      if (document.getElementById("resetCredits").checked) body.reset_credits_used = true;
+      if (document.getElementById("clearGrace").checked) body.clear_grace = true;
+      if (document.getElementById("clearPeriod").checked) body.clear_period_end = true;
+      if (document.getElementById("touchReactivated").checked) body.touch_reactivated_now = true;
+      const plan = optionalString("planSlug");
+      if (plan !== undefined) body.plan_slug = plan;
+      const st = optionalString("subStatus");
+      if (st !== undefined) body.subscription_status = st;
+      const cu = optionalNumber("creditsUsd");
+      if (cu !== undefined) body.monthly_credits_usd = cu;
+      const used = optionalNumber("creditsUsed");
+      if (used !== undefined) body.monthly_credits_used_usd = used;
+      const md = optionalNumber("maxDevices");
+      if (md !== undefined) body.max_devices = md;
+      const pe = optionalString("periodEnd");
+      if (pe !== undefined) body.subscription_current_period_end = pe;
+      const ge = optionalString("graceEnd");
+      if (ge !== undefined) body.grace_period_ends_at = ge;
+      try {
+        const result = await api("/v1/admin/users/" + currentUserId + "/billing", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        setMsg("overrideMsg", "Updated:\n" + JSON.stringify(result, null, 2), true);
+        const user = await api("/v1/admin/users/" + currentUserId);
+        renderSnapshot(user);
+        await loadRelated();
+      } catch (e) {
+        setMsg("overrideMsg", e.message || String(e), false);
+      }
+    }
+
+    document.getElementById("saveKeyBtn").addEventListener("click", () => {
+      const key = document.getElementById("adminKey").value.trim();
+      if (!key) {
+        setMsg("keyMsg", "Enter a key.", false);
+        return;
+      }
+      sessionStorage.setItem(KEY_STORAGE, key);
+      setMsg("keyMsg", "Admin key saved for this browser session.", true);
+    });
+    document.getElementById("lookupBtn").addEventListener("click", lookup);
+    document.getElementById("applyOverrideBtn").addEventListener("click", applyOverrides);
+    document.getElementById("email").addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") lookup();
+    });
+
+    const existing = sessionStorage.getItem(KEY_STORAGE) || "";
+    if (existing) {
+      document.getElementById("adminKey").value = existing;
+      setMsg("keyMsg", "Admin key loaded from sessionStorage.", true);
+    }
+  </script>
+</body>
+</html>

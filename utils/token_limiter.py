@@ -49,8 +49,69 @@ MODEL_TPM_LIMITS: Dict[str, int] = {
     "deepseek-chat": 1_000_000,
 }
 
-# Default TPM if model not found (conservative)
+# Default TPM if model not found (conservative for cloud APIs)
 DEFAULT_TPM_LIMIT = 500_000
+
+# Local / offline models are not subject to cloud TPM quotas.
+_LOCAL_MODEL_TPM_LIMIT = 10_000_000
+
+
+def _is_local_llm_model(model_name: Optional[str]) -> bool:
+    """True for Ollama/local model ids (no cloud TPM metering)."""
+    n = (model_name or "").strip().lower()
+    if not n:
+        return False
+    if n in {"ollama", "local"} or n.startswith("ollama/"):
+        return True
+    # Common Ollama tags: llama3.2:1b, qwen2.5:7b, phi3:mini, mistral:latest
+    local_markers = (
+        "llama",
+        "qwen",
+        "mistral",
+        "phi",
+        "gemma",
+        "deepseek-r1",
+        "codellama",
+        "tinyllama",
+        "orca",
+        "vicuna",
+        "nous-hermes",
+    )
+    if ":" in n and any(m in n for m in local_markers):
+        return True
+    return False
+
+
+def get_tpm_limit(model_name: Optional[str]) -> int:
+    """
+    Get TPM limit for a model.
+    
+    Args:
+        model_name: Model name (e.g., "gpt-5.1", "gemini-2.0-flash")
+        
+    Returns:
+        TPM limit for the model
+    """
+    if not model_name:
+        return DEFAULT_TPM_LIMIT
+
+    if _is_local_llm_model(model_name):
+        return _LOCAL_MODEL_TPM_LIMIT
+    
+    # Try exact match first
+    if model_name in MODEL_TPM_LIMITS:
+        return MODEL_TPM_LIMITS[model_name]
+    
+    # Try partial match (e.g., "gpt-5.1" matches "gpt-5.1")
+    model_lower = model_name.lower()
+    for key, limit in MODEL_TPM_LIMITS.items():
+        if key.lower() in model_lower or model_lower in key.lower():
+            return limit
+    
+    # Default fallback
+    logger.warning(f"Unknown model '{model_name}', using default TPM limit: {DEFAULT_TPM_LIMIT}")
+    return DEFAULT_TPM_LIMIT
+
 
 # Cost per 1M tokens (approximate, varies by model and region)
 MODEL_COSTS: Dict[str, Dict[str, float]] = {
@@ -175,34 +236,6 @@ def estimate_message_tokens(messages: List[Any], model_name: Optional[str] = Non
     return total_input, total_output_estimate
 
 
-def get_tpm_limit(model_name: Optional[str]) -> int:
-    """
-    Get TPM limit for a model.
-    
-    Args:
-        model_name: Model name (e.g., "gpt-5.1", "gemini-2.0-flash")
-        
-    Returns:
-        TPM limit for the model
-    """
-    if not model_name:
-        return DEFAULT_TPM_LIMIT
-    
-    # Try exact match first
-    if model_name in MODEL_TPM_LIMITS:
-        return MODEL_TPM_LIMITS[model_name]
-    
-    # Try partial match (e.g., "gpt-5.1" matches "gpt-5.1")
-    model_lower = model_name.lower()
-    for key, limit in MODEL_TPM_LIMITS.items():
-        if key.lower() in model_lower or model_lower in key.lower():
-            return limit
-    
-    # Default fallback
-    logger.warning(f"Unknown model '{model_name}', using default TPM limit: {DEFAULT_TPM_LIMIT}")
-    return DEFAULT_TPM_LIMIT
-
-
 def estimate_cost(input_tokens: int, output_tokens: int, model_name: Optional[str] = None) -> float:
     """
     Estimate cost for a request.
@@ -215,6 +248,8 @@ def estimate_cost(input_tokens: int, output_tokens: int, model_name: Optional[st
     Returns:
         Estimated cost in USD
     """
+    if _is_local_llm_model(model_name):
+        return 0.0
     if not model_name:
         costs = DEFAULT_COSTS
     else:

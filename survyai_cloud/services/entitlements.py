@@ -55,13 +55,21 @@ def _subscription_period_still_open(user: User, now: datetime | None = None) -> 
 
 
 def _is_active_early_renewal(user: User, settings: CloudSettings, now: datetime | None = None) -> bool:
-    """Active/trialing Pro with an unexpired paid window — remaining credits should carry forward."""
+    """
+    Active Pro with an unexpired paid window and remaining credits.
+
+    Early renewal stacks the new period from the current period end and carries
+    unused credits. Exhausted or expired accounts are treated as a fresh purchase
+    (period starts at payment time) after ``reconcile_pro_access`` / Free downgrade.
+    """
     now = now or datetime.now(timezone.utc)
     if user.plan_slug != settings.pro_plan_slug:
         return False
     if user.subscription_status not in ACTIVE_LLM_STATUSES:
         return False
-    return _subscription_period_still_open(user, now)
+    if not _subscription_period_still_open(user, now):
+        return False
+    return has_platform_credit_remaining(user, settings)
 
 
 def _pro_annual_credit_budget_usd(settings: CloudSettings) -> float:
@@ -84,21 +92,33 @@ def subscription_period_end_from_anchor(anchor: datetime, interval: str) -> date
     return anchor + timedelta(days=billing_interval_period_days(interval))
 
 
-def manual_payment_period_anchor(user: User, paid_at: datetime | None = None) -> datetime:
-    """Anchor a manual renewal at current expiry when the account is still active."""
+def manual_payment_period_anchor(
+    user: User,
+    paid_at: datetime | None = None,
+    settings: CloudSettings | None = None,
+) -> datetime:
+    """
+    Anchor a manual renewal at current expiry when Pro is still active with credits.
+
+    If the user already dropped to Free (credits exhausted or period expired), the
+    new period starts at payment time instead of stacking on a stale end date.
+    """
+    settings = settings or get_cloud_settings()
     now = datetime.now(timezone.utc)
     anchor = paid_at or now
     if anchor.tzinfo is None:
         anchor = anchor.replace(tzinfo=timezone.utc)
     else:
         anchor = anchor.astimezone(timezone.utc)
+    if not _is_active_early_renewal(user, settings, now):
+        return anchor
     current_end = getattr(user, "subscription_current_period_end", None)
     if isinstance(current_end, datetime):
         if current_end.tzinfo is None:
             current_end = current_end.replace(tzinfo=timezone.utc)
         else:
             current_end = current_end.astimezone(timezone.utc)
-        if current_end > anchor and user.subscription_status in ACTIVE_LLM_STATUSES:
+        if current_end > anchor:
             return current_end
     return anchor
 
@@ -177,9 +197,40 @@ def credit_budget_and_interval_from_paystack_payload(
     return paid_usd, interval
 
 
+def reconcile_pro_access(
+    user: User,
+    settings: CloudSettings | None = None,
+    *,
+    db: AsyncSession | None = None,
+) -> bool:
+    """
+    Downgrade Pro → Free when the paid window ended or API credits are exhausted.
+
+    Returns True when the user row was changed. Call from /me, entitlements,
+    bootstrap, and after credit debits so the desktop plan label stays accurate.
+    """
+    settings = settings or get_cloud_settings()
+    if user.plan_slug != settings.pro_plan_slug:
+        return False
+    if user.subscription_status not in ACTIVE_LLM_STATUSES:
+        return False
+
+    period_end = _aware_utc(getattr(user, "subscription_current_period_end", None))
+    period_expired = period_end is not None and not _subscription_period_still_open(user)
+    credits_exhausted = not has_platform_credit_remaining(user, settings)
+    if not period_expired and not credits_exhausted:
+        return False
+
+    apply_free_defaults(user, settings)
+    if db is not None:
+        db.add(user)
+    return True
+
+
 async def ensure_usage_month_rolled(user: User, db: AsyncSession) -> None:
     """
-    Keep ``usage_period_anchor`` aligned with the paid subscription window.
+    Keep ``usage_period_anchor`` aligned with the paid subscription window, and
+    downgrade Pro → Free when the period ended or credits are exhausted.
 
     Credit counters are **not** auto-reset just because calendar time elapsed —
     that would grant a free pool without payment. Fresh / carried budgets are
@@ -198,16 +249,11 @@ async def ensure_usage_month_rolled(user: User, db: AsyncSession) -> None:
         else:
             user.usage_period_anchor = now
         db.add(user)
-        return
 
     # While the paid window is still open (including early-renewal extensions),
     # preserve used credits and the original anchor so remaining balance carries.
-    if period_end is not None and now < period_end:
-        return
-
-    # Expired window without a new payment: leave counters as-is so the UI still
-    # reflects consumption in the last paid period. Hosted LLM access is blocked
-    # separately by ``subscription_allows_platform_llm``.
+    # Expired / exhausted Pro accounts are flipped to Free below.
+    reconcile_pro_access(user, db=db)
 
 
 def can_use_platform_llm(user: User, settings: CloudSettings | None = None) -> bool:

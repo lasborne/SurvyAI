@@ -211,8 +211,8 @@ QPushButton {
     color: #ffffff;
     border: 1px solid #1d4ed8;
     border-radius: 10px;
-    padding: 8px 16px;
-    min-height: 22px;
+    padding: 6px 14px;
+    min-height: 20px;
     font-weight: 600;
 }
 QPushButton:hover {
@@ -229,8 +229,8 @@ QPushButton:disabled {
 QPushButton#sendButton {
     background-color: #2563eb;
     border-color: #1d4ed8;
-    padding: 10px 18px;
-    min-height: 28px;
+    padding: 7px 16px;
+    min-height: 22px;
     font-weight: 700;
 }
 QPushButton#sendButton:hover {
@@ -793,7 +793,8 @@ QPushButton {
     color: #ffffff;
     border: none;
     border-radius: 10px;
-    padding: 9px 16px;
+    padding: 6px 14px;
+    min-height: 20px;
     font-weight: 600;
 }
 QPushButton:hover { background-color: #60a5fa; }
@@ -804,7 +805,8 @@ QPushButton:disabled {
 }
 QPushButton#sendButton {
     background-color: #3b82f6;
-    padding: 10px 20px;
+    padding: 7px 16px;
+    min-height: 22px;
     font-weight: 700;
 }
 QPushButton#sendButton:disabled {

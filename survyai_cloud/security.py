@@ -13,8 +13,9 @@ from survyai_cloud.config import CloudSettings, get_cloud_settings
 
 PASSWORD_MIN_LENGTH = 10
 PASSWORD_MAX_LENGTH = 128
-PASSWORD_SPECIAL_CHARS = r"!@#$%^&*()_+\/-=\[\]{}|;:,.<>?"
-_PASSWORD_SPECIAL_RE = re.compile(rf"[{PASSWORD_SPECIAL_CHARS}]")
+# Keep '-' at the end of the class so it is literal (not a range like /-=).
+PASSWORD_SPECIAL_CHARS = r"!@#$%^&*()_+/=[]{}|;:,.<>?-"
+_PASSWORD_SPECIAL_RE = re.compile(r"[!@#$%^&*()_+/=\[\]{}|;:,.<>?-]")
 _COMMON_PASSWORDS = frozenset(
     {
         "password",

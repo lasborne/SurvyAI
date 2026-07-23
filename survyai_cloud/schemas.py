@@ -340,3 +340,58 @@ class AdminUserBillingPatch(BaseModel):
     touch_reactivated_now: bool = False
     apply_free_defaults: bool = False
     apply_pro_defaults: bool = False
+    monthly_credits_usd: Optional[float] = Field(default=None, ge=0.0)
+    monthly_credits_used_usd: Optional[float] = Field(default=None, ge=0.0)
+    reset_credits_used: bool = False
+    max_devices: Optional[int] = Field(default=None, ge=1, le=50)
+    subscription_current_period_end: Optional[datetime] = None
+    clear_period_end: bool = False
+
+
+class AdminUserSnapshot(BaseModel):
+    """Read-only support view of a user (no password/hash/token material)."""
+
+    id: uuid.UUID
+    email: str
+    display_name: Optional[str] = None
+    plan_slug: str
+    subscription_status: str
+    subscription_current_period_end: Optional[datetime] = None
+    grace_period_ends_at: Optional[datetime] = None
+    last_reactivation_at: Optional[datetime] = None
+    max_devices: int
+    monthly_agent_runs_quota: int
+    monthly_agent_runs_used: int
+    monthly_credits_usd: float
+    monthly_credits_used_usd: float
+    credits_billing_interval: str
+    usage_period_anchor: Optional[datetime] = None
+    paystack_customer_code: Optional[str] = None
+    paystack_subscription_code: Optional[str] = None
+    last_payment_reference: Optional[str] = None
+    device_count: int = 0
+    created_at: datetime
+    updated_at: datetime
+
+
+class AdminUsageEventOut(BaseModel):
+    id: int
+    kind: str
+    quantity: int
+    cost_usd: float
+    meta: Optional[dict[str, Any]] = None
+    device_id: Optional[uuid.UUID] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AdminDiagnosticsOut(BaseModel):
+    id: uuid.UUID
+    filename: str
+    byte_size: int
+    client_version: Optional[str] = None
+    notes: Optional[str] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}

@@ -527,6 +527,128 @@ class AutoCADProcessor:
 
         return {"success": True, "closed": closed_any, "error": str(last_err) if last_err else None}
 
+    def save_and_close_other_drawings(
+        self,
+        *,
+        exclude_paths: Optional[List[str]] = None,
+        close_after_save: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Save unsaved open drawings and optionally close them so a new CAD run is not blocked.
+
+        Excluded paths (typically protected survey-plan templates) are left untouched and
+        are never written. Never-saved drawings (empty FullName) are saved under the user's
+        Documents folder before close.
+        """
+        if not self.is_connected:
+            if not self.connect():
+                return {"success": False, "error": "Not connected to AutoCAD"}
+
+        from pathlib import Path
+        import time
+
+        exclude: set[str] = set()
+        for raw in exclude_paths or []:
+            try:
+                if raw:
+                    exclude.add(str(Path(str(raw)).resolve()).lower())
+            except Exception:
+                continue
+
+        try:
+            docs = self.acad.Documents
+            n = int(getattr(docs, "Count", 0))
+        except Exception as e:
+            return {"success": False, "error": f"AutoCAD Documents unavailable: {e}"}
+
+        saved_paths: List[str] = []
+        closed_paths: List[str] = []
+        errors: List[str] = []
+
+        # Iterate backwards — Count shrinks when documents are closed.
+        for i in range(n - 1, -1, -1):
+            try:
+                d = getattr(docs, "Item")(i)
+            except Exception as e:
+                errors.append(str(e))
+                continue
+
+            try:
+                if bool(getattr(d, "ReadOnly", False)):
+                    continue
+            except Exception:
+                pass
+
+            full = ""
+            name = ""
+            try:
+                full = str(getattr(d, "FullName", "") or "").strip()
+                name = str(getattr(d, "Name", "") or "").strip() or "Drawing1.dwg"
+            except Exception as e:
+                errors.append(str(e))
+                continue
+
+            resolved_key = ""
+            if full:
+                try:
+                    resolved_key = str(Path(full).resolve()).lower()
+                except Exception:
+                    resolved_key = full.lower()
+                if resolved_key in exclude:
+                    continue
+
+            try:
+                is_saved = bool(getattr(d, "Saved", True))
+            except Exception:
+                is_saved = True
+
+            if not is_saved:
+                try:
+                    if full:
+                        d.Save()
+                        saved_paths.append(full)
+                    else:
+                        dest_dir = Path.home() / "Documents"
+                        dest_dir.mkdir(parents=True, exist_ok=True)
+                        dest_name = name if name.lower().endswith(".dwg") else f"{name}.dwg"
+                        dest = dest_dir / dest_name
+                        # Avoid clobbering an unrelated file with the same default name.
+                        if dest.exists():
+                            stem = dest.stem
+                            suffix = dest.suffix
+                            k = 1
+                            while True:
+                                candidate = dest_dir / f"{stem}_{k}{suffix}"
+                                if not candidate.exists():
+                                    dest = candidate
+                                    break
+                                k += 1
+                        d.SaveAs(str(dest))
+                        full = str(dest)
+                        resolved_key = str(Path(full).resolve()).lower()
+                        saved_paths.append(full)
+                except Exception as e:
+                    errors.append(f"Save failed for {name or full or '?'}: {e}")
+                    continue
+
+            if not close_after_save:
+                continue
+            if resolved_key and resolved_key in exclude:
+                continue
+            try:
+                d.Close(False)
+                closed_paths.append(full or name)
+                time.sleep(0.15)
+            except Exception as e:
+                errors.append(f"Close failed for {name or full or '?'}: {e}")
+
+        return {
+            "success": True,
+            "saved": saved_paths,
+            "closed": closed_paths,
+            "errors": errors,
+        }
+
     def is_drawing_open(self, file_path: str) -> bool:
         """
         True if AutoCAD already has this drawing open as a saved document (FullName matches resolved path).

@@ -23,6 +23,7 @@ from survyai_cloud.services.entitlements import (
     apply_pro_defaults,
     credit_budget_and_interval_from_paystack_payload,
     manual_payment_period_anchor,
+    reconcile_pro_access,
     subscription_period_end_from_anchor,
 )
 from survyai_cloud.services.paystack import (
@@ -201,7 +202,8 @@ async def paystack_verify(
             paid_anchor = datetime.fromisoformat(dt)
         except Exception:
             paid_anchor = None
-    anchor = manual_payment_period_anchor(user, paid_anchor)
+    reconcile_pro_access(user, settings)
+    anchor = manual_payment_period_anchor(user, paid_anchor, settings)
     apply_pro_defaults(
         user,
         settings,

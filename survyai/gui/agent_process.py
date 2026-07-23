@@ -34,10 +34,11 @@ import uuid
 from typing import Any, Dict, Optional
 
 
-# Windows SetThreadExecutionState flags (keep system + display awake during runs).
+# Windows SetThreadExecutionState flags (keep system awake during runs).
+# Do NOT include ES_DISPLAY_REQUIRED: forcing the display on during long/hung
+# local LLM calls contributes to thermal/power stress and poor lock-screen UX.
 _ES_CONTINUOUS = 0x80000000
 _ES_SYSTEM_REQUIRED = 0x00000001
-_ES_DISPLAY_REQUIRED = 0x00000002
 
 
 def _windows_acquire_run_awake() -> bool:
@@ -47,7 +48,7 @@ def _windows_acquire_run_awake() -> bool:
     try:
         import ctypes
 
-        flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED
+        flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED
         return bool(ctypes.windll.kernel32.SetThreadExecutionState(flags))
     except Exception:
         return False
@@ -73,7 +74,7 @@ def _payload_signature(settings_payload: Dict[str, Any], ff_payload: Dict[str, A
     """
     # Bump _WORKER_CODE_REV when agent routing/pipelines change so a running app
     # picks up new fast-path logic after restart (warm process rebuilds on mismatch).
-    _WORKER_CODE_REV = "20260707-proxy-fastpath-v1"
+    _WORKER_CODE_REV = "20260722-ollama-cost-fix-v1"
     try:
         return json.dumps([settings_payload, ff_payload, _WORKER_CODE_REV], sort_keys=True, default=str)
     except Exception:
@@ -129,6 +130,7 @@ def _agent_worker_loop(in_queue: "multiprocessing.Queue", out_queue: "multiproce
             break
 
         req_id = req.get("req_id")
+        keep_awake = False
         try:
             # Apply the workspace directory for this request. Reset to the
             # original cwd when none is supplied so requests stay isolated.
@@ -147,19 +149,84 @@ def _agent_worker_loop(in_queue: "multiprocessing.Queue", out_queue: "multiproce
                 out_queue.put({"kind": "warmed", "req_id": req_id})
                 continue
 
-            _windows_acquire_run_awake()
+            # Skip keep-awake for local Ollama: it does not prevent RAM thrash/hibernate
+            # and can interact poorly with laptop power policy during long CPU inference.
+            settings_payload = req.get("settings_payload") or {}
+            use_fb = bool(req.get("use_fallback_llm", False))
+            active_llm = str(
+                settings_payload.get("fallback_llm" if use_fb else "primary_llm", "") or ""
+            ).strip().lower()
+            keep_awake = active_llm != "ollama"
+            if keep_awake:
+                _windows_acquire_run_awake()
             try:
-                result = svc.run_task(
-                    req.get("query") or "",
-                    use_fallback_llm=bool(req.get("use_fallback_llm", False)),
-                    session_id=req.get("session_id"),
-                    interactive=bool(req.get("interactive", False)),
-                )
-                out_queue.put({"kind": "result", "req_id": req_id, "payload": result.raw})
+                # Route CAD file-conflict prompts to the GUI via the out/in queues
+                # so the styled dialog appears on the SurvyAI window (not a hidden MessageBox).
+                try:
+                    from agent.agent import set_cad_file_conflict_handler
+
+                    def _ask_cad_conflict(path: str, mode: str = "overwrite") -> bool:
+                        out_queue.put(
+                            {
+                                "kind": "confirm_overwrite",
+                                "req_id": req_id,
+                                "payload": {
+                                    "path": str(path or ""),
+                                    "mode": str(mode or "overwrite"),
+                                },
+                            }
+                        )
+                        while True:
+                            try:
+                                reply = in_queue.get()
+                            except (EOFError, OSError, KeyboardInterrupt):
+                                return False
+                            if reply is None:
+                                return False
+                            if reply.get("kind") == "shutdown":
+                                return False
+                            if (
+                                reply.get("kind") == "confirm_overwrite_reply"
+                                and reply.get("req_id") == req_id
+                            ):
+                                payload = reply.get("payload") or {}
+                                return bool(payload.get("accepted"))
+                            # Ignore unrelated mid-run messages.
+
+                    set_cad_file_conflict_handler(_ask_cad_conflict)
+                except Exception:
+                    pass
+
+                try:
+                    result = svc.run_task(
+                        req.get("query") or "",
+                        use_fallback_llm=bool(req.get("use_fallback_llm", False)),
+                        session_id=req.get("session_id"),
+                        interactive=bool(req.get("interactive", False)),
+                    )
+                    out_queue.put({"kind": "result", "req_id": req_id, "payload": result.raw})
+                finally:
+                    try:
+                        from agent.agent import set_cad_file_conflict_handler
+
+                        set_cad_file_conflict_handler(None)
+                    except Exception:
+                        pass
             finally:
-                _windows_release_run_awake()
+                if keep_awake:
+                    _windows_release_run_awake()
         except Exception:
-            _windows_release_run_awake()
+            try:
+                if keep_awake:
+                    _windows_release_run_awake()
+            except Exception:
+                pass
+            try:
+                from agent.agent import set_cad_file_conflict_handler
+
+                set_cad_file_conflict_handler(None)
+            except Exception:
+                pass
             out_queue.put({"kind": "error", "req_id": req_id, "payload": traceback.format_exc()})
 
 

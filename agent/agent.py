@@ -70,6 +70,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -219,6 +220,70 @@ _EXTRA_ROAD_SPEC_RE = re.compile(
     r"\s*Add\s|\.\s*Add|\.\s*$|$)",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+# Optional GUI/IPC handler: (path, mode) -> bool. Set by the desktop agent worker.
+_cad_file_conflict_handler: Optional[Callable[[str, str], bool]] = None
+
+
+def set_cad_file_conflict_handler(
+    handler: Optional[Callable[[str, str], bool]],
+) -> None:
+    """Install a confirm callback used by CAD overwrite/modify prompts (GUI IPC)."""
+    global _cad_file_conflict_handler
+    _cad_file_conflict_handler = handler
+
+
+def _confirm_overwrite_existing_dwg(path: str, *, mode: str = "overwrite") -> bool:
+    """
+    Ask whether to overwrite or modify an existing output DWG.
+
+    Prefers the GUI handler (styled SurvyAI dialog). Falls back to a native
+    MessageBox only when no handler is installed (e.g. CLI).
+    """
+    handler = _cad_file_conflict_handler
+    if callable(handler):
+        try:
+            return bool(handler(str(path or ""), str(mode or "overwrite")))
+        except Exception:
+            return False
+    try:
+        import ctypes
+
+        mode_l = (mode or "overwrite").strip().lower()
+        if mode_l == "modify":
+            text = (
+                f"This drawing already exists:\n\n{path}\n\n"
+                "Do you want to apply modifications to this existing drawing?\n\n"
+                "Yes — continue and modify the drawing\n"
+                "No — cancel and leave the drawing unchanged"
+            )
+            title = "SurvyAI — Modify existing drawing"
+        else:
+            text = (
+                f"This drawing already exists:\n\n{path}\n\n"
+                "Do you want to overwrite it with a new plan from the template?\n\n"
+                "Yes — overwrite the existing drawing\n"
+                "No — keep the existing drawing unchanged"
+            )
+            title = "SurvyAI — Drawing already exists"
+        # MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST | MB_SYSTEMMODAL
+        flags = 0x00000004 | 0x00000030 | 0x00010000 | 0x00040000 | 0x00001000
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
+        except Exception:
+            pass
+        result = ctypes.windll.user32.MessageBoxW(0, text, title, flags)
+        return int(result) == 6  # IDYES
+    except Exception:
+        return False
+
+
+def _ollama_ram_policy(model_name: str = "") -> Tuple[bool, str, int]:
+    """Host-aware Ollama safety policy (see ``survyai.ollama_support.ollama_ram_policy``)."""
+    from survyai.ollama_support import ollama_ram_policy
+
+    return ollama_ram_policy(model_name)
 
 
 def _parse_access_road_specs_from_query(query: str) -> List[str]:
@@ -1160,6 +1225,9 @@ class SurvyAIAgent:
         self._openai_llm_cache: Dict[tuple, BaseChatModel] = {}
         self._app_signature: Optional[tuple] = None
         self._pipeline_llm_cost_usd: float = 0.0
+        # Serialize LLM invokes so a timed-out Ollama/HTTP call cannot stack
+        # concurrent generations and thrash the host into lock/hibernate.
+        self._llm_invoke_gate = threading.Lock()
         self._cloud_proxy_enabled = bool(
             getattr(self.settings, "survyai_llm_proxy_enabled", False)
             and str(getattr(self.settings, "survyai_api_base_url", "") or "").strip()
@@ -3828,38 +3896,105 @@ class SurvyAIAgent:
         if not outp.is_absolute():
             outp = self._resolve_user_output_path("", str(outp)).resolve()
 
-        # Connect early. Do NOT close the user's drawing: if the output DWG is already open in AutoCAD,
-        # skip overwriting it from disk (locked file) and edit that session in place instead (better UX).
+        # Never treat the survey-plan template itself as a regeneratable output.
+        try:
+            if outp.resolve() == Path(template).resolve() or self._is_protected_template_path(str(outp)):
+                return {
+                    "success": False,
+                    "error": (
+                        "Refusing to overwrite the survey plan template DWG. "
+                        "Choose a different output file name for the new plan."
+                    ),
+                }
+        except Exception:
+            if self._is_protected_template_path(str(outp)):
+                return {
+                    "success": False,
+                    "error": "Refusing to overwrite the survey plan template DWG.",
+                }
+
         if not self.autocad.is_connected and not self.autocad.connect():
             return {"success": False, "error": "Could not connect to AutoCAD via COM"}
 
-        skip_template_disk_copy = False
+        # Save (and close) other open/unsaved drawings so they do not block the new run.
+        # Protected templates stay open and are never written.
         try:
-            skip_template_disk_copy = bool(self.autocad.is_drawing_open(str(outp)))
-        except Exception:
-            skip_template_disk_copy = False
+            self._ensure_protected_templates_loaded()
+            exclude = list(self._protected_template_paths) + [str(Path(template).resolve())]
+            prep = self.autocad.save_and_close_other_drawings(
+                exclude_paths=exclude,
+                close_after_save=True,
+            )
+            if prep.get("saved") or prep.get("closed"):
+                logger.info(
+                    "Prepared AutoCAD session for new output (saved=%s closed=%s)",
+                    prep.get("saved"),
+                    prep.get("closed"),
+                )
+        except Exception as e:
+            logger.warning("save_and_close_other_drawings failed (continuing): %s", e)
 
-        # Copy template to output (overwrite) only when the target is not already open in AutoCAD.
-        # Template file itself is never modified; output receives a copy unless we reuse the open drawing.
         try:
             outp.parent.mkdir(parents=True, exist_ok=True)
         except Exception as e:
             return {"success": False, "error": f"Cannot create output folder: {e}"}
 
-        if not skip_template_disk_copy:
+        # If the output already exists (on disk or still open), ask before overwriting.
+        output_exists = False
+        try:
+            output_exists = outp.exists()
+        except Exception:
+            output_exists = False
+        if not output_exists:
             try:
-                shutil.copy2(str(template), str(outp))
-            except PermissionError:
+                output_exists = bool(self.autocad.is_drawing_open(str(outp)))
+            except Exception:
+                output_exists = False
+
+        if output_exists:
+            if not _confirm_overwrite_existing_dwg(str(outp), mode="overwrite"):
                 return {
                     "success": False,
+                    "cancelled": True,
                     "error": (
-                        f"Cannot write output DWG (permission denied): {str(outp)}\n"
-                        "If another program holds an exclusive lock, save or retry.\n"
-                        "SurvyAI will not create alternate output filenames automatically."
+                        f"Kept existing drawing unchanged: {str(outp)}\n"
+                        "Overwrite was declined. Change the output name or choose Overwrite to replace it."
                     ),
                 }
+            # Release any remaining AutoCAD lock on the target before disk overwrite.
+            try:
+                self.autocad.close_drawing_if_open(str(outp), save_changes=False)
+                time.sleep(0.25)
+            except Exception:
+                pass
+
+        def _copy_template_to_output() -> Optional[Dict[str, Any]]:
+            try:
+                shutil.copy2(str(template), str(outp))
+                return None
+            except PermissionError:
+                # One retry after forcing the target closed (common when still locked).
+                try:
+                    self.autocad.close_drawing_if_open(str(outp), save_changes=False)
+                    time.sleep(0.4)
+                    shutil.copy2(str(template), str(outp))
+                    return None
+                except PermissionError:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"Cannot write output DWG (still locked): {str(outp)}\n"
+                            "Close the drawing in AutoCAD (or any other program using it), then retry."
+                        ),
+                    }
+                except Exception as e2:
+                    return {"success": False, "error": f"Failed to copy template to output: {e2}"}
             except Exception as e:
                 return {"success": False, "error": f"Failed to copy template to output: {e}"}
+
+        copy_err = _copy_template_to_output()
+        if copy_err is not None:
+            return copy_err
 
         opened = self.autocad.open_drawing(str(outp))
         if not opened.get("success"):
@@ -6801,8 +6936,32 @@ class SurvyAIAgent:
         if self._is_template_path(target):
             return {"success": False, "error": "The template file is read-only and cannot be modified. Use the output plan file or the plan we just generated."}
 
+        # Same path/name already on disk — confirm before modifying (never the template).
+        if target_p.exists():
+            if not _confirm_overwrite_existing_dwg(str(target_p), mode="modify"):
+                return {
+                    "success": False,
+                    "cancelled": True,
+                    "error": (
+                        f"Left existing drawing unchanged: {str(target_p)}\n"
+                        "Modification was declined."
+                    ),
+                }
+
         if not self.autocad.is_connected and not self.autocad.connect():
             return {"success": False, "error": "Could not connect to AutoCAD via COM"}
+
+        # Save/close other unsaved drawings (never the protected template, keep the target open).
+        try:
+            self._ensure_protected_templates_loaded()
+            exclude = list(self._protected_template_paths) + [str(target_p)]
+            self.autocad.save_and_close_other_drawings(
+                exclude_paths=exclude,
+                close_after_save=True,
+            )
+        except Exception as e:
+            logger.warning("save_and_close_other_drawings (modification) failed: %s", e)
+
         opened = self.autocad.open_drawing(str(target_p), read_only=False)
         if not opened.get("success"):
             return {"success": False, "error": opened.get("error", "Failed to open plan drawing")}
@@ -8126,6 +8285,14 @@ class SurvyAIAgent:
         """Single LLM call for explanatory Q&A; no tools, no graph, no stale task state."""
         from langchain_core.messages import HumanMessage, SystemMessage
 
+        if self._llm_is_ollama(llm):
+            ok, ram_err, _num_ctx = _ollama_ram_policy(
+                model_name_used or self._resolve_provider_model_name("ollama")
+            )
+            if not ok:
+                return {"success": False, "error": ram_err, "model_name": model_name_used}
+            timeout_seconds = min(int(timeout_seconds or 60), 90)
+
         system = (
             "You are SurvyAI, a professional surveying, geospatial, and CAD assistant. "
             "Answer only the user's current question. Do not continue previous CAD/file tasks, "
@@ -8137,6 +8304,7 @@ class SurvyAIAgent:
             timeout_seconds,
             lambda: llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]),
             llm_model_name=model_name_used,
+            serialize_llm=True,
         )
         if timed_out:
             return {
@@ -8703,6 +8871,58 @@ class SurvyAIAgent:
     # LLM INITIALIZATION
     # ==========================================================================
 
+    def _resolve_provider_model_name(self, provider: Optional[str]) -> str:
+        """Map provider id (e.g. 'ollama') to the concrete model id for TPM/cost/logging."""
+        p = str(provider or "").strip().lower()
+        if p == "ollama":
+            return str(getattr(self.settings, "ollama_model", None) or "llama3.2:1b").strip() or "llama3.2:1b"
+        if p == "deepseek":
+            return str(getattr(self.settings, "deepseek_model", None) or "deepseek-chat").strip() or "deepseek-chat"
+        if p == "claude":
+            return str(
+                getattr(self.settings, "claude_model", None) or "claude-3-5-sonnet-20241022"
+            ).strip()
+        if p == "gemini":
+            return (
+                self._current_gemini_model
+                or str(getattr(self.settings, "gemini_model", None) or "gemini-2.0-flash")
+            )
+        if p == "openai":
+            return (
+                self._current_openai_model
+                or str(getattr(self.settings, "openai_model", None) or "gpt-4o-mini")
+            )
+        return str(provider or "unknown")
+
+    def _llm_is_ollama(self, llm: Optional[Any] = None) -> bool:
+        """True when the chat model talks to a local Ollama OpenAI-compatible endpoint."""
+        target = llm
+        if target is None:
+            target = getattr(self, "llm_with_tools", None) or getattr(self, "llm_primary", None)
+        try:
+            base = str(
+                getattr(target, "openai_api_base", None)
+                or getattr(target, "base_url", None)
+                or ""
+            )
+            if "11434" in base or "ollama" in base.lower():
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _release_ollama_model(self) -> None:
+        """Best-effort unload so a timed-out local run cannot keep thrashing host RAM."""
+        try:
+            from survyai.ollama_support import release_ollama_model
+
+            base = str(getattr(self.settings, "ollama_base_url", None) or "http://localhost:11434")
+            model = str(getattr(self.settings, "ollama_model", None) or "").strip()
+            if model:
+                release_ollama_model(base, model)
+        except Exception:
+            pass
+
     def _make_cloud_proxy_llm(
         self, llm_type: str, model_name: Optional[str] = None
     ) -> BaseChatModel:
@@ -8932,20 +9152,50 @@ class SurvyAIAgent:
                 base = (
                     getattr(self.settings, "ollama_base_url", None) or "http://localhost:11434"
                 ).strip().rstrip("/")
-                model_name = getattr(self.settings, "ollama_model", "llama3.2:1b")
+                model_name = (
+                    model_name
+                    or getattr(self.settings, "ollama_model", None)
+                    or "llama3.2:1b"
+                )
+                ok, ram_err, num_ctx = _ollama_ram_policy(model_name)
+                if not ok:
+                    raise RuntimeError(ram_err)
                 num_predict = int(getattr(self.settings, "ollama_num_predict", 512) or 512)
+                # On low-RAM hosts, shrink generation budget further.
+                if num_ctx <= 1024:
+                    num_predict = min(num_predict, 256)
+                elif num_ctx <= 2048:
+                    num_predict = min(num_predict, 384)
                 requested_tokens = int(self.settings.agent_max_tokens or num_predict)
                 actual_max_tokens = min(requested_tokens, num_predict)
+                # Hard HTTP timeout is critical: without it, SurvyAI's join-timeout
+                # leaves Ollama generating forever in a daemon thread (RAM/CPU thrash).
+                invoke_budget = int(getattr(self.settings, "llm_invoke_timeout_seconds", 180) or 180)
+                http_timeout = max(30, min(invoke_budget, 90))
                 logger.info(
-                    f"Initializing Ollama LLM with model: {model_name} at {base}/v1"
+                    f"Initializing Ollama LLM with model: {model_name} at {base}/v1 "
+                    f"(max_tokens={actual_max_tokens}, num_ctx={num_ctx}, http_timeout={http_timeout}s)"
                 )
-                return ChatOpenAI(
-                    model=model_name,
-                    api_key="ollama",
-                    base_url=f"{base}/v1",
-                    temperature=self.settings.agent_temperature,
-                    max_tokens=actual_max_tokens,
-                )
+                kwargs: Dict[str, Any] = {
+                    "model": model_name,
+                    "api_key": "ollama",
+                    "base_url": f"{base}/v1",
+                    "temperature": self.settings.agent_temperature,
+                    "max_tokens": actual_max_tokens,
+                    "timeout": http_timeout,
+                    "max_retries": 1,
+                    # Cap KV-cache / context and unload immediately after each call
+                    # so Ollama cannot keep a large resident footprint between prompts.
+                    "extra_body": {
+                        "keep_alive": 0,
+                        "options": {
+                            "num_ctx": int(num_ctx),
+                            "num_predict": int(actual_max_tokens),
+                        },
+                    },
+                }
+                self._ollama_num_ctx = int(num_ctx)
+                return ChatOpenAI(**kwargs)
                 
             else:
                 raise ValueError(
@@ -11864,18 +12114,27 @@ class SurvyAIAgent:
         """Add one direct LLM response (AIMessage) to the current query's cost tally."""
         try:
             from langchain_core.messages import AIMessage
-            from utils.cost_estimator import estimate_token_cost_usd, extract_message_token_usage
+            from utils.cost_estimator import (
+                estimate_token_cost_usd,
+                extract_message_token_usage,
+                is_local_free_model,
+            )
         except ImportError:
             return
         if not isinstance(msg, AIMessage):
             return
-        mn = (model_name or "").strip()
+        # Prefer the bound active model; never default Ollama runs to OpenAI pricing.
+        mn = (model_name or "").strip() or str(getattr(self, "_active_model_name", "") or "").strip()
+        if not mn and self._llm_is_ollama():
+            mn = self._resolve_provider_model_name("ollama")
         if not mn:
             mn = (
                 getattr(self, "_current_openai_model", None)
                 or getattr(self.settings, "openai_model", None)
                 or getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
             )
+        if self._llm_is_ollama() or is_local_free_model(str(mn)):
+            return
         usage = extract_message_token_usage(msg)
         if not usage:
             return
@@ -11896,8 +12155,17 @@ class SurvyAIAgent:
 
         Prefers an explicit graph estimate when present; otherwise uses the per-query
         accumulator fed by ``_run_with_timeout`` / direct ``llm.invoke`` calls.
+        Local/Ollama runs are always $0.
         """
         out = dict(result or {})
+        try:
+            from utils.cost_estimator import is_local_free_model
+        except ImportError:
+            is_local_free_model = lambda _n: False  # type: ignore
+        mn = str(out.get("model_name") or getattr(self, "_active_model_name", "") or "").strip()
+        if self._llm_is_ollama() or is_local_free_model(mn):
+            out["llm_cost_usd"] = 0.0
+            return out
         existing = float(out.get("llm_cost_usd") or 0.0)
         tracked = float(self._pipeline_llm_cost_usd or 0.0)
         if existing > 0:
@@ -11912,48 +12180,108 @@ class SurvyAIAgent:
         """Return a ``run_with_timeout`` callable that tags LLM costs with ``model_name``."""
 
         def _runner(timeout_seconds: int, fn: Callable[[], Any]) -> Tuple[Optional[Any], Optional[Exception], bool]:
-            return self._run_with_timeout(timeout_seconds, fn, llm_model_name=model_name)
+            return self._run_with_timeout(
+                timeout_seconds, fn, llm_model_name=model_name, serialize_llm=True
+            )
 
         return _runner
 
     def _run_with_timeout(
-        self, timeout_seconds: int, fn: Callable[[], Any], *, llm_model_name: Optional[str] = None
+        self,
+        timeout_seconds: int,
+        fn: Callable[[], Any],
+        *,
+        llm_model_name: Optional[str] = None,
+        serialize_llm: bool = False,
     ) -> Tuple[Optional[Any], Optional[Exception], bool]:
         """
         Run a callable in a daemon thread with a timeout.
         Returns (result, error, timed_out). Exactly one of result or error is set when not timed_out.
+
+        When ``serialize_llm`` is True, acquires an invoke gate so timed-out Ollama/HTTP
+        calls cannot stack concurrent generations (a common cause of host lockups).
+        The gate stays held until the worker thread finishes.
         """
-        import threading
         result_container: List[Any] = [None]
         err_container: List[Optional[Exception]] = [None]
+        gate = getattr(self, "_llm_invoke_gate", None) if serialize_llm else None
+        acquired = False
+        started = False
+        if gate is not None:
+            acquired = bool(gate.acquire(timeout=max(1.0, float(timeout_seconds))))
+            if not acquired:
+                return (
+                    None,
+                    TimeoutError(
+                        "Another LLM call is still finishing. Wait a moment and try again "
+                        "(this protects your PC from stacked local-model load)."
+                    ),
+                    True,
+                )
 
         def run():
             try:
                 result_container[0] = fn()
             except Exception as e:
                 err_container[0] = e
+            finally:
+                if gate is not None and acquired:
+                    try:
+                        gate.release()
+                    except RuntimeError:
+                        pass
 
-        t = threading.Thread(target=run)
-        t.daemon = True
-        t.start()
-        t.join(timeout=timeout_seconds)
-        timed_out = t.is_alive()
-        result = result_container[0]
-        error = err_container[0]
-        if result is not None and error is None and not timed_out:
-            try:
-                self._track_llm_invoke_result(result, llm_model_name)
-            except Exception:
-                pass
-        return (result, error, timed_out)
+        try:
+            t = threading.Thread(target=run, daemon=True)
+            t.start()
+            started = True
+            t.join(timeout=timeout_seconds)
+            timed_out = t.is_alive()
+            if timed_out and serialize_llm:
+                # Give HTTP-layer timeouts a short window to abort the orphaned call
+                # instead of leaving Ollama generating indefinitely.
+                t.join(timeout=min(20.0, float(timeout_seconds)))
+                if self._llm_is_ollama():
+                    self._release_ollama_model()
+                if t.is_alive():
+                    logger.error(
+                        "LLM call still running after timeout — further LLM invokes are "
+                        "blocked until it finishes (protects the PC from overload)."
+                    )
+            result = result_container[0]
+            error = err_container[0]
+            if result is not None and error is None and not timed_out:
+                try:
+                    self._track_llm_invoke_result(result, llm_model_name)
+                except Exception:
+                    pass
+            return (result, error, timed_out)
+        finally:
+            if gate is not None and acquired and not started:
+                try:
+                    gate.release()
+                except RuntimeError:
+                    pass
 
     def _invoke_llm_with_retry(self, messages: List[Any]) -> Any:
         """Invoke LLM with timeout protection; raises TimeoutError or the LLM exception on failure."""
         timeout_seconds = int(getattr(self.settings, "llm_invoke_timeout_seconds", 180) or 180)
         if timeout_seconds < 60:
             timeout_seconds = 60
+        # Local Ollama on CPU can peg the machine; keep per-call budget tighter.
+        if self._llm_is_ollama():
+            ok, ram_err, _num_ctx = _ollama_ram_policy(self._resolve_provider_model_name("ollama"))
+            if not ok:
+                raise RuntimeError(ram_err)
+            timeout_seconds = min(timeout_seconds, 90)
+        active_model = str(getattr(self, "_active_model_name", "") or "").strip()
+        if not active_model and self._llm_is_ollama():
+            active_model = self._resolve_provider_model_name("ollama")
         result, error, timed_out = self._run_with_timeout(
-            timeout_seconds, lambda: self.llm_with_tools.invoke(messages)
+            timeout_seconds,
+            lambda: self.llm_with_tools.invoke(messages),
+            llm_model_name=active_model or None,
+            serialize_llm=True,
         )
         if timed_out:
             logger.error(f"LLM invocation timed out after {timeout_seconds} seconds")
@@ -11980,6 +12308,7 @@ class SurvyAIAgent:
             return
 
         self._current_tools = tools_to_bind
+        self._active_model_name = str(model_name or model_sig or "").strip()
         self.llm_with_tools = llm.bind_tools(tools_to_bind)
         self.graph = self._build_graph()
         self.app = self.graph.compile(checkpointer=self.memory)
@@ -12599,7 +12928,7 @@ class SurvyAIAgent:
                 elif self.settings.fallback_llm == "gemini":
                     model_name_used = self._current_gemini_model or getattr(self.settings, "gemini_model", "gemini-2.0-flash")
                 else:
-                    model_name_used = self.settings.fallback_llm
+                    model_name_used = self._resolve_provider_model_name(self.settings.fallback_llm)
             else:
                 # Using primary LLM with complexity-based selection for OpenAI
                 if self.settings.primary_llm == "openai" and getattr(self.settings, "enable_tiered_models", True):
@@ -12617,8 +12946,25 @@ class SurvyAIAgent:
                     elif self.settings.primary_llm == "gemini":
                         model_name_used = self._current_gemini_model or getattr(self.settings, "gemini_model", "gemini-2.0-flash")
                     else:
-                        model_name_used = self.settings.primary_llm
+                        model_name_used = self._resolve_provider_model_name(self.settings.primary_llm)
                     logger.info(f"✓ Using primary LLM: {self.settings.primary_llm} (model: {model_name_used})")
+
+            # Host RAM hard-cap for local Ollama before any heavy prompt/tool work.
+            if self._llm_is_ollama(llm_to_use) or str(
+                self.settings.fallback_llm if use_fallback else self.settings.primary_llm
+            ).lower() == "ollama":
+                ollama_model = model_name_used or self._resolve_provider_model_name("ollama")
+                ok, ram_err, _num_ctx = _ollama_ram_policy(ollama_model)
+                if not ok:
+                    return {
+                        "query": query,
+                        "response": ram_err,
+                        "success": False,
+                        "error": ram_err,
+                        "llm_used": "fallback" if use_fallback else "primary",
+                        "model_name": ollama_model,
+                        "session_id": current_session_id,
+                    }
 
             # FAST PATH: standalone knowledge/explanation prompts.
             # This is intentionally before any tool-enabled graph execution to avoid
@@ -13219,6 +13565,14 @@ class SurvyAIAgent:
                 tools_to_bind = [t for t in self.tools if t.name != "internet_search"]
                 logger.info("✓ Removed internet_search tool (already searched) to prevent loops")
 
+            # Ollama + full tool schemas massively inflate prompt/KV-cache RAM.
+            # For non-file prompts, run tool-free to protect the host.
+            if self._llm_is_ollama(llm_to_use) and not looks_like_file_driven_task(
+                actual_query_for_routing or routing_query or query or ""
+            ):
+                tools_to_bind = []
+                logger.info("✓ Ollama non-file prompt: binding no tools (RAM-safe)")
+
             # Bind tools and compile graph only if (model, toolset) changed
             self._ensure_app_bound(llm_to_use, model_name_used, tools_to_bind)
             
@@ -13584,11 +13938,16 @@ class SurvyAIAgent:
         the run. If the provider omits usage metadata, return 0 so customer credits
         are not debited from estimates.
         """
-        from utils.cost_estimator import summarize_graph_llm_usage
+        mn = (model_name or "").strip() or str(getattr(self, "_active_model_name", "") or "").strip()
+        if not mn:
+            mn = getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
+        try:
+            from utils.cost_estimator import is_local_free_model, summarize_graph_llm_usage
 
-        mn = (model_name or "").strip() or getattr(
-            self.settings, "openai_model_mini", "gpt-5.4-mini"
-        )
+            if self._llm_is_ollama() or is_local_free_model(mn):
+                return 0.0
+        except Exception:
+            from utils.cost_estimator import summarize_graph_llm_usage
         try:
             usage = summarize_graph_llm_usage(
                 list((result or {}).get("messages") or []),

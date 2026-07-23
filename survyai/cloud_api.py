@@ -164,8 +164,9 @@ def refresh_tokens(*, base_url: str, refresh_token: str, timeout_s: int = 20) ->
 # Mirrors survyai_cloud.security password policy for desktop UX (no cloud import).
 _PASSWORD_MIN_LENGTH = 10
 _PASSWORD_MAX_LENGTH = 128
-_PASSWORD_SPECIAL_CHARS = r"!@#$%^&*()_+\-=\[\]{}|;:,.<>?"
-_PASSWORD_SPECIAL_RE = re.compile(rf"[{_PASSWORD_SPECIAL_CHARS}]")
+# Keep '-' at the end of the class so it is literal (not a range like /-=).
+_PASSWORD_SPECIAL_CHARS = r"!@#$%^&*()_+/=[]{}|;:,.<>?-"
+_PASSWORD_SPECIAL_RE = re.compile(r"[!@#$%^&*()_+/=\[\]{}|;:,.<>?-]")
 _COMMON_PASSWORDS = frozenset(
     {
         "password",

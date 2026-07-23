@@ -11,7 +11,7 @@ child process immediately when the user clicks Cancel.
 
 from __future__ import annotations
 
-import os
+import threading
 import traceback
 from typing import Any, Optional
 
@@ -21,36 +21,6 @@ from survyai.agent_service import SurvyAIAgentService
 from survyai.gui.agent_process import get_shared_agent_process
 from survyai.types import AgentRunResult
 
-# Windows SetThreadExecutionState flags (keep system + display awake during runs).
-_ES_CONTINUOUS = 0x80000000
-_ES_SYSTEM_REQUIRED = 0x00000001
-_ES_DISPLAY_REQUIRED = 0x00000002
-
-
-def _windows_acquire_run_awake() -> bool:
-    """Ask Windows not to sleep/hibernate while a SurvyAI task is active."""
-    if os.name != "nt":
-        return False
-    try:
-        import ctypes
-
-        flags = _ES_CONTINUOUS | _ES_SYSTEM_REQUIRED | _ES_DISPLAY_REQUIRED
-        return bool(ctypes.windll.kernel32.SetThreadExecutionState(flags))
-    except Exception:
-        return False
-
-
-def _windows_release_run_awake() -> None:
-    """Clear the keep-awake request so normal power policy resumes."""
-    if os.name != "nt":
-        return
-    try:
-        import ctypes
-
-        ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
-    except Exception:
-        pass
-
 
 class AgentRunThread(QThread):
     """Runs one killable `run_task` call against the warm agent process."""
@@ -59,6 +29,8 @@ class AgentRunThread(QThread):
     failed = Signal(str)
     progress_text = Signal(str)
     cancelled = Signal(str)
+    # Emitted on the GUI thread path: payload dict {path, mode}.
+    confirm_overwrite = Signal(object)
 
     def __init__(
         self,
@@ -88,18 +60,44 @@ class AgentRunThread(QThread):
             "allow_internet_tools": service.feature_flags.allow_internet_tools,
             "allow_vector_store": service.feature_flags.allow_vector_store,
         }
+        self._confirm_event = threading.Event()
+        self._confirm_accepted = False
+
+    def _release_local_ollama(self) -> None:
+        """Unload Ollama model after cancel so inference cannot keep thrashing the PC."""
+        try:
+            from survyai.ollama_support import release_ollama_model
+
+            settings = self._settings_payload or {}
+            primary = str(settings.get("primary_llm", "") or "").strip().lower()
+            fallback = str(settings.get("fallback_llm", "") or "").strip().lower()
+            if primary != "ollama" and fallback != "ollama":
+                return
+            base = str(settings.get("ollama_base_url") or "http://localhost:11434")
+            model = str(settings.get("ollama_model") or "").strip()
+            if model:
+                release_ollama_model(base, model)
+        except Exception:
+            pass
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
+        # Unblock any in-flight CAD conflict wait so cancel can proceed.
+        self._confirm_accepted = False
+        self._confirm_event.set()
         self.progress_text.emit(
             "Cancellation requested. SurvyAI is terminating the active agent run now."
         )
 
+    def provide_confirm_result(self, accepted: bool) -> None:
+        """Called from the GUI thread after the CAD conflict dialog closes."""
+        self._confirm_accepted = bool(accepted)
+        self._confirm_event.set()
+
     def run(self) -> None:
         proc = get_shared_agent_process()
-        awake = _windows_acquire_run_awake()
-        if awake:
-            self.progress_text.emit("Keeping this PC awake while the task runs.")
+        # Keep-awake is owned solely by the agent worker process (not duplicated
+        # here) to avoid conflicting SetThreadExecutionState calls.
         try:
             if self._working_directory:
                 self.progress_text.emit(f"Workspace active: {self._working_directory}")
@@ -123,6 +121,7 @@ class AgentRunThread(QThread):
 
             while True:
                 if self._cancel_requested:
+                    self._release_local_ollama()
                     proc.kill()
                     self.cancelled.emit("Task cancelled. The active agent run was terminated.")
                     return
@@ -145,6 +144,31 @@ class AgentRunThread(QThread):
 
                 kind = message.get("kind")
                 payload = message.get("payload")
+                if kind == "confirm_overwrite":
+                    self.progress_text.emit("Waiting for confirmation about an existing drawing…")
+                    self._confirm_event.clear()
+                    self._confirm_accepted = False
+                    self.confirm_overwrite.emit(payload if isinstance(payload, dict) else {})
+                    while not self._confirm_event.wait(0.25):
+                        if self._cancel_requested:
+                            break
+                    accepted = bool(self._confirm_accepted) and not self._cancel_requested
+                    try:
+                        proc.submit(
+                            {
+                                "kind": "confirm_overwrite_reply",
+                                "req_id": req_id,
+                                "payload": {"accepted": accepted},
+                            }
+                        )
+                    except Exception:
+                        pass
+                    if self._cancel_requested:
+                        self._release_local_ollama()
+                        proc.kill()
+                        self.cancelled.emit("Task cancelled. The active agent run was terminated.")
+                        return
+                    continue
                 if kind == "result":
                     result = AgentRunResult.from_process_query_dict(payload or {})
                     self.result_ready.emit(result)
@@ -158,5 +182,3 @@ class AgentRunThread(QThread):
                     return
         except Exception:
             self.failed.emit(traceback.format_exc())
-        finally:
-            _windows_release_run_awake()
