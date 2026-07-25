@@ -39,6 +39,15 @@ QDialog, QMessageBox, QInputDialog {
 }
 QDialog QLabel, QMessageBox QLabel, QInputDialog QLabel {
     color: #0f172a;
+    font-size: 10.5pt;
+    line-height: 1.45;
+}
+QMessageBox {
+    min-width: 380px;
+}
+QMessageBox QLabel {
+    min-width: 280px;
+    padding: 4px 2px 8px 2px;
 }
 QDialog QLineEdit, QMessageBox QLineEdit, QInputDialog QLineEdit {
     background-color: #ffffff;
@@ -47,7 +56,73 @@ QDialog QLineEdit, QMessageBox QLineEdit, QInputDialog QLineEdit {
     padding: 8px 12px;
 }
 QDialogButtonBox QPushButton, QMessageBox QPushButton, QInputDialog QPushButton {
-    min-width: 92px;
+    min-width: 100px;
+    min-height: 32px;
+    padding: 7px 16px;
+    border-radius: 10px;
+    font-weight: 600;
+}
+QMessageBox QPushButton {
+    background-color: #2563eb;
+    border: 1px solid #1d4ed8;
+    color: #ffffff;
+}
+QMessageBox QPushButton:hover {
+    background-color: #1d4ed8;
+}
+QMessageBox QPushButton[text="Cancel"],
+QMessageBox QPushButton[text="No"],
+QMessageBox QPushButton[text="&No"] {
+    background-color: #ffffff;
+    color: #334155;
+    border: 1px solid #cbd5e1;
+}
+QMessageBox QPushButton[text="Cancel"]:hover,
+QMessageBox QPushButton[text="No"]:hover,
+QMessageBox QPushButton[text="&No"]:hover {
+    background-color: #f8fafc;
+    border-color: #94a3b8;
+}
+
+/* Help / Getting Started dialog */
+QDialog#helpDialog {
+    background-color: #f8fafc;
+}
+QLabel#helpDialogTitle {
+    font-size: 16pt;
+    font-weight: 700;
+    color: #0f172a;
+    padding-bottom: 2px;
+}
+QLabel#helpDialogSubtitle {
+    font-size: 10pt;
+    color: #64748b;
+    padding-bottom: 4px;
+}
+QTextBrowser#helpBrowser {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+    padding: 14px 16px;
+    selection-background-color: #bfdbfe;
+}
+QCheckBox#helpDontShowAgain {
+    color: #475569;
+    spacing: 8px;
+    padding: 2px 0;
+}
+QPushButton#primaryButton {
+    background-color: #2563eb;
+    border: 1px solid #1d4ed8;
+    color: #ffffff;
+    font-weight: 700;
+    min-width: 108px;
+    min-height: 34px;
+    padding: 8px 18px;
+    border-radius: 10px;
+}
+QPushButton#primaryButton:hover {
+    background-color: #1d4ed8;
 }
 
 /* --- Tabs (Console / Output History) -------------------------------- */
@@ -625,6 +700,15 @@ QDialog, QMessageBox, QInputDialog {
 }
 QDialog QLabel, QMessageBox QLabel, QInputDialog QLabel {
     color: #e4e4e7;
+    font-size: 10.5pt;
+    line-height: 1.45;
+}
+QMessageBox {
+    min-width: 380px;
+}
+QMessageBox QLabel {
+    min-width: 280px;
+    padding: 4px 2px 8px 2px;
 }
 QDialog QLineEdit, QMessageBox QLineEdit, QInputDialog QLineEdit {
     background-color: #18181b;
@@ -634,7 +718,73 @@ QDialog QLineEdit, QMessageBox QLineEdit, QInputDialog QLineEdit {
     color: #f4f4f5;
 }
 QDialogButtonBox QPushButton, QMessageBox QPushButton, QInputDialog QPushButton {
-    min-width: 92px;
+    min-width: 100px;
+    min-height: 32px;
+    padding: 7px 16px;
+    border-radius: 10px;
+    font-weight: 600;
+}
+QMessageBox QPushButton {
+    background-color: #3b82f6;
+    border: 1px solid #2563eb;
+    color: #ffffff;
+}
+QMessageBox QPushButton:hover {
+    background-color: #2563eb;
+}
+QMessageBox QPushButton[text="Cancel"],
+QMessageBox QPushButton[text="No"],
+QMessageBox QPushButton[text="&No"] {
+    background-color: #18181b;
+    color: #e4e4e7;
+    border: 1px solid #3f3f46;
+}
+QMessageBox QPushButton[text="Cancel"]:hover,
+QMessageBox QPushButton[text="No"]:hover,
+QMessageBox QPushButton[text="&No"]:hover {
+    background-color: #27272a;
+    border-color: #52525b;
+}
+
+QDialog#helpDialog {
+    background-color: #0c0c0f;
+}
+QLabel#helpDialogTitle {
+    font-size: 16pt;
+    font-weight: 700;
+    color: #fafafa;
+    padding-bottom: 2px;
+}
+QLabel#helpDialogSubtitle {
+    font-size: 10pt;
+    color: #a1a1aa;
+    padding-bottom: 4px;
+}
+QTextBrowser#helpBrowser {
+    background-color: #141416;
+    border: 1px solid #27272a;
+    border-radius: 12px;
+    padding: 14px 16px;
+    color: #e4e4e7;
+    selection-background-color: #1d4ed8;
+}
+QCheckBox#helpDontShowAgain {
+    color: #a1a1aa;
+    spacing: 8px;
+    padding: 2px 0;
+}
+QPushButton#primaryButton {
+    background-color: #3b82f6;
+    border: 1px solid #2563eb;
+    color: #ffffff;
+    font-weight: 700;
+    min-width: 108px;
+    min-height: 34px;
+    padding: 8px 18px;
+    border-radius: 10px;
+}
+QPushButton#primaryButton:hover {
+    background-color: #2563eb;
 }
 
 QWidget#topBar {

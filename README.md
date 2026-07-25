@@ -103,5 +103,7 @@ update is installed.
 
 ## Support
 
-Use **Help → Documentation** in the app for this guide, **Help → Tutorial** for a
-guided walkthrough, and **Help → About** for version information.
+Use **Help → Getting started guide** in the app for a short playbook with CAD,
+PDF-to-CAD, and ArcGIS examples (also shown once after first install). Use
+**Help → Documentation** for this overview, **Help → First-run tutorial** for the
+setup wizard, and **Help → About** for version information.

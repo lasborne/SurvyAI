@@ -88,6 +88,8 @@ class Conversation:
 @dataclass
 class DesktopState:
     onboarding_complete: bool = False
+    # First-run Getting Started guide (Help → Getting started). Separate from onboarding wizard.
+    getting_started_seen: bool = False
     profile: AccountProfile = field(default_factory=AccountProfile)
     cloud_api_base_url: str = DEFAULT_CLOUD_API_BASE_URL
     cloud_access_token: str = ""
@@ -150,6 +152,7 @@ class DesktopState:
         convs = raw.get("conversations") or []
         return cls(
             onboarding_complete=bool(raw.get("onboarding_complete", False)),
+            getting_started_seen=bool(raw.get("getting_started_seen", False)),
             profile=AccountProfile(
                 display_name=str(profile.get("display_name", "")),
                 email=str(profile.get("email", "")),
@@ -480,6 +483,7 @@ class AppStateStore:
             "data_folder": state.data_folder,
             "safe_mode": state.safe_mode,
             "onboarding_complete": state.onboarding_complete,
+            "getting_started_seen": state.getting_started_seen,
             "profile": {
                 "display_name": state.profile.display_name,
                 "email": state.profile.email,

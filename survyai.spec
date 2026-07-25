@@ -28,6 +28,7 @@ block_cipher = None
 # --- Application data files (relative to project root) ----------------------
 datas = [
     ("README.md", "."),
+    ("docs/GETTING_STARTED.md", "docs"),
     ("agent/agent_config.json", "agent"),
     ("agent/system_prompt.txt", "agent"),
     ("survyai/packaging_manifest.json", "survyai"),

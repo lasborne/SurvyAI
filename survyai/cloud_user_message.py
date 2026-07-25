@@ -99,7 +99,8 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
         )"""
         return (
             "The cloud API did not respond in time. Database_ok is false, the server is waiting on a database that is down or unreachable."
-            "Try again."
+            "Try again. \n\n"
+            "Wait for approximately 50s; Go to Settings and Click on 'Refresh Cloud Account', if this box does not appear again, Cloud interaction is active, else, try again."
         )
 
     if any(

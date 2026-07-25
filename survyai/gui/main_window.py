@@ -52,7 +52,6 @@ from PySide6.QtWidgets import (
     QSplitter,
     QStackedWidget,
     QTabWidget,
-    QTextBrowser,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -75,6 +74,7 @@ from survyai.gui.manage_pcs_dialog import ManagePcsDialog
 from survyai.gui.theme_toggle import ThemeToggle
 from survyai.gui.styles import THEME_DARK, THEME_LIGHT, get_stylesheet
 from survyai.gui.onboarding import OnboardingWizard, environment_validation_report
+from survyai.gui.help_dialog import MarkdownHelpDialog
 from survyai.gui.cursor_affordance import install_clickable_cursor_affordance
 from survyai.cloud_user_message import user_facing_cloud_message
 from survyai.cloud_api import (
@@ -2600,9 +2600,17 @@ class MainWindow(QMainWindow):
         help_menu = menubar.addMenu("&Help")
         help_menu.setToolTipsVisible(True)
         help_menu.menuAction().setToolTip(
-            "Documentation, guided tutorial, and product version — hover each link for details."
+            "Getting started guide, documentation, tutorial, and product version — hover each link for details."
         )
-        help_menu.menuAction().setStatusTip("README, tutorial wizard, and About SurvyAI.")
+        help_menu.menuAction().setStatusTip("Getting started, README, tutorial wizard, and About SurvyAI.")
+
+        getting_started = QAction("Getting started guide", self)
+        getting_started.triggered.connect(self._open_getting_started_guide)
+        self._describe_menu_action(
+            getting_started,
+            "Short playbook with examples for CAD plotting, PDF-to-CAD, ArcGIS, and everyday SurvyAI use.",
+        )
+        help_menu.addAction(getting_started)
 
         readme = QAction("Documentation (README)", self)
         readme.triggered.connect(self._open_readme_docs)
@@ -2962,6 +2970,9 @@ class MainWindow(QMainWindow):
     def _finish_startup(self) -> None:
         if not self._state.onboarding_complete:
             self._run_onboarding()
+        # First install / first open: show the Getting Started playbook once.
+        if not self._state.getting_started_seen:
+            QTimer.singleShot(120, self._maybe_show_getting_started_first_run)
         # Kick off agent warm-up right away so the engine is ready by the time
         # the user submits their first prompt (eliminates per-prompt cold start).
         QTimer.singleShot(200, self._prewarm_agent)
@@ -6401,54 +6412,85 @@ class MainWindow(QMainWindow):
         if app is not None:
             QTimer.singleShot(350, app.quit)
 
+    def _getting_started_path(self) -> Path | None:
+        for candidate in (
+            resource_path("docs", "GETTING_STARTED.md"),
+            resource_path("GETTING_STARTED.md"),
+        ):
+            if candidate.is_file():
+                return candidate
+        return None
+
+    @Slot()
+    def _open_getting_started_guide(self) -> None:
+        self._show_getting_started_guide(first_run=False)
+
+    @Slot()
+    def _maybe_show_getting_started_first_run(self) -> None:
+        if self._state.getting_started_seen:
+            return
+        self._show_getting_started_guide(first_run=True)
+
+    def _show_getting_started_guide(self, *, first_run: bool) -> None:
+        path = self._getting_started_path()
+        if path is None:
+            if first_run:
+                # Do not block forever on missing bundle; mark seen so startup continues.
+                self._state.getting_started_seen = True
+                self._state_store.save(self._state)
+            QMessageBox.information(
+                self,
+                "Getting started",
+                "Getting Started guide was not found in this install. Use Help → Documentation instead.",
+            )
+            return
+        dlg = MarkdownHelpDialog(
+            self,
+            title="Getting started with SurvyAI",
+            subtitle="Learn the basics: workspace, CAD plans, PDF-to-CAD, ArcGIS, and everyday tips.",
+            markdown_path=path,
+            primary_label="Got it" if first_run else "Close",
+            show_dont_show_again=first_run,
+        )
+        dlg.exec()
+        # First-run: always mark seen after the dialog closes so startup is not stuck in a loop.
+        # Checkbox defaults to "don't show again"; unchecking still completes this launch's gate.
+        if first_run:
+            self._state.getting_started_seen = True
+            self._state_store.save(self._state)
+
     @Slot()
     def _open_readme_docs(self) -> None:
         readme = resource_path("README.md")
         if readme.is_file():
-            self._show_markdown_dialog(readme, "SurvyAI Documentation")
+            self._show_markdown_dialog(
+                readme,
+                "SurvyAI Documentation",
+                subtitle="Product overview, billing, privacy, and support — shown inside SurvyAI.",
+            )
         else:
             QMessageBox.information(self, "Documentation", "README.md was not found.")
 
-    def _show_markdown_dialog(self, markdown_path: Path, title: str) -> None:
+    def _show_markdown_dialog(
+        self,
+        markdown_path: Path,
+        title: str,
+        *,
+        subtitle: str = "",
+    ) -> None:
         """Show local markdown help inside the app instead of delegating to the OS."""
-        try:
-            content = markdown_path.read_text(encoding="utf-8")
-        except OSError as e:
-            QMessageBox.critical(self, title, f"Could not open documentation:\n\n{e}")
+        if not markdown_path.is_file():
+            QMessageBox.critical(self, title, f"Could not open documentation:\n\nFile not found:\n{markdown_path}")
             return
-
-        dlg = QDialog(self)
-        dlg.setWindowTitle(title)
-        dlg.resize(980, 760)
-
-        layout = QVBoxLayout(dlg)
-        intro = QLabel(
-            f"Showing `{markdown_path.name}` inside SurvyAI so help works consistently without relying on external apps."
+        dlg = MarkdownHelpDialog(
+            self,
+            title=title,
+            subtitle=subtitle
+            or "In-app help so documentation works consistently without relying on external apps.",
+            markdown_path=markdown_path,
+            primary_label="Close",
+            show_dont_show_again=False,
         )
-        intro.setWordWrap(True)
-        layout.addWidget(intro)
-
-        viewer = QTextBrowser()
-        viewer.setOpenExternalLinks(True)
-        try:
-            viewer.setMarkdown(content)
-        except Exception:
-            viewer.setPlainText(content)
-        layout.addWidget(viewer, 1)
-
-        actions = QHBoxLayout()
-        open_folder = QPushButton("Open docs folder")
-        open_folder.setObjectName("secondaryButton")
-        open_folder.clicked.connect(
-            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(markdown_path.parent)))
-        )
-        actions.addWidget(open_folder)
-        actions.addStretch()
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(dlg.accept)
-        actions.addWidget(close_btn)
-        layout.addLayout(actions)
-
         dlg.exec()
 
     @Slot()
