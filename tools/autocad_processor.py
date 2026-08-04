@@ -205,6 +205,11 @@ class AutoCADProcessor:
         self._connected = False
         # When set, COM operations prefer re-activating this drawing (cadastral pipeline output).
         self._workflow_doc_path: Optional[str] = None
+        # COM recovery / warning throttle (separate-owner batches can thrash Documents).
+        self._last_com_recover_ts: float = 0.0
+        self._workflow_open_fail_until: float = 0.0
+        self._last_doc_warn_ts: float = 0.0
+        self._last_doc_warn_msg: str = ""
         
         # Optionally connect immediately
         if auto_connect:
@@ -483,6 +488,12 @@ class AutoCADProcessor:
         target = Path(file_path).resolve()
         target_name = target.name.lower()
 
+        # Cancel any interactive AutoCAD command (Zoom/Window/etc.) that blocks Close/Open.
+        try:
+            self.quiesce_autocad(esc_count=3)
+        except Exception:
+            pass
+
         try:
             docs = self.acad.Documents
         except Exception as e:
@@ -495,7 +506,8 @@ class AutoCADProcessor:
         except Exception:
             n = 0
 
-        for i in range(n):
+        # Iterate backwards — Count shrinks when documents are closed.
+        for i in range(n - 1, -1, -1):
             try:
                 d = getattr(docs, "Item")(i)
             except Exception as e:
@@ -517,6 +529,8 @@ class AutoCADProcessor:
                 try:
                     d.Close(bool(save_changes))
                     closed_any = True
+                    if self.doc is d:
+                        self.doc = None
                     time.sleep(0.2)
                 except Exception as e:
                     last_err = e
@@ -717,15 +731,21 @@ class AutoCADProcessor:
         if not self.is_connected:
             if not self.connect():
                 return {"success": False, "error": "Not connected to AutoCAD"}
-        
+
         # Validate file path
         file_path = Path(file_path).resolve()
         if not file_path.exists():
             return {"success": False, "error": f"File not found: {file_path}"}
-        
+
         file_name = file_path.name.lower()
         full_path_str = str(file_path)
-        
+
+        # Leave any stuck interactive command before Documents.Open (common hang).
+        try:
+            self.quiesce_autocad(esc_count=3)
+        except Exception:
+            pass
+
         try:
             # COM calls can be intermittently rejected when AutoCAD is busy/modal.
             # Wrap critical COM operations with a small retry.
@@ -799,11 +819,21 @@ class AutoCADProcessor:
             # Step 2: Activate existing or open new
             # ------------------------------------------------------------------
             if existing_doc:
-                # Activate the existing document
+                # Activate the existing document — already loaded; skip long readiness wait.
                 _com_retry(lambda: existing_doc.Activate(), attempts=8)
                 self.doc = existing_doc
                 logger.info(f"Activated existing document: {self.doc.Name}")
+                activated_existing = True
             else:
+                activated_existing = False
+                # If Documents is already wedged, recover before Open.
+                try:
+                    _ = _com_retry(lambda: int(self.acad.Documents.Count), attempts=3)
+                except Exception as probe_exc:
+                    if self._com_error_is_broken_proxy(probe_exc):
+                        if not self.recover_com_session(force=True, reason=str(probe_exc)):
+                            return {"success": False, "error": str(probe_exc)}
+                        time.sleep(0.4)
                 # Close any existing read-only copies of the same file first
                 try:
                     for doc in _iter_docs():
@@ -816,16 +846,45 @@ class AutoCADProcessor:
                 except Exception:
                     pass
                 
-                # Open the drawing fresh
-                # The second parameter (False) means "don't open read-only"
+                # Open the drawing fresh.
+                # Cap retries: unbounded COM loops + "<unknown>.Open" previously hung the GUI run.
+                # RPC_E_CALL_REJECTED (-2147418111) is common while AutoCAD is modal/busy —
+                # use longer backoff than generic COM probes.
                 try:
-                    docs = _com_retry(lambda: self.acad.Documents, attempts=12)
-                    self.doc = _com_retry(lambda: getattr(docs, "Open")(full_path_str, read_only), attempts=12)
-                except Exception:
-                    # Fallback: try opening without the read-only parameter
-                    docs = _com_retry(lambda: self.acad.Documents, attempts=12)
-                    self.doc = _com_retry(lambda: getattr(docs, "Open")(full_path_str), attempts=12)
-                
+                    docs = _com_retry(lambda: self.acad.Documents, attempts=8, base_sleep=0.25)
+                    self.doc = _com_retry(
+                        lambda: getattr(docs, "Open")(full_path_str, read_only),
+                        attempts=12,
+                        base_sleep=0.35,
+                    )
+                except Exception as open_exc:
+                    # Broken Documents proxy / busy reject — reconnect, then retry patiently.
+                    logger.warning(
+                        "Documents.Open failed (%s); reconnecting AutoCAD COM…",
+                        open_exc,
+                    )
+                    try:
+                        if not self.recover_com_session(force=True, reason=str(open_exc)):
+                            raise open_exc
+                        self.quiesce_autocad(esc_count=4)
+                        time.sleep(1.0)
+                        docs = _com_retry(lambda: self.acad.Documents, attempts=6, base_sleep=0.3)
+                        try:
+                            self.doc = _com_retry(
+                                lambda: getattr(docs, "Open")(full_path_str, read_only),
+                                attempts=8,
+                                base_sleep=0.4,
+                            )
+                        except Exception:
+                            # Some builds reject read_only Open while busy; try writable open.
+                            self.doc = _com_retry(
+                                lambda: getattr(docs, "Open")(full_path_str),
+                                attempts=8,
+                                base_sleep=0.4,
+                            )
+                    except Exception:
+                        raise open_exc
+
                 logger.info(f"Opened new document: {self.doc.Name}")
             
             # ------------------------------------------------------------------
@@ -847,16 +906,17 @@ class AutoCADProcessor:
                 else:
                     # Document is already correct, but ensure it's active
                     _com_retry(lambda: self.doc.Activate(), attempts=8)
-                    time.sleep(0.2)  # Brief pause for activation
+                    time.sleep(0.05 if activated_existing else 0.2)
             except Exception as e:
                 logger.warning(f"Could not activate document: {e}")
             
             # ------------------------------------------------------------------
             # Step 4: Wait for document to fully load and verify it's accessible
             # ------------------------------------------------------------------
-            # AutoCAD needs time to parse and render complex drawings
-            max_wait = 25
-            wait_interval = 0.5
+            # Already-open docs need only a short ModelSpace probe; new opens may
+            # need longer (capped) readiness for complex templates.
+            max_wait = 2.0 if activated_existing else 25.0
+            wait_interval = 0.15 if activated_existing else 0.5
             waited = 0
             doc_ready = False
             
@@ -872,7 +932,7 @@ class AutoCADProcessor:
                             try:
                                 if doc.Name.lower() == file_name:
                                     _com_retry(lambda: doc.Activate(), attempts=8)
-                                    time.sleep(0.3)
+                                    time.sleep(0.1 if activated_existing else 0.3)
                                     self.doc = _com_retry(lambda: self.acad.ActiveDocument, attempts=8)
                                     if self.doc.Name.lower() == file_name:
                                         break
@@ -900,8 +960,8 @@ class AutoCADProcessor:
                     "error": f"Document opened but did not become ready after {max_wait} seconds. The file may be corrupted or AutoCAD may need more time."
                 }
             
-            # Give a bit more time for the UI to settle
-            time.sleep(0.5)
+            # Give a bit more time for the UI to settle (skip heavy settle for re-activate)
+            time.sleep(0.05 if activated_existing else 0.5)
             
             # ------------------------------------------------------------------
             # Step 5: Final verification that document is accessible
@@ -926,8 +986,14 @@ class AutoCADProcessor:
                 
                 # Final verification - try to access document properties
                 doc_name = self.doc.Name
-                entity_count = self._count_entities()
                 is_readonly = getattr(self.doc, 'ReadOnly', False)
+                if activated_existing:
+                    # Fast path: already-open doc — avoid full ModelSpace / layer scans.
+                    entity_count = -1
+                    layers: List[str] = []
+                else:
+                    entity_count = self._count_entities()
+                    layers = self._get_layers()
                 
                 if is_readonly:
                     logger.warning("Document opened in READ-ONLY mode. Some operations may be limited.")
@@ -937,12 +1003,17 @@ class AutoCADProcessor:
                     "file_path": str(file_path),
                     "drawing_name": doc_name,
                     "units": self._get_units(),
-                    "layers": self._get_layers(),
+                    "layers": layers,
                     "entity_count": entity_count,
                     "read_only": is_readonly,
+                    "activated_existing": bool(activated_existing),
                 }
                 
-                logger.info(f"Document ready: {doc_name} ({entity_count} entities)")
+                logger.info(
+                    "Document ready: %s (%s)",
+                    doc_name,
+                    "reactivated" if activated_existing else f"{entity_count} entities",
+                )
                 return result
                 
             except Exception as e:
@@ -954,7 +1025,93 @@ class AutoCADProcessor:
             
         except Exception as e:
             logger.error(f"Failed to open drawing: {e}")
+            # Last-chance recovery for busy/rejected COM (reference DWG metadata opens).
+            if self._com_error_is_broken_proxy(e):
+                try:
+                    if self.recover_com_session(force=True, reason=f"open_drawing final: {e}"):
+                        self.quiesce_autocad(esc_count=4)
+                        time.sleep(1.2)
+                        docs = self._com_retry(
+                            lambda: self.acad.Documents, attempts=6, base_sleep=0.3
+                        )
+                        try:
+                            self.doc = self._com_retry(
+                                lambda: getattr(docs, "Open")(full_path_str, read_only),
+                                attempts=8,
+                                base_sleep=0.4,
+                            )
+                        except Exception:
+                            self.doc = self._com_retry(
+                                lambda: getattr(docs, "Open")(full_path_str),
+                                attempts=8,
+                                base_sleep=0.4,
+                            )
+                        if self.doc is not None:
+                            try:
+                                self._com_retry(lambda: self.doc.Activate(), attempts=6)
+                            except Exception:
+                                pass
+                            logger.info(
+                                "Opened drawing after final COM recovery: %s",
+                                getattr(self.doc, "Name", file_name),
+                            )
+                            return {
+                                "success": True,
+                                "file_path": str(file_path),
+                                "drawing_name": getattr(self.doc, "Name", file_name),
+                                "units": self._get_units(),
+                                "layers": [],
+                                "entity_count": -1,
+                                "read_only": bool(getattr(self.doc, "ReadOnly", read_only)),
+                                "activated_existing": False,
+                                "recovered_open": True,
+                            }
+                except Exception as e2:
+                    logger.error("Final open_drawing recovery failed: %s", e2)
+                    return {"success": False, "error": f"{e}; recovery failed: {e2}"}
             return {"success": False, "error": str(e)}
+
+    def open_drawing_resilient(
+        self,
+        file_path: str,
+        *,
+        read_only: bool = True,
+        attempts: int = 3,
+    ) -> Dict[str, Any]:
+        """
+        Open a drawing with patient COM recovery for reference/input DWG reads.
+
+        Used when metadata must be taken from an existing plan before a plot batch.
+        Does not change the successful open_drawing contract — only adds outer retries.
+        """
+        last: Dict[str, Any] = {"success": False, "error": "open_drawing_resilient: no attempts"}
+        path = str(Path(file_path).resolve()) if file_path else ""
+        for i in range(max(1, int(attempts))):
+            try:
+                if not self.is_connected:
+                    if not self.connect():
+                        last = {"success": False, "error": "Not connected to AutoCAD"}
+                        time.sleep(0.6 * (i + 1))
+                        continue
+                if i > 0:
+                    self.recover_com_session(
+                        force=True, reason=f"open_drawing_resilient attempt {i + 1}"
+                    )
+                    time.sleep(0.8 * i)
+                try:
+                    self.quiesce_autocad(esc_count=3 + i)
+                except Exception:
+                    pass
+                # Alternate read_only on later attempts — some AutoCAD builds reject RO Open.
+                use_ro = bool(read_only) if i == 0 else False
+                result = self.open_drawing(path, read_only=use_ro)
+                if result.get("success"):
+                    return result
+                last = result if isinstance(result, dict) else {"success": False, "error": str(result)}
+            except Exception as exc:
+                last = {"success": False, "error": str(exc)}
+            time.sleep(0.75 * (i + 1))
+        return last
     
     def execute_command(self, command: str) -> Dict[str, Any]:
         """
@@ -1011,6 +1168,127 @@ class AutoCADProcessor:
         except Exception:
             self._workflow_doc_path = str(file_path)
 
+    @staticmethod
+    def _com_error_is_broken_proxy(exc: BaseException) -> bool:
+        """True for dead COM proxies (`<unknown>.Count`) and busy-reject errors."""
+        msg = str(exc or "")
+        low = msg.lower()
+        return (
+            "<unknown>." in low
+            or "rejected by callee" in low
+            or "-2147418111" in low
+            or "rpc server is unavailable" in low
+            or "server threw an exception" in low
+        )
+
+    def _log_doc_warn_throttled(self, message: str) -> None:
+        """Avoid flooding the CLI when Documents is wedged during a batch."""
+        now = time.time()
+        if (
+            message == getattr(self, "_last_doc_warn_msg", "")
+            and (now - float(getattr(self, "_last_doc_warn_ts", 0.0) or 0.0)) < 2.5
+        ):
+            return
+        self._last_doc_warn_msg = message
+        self._last_doc_warn_ts = now
+        logger.warning(message)
+
+    def recover_com_session(self, *, force: bool = False, reason: str = "") -> bool:
+        """
+        Drop stale COM references and re-attach to AutoCAD.
+
+        Used when Documents/Open start returning ``<unknown>.Count`` / ``<unknown>.Open``.
+        Rate-limited so a wedged session does not reconnect in a tight loop.
+        """
+        now = time.time()
+        last = float(getattr(self, "_last_com_recover_ts", 0.0) or 0.0)
+        if not force and (now - last) < 2.0 and self.is_connected:
+            return True
+        self._last_com_recover_ts = now
+        if reason:
+            logger.warning("Recovering AutoCAD COM session (%s)…", reason)
+        else:
+            logger.warning("Recovering AutoCAD COM session…")
+        self.doc = None
+        self._connected = False
+        self.acad = None
+        ok = self.connect()
+        if ok:
+            time.sleep(0.45)
+            try:
+                self.quiesce_autocad(esc_count=3)
+            except Exception:
+                pass
+        return bool(ok)
+
+    def _documents_count_safe(self) -> Optional[int]:
+        """Return Documents.Count with COM retry; None if Documents is unusable."""
+        if not self._connected or not self.acad:
+            if not self.connect():
+                return None
+        try:
+            return int(self._com_retry(lambda: self.acad.Documents.Count, attempts=4, base_sleep=0.15))
+        except Exception as e:
+            if self._com_error_is_broken_proxy(e):
+                if self.recover_com_session(reason=f"Documents.Count: {e}"):
+                    try:
+                        return int(
+                            self._com_retry(lambda: self.acad.Documents.Count, attempts=3, base_sleep=0.2)
+                        )
+                    except Exception:
+                        return None
+            return None
+
+    def save_and_close_drawing(self, file_path: str, *, save: bool = True) -> Dict[str, Any]:
+        """
+        Save (optional) and close a specific drawing so batch CAD runs do not pile up tabs.
+
+        Clears the workflow pin when it matches ``file_path``.
+        """
+        from pathlib import Path
+
+        try:
+            target = str(Path(file_path).resolve())
+        except Exception:
+            target = str(file_path)
+        errors: List[str] = []
+        if save:
+            try:
+                opened = self.open_drawing(target, read_only=False)
+                if opened.get("success"):
+                    try:
+                        if bool(getattr(self.doc, "ReadOnly", False)):
+                            errors.append("drawing is read-only; close without save")
+                        else:
+                            self.save_active_drawing()
+                    except Exception as e:
+                        errors.append(f"save failed: {e}")
+                else:
+                    errors.append(str(opened.get("error") or "could not activate for save"))
+            except Exception as e:
+                errors.append(f"activate/save failed: {e}")
+        try:
+            closed = self.close_drawing_if_open(target, save_changes=False)
+            if not closed.get("success") and closed.get("error"):
+                errors.append(str(closed.get("error")))
+        except Exception as e:
+            errors.append(f"close failed: {e}")
+        try:
+            if self._workflow_doc_path:
+                try:
+                    if str(Path(self._workflow_doc_path).resolve()) == str(Path(target).resolve()):
+                        self.set_workflow_document(None)
+                except Exception:
+                    self.set_workflow_document(None)
+        except Exception:
+            pass
+        self.doc = None
+        time.sleep(0.35)
+        # Probe Documents; recover once if the close left COM wedged.
+        if self._documents_count_safe() is None:
+            self.recover_com_session(reason="after save_and_close_drawing")
+        return {"success": len(errors) == 0, "path": target, "errors": errors}
+
     def _com_retry(self, fn, attempts: int = 10, base_sleep: float = 0.2):
         """Retry COM calls rejected while AutoCAD is busy or the user is interacting."""
         try:
@@ -1033,11 +1311,13 @@ class AutoCADProcessor:
                     pass
                 try:
                     if isinstance(ex, AttributeError) and any(
-                        s in str(ex) for s in (".Open", ".Count", ".Item", ".SendCommand")
+                        s in str(ex) for s in (".Open", ".Count", ".Item", ".SendCommand", ".Name")
                     ):
                         retryable = True
                 except Exception:
                     pass
+                if self._com_error_is_broken_proxy(ex):
+                    retryable = True
                 if retryable or k + 1 < attempts:
                     time.sleep(base_sleep * (k + 1))
                     continue
@@ -1057,16 +1337,20 @@ class AutoCADProcessor:
                 pass
             time.sleep(0.05)
 
-    def ensure_workflow_document(self) -> bool:
+    def ensure_workflow_document(self, *, light: bool = False) -> bool:
         """
         Re-activate the pinned workflow drawing and quiesce stray commands.
+
+        ``light=True`` (batch checkpoints): verify the active ModelSpace only —
+        do not call ``open_drawing`` (avoids spam when Documents is wedged).
 
         Returns True when a usable document is ready for COM edits.
         """
         if not self._connected or not self.acad:
             if not self.connect():
                 return False
-        self.quiesce_autocad()
+        if not light:
+            self.quiesce_autocad()
         if self._workflow_doc_path:
             try:
                 want = Path(self._workflow_doc_path).resolve()
@@ -1077,15 +1361,52 @@ class AutoCADProcessor:
                         cur = Path(str(cur_raw)).resolve()
                 except Exception:
                     cur = None
-                if cur != want:
+                if cur == want:
+                    # Fast path: already on the pinned drawing and ModelSpace responds.
+                    try:
+                        if self.doc is not None:
+                            _ = self._com_retry(lambda: self.doc.ModelSpace.Count, attempts=3, base_sleep=0.1)
+                            return True
+                    except Exception as e:
+                        if self._com_error_is_broken_proxy(e):
+                            self.recover_com_session(reason=str(e))
+                        self.doc = None
+                elif light:
+                    # Batch checkpoints: try activate-by-handle only, never Open.
+                    try:
+                        n = self._documents_count_safe()
+                        if n:
+                            for i in range(int(n)):
+                                try:
+                                    doc = self.acad.Documents.Item(i)
+                                    dp = Path(str(getattr(doc, "FullName", "") or "")).resolve()
+                                    if dp == want:
+                                        self._com_retry(lambda d=doc: d.Activate(), attempts=4)
+                                        self.doc = doc
+                                        return True
+                                except Exception:
+                                    continue
+                    except Exception:
+                        pass
+                    return self._ensure_active_document()
+                else:
+                    # Circuit breaker: do not hammer Open on a known-bad path.
+                    if time.time() < float(getattr(self, "_workflow_open_fail_until", 0.0) or 0.0):
+                        return self._ensure_active_document()
                     opened = self.open_drawing(str(want), read_only=False)
                     if not opened.get("success"):
-                        logger.warning(
-                            "ensure_workflow_document: could not activate %s: %s",
-                            want,
-                            opened.get("error"),
+                        self._workflow_open_fail_until = time.time() + 4.0
+                        self._log_doc_warn_throttled(
+                            f"ensure_workflow_document: could not activate {want}: {opened.get('error')}"
                         )
-                self.quiesce_autocad()
+                        if self._com_error_is_broken_proxy(
+                            Exception(str(opened.get("error") or ""))
+                        ):
+                            self.recover_com_session(reason="workflow open failed")
+                    else:
+                        self._workflow_open_fail_until = 0.0
+                if not light:
+                    self.quiesce_autocad()
             except Exception as e:
                 logger.debug("ensure_workflow_document: %s", e)
         return self._ensure_active_document()
@@ -1110,7 +1431,7 @@ class AutoCADProcessor:
         if not self._connected or not self.acad:
             logger.debug("Not connected, attempting to reconnect...")
             if not self.connect():
-                logger.warning("Could not connect to AutoCAD")
+                self._log_doc_warn_throttled("Could not connect to AutoCAD")
                 return False
 
         # Prefer the pinned workflow drawing when the user switched tabs mid-pipeline.
@@ -1125,70 +1446,92 @@ class AutoCADProcessor:
                 except Exception:
                     active_ok = False
                 if not active_ok:
-                    for i in range(self.acad.Documents.Count):
-                        try:
-                            doc = self.acad.Documents.Item(i)
-                            dp = Path(str(getattr(doc, "FullName", "") or "")).resolve()
-                            if dp == want:
-                                self._com_retry(lambda d=doc: d.Activate(), attempts=6)
-                                self.doc = doc
-                                time.sleep(0.12)
-                                break
-                        except Exception:
-                            continue
+                    n = self._documents_count_safe()
+                    if n:
+                        for i in range(int(n)):
+                            try:
+                                doc = self.acad.Documents.Item(i)
+                                dp = Path(str(getattr(doc, "FullName", "") or "")).resolve()
+                                if dp == want:
+                                    self._com_retry(lambda d=doc: d.Activate(), attempts=6)
+                                    self.doc = doc
+                                    time.sleep(0.12)
+                                    break
+                            except Exception:
+                                continue
             except Exception as e:
                 logger.debug("Workflow document re-activation skipped: %s", e)
         
         # Verify connection is still valid
         try:
-            _ = self.acad.Name
+            _ = self._com_retry(lambda: self.acad.Name, attempts=3, base_sleep=0.1)
         except Exception:
-            logger.warning("Connection lost, attempting to reconnect...")
-            if not self.connect():
+            self._log_doc_warn_throttled("Connection lost, attempting to reconnect...")
+            if not self.recover_com_session(force=True, reason="ActiveDocument probe"):
                 return False
         
         # Check if current doc reference is valid and accessible
         try:
             if self.doc:
                 # Test basic access
-                _ = self.doc.Name
+                _ = self._com_retry(lambda: self.doc.Name, attempts=3, base_sleep=0.1)
                 # Test ModelSpace access - this is the real test
-                _ = self.doc.ModelSpace.Count
+                _ = self._com_retry(lambda: self.doc.ModelSpace.Count, attempts=3, base_sleep=0.1)
                 return True
         except Exception as e:
             logger.debug(f"Current doc reference is stale or inaccessible: {e}")
+            if self._com_error_is_broken_proxy(e):
+                self.recover_com_session(reason=str(e))
             self.doc = None  # Clear stale reference
         
         # Try to get the active document from AutoCAD
         try:
             # Check if there are any open documents
-            doc_count = self.acad.Documents.Count
+            doc_count = self._documents_count_safe()
+            if doc_count is None:
+                self._log_doc_warn_throttled(
+                    "Could not access active document: Documents.Count unavailable"
+                )
+                return False
             if doc_count == 0:
-                logger.warning("No documents are open in AutoCAD")
+                self._log_doc_warn_throttled("No documents are open in AutoCAD")
                 return False
             
             # Get the active document
             try:
-                self.doc = self.acad.ActiveDocument
+                self.doc = self._com_retry(lambda: self.acad.ActiveDocument, attempts=4)
             except Exception:
                 # If ActiveDocument fails, try to get the first document
                 if doc_count > 0:
-                    self.doc = self.acad.Documents.Item(0)
-                    self.doc.Activate()
+                    self.doc = self._com_retry(lambda: self.acad.Documents.Item(0), attempts=4)
+                    self._com_retry(lambda: self.doc.Activate(), attempts=4)
                     time.sleep(0.3)
-                    self.doc = self.acad.ActiveDocument
+                    self.doc = self._com_retry(lambda: self.acad.ActiveDocument, attempts=4)
             
             # Verify it's accessible
-            _ = self.doc.Name
-            _ = self.doc.ModelSpace.Count
+            _ = self._com_retry(lambda: self.doc.Name, attempts=3)
+            _ = self._com_retry(lambda: self.doc.ModelSpace.Count, attempts=3)
             
             logger.info(f"Document ready: {self.doc.Name}")
             return True
         except Exception as e:
-            logger.warning(f"Could not access active document: {e}")
+            self._log_doc_warn_throttled(f"Could not access active document: {e}")
+            if self._com_error_is_broken_proxy(e):
+                if self.recover_com_session(reason=str(e)):
+                    try:
+                        doc_count = self._documents_count_safe() or 0
+                        if doc_count > 0:
+                            self.doc = self.acad.Documents.Item(0)
+                            self.doc.Activate()
+                            time.sleep(0.25)
+                            _ = self.doc.ModelSpace.Count
+                            return True
+                    except Exception:
+                        pass
             # Try to find any open document as a fallback
             try:
-                if self.acad.Documents.Count > 0:
+                n = self._documents_count_safe() or 0
+                if n > 0:
                     # Try to use the first document
                     self.doc = self.acad.Documents.Item(0)
                     self.doc.Activate()
@@ -1199,7 +1542,9 @@ class AutoCADProcessor:
                     logger.info(f"Activated document: {self.doc.Name}")
                     return True
             except Exception as fallback_error:
-                logger.warning(f"Fallback document activation failed: {fallback_error}")
+                self._log_doc_warn_throttled(
+                    f"Fallback document activation failed: {fallback_error}"
+                )
             
             return False
     
@@ -1398,6 +1743,44 @@ class AutoCADProcessor:
             
         except Exception as e:
             logger.error(f"Failed to get all entities: {e}")
+            return {"success": False, "error": str(e)}
+
+    def get_entities_on_layers(self, layers: List[str]) -> Dict[str, Any]:
+        """
+        Return entities whose layer is in ``layers`` (case-insensitive).
+
+        Prefer this over ``get_all_entities`` for cadastral apply alignment so
+        we do not walk/extract the entire ModelSpace twice per plan.
+        """
+        if not self._ensure_active_document():
+            return {
+                "success": False,
+                "error": "No active document. Please open a drawing first using autocad_open_drawing.",
+            }
+        want = {str(L or "").strip().upper() for L in (layers or []) if str(L or "").strip()}
+        if not want:
+            return {"success": True, "entity_count": 0, "entities": []}
+        try:
+            entities: List[Dict[str, Any]] = []
+            modelspace = self.doc.ModelSpace
+            for i in range(modelspace.Count):
+                try:
+                    entity = modelspace.Item(i)
+                    lyr = str(getattr(entity, "Layer", "") or "").upper()
+                    if lyr not in want:
+                        continue
+                    obj_name = entity.ObjectName
+                    ent_type = ENTITY_TYPES.get(obj_name, obj_name)
+                    entity_data = self._extract_entity_data(entity, ent_type)
+                    entity_data["color_code"] = entity.Color
+                    if "color" not in entity_data:
+                        entity_data["color"] = self._get_color_name(entity.Color)
+                    entities.append(entity_data)
+                except Exception:
+                    continue
+            return {"success": True, "entity_count": len(entities), "entities": entities}
+        except Exception as e:
+            logger.error(f"Failed to get entities on layers: {e}")
             return {"success": False, "error": str(e)}
     
     def get_entity_by_handle(self, handle: str) -> Dict[str, Any]:
@@ -2350,6 +2733,95 @@ class AutoCADProcessor:
                 except Exception as ex:
                     return {"success": False, "error": str(ex)}
             return {"success": True, "handle": handle}
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+    def get_table_column_width(self, handle: str, col: int = 0) -> Dict[str, Any]:
+        """Read one TABLE column width (drawing units)."""
+        if not self._ensure_active_document():
+            return {"success": False, "error": "No active document.", "width": 0.0}
+        try:
+            modelspace = self.doc.ModelSpace
+            target = None
+            for i in range(modelspace.Count):
+                e = modelspace.Item(i)
+                if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                    target = e
+                    break
+            if target is None:
+                return {"success": False, "error": f"TABLE with handle {handle} not found", "width": 0.0}
+            width = 0.0
+            err = None
+            for method in ("GetColumnWidth", "GetColumnWidth2"):
+                try:
+                    width = float(getattr(target, method)(int(col)))
+                    err = None
+                    break
+                except Exception as ex:
+                    err = ex
+                    continue
+            if err is not None or width <= 0.0:
+                # Fallback: outer bbox width for single-column tables.
+                try:
+                    bb = target.GetBoundingBox()
+                    width = abs(float(bb[1][0]) - float(bb[0][0]))
+                    err = None
+                except Exception as ex:
+                    err = ex
+            if err is not None:
+                return {
+                    "success": False,
+                    "error": f"Could not read column width ({col}): {err}",
+                    "width": 0.0,
+                }
+            return {"success": True, "handle": handle, "col": int(col), "width": float(width)}
+        except Exception as e:
+            return {"success": False, "error": str(e), "width": 0.0}
+
+    def set_table_column_width(self, handle: str, col: int, width: float) -> Dict[str, Any]:
+        """Set one TABLE column width (drawing units)."""
+        if not self.ensure_workflow_document():
+            return {"success": False, "error": "No active document."}
+        try:
+            def _do() -> Dict[str, Any]:
+                modelspace = self.doc.ModelSpace
+                target = None
+                for i in range(modelspace.Count):
+                    e = modelspace.Item(i)
+                    if getattr(e, "Handle", None) == handle and getattr(e, "ObjectName", "") == "AcDbTable":
+                        target = e
+                        break
+                if target is None:
+                    return {"success": False, "error": f"TABLE with handle {handle} not found"}
+                w = float(width)
+                if w <= 0.0:
+                    return {"success": False, "error": "width must be positive"}
+                err = None
+                for method in ("SetColumnWidth", "SetColumnWidth2"):
+                    try:
+                        getattr(target, method)(int(col), w)
+                        err = None
+                        break
+                    except Exception as ex:
+                        err = ex
+                        continue
+                if err is not None:
+                    return {"success": False, "error": f"Could not set column width ({col}): {err}"}
+                try:
+                    target.RecomputeTableBlock(True)
+                except Exception:
+                    try:
+                        target.RecomputeTableBlock()
+                    except Exception:
+                        pass
+                return {
+                    "success": True,
+                    "handle": handle,
+                    "col": int(col),
+                    "width": w,
+                }
+
+            return self._com_retry(_do, attempts=8)
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -4155,6 +4627,85 @@ class AutoCADProcessor:
 # FALLBACK DXF PROCESSOR (using ezdxf - works without AutoCAD)
 # ==============================================================================
 
+def _locate_oda_file_converter() -> Optional[str]:
+    """
+    Find ODAFileConverter.exe for ezdxf DWG fallback reads.
+
+    Checks (in order): configured ezdxf option, ODAFC / ODA_FILE_CONVERTER env,
+    PATH, then common Windows install directories. Returns None when not found.
+    """
+    candidates: List[str] = []
+
+    try:
+        import ezdxf
+        from ezdxf.addons import odafc
+
+        configured = str(odafc.get_win_exec_path() or "").strip().strip('"')
+        if configured:
+            candidates.append(configured)
+        # Also accept a direct options key if present.
+        try:
+            opt = str(ezdxf.options.get("odafc-addon", "win_exec_path") or "").strip().strip('"')
+            if opt:
+                candidates.append(opt)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    for env_key in ("ODAFC", "ODA_FILE_CONVERTER", "ODA_FILE_CONVERTER_EXE"):
+        val = str(os.environ.get(env_key) or "").strip().strip('"')
+        if val:
+            candidates.append(val)
+
+    try:
+        import shutil
+
+        which = shutil.which("ODAFileConverter") or shutil.which("ODAFileConverter.exe")
+        if which:
+            candidates.append(which)
+    except Exception:
+        pass
+
+    # Common Windows install roots (versioned folders under ODA\).
+    roots = []
+    for env_key in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432"):
+        root = os.environ.get(env_key)
+        if root:
+            roots.append(Path(root) / "ODA")
+            roots.append(Path(root))
+    for root in roots:
+        try:
+            if not root.is_dir():
+                continue
+            # Exact well-known path patterns
+            for pattern in (
+                "ODAFileConverter*/ODAFileConverter.exe",
+                "ODA/ODAFileConverter*/ODAFileConverter.exe",
+            ):
+                for hit in root.glob(pattern):
+                    candidates.append(str(hit))
+            direct = root / "ODAFileConverter.exe"
+            if direct.is_file():
+                candidates.append(str(direct))
+        except Exception:
+            continue
+
+    seen: set[str] = set()
+    for raw in candidates:
+        try:
+            p = Path(raw).expanduser().resolve()
+        except Exception:
+            continue
+        key = str(p).lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        if p.is_file():
+            return str(p)
+    return None
+
+
 class DXFProcessor:
     """
     Fallback DXF/DWG processor using ezdxf library.
@@ -4215,16 +4766,32 @@ class DXFProcessor:
         
         try:
             if ext == '.dwg':
-                # ezdxf has limited DWG support via odafc (if installed)
+                # ezdxf DWG support requires ODA File Converter on PATH or a known install dir.
                 try:
                     from ezdxf.addons import odafc
-                    self.doc = odafc.readfile(str(file_path))
-                    logger.info("Opened DWG file via ODA File Converter")
                 except ImportError:
                     return {
-                        "success": False, 
-                        "error": "DWG files require ODA File Converter. Please use DXF format or install AutoCAD."
+                        "success": False,
+                        "error": "DWG files require ODA File Converter. Please use DXF format or install AutoCAD.",
                     }
+                oda_exe = _locate_oda_file_converter()
+                if oda_exe:
+                    try:
+                        ezdxf.options.set("odafc-addon", "win_exec_path", oda_exe)
+                        logger.info("Configured ODA File Converter: %s", oda_exe)
+                    except Exception as cfg_exc:
+                        logger.debug("Could not set odafc win_exec_path: %s", cfg_exc)
+                if not odafc.is_installed():
+                    return {
+                        "success": False,
+                        "error": (
+                            "Could not find ODAFileConverter. Install from "
+                            "https://www.opendesign.com/guestfiles/oda_file_converter "
+                            "or open the DWG with AutoCAD (preferred)."
+                        ),
+                    }
+                self.doc = odafc.readfile(str(file_path))
+                logger.info("Opened DWG file via ODA File Converter")
             else:
                 self.doc = ezdxf.readfile(str(file_path))
             

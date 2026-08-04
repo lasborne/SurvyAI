@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
-from typing import Annotated
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import delete, func, select
@@ -47,6 +47,8 @@ def _snapshot(user: User, device_count: int) -> AdminUserSnapshot:
         paystack_customer_code=user.paystack_customer_code,
         paystack_subscription_code=user.paystack_subscription_code,
         last_payment_reference=user.last_payment_reference,
+        admin_privilege_active=bool(getattr(user, "admin_privilege_active", False)),
+        admin_privilege_note=getattr(user, "admin_privilege_note", None),
         device_count=device_count,
         created_at=user.created_at,
         updated_at=user.updated_at,
@@ -66,6 +68,29 @@ async def _get_user_or_404(db: AsyncSession, user_id: uuid.UUID) -> User:
     return user
 
 
+def _looks_like_legacy_admin_grant(user: User) -> bool:
+    """Pre-migration admin Pro grants: Pro + credits, no Paystack subscription code."""
+    plan = str(user.plan_slug or "").strip().lower()
+    if plan != "pro":
+        return False
+    if float(user.monthly_credits_usd or 0.0) <= 0:
+        return False
+    sub = str(user.paystack_subscription_code or "").strip()
+    return not sub
+
+
+def _mark_admin_privilege(user: User, *, note: Optional[str] = None) -> None:
+    user.admin_privilege_active = True
+    if note is not None:
+        cleaned = str(note).strip()
+        user.admin_privilege_note = cleaned[:500] if cleaned else None
+
+
+def _clear_admin_privilege(user: User) -> None:
+    user.admin_privilege_active = False
+    user.admin_privilege_note = None
+
+
 @router.get("/users", response_model=AdminUserSnapshot)
 async def admin_lookup_user_by_email(
     _: Annotated[None, Depends(require_admin)],
@@ -79,6 +104,62 @@ async def admin_lookup_user_by_email(
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     return _snapshot(user, await _device_count(db, user.id))
+
+
+@router.get("/privileges", response_model=list[AdminUserSnapshot])
+async def admin_list_privileges(
+    _: Annotated[None, Depends(require_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> list[AdminUserSnapshot]:
+    """
+    List users with admin-managed privileges (grant / extend / credit overrides).
+
+    Includes explicit ``admin_privilege_active`` rows and legacy Pro grants that
+    have credits but no Paystack subscription code (pre-flag admin overrides).
+    """
+    res = await db.execute(select(User).order_by(User.updated_at.desc()).limit(2000))
+    users = list(res.scalars().all())
+    out: list[AdminUserSnapshot] = []
+    backfilled = False
+    for user in users:
+        active = bool(getattr(user, "admin_privilege_active", False))
+        legacy = (not active) and _looks_like_legacy_admin_grant(user)
+        if not active and not legacy:
+            continue
+        if legacy:
+            # Soft backfill so the dashboard stays consistent after first list.
+            user.admin_privilege_active = True
+            db.add(user)
+            backfilled = True
+        out.append(_snapshot(user, await _device_count(db, user.id)))
+        if len(out) >= limit:
+            break
+    if backfilled:
+        await db.flush()
+    return out
+
+
+@router.delete("/privileges/{user_id}", status_code=status.HTTP_200_OK)
+async def admin_revoke_privilege(
+    user_id: uuid.UUID,
+    _: Annotated[None, Depends(require_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> dict[str, object]:
+    """Revoke admin-managed privilege and restore Free defaults."""
+    user = await _get_user_or_404(db, user_id)
+    apply_free_defaults(user)
+    _clear_admin_privilege(user)
+    db.add(user)
+    await db.flush()
+    await db.refresh(user)
+    return {
+        "ok": True,
+        "user_id": str(user.id),
+        "email": user.email,
+        "plan_slug": user.plan_slug,
+        "admin_privilege_active": False,
+    }
 
 
 @router.get("/users/{user_id}", response_model=AdminUserSnapshot)
@@ -147,10 +228,13 @@ async def admin_patch_user_billing(
 ) -> dict[str, object]:
     user = await _get_user_or_404(db, user_id)
 
-    if body.apply_free_defaults:
+    if body.revoke_privilege or body.apply_free_defaults:
         apply_free_defaults(user)
-    if body.apply_pro_defaults:
+        _clear_admin_privilege(user)
+
+    if body.apply_pro_defaults and not body.revoke_privilege and not body.apply_free_defaults:
         apply_pro_defaults(user)
+        _mark_admin_privilege(user)
 
     if body.plan_slug is not None:
         user.plan_slug = body.plan_slug.strip()
@@ -188,6 +272,30 @@ async def admin_patch_user_billing(
     elif body.subscription_current_period_end is not None:
         user.subscription_current_period_end = body.subscription_current_period_end
 
+    if body.clear_privilege_note:
+        user.admin_privilege_note = None
+    elif body.admin_privilege_note is not None:
+        note = str(body.admin_privilege_note).strip()
+        user.admin_privilege_note = note[:500] if note else None
+
+    # Any non-revoke privilege adjustment marks the user as admin-managed.
+    privilege_touch = any(
+        (
+            body.apply_pro_defaults,
+            body.monthly_credits_usd is not None,
+            body.monthly_credits_used_usd is not None,
+            body.reset_credits_used,
+            body.subscription_current_period_end is not None,
+            body.plan_slug is not None
+            and str(body.plan_slug).strip().lower() in {"pro", "trialing"},
+            body.subscription_status is not None
+            and str(body.subscription_status).strip().lower()
+            in {"trialing", "active", "non_renewing"},
+        )
+    )
+    if privilege_touch and not body.revoke_privilege and not body.apply_free_defaults:
+        _mark_admin_privilege(user, note=body.admin_privilege_note)
+
     db.add(user)
     await db.flush()
     await db.refresh(user)
@@ -208,6 +316,8 @@ async def admin_patch_user_billing(
         "subscription_current_period_end": user.subscription_current_period_end.isoformat()
         if user.subscription_current_period_end
         else None,
+        "admin_privilege_active": bool(getattr(user, "admin_privilege_active", False)),
+        "admin_privilege_note": getattr(user, "admin_privilege_note", None),
     }
 
 

@@ -135,10 +135,30 @@ def _agent_worker_loop(in_queue: "multiprocessing.Queue", out_queue: "multiproce
             # Apply the workspace directory for this request. Reset to the
             # original cwd when none is supplied so requests stay isolated.
             wd = req.get("working_directory")
+            target_wd = wd if wd else base_cwd
             try:
-                os.chdir(wd if wd else base_cwd)
-            except Exception:
-                pass
+                if target_wd:
+                    from pathlib import Path as _Path
+
+                    _Path(str(target_wd)).mkdir(parents=True, exist_ok=True)
+                    os.chdir(str(target_wd))
+            except Exception as chdir_err:
+                try:
+                    out_queue.put(
+                        {
+                            "kind": "progress",
+                            "req_id": req_id,
+                            "payload": {
+                                "message": (
+                                    f"Warning: could not activate workspace "
+                                    f"'{target_wd}': {chdir_err}. "
+                                    f"Outputs may fall back to {base_cwd}."
+                                )
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
 
             svc = _ensure_service(
                 req.get("settings_payload") or {},
@@ -176,9 +196,32 @@ def _agent_worker_loop(in_queue: "multiprocessing.Queue", out_queue: "multiproce
                                 },
                             }
                         )
+                        # Timed get so we can emit heartbeats and never sit forever
+                        # if the GUI reply is lost (previous hang after Overwrite click).
+                        waited_s = 0.0
                         while True:
                             try:
-                                reply = in_queue.get()
+                                reply = in_queue.get(timeout=1.0)
+                            except queue.Empty:
+                                waited_s += 1.0
+                                if waited_s >= 15.0 and int(waited_s) % 15 == 0:
+                                    try:
+                                        out_queue.put(
+                                            {
+                                                "kind": "confirm_overwrite_waiting",
+                                                "req_id": req_id,
+                                                "payload": {
+                                                    "message": (
+                                                        "Still waiting for overwrite confirmation "
+                                                        "in SurvyAI…"
+                                                    ),
+                                                    "waited_s": waited_s,
+                                                },
+                                            }
+                                        )
+                                    except Exception:
+                                        pass
+                                continue
                             except (EOFError, OSError, KeyboardInterrupt):
                                 return False
                             if reply is None:

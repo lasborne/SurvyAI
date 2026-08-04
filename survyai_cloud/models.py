@@ -104,6 +104,9 @@ class User(Base):
     credits_billing_interval: Mapped[str] = mapped_column(String(16), default="monthly", nullable=False)
     usage_period_anchor: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
     password_changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    # Set when support grants/adjusts Pro or credits via admin UI (not Paystack purchase).
+    admin_privilege_active: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    admin_privilege_note: Mapped[Optional[str]] = mapped_column(String(500))
 
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False

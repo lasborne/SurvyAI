@@ -346,6 +346,9 @@ class AdminUserBillingPatch(BaseModel):
     max_devices: Optional[int] = Field(default=None, ge=1, le=50)
     subscription_current_period_end: Optional[datetime] = None
     clear_period_end: bool = False
+    revoke_privilege: bool = False
+    admin_privilege_note: Optional[str] = Field(default=None, max_length=500)
+    clear_privilege_note: bool = False
 
 
 class AdminUserSnapshot(BaseModel):
@@ -369,6 +372,8 @@ class AdminUserSnapshot(BaseModel):
     paystack_customer_code: Optional[str] = None
     paystack_subscription_code: Optional[str] = None
     last_payment_reference: Optional[str] = None
+    admin_privilege_active: bool = False
+    admin_privilege_note: Optional[str] = None
     device_count: int = 0
     created_at: datetime
     updated_at: datetime

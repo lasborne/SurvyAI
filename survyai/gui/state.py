@@ -104,7 +104,8 @@ class DesktopState:
     data_folder: str = ""
     safe_mode: bool = False
     use_fallback_llm: bool = False
-    preferred_primary_llm: str = ""
+    # Symbolic primary selection ("auto" = best paid hosted model; persists across restarts).
+    preferred_primary_llm: str = "auto"
     preferred_fallback_llm: str = ""
     # Ollama runtime settings for offline/local models.
     # Stored here (not in .env) so end-users don't edit config files.
@@ -171,7 +172,10 @@ class DesktopState:
             data_folder=str(raw.get("data_folder", "")),
             safe_mode=bool(raw.get("safe_mode", False)),
             use_fallback_llm=bool(raw.get("use_fallback_llm", False)),
-            preferred_primary_llm=str(raw.get("preferred_primary_llm", "")),
+            # Missing or blank → product default "auto" (resolves to best paid provider).
+            preferred_primary_llm=(
+                str(raw.get("preferred_primary_llm") or "auto").strip().lower() or "auto"
+            ),
             preferred_fallback_llm=str(raw.get("preferred_fallback_llm", "")),
             ollama_base_url=str(raw.get("ollama_base_url", "")),
             ollama_model=str(raw.get("ollama_model", "")),

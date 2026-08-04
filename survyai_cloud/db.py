@@ -287,6 +287,12 @@ async def _sqlite_migrate(conn) -> None:
         )
     if "password_changed_at" not in cols:
         alter.append("ALTER TABLE users ADD COLUMN password_changed_at DATETIME")
+    if "admin_privilege_active" not in cols:
+        alter.append(
+            "ALTER TABLE users ADD COLUMN admin_privilege_active BOOLEAN NOT NULL DEFAULT 0"
+        )
+    if "admin_privilege_note" not in cols:
+        alter.append("ALTER TABLE users ADD COLUMN admin_privilege_note VARCHAR(500)")
 
     for stmt in alter:
         await conn.execute(text(stmt))

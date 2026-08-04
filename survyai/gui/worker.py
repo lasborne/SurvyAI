@@ -146,12 +146,18 @@ class AgentRunThread(QThread):
                 payload = message.get("payload")
                 if kind == "confirm_overwrite":
                     self.progress_text.emit("Waiting for confirmation about an existing drawing…")
-                    self._confirm_event.clear()
+                    # Clear only after capturing any stale set(); then wait for this dialog.
                     self._confirm_accepted = False
+                    self._confirm_event.clear()
                     self.confirm_overwrite.emit(payload if isinstance(payload, dict) else {})
                     while not self._confirm_event.wait(0.25):
                         if self._cancel_requested:
                             break
+                        if not proc.is_alive():
+                            self.failed.emit(
+                                "Agent process exited while waiting for drawing overwrite confirmation."
+                            )
+                            return
                     accepted = bool(self._confirm_accepted) and not self._cancel_requested
                     try:
                         proc.submit(
@@ -161,13 +167,35 @@ class AgentRunThread(QThread):
                                 "payload": {"accepted": accepted},
                             }
                         )
-                    except Exception:
-                        pass
+                    except Exception as submit_exc:
+                        self.failed.emit(
+                            f"Could not send overwrite confirmation to the agent: {submit_exc}"
+                        )
+                        return
                     if self._cancel_requested:
                         self._release_local_ollama()
                         proc.kill()
                         self.cancelled.emit("Task cancelled. The active agent run was terminated.")
                         return
+                    if accepted:
+                        self.progress_text.emit(
+                            "Overwrite confirmed. Preparing the drawing in AutoCAD…"
+                        )
+                    else:
+                        self.progress_text.emit("Existing drawing kept. Finishing…")
+                    continue
+                if kind == "confirm_overwrite_waiting":
+                    # Heartbeat while agent is blocked on the dialog (UI feedback only).
+                    self.progress_text.emit(
+                        str((payload or {}).get("message") or "Still waiting for overwrite confirmation…")
+                    )
+                    continue
+                if kind == "progress":
+                    msg = ""
+                    if isinstance(payload, dict):
+                        msg = str(payload.get("message") or "")
+                    if msg:
+                        self.progress_text.emit(msg)
                     continue
                 if kind == "result":
                     result = AgentRunResult.from_process_query_dict(payload or {})

@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
@@ -64,6 +64,11 @@ from survyai.app_config import merge_settings
 from survyai.capabilities import format_capabilities_summary, scan_machine_capabilities
 from survyai.credit_gate import credit_limit_enforcement_enabled
 from survyai.feature_flags import FeatureFlags
+from survyai.llm_routing import (
+    AUTO_PRIMARY_LLM,
+    normalize_primary_llm_selection,
+    resolve_primary_llm_selection,
+)
 from survyai.gui.branding import SurvyLogoWidget, make_app_icon
 from survyai.gui.cad_prompt_defaults import (
     SYSTEM_DEFAULT_CAD_PROMPT,
@@ -301,13 +306,15 @@ def _is_save_session_docx_request(raw_query: str) -> bool:
             "borrow pit", "exported result", "perform analysis", "geospatial analysis",
         )
         has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.I))
+        wants_word = has_docx or "word document" in q or "word doc" in q
         explicit_essay = any(
             k in q for k in ("essay", "well-structured", "turn this", "previous topic")
         )
-        if any(m in q for m in operational) and not (has_docx and explicit_essay):
+        if any(m in q for m in operational) and not (wants_word and (explicit_essay or has_docx)):
             return False
 
     has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.I))
+    wants_word = has_docx or "word document" in q or "word doc" in q
     wants_save = any(k in q for k in ("save", "saved", "write it", "write this"))
     wants_essay = any(
         k in q
@@ -316,7 +323,7 @@ def _is_save_session_docx_request(raw_query: str) -> bool:
             "last answer", "above", "report",
         )
     )
-    if has_docx and wants_save and wants_essay:
+    if wants_save and wants_word and (wants_essay or has_docx or "word document" in q):
         return True
     return False
 
@@ -1163,6 +1170,13 @@ class MainWindow(QMainWindow):
 
         self._state_store = AppStateStore()
         self._state: DesktopState = self._state_store.load()
+        # Product rule: Primary LLM selection is Auto on every cold start.
+        # Users may switch providers during a session; the next restart restores Auto.
+        if self._state.preferred_primary_llm != AUTO_PRIMARY_LLM:
+            self._state.preferred_primary_llm = AUTO_PRIMARY_LLM
+            self._state_store.save(self._state)
+        else:
+            self._state.preferred_primary_llm = AUTO_PRIMARY_LLM
         self._caps = scan_machine_capabilities()
         self._display_feature_flags = FeatureFlags.from_env()
         self._feature_flags = self._display_feature_flags
@@ -1223,6 +1237,12 @@ class MainWindow(QMainWindow):
         self._payment_watch_baseline: Optional[dict] = None
         self._payment_watch_attempts = 0
         self._payment_watch_max_attempts = 75  # ~5 minutes at 4s
+        # Background poll: pick up admin Pro overrides / webhook upgrades without
+        # requiring a manual "Refresh cloud account" click.
+        self._account_poll_timer = QTimer(self)
+        self._account_poll_timer.setInterval(45_000)
+        self._account_poll_timer.timeout.connect(self._on_account_status_poll_tick)
+        self._account_poll_last_focus_sync_at = 0.0
 
         QTimer.singleShot(0, self._finish_startup)
         # Credit strip lays out after first frame; refresh once the prompt row has geometry.
@@ -1234,6 +1254,12 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(50, self._update_credit_usage_notice)
         QTimer.singleShot(0, self._apply_prompt_controls_scale)
         QTimer.singleShot(0, self._refresh_console_prompt_layout)
+
+    def changeEvent(self, event) -> None:  # noqa: N802
+        super().changeEvent(event)
+        # Returning to SurvyAI after admin approve / Paystack browser checkout.
+        if event is not None and event.type() == QEvent.Type.WindowActivate:
+            QTimer.singleShot(250, self._maybe_refresh_account_on_focus)
 
     def resizeEvent(self, event) -> None:  # noqa: N802
         super().resizeEvent(event)
@@ -1456,6 +1482,7 @@ class MainWindow(QMainWindow):
             )
         else:
             self.statusBar().showMessage(success_status, 6000)
+        self._ensure_account_status_poll()
 
     def _start_cloud_account_sync(
         self,
@@ -1537,6 +1564,12 @@ class MainWindow(QMainWindow):
             return False
         if after.get("plan_slug") == "pro" and before.get("plan_slug") != "pro":
             return True
+        # Admin override / webhook: subscription becomes active without plan_slug change yet.
+        _active = {"active", "non_renewing", "trialing"}
+        before_st = str(before.get("subscription_status") or "").strip().lower()
+        after_st = str(after.get("subscription_status") or "").strip().lower()
+        if after_st in _active and before_st not in _active:
+            return True
         if after.get("period_end") and after.get("period_end") != before.get("period_end"):
             return True
         if float(after.get("credits_usd") or 0) > float(before.get("credits_usd") or 0) + 1e-6:
@@ -1549,6 +1582,75 @@ class MainWindow(QMainWindow):
         ):
             return True
         return False
+
+    def _ensure_account_status_poll(self) -> None:
+        """Start background Pro/status polling while a cloud session is present."""
+        base, token = self._cloud_base_and_token()
+        if not base or not token:
+            self._stop_account_status_poll()
+            return
+        if not self._account_poll_timer.isActive():
+            self._account_poll_timer.start()
+
+    def _stop_account_status_poll(self) -> None:
+        if self._account_poll_timer.isActive():
+            self._account_poll_timer.stop()
+
+    def _maybe_refresh_account_on_focus(self) -> None:
+        """Silent sync when the window regains focus (admin approve / browser payment)."""
+        base, token = self._cloud_base_and_token()
+        if not base or not token:
+            return
+        if self._cloud_network_busy():
+            return
+        # Payment watch already polls aggressively.
+        if self._payment_watch_timer.isActive() and self._payment_watch_baseline is not None:
+            return
+        now = time.monotonic()
+        if (now - float(self._account_poll_last_focus_sync_at or 0.0)) < 12.0:
+            return
+        self._account_poll_last_focus_sync_at = now
+        baseline = self._payment_watch_snapshot()
+
+        def _after(_result: object) -> None:
+            after = self._payment_watch_snapshot()
+            if self._payment_watch_detected_upgrade(baseline, after):
+                self.statusBar().showMessage(
+                    "Account updated — Pro access and license refreshed.",
+                    8000,
+                )
+
+        self._start_cloud_account_sync(
+            success_status="Account status updated.",
+            silent=True,
+            on_success=_after,
+        )
+
+    @Slot()
+    def _on_account_status_poll_tick(self) -> None:
+        base, token = self._cloud_base_and_token()
+        if not base or not token:
+            self._stop_account_status_poll()
+            return
+        if self._cloud_network_busy():
+            return
+        if self._payment_watch_timer.isActive() and self._payment_watch_baseline is not None:
+            return
+        baseline = self._payment_watch_snapshot()
+
+        def _after(_result: object) -> None:
+            after = self._payment_watch_snapshot()
+            if self._payment_watch_detected_upgrade(baseline, after):
+                self.statusBar().showMessage(
+                    "Account updated — Pro access and license refreshed.",
+                    8000,
+                )
+
+        self._start_cloud_account_sync(
+            success_status="Account status updated.",
+            silent=True,
+            on_success=_after,
+        )
 
     @Slot()
     def _on_payment_watch_tick(self) -> None:
@@ -2085,7 +2187,14 @@ class MainWindow(QMainWindow):
         runtime_form.setHorizontalSpacing(14)
         runtime_form.setVerticalSpacing(10)
         self._primary_llm_combo = QComboBox()
-        self._primary_llm_combo.addItems(["openai", "gemini", "claude", "deepseek", "ollama"])
+        # "auto" is the product default: routes to the best paid hosted model for the task.
+        self._primary_llm_combo.addItems(
+            ["auto", "openai", "gemini", "claude", "deepseek", "ollama"]
+        )
+        self._primary_llm_combo.setToolTip(
+            "Auto selects the best paid hosted model for the task "
+            "(currently OpenAI). Choose a specific provider to lock it."
+        )
         self._fallback_llm_combo = QComboBox()
         self._fallback_llm_combo.addItems(["gemini", "openai", "claude", "deepseek", "ollama"])
         self._settings_workspace = QLineEdit()
@@ -2981,6 +3090,8 @@ class MainWindow(QMainWindow):
         self._sync_update_check_timer()
         # Consent-gated background update check after the UI settles.
         QTimer.singleShot(2800, self._maybe_auto_check_updates)
+        # Keep license/Pro status current (admin override + Paystack webhooks).
+        QTimer.singleShot(3500, self._ensure_account_status_poll)
         if self._startup_initial_query:
             self._input.setPlainText(self._startup_initial_query)
             if self._startup_auto_run:
@@ -3148,8 +3259,11 @@ class MainWindow(QMainWindow):
         # User-selected runtime providers win over cloud defaults. The cloud
         # bootstrap supplies hosted model credentials/config, but Apply Settings
         # must still honor the user's selected primary/fallback provider.
+        # "auto" is persisted as the preference; Settings/agent only see a concrete provider.
         if self._state.preferred_primary_llm:
-            overrides["primary_llm"] = self._state.preferred_primary_llm
+            overrides["primary_llm"] = resolve_primary_llm_selection(
+                self._state.preferred_primary_llm
+            )
         if self._state.preferred_fallback_llm:
             overrides["fallback_llm"] = self._state.preferred_fallback_llm
         if self._state.safe_mode:
@@ -3264,7 +3378,8 @@ class MainWindow(QMainWindow):
         return False
 
     def _clear_cloud_session(self) -> None:
-        self._state.cloud_api_base_url = ""
+        # Keep the production default so the next Login/Create flow needs no URL prompt.
+        self._state.cloud_api_base_url = DEFAULT_CLOUD_API_BASE_URL
         self._state.cloud_access_token = ""
         self._state.cloud_refresh_token = ""
         self._state.cloud_access_token_expires_at = ""
@@ -3285,6 +3400,8 @@ class MainWindow(QMainWindow):
         self._state.credit_banner_dismissed_ninetyfive = False
         self._state.profile = AccountProfile()
         self._state_store.save(self._state)
+        self._stop_payment_refresh_watch()
+        self._stop_account_status_poll()
         self._rebuild_service(skip_cloud_refresh=True)
         self._refresh_account_views()
         self._refresh_license_card()
@@ -3388,7 +3505,7 @@ class MainWindow(QMainWindow):
             self._refresh_updates_status_label()
         self._set_combo_value(
             self._primary_llm_combo,
-            self._state.preferred_primary_llm or self._settings.primary_llm,
+            normalize_primary_llm_selection(self._state.preferred_primary_llm),
         )
         self._set_combo_value(
             self._fallback_llm_combo,
@@ -3448,20 +3565,17 @@ class MainWindow(QMainWindow):
         )
         if period_end is not None and period_end <= datetime.now(timezone.utc):
             return False
-        # Local state is updated on each run; prefer it, fall back to last /me payload.
+        # Cloud /me (and admin overrides) are authoritative for pool/used when present.
         budget = float(self._state.monthly_credits_usd or 0.0)
         used = float(self._state.monthly_credits_used_usd or 0.0)
-        if budget <= 0 and me.get("monthly_credits_usd") is not None:
+        if me.get("monthly_credits_usd") is not None:
             try:
                 budget = float(me.get("monthly_credits_usd") or 0.0)
-                used = float(me.get("monthly_credits_used_usd") or 0.0)
             except (TypeError, ValueError):
-                budget = 0.0
-                used = 0.0
-        elif me.get("monthly_credits_used_usd") is not None:
-            # If either side shows the pool spent, treat as exhausted.
+                pass
+        if me.get("monthly_credits_used_usd") is not None:
             try:
-                used = max(used, float(me.get("monthly_credits_used_usd") or 0.0))
+                used = float(me.get("monthly_credits_used_usd") or 0.0)
             except (TypeError, ValueError):
                 pass
         if budget <= 0 or used + 1e-6 >= budget:
@@ -3934,14 +4048,25 @@ class MainWindow(QMainWindow):
                 total += self._billed_cost_usd(raw)
         return round(total, 6)
 
+    def _cloud_credits_are_authoritative(self) -> bool:
+        """True when signed-in cloud counters (incl. admin overrides) own Used/Remaining."""
+        return bool(
+            self._state.cloud_access_token.strip()
+            and self._state.cloud_api_base_url.strip()
+        )
+
     def _period_credits_used_usd(self) -> float:
         """Billed USD consumed in the active billing window (not lifetime)."""
+        cloud_used = round(float(self._state.monthly_credits_used_usd or 0.0), 6)
+        # Signed-in: cloud /me and /entitlements (and admin overrides) are source of truth.
+        # Local output_history is only a recent-activity log — never inflate Used above cloud.
+        if self._cloud_credits_are_authoritative():
+            return cloud_used
         period_start, period_end, _ = self._credits_usage_period_bounds()
         from_history = self._billed_usage_total_from_history(
             period_start=period_start,
             period_end=period_end,
         )
-        cloud_used = round(float(self._state.monthly_credits_used_usd or 0.0), 6)
         if self._state.output_history or cloud_used > 0:
             return round(max(from_history, cloud_used), 6)
         return cloud_used
@@ -3950,7 +4075,13 @@ class MainWindow(QMainWindow):
         return self._billed_usage_total_from_history()
 
     def _reconcile_credits_used_from_history(self) -> None:
-        """Align stored period-used with in-window local history and cloud (never lifetime)."""
+        """Align stored period-used with local history only when offline / no cloud session.
+
+        When signed in, never raise Used from the local run log — that would undo admin
+        resets (e.g. used=0.1) and show stale totals like $5.09.
+        """
+        if self._cloud_credits_are_authoritative():
+            return
         period_start, period_end, _ = self._credits_usage_period_bounds()
         from_history = self._billed_usage_total_from_history(
             period_start=period_start,
@@ -3967,10 +4098,17 @@ class MainWindow(QMainWindow):
         used = self._period_credits_used_usd()
         remaining = max(budget - used, 0.0)
         _, _, period_label = self._credits_usage_period_bounds()
-        self._credits_period_note.setText(
-            f"{period_label}. Credit pool is subscription USD. Used is billed hosted-model "
-            f"usage inside this paid window. Lifetime total is at the bottom."
-        )
+        if self._cloud_credits_are_authoritative():
+            self._credits_period_note.setText(
+                f"{period_label}. Credit pool and Used come from your SurvyAI account "
+                f"(including admin adjustments). Recent usage below is a local activity log "
+                f"and does not override the Used counter. Lifetime total is at the bottom."
+            )
+        else:
+            self._credits_period_note.setText(
+                f"{period_label}. Credit pool is subscription USD. Used is billed hosted-model "
+                f"usage inside this paid window. Lifetime total is at the bottom."
+            )
 
         self._credits_total_label.setText(f"${budget:,.2f}")
         self._credits_used_label.setText(f"${used:,.2f}")
@@ -4812,7 +4950,11 @@ class MainWindow(QMainWindow):
         self._thread.progress_text.connect(self._on_worker_progress)
         self._thread.cancelled.connect(self._on_agent_cancelled)
         self._thread.finished.connect(self._on_thread_finished)
-        self._thread.confirm_overwrite.connect(self._on_cad_file_conflict)
+        # QueuedConnection: dialog must run on the GUI thread (never Direct on the worker).
+        self._thread.confirm_overwrite.connect(
+            self._on_cad_file_conflict,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._thread.start()
         self.statusBar().showMessage("Working…")
 
@@ -4823,6 +4965,28 @@ class MainWindow(QMainWindow):
         path = str(data.get("path") or "").strip()
         mode = str(data.get("mode") or "overwrite").strip().lower()
         thread = self._thread
+        # If a conflict dialog is already up, bring it forward (do not drop the reply path).
+        existing = getattr(self, "_cad_conflict_dialog", None)
+        if existing is not None:
+            try:
+                existing.raise_()
+                existing.activateWindow()
+            except Exception:
+                pass
+            return
+
+        def _finish(result_code: int) -> None:
+            self._cad_conflict_dialog = None
+            accepted = int(result_code) == int(QDialog.DialogCode.Accepted)
+            if thread is not None:
+                thread.provide_confirm_result(accepted)
+            if accepted:
+                self._append_activity("Overwrite confirmed — continuing CAD generation…")
+                self.statusBar().showMessage("Overwrite confirmed — preparing drawing…")
+            else:
+                self._append_activity("Kept existing drawing; agent was told not to overwrite.")
+                self.statusBar().showMessage("Existing drawing kept.")
+
         try:
             # Bring SurvyAI forward so the dialog is visible (not only a taskbar flash).
             self.showNormal()
@@ -4834,13 +4998,17 @@ class MainWindow(QMainWindow):
                 app.setActiveWindow(self)
             dark = str(getattr(self._state, "theme", "") or "").lower() == "dark"
             dlg = _CadFileConflictDialog(self, path, mode=mode, dark=dark)
+            self._cad_conflict_dialog = dlg
+            dlg.finished.connect(_finish)
+            # Non-blocking open(): nested exec() can swallow Overwrite clicks while the
+            # agent thread waits — leaving the run hung with the dialog still visible.
+            dlg.open()
             dlg.raise_()
             dlg.activateWindow()
-            accepted = dlg.exec() == QDialog.DialogCode.Accepted
         except Exception:
-            accepted = False
-        if thread is not None:
-            thread.provide_confirm_result(accepted)
+            self._cad_conflict_dialog = None
+            if thread is not None:
+                thread.provide_confirm_result(False)
 
     @Slot(object)
     def _on_agent_result(self, result: object) -> None:
@@ -5165,7 +5333,9 @@ class MainWindow(QMainWindow):
         if self._thread is not None and self._thread.isRunning():
             QMessageBox.warning(self, "Busy", "Wait for the current task to finish before changing runtime settings.")
             return
-        self._state.preferred_primary_llm = self._primary_llm_combo.currentText().strip()
+        self._state.preferred_primary_llm = normalize_primary_llm_selection(
+            self._primary_llm_combo.currentText()
+        )
         self._state.preferred_fallback_llm = self._fallback_llm_combo.currentText().strip()
         self._state.fast_mode_non_file_prompts = bool(self._fast_mode_cb.isChecked())
         # If user switches to Ollama from the dropdown, ensure we have a usable local model selected.
@@ -5240,7 +5410,11 @@ class MainWindow(QMainWindow):
                 return f"claude ({m})" if m else "claude"
             return prov
 
-        self._active_primary_llm_label.setText(_fmt("primary_llm"))
+        primary_txt = _fmt("primary_llm")
+        if normalize_primary_llm_selection(self._state.preferred_primary_llm) == AUTO_PRIMARY_LLM:
+            # Show routing explicitly so Auto remains visible while agent runs a concrete provider.
+            primary_txt = f"auto → {primary_txt}" if primary_txt != "—" else "auto"
+        self._active_primary_llm_label.setText(primary_txt)
         self._active_fallback_llm_label.setText(_fmt("fallback_llm"))
 
     def _cloud_base_and_token(self) -> tuple[str, str]:
@@ -5267,9 +5441,9 @@ class MainWindow(QMainWindow):
                 (
                     f"Could not reach the cloud API at:\n{base}\n\n"
                     f"{user_facing_cloud_message(exc)}\n\n"
-                    "• Start the API: python -m survyai_cloud\n"
-                    "• Sign in with the same base URL (default "
-                    f"{DEFAULT_CLOUD_API_BASE_URL})"
+                    "• Confirm you are online and try again\n"
+                    "• Local API development: start python -m survyai_cloud and set "
+                    f"SURVYAI_API_BASE_URL (default {DEFAULT_CLOUD_API_BASE_URL})"
                 ),
             )
             return False
@@ -5304,9 +5478,9 @@ class MainWindow(QMainWindow):
                 (
                     f"Could not reach the cloud API at:\n{base}\n\n"
                     f"{user_facing_cloud_message(exc)}\n\n"
-                    "• Start the API in a terminal: python -m survyai_cloud\n"
-                    "• Sign in with the same base URL (default "
-                    f"{DEFAULT_CLOUD_API_BASE_URL})\n"
+                    "• Confirm you are online and try again\n"
+                    "• Local API development: start python -m survyai_cloud and set "
+                    f"SURVYAI_API_BASE_URL (default {DEFAULT_CLOUD_API_BASE_URL})\n"
                     f"• Open {DEFAULT_CLOUD_API_BASE_URL}/health in a browser — database_ok should be true"
                 ),
             )
@@ -5490,6 +5664,8 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         QDesktopServices.openUrl(QUrl(dlg.portal_url()))
+        # Renewals / plan changes in the Paystack portal should auto-refresh Desktop status.
+        self._start_payment_refresh_watch()
 
     @Slot()
     def _on_paystack_verify_reference(self) -> None:
@@ -5623,17 +5799,11 @@ class MainWindow(QMainWindow):
         """
         Cloud sign-in: optional register -> login -> store tokens -> /v1/me, entitlements, bootstrap
         -> rebuild agent service with injected platform keys + model tiers.
+
+        The production cloud API base URL is used by default (no user-facing prompt).
+        Developers can still override via SURVYAI_API_BASE_URL / saved state.
         """
-        default_base = self._default_cloud_api_base_url()
-        base_url, ok = QInputDialog.getText(
-            self,
-            "Cloud API base URL",
-            f"Enter cloud API base URL (e.g. {DEFAULT_CLOUD_API_BASE_URL})",
-            text=default_base,
-        )
-        if not ok:
-            return
-        base_url = base_url.strip()
+        base_url = self._default_cloud_api_base_url().strip() or DEFAULT_CLOUD_API_BASE_URL
         if not self._preflight_cloud_api(base_url):
             return
         display_name_for_profile = ""
@@ -5840,17 +6010,11 @@ class MainWindow(QMainWindow):
 
     def _on_forgot_password(self, *, base_url: str | None = None) -> None:
         """Request a one-time email code, then set a new password."""
-        base = (base_url or self._default_cloud_api_base_url()).strip()
-        if not base:
-            base, ok = QInputDialog.getText(
-                self,
-                "Cloud API base URL",
-                f"Enter cloud API base URL (e.g. {DEFAULT_CLOUD_API_BASE_URL})",
-                text=self._default_cloud_api_base_url(),
-            )
-            if not ok or not base.strip():
-                return
-            base = base.strip()
+        base = (
+            (base_url or "").strip()
+            or self._default_cloud_api_base_url().strip()
+            or DEFAULT_CLOUD_API_BASE_URL
+        )
         if not self._preflight_cloud_api(base):
             return
 
@@ -6118,6 +6282,7 @@ class MainWindow(QMainWindow):
         return (
             self._state.cloud_api_base_url
             or getattr(self._settings, "survyai_api_base_url", "")
+            or DEFAULT_CLOUD_API_BASE_URL
             or ""
         ).strip()
 

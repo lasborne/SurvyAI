@@ -65,7 +65,7 @@ FREE_POLICY = PlanPolicy(
 PRO_POLICY = PlanPolicy(
     slug="pro",
     models=ModelPolicy(
-        allowed_primary_llms=("openai", "gemini", "claude", "deepseek", "ollama"),
+        allowed_primary_llms=("auto", "openai", "gemini", "claude", "deepseek", "ollama"),
         allowed_fallback_llms=("openai", "gemini", "claude", "deepseek", "ollama"),
         allow_switching=True,
     ),

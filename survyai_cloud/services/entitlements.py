@@ -389,6 +389,10 @@ def apply_free_defaults(user: User, settings: CloudSettings | None = None) -> No
     user.monthly_credits_usd = 0.0
     user.monthly_credits_used_usd = 0.0
     user.credits_billing_interval = "monthly"
+    if hasattr(user, "admin_privilege_active"):
+        user.admin_privilege_active = False
+    if hasattr(user, "admin_privilege_note"):
+        user.admin_privilege_note = None
 
 
 def apply_pro_defaults(

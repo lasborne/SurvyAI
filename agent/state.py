@@ -53,7 +53,22 @@ def looks_like_file_driven_task(query: str) -> bool:
     """True if the query mentions file types or paths (documents, CAD, etc.)."""
     q = query or ""
     ql = q.lower()
-    if any(ext in ql for ext in [".docx", ".pdf", ".xlsx", ".xls", ".dwg", ".dxf", ".csv", ".shp", ".aprx"]):
+    if any(
+        ext in ql
+        for ext in [
+            ".docx",
+            ".doc",
+            ".pdf",
+            ".xlsx",
+            ".xls",
+            ".dwg",
+            ".dxf",
+            ".csv",
+            ".txt",
+            ".shp",
+            ".aprx",
+        ]
+    ):
         return True
     if "\\Users\\" in q or ":\\" in q:
         return True

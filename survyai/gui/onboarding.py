@@ -67,10 +67,12 @@ def environment_validation_report(settings: Settings) -> str:
     lines.append("Fallback LLM: " + str(settings.fallback_llm))
     lines.append("Ollama URL: " + str(getattr(settings, "ollama_base_url", "http://localhost:11434")))
     lines.append("Ollama model: " + str(getattr(settings, "ollama_model", "llama3.2:1b")))
-    lines.append("SurvyAI cloud API: " + str(getattr(settings, "survyai_api_base_url", "") or "not configured"))
+    cloud_base = str(getattr(settings, "survyai_api_base_url", "") or "").strip()
+    lines.append("SurvyAI cloud API: " + (cloud_base or "production default"))
     lines.append("Vector store: " + ("enabled" if settings.vector_store_enabled else "disabled"))
     local_ready = str(settings.primary_llm).lower() == "ollama" or str(settings.fallback_llm).lower() == "ollama"
-    cloud_ready = bool(str(getattr(settings, "survyai_api_base_url", "") or "").strip())
+    # Desktop always has a production cloud default (users are not asked for the URL).
+    cloud_ready = True
     ready = any_direct_provider_key or local_ready or cloud_ready
     lines.append(
         "Overall readiness: "

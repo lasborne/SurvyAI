@@ -74,7 +74,7 @@ import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Literal, Optional, Tuple
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple
 
 # Ensure Any is available globally (for Pydantic model evaluation)
 # This prevents "name 'Any' is not defined" errors
@@ -201,6 +201,12 @@ from agent.pdf_survey_plan import (
     CADASTRAL_COORDINATES_FOR_STOP as _COORDINATES_FOR_STOP,
     extract_coordinates_blob_from_cadastral_query,
     resolve_cadastral_coordinates_blob,
+)
+from agent.excel_cadastral import (
+    coordinates_deferred_to_external_source,
+    default_excel_plot_output_name,
+    explicit_cadastral_plot_intent,
+    is_tabular_inspect_only_request,
 )
 
 
@@ -375,18 +381,204 @@ def _parse_access_road_specs_from_query(query: str) -> List[str]:
     return specs
 
 
-def _format_buyer_name_for_titleblock(name: str) -> str:
+def _split_buyer_owner_names(name: str) -> List[str]:
+    """Split a buyer/owner string into ordered display names (preserves sequence)."""
+    raw = (name or "").strip()
+    if not raw:
+        return []
+    # Normalize "A, B and C" / "A & B" into a flat ordered list.
+    chunks = [p.strip() for p in re.split(r",\s*", raw) if p.strip()]
+    names: List[str] = []
+    for chunk in chunks:
+        and_parts = [
+            p.strip()
+            for p in re.split(r"\s+(?:and|&)\s+", chunk, flags=re.IGNORECASE)
+            if p.strip()
+        ]
+        if len(and_parts) <= 1:
+            names.append(and_parts[0] if and_parts else chunk)
+        else:
+            names.extend(and_parts)
+    return names
+
+
+def _pack_owner_names_into_title_lines(
+    names: Sequence[str],
+    *,
+    max_chars_per_line: int = 38,
+) -> List[str]:
+    """
+    Pack consecutive owner names onto title-block rows (ordered only).
+
+    Names stay in input order: 1st+2nd may share a row when they fit; never
+    jump ahead to pair 1st with 4th. No per-name text shrinking — only line breaks.
+    """
+    max_chars = max(12, int(max_chars_per_line))
+    clean = [re.sub(r"\s+", " ", str(n or "").strip()) for n in names if str(n or "").strip()]
+    if not clean:
+        return []
+    if len(clean) == 1:
+        return [clean[0]]
+
+    lines: List[str] = []
+    current_parts: List[str] = []
+
+    def _flush(final: bool = False) -> None:
+        nonlocal current_parts
+        if not current_parts:
+            return
+        # Trailing comma on every row except the last completed block when finalizing last line.
+        body = ", ".join(current_parts)
+        if not final:
+            body = f"{body},"
+        lines.append(body)
+        current_parts = []
+
+    for i, nm in enumerate(clean):
+        is_last = i == len(clean) - 1
+        if not current_parts:
+            current_parts = [nm]
+            if is_last:
+                _flush(final=True)
+            continue
+        candidate = ", ".join(current_parts + [nm])
+        # Leave room for a trailing comma on non-final rows.
+        limit = max_chars if is_last and len(current_parts) >= 1 else max_chars - 1
+        if len(candidate) <= limit:
+            current_parts.append(nm)
+            if is_last:
+                _flush(final=True)
+        else:
+            _flush(final=False)
+            current_parts = [nm]
+            if is_last:
+                _flush(final=True)
+    if current_parts:
+        _flush(final=True)
+    return lines
+
+
+def _pack_location_clauses_into_lines(
+    parts: Sequence[str],
+    *,
+    max_chars_per_line: int = 36,
+    preferred_max_lines: int = 3,
+) -> List[str]:
+    """
+    Pack location address clauses into as few title-block lines as practical.
+
+    Cartographic default: prefer ≤ ``preferred_max_lines`` (3). Consecutive clauses
+    share a line when they fit; only exceed 3 lines when the address cannot
+    reasonably compress further.
+    """
+    clean = [re.sub(r"\s+", " ", str(p or "").strip()) for p in parts if str(p or "").strip()]
+    if not clean:
+        return []
+
+    def _wrap_long_clause(clause: str, limit: int) -> List[str]:
+        if len(clause) <= limit:
+            return [clause]
+        words = clause.split()
+        out: List[str] = []
+        buf: List[str] = []
+        for w in words:
+            cand = (" ".join(buf + [w])).strip()
+            if buf and len(cand) > limit:
+                out.append(" ".join(buf))
+                buf = [w]
+            else:
+                buf.append(w)
+        if buf:
+            out.append(" ".join(buf))
+        return out or [clause]
+
+    def _pack(limit: int) -> List[str]:
+        lines: List[str] = []
+        current = ""
+        for clause in clean:
+            chunks = _wrap_long_clause(clause, limit)
+            for chunk in chunks:
+                if not current:
+                    current = chunk
+                    continue
+                candidate = f"{current}, {chunk}"
+                if len(candidate) <= limit:
+                    current = candidate
+                else:
+                    lines.append(current)
+                    current = chunk
+        if current:
+            lines.append(current)
+        return lines
+
+    limit = max(16, int(max_chars_per_line))
+    preferred = max(1, int(preferred_max_lines))
+    best = _pack(limit)
+    if len(best) <= preferred:
+        return best
+    for widen in (1.15, 1.30, 1.50, 1.75):
+        wider = max(limit, int(round(limit * widen)))
+        packed = _pack(wider)
+        if len(packed) < len(best):
+            best = packed
+        if len(best) <= preferred:
+            return best
+    return best
+
+
+def _format_location_for_titleblock(
+    location: str,
+    *,
+    max_chars_per_line: Optional[int] = None,
+    preferred_max_lines: int = 3,
+) -> str:
+    """
+    Format location clauses for the title-block AT row as MTEXT lines.
+
+    Comma- or newline-separated clauses are packed into preferably ≤3 lines
+    (cartographic compression). LGA / state stay on their own title-block rows.
+    """
+    raw = (location or "").strip()
+    if not raw:
+        return ""
+    parts = [p.strip(" ,;:-") for p in re.split(r"\s*,\s*|\n+", raw) if p.strip(" ,;:-")]
+    if not parts:
+        return raw.upper()
+    packed = _pack_location_clauses_into_lines(
+        parts,
+        max_chars_per_line=int(max_chars_per_line) if max_chars_per_line else 36,
+        preferred_max_lines=preferred_max_lines,
+    )
+    return "\\P".join(p.upper() for p in packed)
+
+
+def _format_buyer_name_for_titleblock(
+    name: str,
+    *,
+    max_chars_per_line: Optional[int] = None,
+) -> str:
     """
     Format buyer/owner names for CADA_TITLEBLOCK row 2 (MTEXT with \\P line breaks).
 
-    Rules:
-    - Comma-separated names each get their own line; commas are kept except before AND.
-    - The word \"and\" (any spacing/casing) joins names with AND on its own line.
-    - Example: \"A, B and C\" -> \"A,\\PB,\\PAND\\PC\"
+    Multi-owner lists pack consecutive names onto the same row when they fit
+    (cartographic compression of vertical title space). Single / dual names keep
+    a simple readable layout. \"AND\" still appears on its own line when the source
+    used \"and\" between the last two groups and packing is not used (<3 names).
     """
     raw = (name or "").strip()
     if not raw:
         return ""
+    names = _split_buyer_owner_names(raw)
+    if not names:
+        return raw.upper()
+
+    # Multi-owner / multi-parcel title: pack consecutive names to reduce title height.
+    if len(names) >= 3:
+        max_chars = int(max_chars_per_line) if max_chars_per_line else 38
+        packed = _pack_owner_names_into_title_lines(names, max_chars_per_line=max_chars)
+        return "\\P".join(line.upper() for line in packed)
+
+    # 1–2 names (or legacy \"A and B\"): keep explicit AND line when present in source.
     parts = [p.strip() for p in re.split(r",\s*", raw) if p.strip()]
     lines: List[str] = []
     if len(parts) > 1:
@@ -532,9 +724,222 @@ def _ideal_plan_number_text_height(
 
 
 _CADASTRAL_ALLOWED_SCALES = [250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 25000]
+# Ground span (m) at/below which cartography prefers 1:250 when the sheet fit allows.
+_CADASTRAL_AUTO_FINE_SPAN_M = 45.0
 # survey_plan_template3.dwg CADA_PLANNUMBER nominal height at template authoring scale 1:500.
 _CADASTRAL_TEMPLATE_REF_DENOM = 500
 _CADASTRAL_TEMPLATE_PLANNUMBER_REF_H = 1.2
+# CADA_PILLARNUMBERS single-column TABLE width at template authoring scale 1:500.
+# Widened from 8.0 → 9.2 so longer Nigerian peg tokens fit on one line.
+_CADASTRAL_TEMPLATE_PILLARNUMBER_REF_W = 9.2
+
+
+def _ideal_pillar_number_table_width(
+    *,
+    template_denom: int,
+    chosen_denom: int,
+    template_nominal_w: Optional[float] = None,
+) -> float:
+    """
+    Drawing-unit width for CADA_PILLARNUMBERS tables at the output plan scale.
+
+    ``template_nominal_w`` defaults to the survey_plan_template3 authoring width (9.2 @ 1:500).
+    """
+    ref = float(template_nominal_w) if template_nominal_w and float(template_nominal_w) > 0 else (
+        _CADASTRAL_TEMPLATE_PILLARNUMBER_REF_W
+    )
+    td = max(1, int(template_denom or _CADASTRAL_TEMPLATE_REF_DENOM))
+    cd = max(1, int(chosen_denom or td))
+    return float(ref) * (float(cd) / float(td))
+
+
+def _cartographic_denom_for_layout_extent(
+    width_m: float,
+    height_m: float,
+    allowed_denoms: Optional[List[int]] = None,
+    *,
+    parcel_count: int = 1,
+    dense_title: bool = False,
+) -> int:
+    """
+    Suggested cadastral plan scale from ground extent (meters).
+
+    Span bands follow common survey/cartography practice for ownership layouts
+    (versatile across sites — not tuned to one workbook). Dense multi-owner title
+    blocks may take one coarser step within the same band for sheet room.
+
+    Very small parcels (span ≤ ~45 m) prefer 1:250 so bearings/pillars remain
+    readable — the inverse of auto-coarsening large land to 1:1000+.
+    """
+    allowed = allowed_denoms or _CADASTRAL_ALLOWED_SCALES
+    span = max(float(width_m or 0.0), float(height_m or 0.0))
+    # Unknown extent → template convention (1:500), never auto-fine.
+    if span <= 1e-6:
+        target = 500
+    elif span <= _CADASTRAL_AUTO_FINE_SPAN_M:
+        target = 250
+    elif span <= 100:
+        target = 500
+    elif span <= 220:
+        target = 1000
+    elif span <= 400:
+        target = 2000
+    elif span <= 750:
+        target = 5000
+    elif span <= 1400:
+        target = 5000
+    elif span <= 2500:
+        target = 10000
+    else:
+        target = 20000
+    # Many owners / dense legend: prefer a touch more sheet inside the same span class.
+    # Never coarsen away from 1:250 for tiny single parcels.
+    if (
+        (dense_title or int(parcel_count) >= 8)
+        and span > _CADASTRAL_AUTO_FINE_SPAN_M
+        and span <= 400
+        and target <= 2000
+    ):
+        target = 5000
+    cands = [d for d in allowed if d >= int(target)]
+    return int(min(cands) if cands else max(allowed))
+
+
+def _allowed_denom_steps_above(
+    start_denom: int,
+    steps: int,
+    allowed_denoms: Optional[List[int]] = None,
+) -> int:
+    """Return the denom `steps` coarser than start (or the coarsest allowed)."""
+    allowed = sorted(allowed_denoms or _CADASTRAL_ALLOWED_SCALES)
+    at_or_above = [d for d in allowed if d >= int(start_denom)]
+    if not at_or_above:
+        return int(max(allowed))
+    idx = min(max(0, int(steps)), len(at_or_above) - 1)
+    return int(at_or_above[idx])
+
+
+def _choose_layout_plan_scale_after_plot(
+    *,
+    plotted_w: float,
+    plotted_h: float,
+    usable_w: float,
+    usable_h: float,
+    interior_w: float,
+    interior_h: float,
+    template_denom: int,
+    user_scale_denom: Optional[int],
+    parcel_count: int = 1,
+    allowed_denoms: Optional[List[int]] = None,
+) -> tuple[int, float, str]:
+    """
+    Intelligent post-plot scale for multi-parcel layouts.
+
+    1) Cartographic scale from ground span (primary — versatile across prompts/sites)
+    2) Fit-required scale from measured plot window (secondary, only if trustworthy)
+    3) Cap so pathological usable-window math cannot explode to 1:20000 for mid-size land
+    """
+    allowed = allowed_denoms or _CADASTRAL_ALLOWED_SCALES
+    td = max(1, int(template_denom or 500))
+    pw = max(float(plotted_w or 0.0), 1e-6)
+    ph = max(float(plotted_h or 0.0), 1e-6)
+    uw = max(float(usable_w or 0.0), 1e-6)
+    uh = max(float(usable_h or 0.0), 1e-6)
+    iw = max(float(interior_w or 0.0), 1e-6)
+    ih = max(float(interior_h or 0.0), 1e-6)
+
+    carto = _cartographic_denom_for_layout_extent(
+        pw,
+        ph,
+        allowed,
+        parcel_count=int(parcel_count or 1),
+        dense_title=int(parcel_count or 1) >= 6,
+    )
+    # Soft enclosure headroom: at most one allowed step coarser than cartographic
+    # (e.g. 1:5000 → 1:10000). Two steps would still allow 1:20000 for mid-size land.
+    carto_cap = _allowed_denom_steps_above(carto, 1, allowed)
+
+    pad_w = max(pw * 1.12, pw + 10.0)
+    pad_h = max(ph * 1.12, ph + 10.0)
+    req_k = max(pad_w / uw, pad_h / uh)
+    fit_denom, _fit_k, _fit_reason = _resolve_cadastral_output_scale(
+        template_denom=td,
+        user_scale_denom=None,
+        required_k=float(req_k),
+        allowed_denoms=allowed,
+        multi_parcel_layout=False,
+        boundary_w=pw,
+        boundary_h=ph,
+        enforce_enclosure=True,
+    )
+
+    usable_frac = (uw * uh) / max(iw * ih, 1e-6)
+    pathological_window = (
+        usable_frac < 0.18
+        or uw < 0.22 * iw
+        or uh < 0.28 * ih
+        or req_k > (float(carto) / float(td)) * 1.15
+    )
+
+    if user_scale_denom and int(user_scale_denom) in allowed:
+        usd = int(user_scale_denom)
+        # Honour user scale when it can enclose under a trustworthy window, else fall through.
+        if (not pathological_window) and req_k <= (float(usd) / float(td)) + 0.02:
+            return usd, float(usd) / float(td), "user_scale"
+        if pathological_window and usd >= carto:
+            return usd, float(usd) / float(td), "user_scale"
+
+    if pathological_window:
+        chosen = int(carto)
+        reason = "layout_cartographic"
+    elif int(carto) < int(fit_denom) and req_k <= (float(carto) / float(td)) + 0.02:
+        # Tiny layouts: cartographic 1:250 must not be blocked by template fit_denom.
+        chosen = int(carto)
+        reason = "layout_cartographic_fine"
+    else:
+        chosen = max(int(carto), int(fit_denom))
+        if chosen > int(carto_cap):
+            chosen = int(carto_cap)
+            reason = "layout_cartographic_capped_fit"
+        elif chosen > int(carto):
+            reason = "layout_cartographic_and_fit"
+        else:
+            reason = "layout_cartographic"
+
+    return int(chosen), float(chosen) / float(td), reason
+
+
+def _multi_parcel_owner_label_height(
+    parcel_rings: Sequence[Sequence[Dict[str, float]]],
+    *,
+    layout_w: float,
+    layout_h: float,
+    native_bearing_height: float,
+) -> float:
+    """
+    Cartographic owner-label height (drawing meters) for multi-parcel layouts.
+
+    Sized from typical parcel span so labels stay inside parcels; independent of
+    an over-large sheet scale factor.
+    """
+    spans: List[float] = []
+    for ring in parcel_rings or []:
+        xs = [float(p.get("x", 0.0)) for p in ring if isinstance(p, dict)]
+        ys = [float(p.get("y", 0.0)) for p in ring if isinstance(p, dict)]
+        if len(xs) < 2:
+            continue
+        spans.append(max(max(xs) - min(xs), max(ys) - min(ys)))
+    spans_sorted = sorted(spans)
+    median_span = spans_sorted[len(spans_sorted) // 2] if spans_sorted else 0.0
+    layout_span = max(float(layout_w or 0.0), float(layout_h or 0.0), 1.0)
+    native = max(0.5, float(native_bearing_height or 1.2))
+    # ~7% of typical parcel, but never larger than ~1.5% of whole layout span.
+    h = median_span * 0.07 if median_span > 1e-6 else native
+    h = min(h, layout_span * 0.015)
+    h = max(1.0, min(h, native * 1.35, 12.0))
+    if median_span > 1e-6:
+        h = min(h, max(1.0, median_span * 0.22))
+    return float(h)
 
 
 def _resolve_cadastral_output_scale(
@@ -543,18 +948,35 @@ def _resolve_cadastral_output_scale(
     user_scale_denom: Optional[int],
     required_k: float,
     allowed_denoms: Optional[List[int]] = None,
+    multi_parcel_layout: bool = False,
+    boundary_w: float = 0.0,
+    boundary_h: float = 0.0,
+    enforce_enclosure: bool = False,
 ) -> tuple[int, float, str]:
     """
     Choose output plan scale (denominator) and sheet scale factor.
 
+    Fit criterion (symmetric):
+    - ``required_k`` is the minimum sheet scale factor needed for the padded
+      parcel to sit inside the usable interior window (``scale_k = denom / template``).
+    - If ``required_k > 1``, auto-**coarsen** (e.g. 1:500 → 1:1000+) so the land fits.
+    - If ``required_k`` is small enough that a finer scale still fits, auto-**refine**
+      (typically template 1:500 → 1:250) for very small parcels — same gate, opposite
+      direction. Cartographic span bands decide *whether* refining is desirable;
+      fit decides *whether it is allowed*.
+
     When the user/PDF states a scale (e.g. 1:250), that scale is used unless the
     parcel (+ road padding) cannot fit — then the next coarser allowed scale is chosen.
-  """
+
+    ``enforce_enclosure=True`` (plot-then-fit): never choose a scale finer than the
+    fit-required factor — the border must enclose the plotted land.
+    """
     import math
 
     allowed = allowed_denoms or _CADASTRAL_ALLOWED_SCALES
     td = max(1, int(template_denom or 500))
     rk = max(0.0, float(required_k))
+    span = max(float(boundary_w or 0.0), float(boundary_h or 0.0))
 
     if user_scale_denom and int(user_scale_denom) in allowed:
         usd = int(user_scale_denom)
@@ -568,13 +990,193 @@ def _resolve_cadastral_output_scale(
 
     chosen = td
     scale_k = 1.0
+    reason = "template"
     if rk > 1.0 + 1e-6:
         target_denom = float(td) * rk * 1.02
         candidates = [s for s in allowed if s >= target_denom and s >= td]
         chosen = min(candidates) if candidates else max(allowed)
         scale_k = float(chosen) / float(td)
-        return int(chosen), scale_k, "auto_upscale"
-    return int(chosen), scale_k, "template"
+        reason = "auto_upscale"
+    else:
+        # Auto-downscale (refine): mirror of auto_upscale — only when fit allows.
+        # Typical path: template 1:500 → 1:250 when the parcel is cartographically small.
+        finer = sorted(d for d in allowed if int(d) < int(td))
+        if finer and not (multi_parcel_layout and span > _CADASTRAL_AUTO_FINE_SPAN_M):
+            carto = _cartographic_denom_for_layout_extent(
+                boundary_w,
+                boundary_h,
+                allowed,
+                parcel_count=1,
+                dense_title=False,
+            )
+            # Prefer cartographic fine scale if it still encloses; else any finer
+            # denom that fits when span is in the tiny-parcel band.
+            candidates_fit = [
+                d
+                for d in finer
+                if rk <= (float(d) / float(td)) + 0.015
+            ]
+            if candidates_fit:
+                prefer = int(carto) if int(carto) in candidates_fit else None
+                if prefer is None and span > 1e-6 and span <= _CADASTRAL_AUTO_FINE_SPAN_M:
+                    # Small ground span: pick the finest that still fits (usually 250).
+                    prefer = int(min(candidates_fit))
+                if prefer is not None and int(prefer) < int(td):
+                    # Enclosure mode: never go finer than fit requires (already gated).
+                    if enforce_enclosure and rk > (float(prefer) / float(td)) + 0.015:
+                        prefer = None
+                    if prefer is not None:
+                        chosen = int(prefer)
+                        scale_k = float(chosen) / float(td)
+                        reason = "auto_downscale"
+
+    # Pre-plot estimate only: may trim pathological oversize. Never when enclosing plotted land.
+    if (
+        multi_parcel_layout
+        and not enforce_enclosure
+        and (boundary_w > 1e-6 or boundary_h > 1e-6)
+    ):
+        carto = _cartographic_denom_for_layout_extent(boundary_w, boundary_h, allowed)
+        if int(chosen) > int(carto) * 2:
+            chosen = int(carto)
+            scale_k = float(chosen) / float(td)
+            reason = "multi_parcel_cartographic"
+        elif int(chosen) > int(carto) and rk <= (float(carto) / float(td)) * 1.08:
+            chosen = int(carto)
+            scale_k = float(chosen) / float(td)
+            reason = "multi_parcel_cartographic"
+
+    return int(chosen), float(scale_k), reason
+
+
+def _cadastral_sheet_layers(profile: Dict[str, Any]) -> List[str]:
+    """Sheet/presentation layers that may move/scale — never survey geometry."""
+    layers = list(profile.get("sheet_layers") or []) or [
+        "CADA_BORDER",
+        "CADA_INTERIORBORDER",
+        "CADA_SCALEBAR",
+        "CADA_NORTHARROW",
+        "CADA_EASTARROW",
+        "CADA_TITLEBLOCK",
+        "CADA_PLANNUMBER",
+        "CADA_CERTIFICATION",
+        "CADA_SURVEYOR",
+        "CADA_COORDINATES",
+        "CADA_NORTHCOORDINATES",
+        "CADA_EASTCOORDINATES",
+        "CADA_PRIMARYPILLAR_ARROWS",
+        "TITLE",
+        "text",
+    ]
+    for req in [
+        "CADA_BORDER",
+        "CADA_INTERIORBORDER",
+        "CADA_NORTHARROW",
+        "CADA_EASTARROW",
+        "CADA_NORTHCOORDINATES",
+        "CADA_EASTCOORDINATES",
+        "CADA_COORDINATES",
+        "CADA_PRIMARYPILLAR_ARROWS",
+        "CADA_SCALEBAR",
+        "CADA_TITLEBLOCK",
+        "CADA_PLANNUMBER",
+        "CADA_CERTIFICATION",
+        "CADA_SURVEYOR",
+    ]:
+        if req not in layers:
+            layers.append(req)
+    ban = {
+        "CADA_BOUNDARY",
+        "CADA_PILLARS",
+        "CADA_TEXT",
+        "CADA_BEARING_DIST",
+        "CADA_ROAD",
+        "CADA_CWF",
+        "CADA_PILLARNUMBERS",
+    }
+    return [L for L in layers if str(L).upper() not in ban]
+
+
+def _cadastral_sheet_translate_layers(profile: Dict[str, Any]) -> List[str]:
+    """
+    Sheet layers safe to translate/recenter about the plot.
+
+    Excludes ``CADA_PRIMARYPILLAR_ARROWS`` so the primary crosshair stays locked
+    to the primary peg after ``move_all_modelspace``. Those arrows still scale
+    about the template primary via ``_cadastral_sheet_layers`` / scale lists.
+    """
+    ban = {
+        "CADA_PRIMARYPILLAR_ARROWS",
+        "CADA_NORTHARROW",
+        "CADA_EASTARROW",
+        "CADA_COORDINATES",
+        "CADA_NORTHCOORDINATES",
+        "CADA_EASTCOORDINATES",
+        "CADA_BOUNDARY",
+        "CADA_BEARING_DIST",
+        "CADA_PILLARS",
+        "CADA_PILLARNUMBERS",
+        "CADA_ROAD",
+        "CADA_CWF",
+        "CADA_TEXT",
+    }
+    return [L for L in _cadastral_sheet_layers(profile) if str(L).upper() not in ban]
+
+
+def _usable_plot_window_from_bboxes(
+    interior_bb: Dict[str, Any],
+    title_bb: Optional[Dict[str, Any]],
+    *,
+    margin: float = 0.08,
+) -> Optional[Dict[str, float]]:
+    """
+    Usable land-plot rectangle inside the interior border, excluding the title block.
+    Returns minx/miny/maxx/maxy/width/height or None.
+    """
+    if not interior_bb or not interior_bb.get("success"):
+        return None
+    ix0 = float(interior_bb.get("minx", 0.0))
+    iy0 = float(interior_bb.get("miny", 0.0))
+    ix1 = float(interior_bb.get("maxx", 0.0))
+    iy1 = float(interior_bb.get("maxy", 0.0))
+    iw = ix1 - ix0
+    ih = iy1 - iy0
+    if iw <= 1e-6 or ih <= 1e-6:
+        return None
+    minx = ix0 + margin * iw
+    maxx = ix1 - margin * iw
+    miny = iy0 + margin * ih
+    maxy = iy1 - margin * ih
+    if title_bb and title_bb.get("success"):
+        tminx = float(title_bb.get("minx", 0.0))
+        tminy = float(title_bb.get("miny", 0.0))
+        tmaxx = float(title_bb.get("maxx", 0.0))
+        tmaxy = float(title_bb.get("maxy", 0.0))
+        tcx = 0.5 * (tminx + tmaxx)
+        tcy = 0.5 * (tminy + tmaxy)
+        gap = max(3.0, 0.02 * max(iw, ih))
+        # Title on the right → plot band is to the left of title.
+        if tcx > ix0 + 0.55 * iw and tminx < ix1 and tmaxx > ix0:
+            maxx = min(maxx, tminx - gap)
+        # Title in the upper band → plot band is below title.
+        elif tcy > iy0 + 0.55 * ih and tminy < iy1 and tmaxy > iy0:
+            maxy = min(maxy, tminy - gap)
+    if maxx <= minx + 1.0 or maxy <= miny + 1.0:
+        # Fallback: majority of interior.
+        minx = ix0 + margin * iw
+        maxx = ix1 - margin * iw
+        miny = iy0 + margin * ih
+        maxy = iy1 - margin * ih
+    return {
+        "minx": float(minx),
+        "miny": float(miny),
+        "maxx": float(maxx),
+        "maxy": float(maxy),
+        "width": float(maxx - minx),
+        "height": float(maxy - miny),
+        "center_x": float(0.5 * (minx + maxx)),
+        "center_y": float(0.5 * (miny + maxy)),
+    }
 
 
 def _split_address_segments(raw: str) -> List[str]:
@@ -1333,6 +1935,14 @@ class SurvyAIAgent:
         # If the primary fails, we automatically try the fallback
         
         requested_primary = str(self.settings.primary_llm or "ollama").strip().lower()
+        # Symbolic "auto" (best paid hosted model) must never reach provider init.
+        if requested_primary == "auto":
+            try:
+                from survyai.llm_routing import resolve_primary_llm_selection
+
+                requested_primary = resolve_primary_llm_selection("auto")
+            except Exception:
+                requested_primary = "openai"
         requested_fallback = str(self.settings.fallback_llm or "ollama").strip().lower()
         logger.info(f"Initializing primary LLM: {requested_primary}")
         logger.info(f"Initializing fallback LLM: {requested_fallback}")
@@ -1627,7 +2237,7 @@ class SurvyAIAgent:
 
         p = Path(ref)
         if p.is_absolute():
-            return p.resolve()
+            return self._coerce_write_path_away_from_install_root(p, ws)
 
         if len(p.parts) > 1 or ("/" in ref) or ("\\" in ref):
             return (ws / p).resolve()
@@ -1641,6 +2251,42 @@ class SurvyAIAgent:
             return (explicit_folder / p.name).resolve()
 
         return (ws / p.name).resolve()
+
+    @staticmethod
+    def _path_looks_like_survyai_install_root(folder: Path) -> bool:
+        """True when *folder* looks like the SurvyAI source/install tree (not a user workspace)."""
+        try:
+            root = folder.resolve()
+        except Exception:
+            root = folder
+        return (root / "agent").is_dir() and (root / "survyai").is_dir()
+
+    def _coerce_write_path_away_from_install_root(self, path: Path, workspace: Path) -> Path:
+        """
+        If a model invents an absolute path under the SurvyAI install/repo root while a
+        different active workspace is set, redirect the basename into the workspace.
+        Explicit user absolute paths outside the install root are preserved.
+        """
+        try:
+            resolved = path.resolve()
+        except Exception:
+            resolved = path
+        try:
+            ws = workspace.resolve()
+        except Exception:
+            ws = workspace
+        if resolved.parent == ws:
+            return resolved
+        if self._path_looks_like_survyai_install_root(resolved.parent) and ws != resolved.parent:
+            return (ws / resolved.name).resolve()
+        return resolved
+
+    def _resolve_output_path_for_write(self, file_path: str) -> Path:
+        """Resolve tool save paths: bare/relative names → active workspace (cwd)."""
+        ref = (file_path or "").strip().strip("\"'")
+        if not ref:
+            raise ValueError("file_path is required")
+        return self._resolve_user_output_path("", ref, fallback_dir=Path.cwd())
     
     def _extract_requested_output_docx(self, query: str, input_doc_path: str) -> Optional[str]:
         """
@@ -1848,6 +2494,7 @@ class SurvyAIAgent:
         if not q:
             return False
         has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.IGNORECASE))
+        wants_word = has_docx or "word document" in q or "word doc" in q
         wants_save = any(
             k in q for k in ("save", "saved", "write it", "write this", "into '", 'into "')
         )
@@ -1861,6 +2508,8 @@ class SurvyAIAgent:
         if has_docx and wants_save and explicit_essay:
             return True
         if wants_save and explicit_essay and ("turn this" in q or "turn the" in q):
+            return True
+        if wants_save and wants_word:
             return True
         return False
 
@@ -1897,6 +2546,12 @@ class SurvyAIAgent:
                 return False
 
         has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.IGNORECASE))
+        wants_word = (
+            has_docx
+            or "word document" in q
+            or "word doc" in q
+            or bool(re.search(r"\bas\s+a\s+word\b", q))
+        )
         wants_save = any(
             k in q
             for k in ("save", "saved", "write it", "write this", "into '", 'into "')
@@ -1911,6 +2566,9 @@ class SurvyAIAgent:
         has_history = "Assistant:" in (full_query or "")
         if has_docx and wants_save and (wants_essay or "turn this" in q):
             return has_history
+        # "Save it as a word document 'S_G_G'" after a prior assistant answer.
+        if wants_save and wants_word and has_history:
+            return True
         if self._is_affirmative_reply(q) and has_history:
             if self._last_assistant_offered_session_docx_save(full_query):
                 return True
@@ -1925,7 +2583,7 @@ class SurvyAIAgent:
         markers = (
             "essay", "essay1.docx", "save it as", "well-structured essay",
             "turn the previous topic", "turn this into", "save as **essay",
-            "save as essay", "i can turn",
+            "save as essay", "i can turn", "word document", "save it into",
         )
         return any(m in last_assistant for m in markers)
 
@@ -2049,6 +2707,30 @@ class SurvyAIAgent:
             return text.strip()
         return assistants[-1].strip()
 
+    def _extract_requested_save_basename(self, routing_query: str) -> Optional[str]:
+        """Extract a save-as basename from prompts like: save as a word document 'S_G_G'."""
+        q = routing_query or ""
+        patterns = (
+            r"(?:save|saved|export)\s+(?:it\s+)?as\s+(?:a\s+)?(?:word\s+)?(?:document|doc|docx)\s+['\"]([^'\"]+)['\"]",
+            r"(?:word\s+document|word\s+doc)\s+['\"]([^'\"]+)['\"]",
+            r"(?:save|saved|export)\s+(?:it\s+)?as\s+['\"]([^'\"]+)['\"]",
+        )
+        for pat in patterns:
+            m = re.search(pat, q, flags=re.IGNORECASE)
+            if not m:
+                continue
+            name = (m.group(1) or "").strip().strip("\"'").rstrip(").,;")
+            if not name:
+                continue
+            # Ignore obvious non-document tokens / paths with separators when bare name expected.
+            if any(sep in name for sep in ("/", "\\")) and not name.lower().endswith((".docx", ".doc")):
+                # Absolute/relative path — still usable as output ref.
+                return name
+            if name.lower() in {"it", "this", "that", "word", "document", "docx"}:
+                continue
+            return name
+        return None
+
     def _resolve_session_docx_output_path(self, routing_query: str, workspace: Optional[Path] = None) -> Path:
         ws = (workspace or Path.cwd()).resolve()
         out = self._extract_any_output_docx(routing_query)
@@ -2058,6 +2740,11 @@ class SurvyAIAgent:
         m = re.search(r"['\"]([^'\"]+\.docx)['\"]", routing_query or "", flags=re.IGNORECASE)
         if m:
             return self._resolve_user_output_path(routing_query, m.group(1), fallback_dir=ws)
+        bare = self._extract_requested_save_basename(routing_query)
+        if bare:
+            name = bare if bare.lower().endswith((".docx", ".doc")) else f"{bare}.docx"
+            resolved = self._resolve_user_output_path(routing_query, name, fallback_dir=ws)
+            return resolved if resolved.suffix.lower() == ".docx" else resolved.with_suffix(".docx")
         m2 = re.search(r"\b(essay\d*)\b", routing_query or "", flags=re.IGNORECASE)
         if m2:
             name = m2.group(1)
@@ -2227,6 +2914,23 @@ class SurvyAIAgent:
             field_context=field_context,
         )
 
+    def _should_fastpath_pdf_plan_key_details(self, query: str) -> bool:
+        """Fast-path: extract key survey-plan details from a PDF via layout + vision."""
+        from agent.pdf_survey_plan import should_fastpath_pdf_plan_key_details
+
+        return should_fastpath_pdf_plan_key_details(query)
+
+    def _run_pdf_plan_key_details_pipeline(self, query: str) -> Dict[str, Any]:
+        """Scanned/image survey PDFs: vision+layout key details (not plain text only)."""
+        from agent.pdf_survey_plan import run_pdf_plan_key_details_extract
+
+        scope = self._cadastral_user_message_body(query)
+        return run_pdf_plan_key_details_extract(
+            query=scope,
+            full_query=query,
+            extract_fn=self._extract_pdf_survey_plan_with_tier_fallback,
+        )
+
     # ==========================================================================
     # FAST-PATH: CAD CADASTRAL PLAN (Template DWG -> Output DWG)
     # ==========================================================================
@@ -2281,6 +2985,58 @@ class SurvyAIAgent:
                 out.append(s)
         return out
 
+    def _prefer_shipped_bundled_template(self, tp: Path) -> Path:
+        """
+        Prefer ``bundled_templates/<name>`` when the remembered path is a stale
+        same-named copy outside the bundle (common for survey_plan_template3.dwg).
+
+        User-edited bundled templates then take effect without requiring a manual
+        template-memory reset. Custom uniquely-named templates are left alone.
+        """
+        from pathlib import Path
+
+        try:
+            cur = Path(tp).resolve()
+        except Exception:
+            return tp
+        name = cur.name
+        if not name.lower().startswith("survey_plan_template") or not name.lower().endswith(".dwg"):
+            return cur
+        # Already the bundled file.
+        try:
+            if "bundled_templates" in str(cur).replace("\\", "/").lower():
+                return cur
+        except Exception:
+            pass
+        candidates = []
+        try:
+            candidates.append(Path(resource_path("bundled_templates", name)))
+        except Exception:
+            pass
+        if not is_frozen_app():
+            try:
+                candidates.append((project_root() / "bundled_templates" / name).resolve())
+            except Exception:
+                pass
+        best = None
+        for c in candidates:
+            try:
+                cr = Path(c).resolve()
+                if cr.is_file():
+                    best = cr
+                    break
+            except Exception:
+                continue
+        if best is None:
+            return cur
+        try:
+            # Prefer bundled when it is same age or newer than the remembered copy.
+            if best.stat().st_mtime + 1.0 >= cur.stat().st_mtime:
+                return best
+        except Exception:
+            return best
+        return cur
+
     def _resolve_cad_template_file_path(
         self,
         path_raw: str,
@@ -2299,6 +3055,12 @@ class SurvyAIAgent:
             name = f"{Path(name).stem}.dwg"
 
         candidates = []
+        # Prefer shipped bundled defaults first for the canonical template names so
+        # edits under bundled_templates/ win over stale project-root copies.
+        if name.lower().startswith("survey_plan_template"):
+            candidates.append(resource_path("bundled_templates", name))
+            if not is_frozen_app():
+                candidates.append(project_root() / "bundled_templates" / name)
         if p.is_absolute():
             candidates.append(p)
         else:
@@ -2325,7 +3087,7 @@ class SurvyAIAgent:
             try:
                 cr = Path(c).resolve()
                 if cr.is_file():
-                    return cr
+                    return self._prefer_shipped_bundled_template(cr)
             except Exception:
                 continue
         return None
@@ -2576,6 +3338,17 @@ class SurvyAIAgent:
                         ent["name"] = recovered.name
                         tp = recovered
                         dirty = True
+                elif tp is not None and tp.exists():
+                    # Stale project-root copies of shipped templates → bundled_templates.
+                    preferred = self._prefer_shipped_bundled_template(tp)
+                    try:
+                        if preferred.resolve() != tp.resolve():
+                            ent["path"] = str(preferred.resolve())
+                            ent["name"] = preferred.name
+                            tp = preferred
+                            dirty = True
+                    except Exception:
+                        pass
                 exists = bool(tp is not None and tp.exists())
                 if bool(ent.get("is_available")) != bool(exists):
                     ent["is_available"] = bool(exists)
@@ -2953,14 +3726,836 @@ class SurvyAIAgent:
             "model_name": model_name,
         }
 
+    def _should_fastpath_excel_cadastral(self, query: str) -> bool:
+        """True when CAD plan coords must be composed from an Excel ownership workbook."""
+        body = self._cadastral_user_message_body(query)
+        ql = body.lower()
+        # Inspect/read/deeper-extract turns must never enter the Excel→DWG pipeline.
+        if is_tabular_inspect_only_request(body) or not explicit_cadastral_plot_intent(body):
+            return False
+        if ".dwg" not in ql:
+            return False
+        if any(m in ql for m in _CADASTRAL_FASTPATH_EXCLUDE_MARKERS):
+            return False
+        if not any(k in ql for k in ("generate", "create", "produce", "plot")):
+            return False
+        if not any(k in ql for k in ("excel", ".xlsx", ".xls", "spreadsheet", "workbook")):
+            return False
+        # Prefer dedicated Excel path only when Excel is the clear tabular source
+        # (not when the user primarily points at CSV/TXT/DOCX).
+        if any(k in ql for k in (".csv", "csv file", ".txt", "text file", ".docx", "word document")):
+            if not any(k in ql for k in ("excel", ".xlsx", ".xls", "spreadsheet", "workbook")):
+                return False
+        return coordinates_deferred_to_external_source(body)
+
+    def _should_fastpath_intelligent_cadastral(self, query: str) -> bool:
+        """
+        Complex / multi-format deferred cadastral composition.
+
+        Simple conventional prompts with inline EmE/NmN or bearings stay on the
+        hard-coded CAD fastpath (this returns False when coords are not deferred).
+        """
+        from agent.cadastral_compose import should_intelligent_cadastral_compose
+
+        body = self._cadastral_user_message_body(query)
+        if any(m in body.lower() for m in _CADASTRAL_FASTPATH_EXCLUDE_MARKERS):
+            return False
+        # Excel-only clear cases keep the cheaper dedicated Excel fastpath.
+        if self._should_fastpath_excel_cadastral(query):
+            return False
+        return should_intelligent_cadastral_compose(body)
+
+    def _run_intelligent_cadastral_pipeline(self, query: str) -> Dict[str, Any]:
+        """
+        File-deferred / complex cadastral goals:
+        discover CSV|TXT|DOCX|Excel → deterministic extract → optional RAG+LLM compose → plot.
+        """
+        import re
+        from pathlib import Path
+
+        from agent.cadastral_compose import (
+            build_subprompt_from_coordinates_blob,
+            compose_cadastral_from_files,
+            store_compose_example,
+        )
+        from agent.excel_cadastral import build_excel_cadastral_subprompt
+        from agent.pdf_survey_plan import extract_plan_details_for_dwg
+
+        scope = self._cadastral_user_message_body(query)
+        workspace = Path.cwd().resolve()
+
+        llm, _model = self._try_openai_tier_llm("simple")
+        if llm is None:
+            llm = getattr(self, "llm_primary", None)
+
+        composed = compose_cadastral_from_files(
+            scope,
+            workspace=workspace,
+            document_processor=getattr(self, "document_processor", None),
+            llm=llm,
+            run_with_timeout=self._run_with_timeout,
+            vector_store=getattr(self, "vector_store", None),
+            search_fn=self._vs_search,
+            prefer_llm=False,
+        )
+        if not composed.get("success"):
+            return {
+                "success": False,
+                "error": composed.get("error") or "Intelligent cadastral composition failed.",
+                "notes": composed.get("notes") or [],
+                "source_files": composed.get("source_files") or [],
+            }
+
+        notes = list(composed.get("notes") or [])
+        meta = dict(composed.get("metadata") or {})
+        ref_dwg = composed.get("reference_dwg")
+        if ref_dwg:
+            try:
+                self._ensure_autocad_connected()
+                details = extract_plan_details_for_dwg(
+                    self.autocad,
+                    getattr(self, "dxf_fallback", None),
+                    str(ref_dwg),
+                    llm=llm,
+                    run_with_timeout=self._run_with_timeout,
+                )
+                plan = details.get("survey_plan")
+                if plan is not None:
+                    try:
+                        from agent.pdf_survey_plan import (
+                            ensure_surveyor_professional_title,
+                            normalize_lga_name,
+                        )
+                    except Exception:
+                        ensure_surveyor_professional_title = None  # type: ignore
+                        normalize_lga_name = None  # type: ignore
+                    for key, attr in (
+                        ("location", "location"),
+                        ("lga", "lga"),
+                        ("state", "state"),
+                        ("plan_number", "plan_number"),
+                        ("surveyor_name", "surveyor_name"),
+                        ("surveyor_address", "surveyor_address"),
+                        ("origin_crs", "origin_crs"),
+                    ):
+                        val = (getattr(plan, attr, None) or "").strip()
+                        if key == "lga" and val and normalize_lga_name is not None:
+                            val = normalize_lga_name(val) or val
+                        if key == "surveyor_name" and val and ensure_surveyor_professional_title is not None:
+                            val = ensure_surveyor_professional_title(val) or val
+                        if val and not meta.get(key):
+                            meta[key] = val
+                errs = details.get("errors") or []
+                if errs:
+                    notes.append("Reference plan warnings: " + "; ".join(str(e) for e in errs[:3]))
+            except Exception as exc:
+                notes.append(f"Could not fully extract metadata from reference DWG: {exc}")
+
+        # Prompt CRS/date overrides
+        m_crs = re.search(
+            r"(?:origin_crs|crs_origin)\s*[:=]\s*([^,\n]+)",
+            scope,
+            flags=re.IGNORECASE,
+        )
+        if m_crs:
+            meta["origin_crs"] = m_crs.group(1).strip().strip("'\"")
+        try:
+            from agent.pdf_survey_plan import (
+                extract_user_requested_certification_date,
+                resolve_certification_date_from_query,
+            )
+
+            user_cert = (
+                extract_user_requested_certification_date(scope)
+                or resolve_certification_date_from_query(scope, scope_text=scope)
+            )
+        except Exception:
+            user_cert = None
+        if user_cert:
+            meta["certification_date"] = user_cert
+
+        # Explicit starting / field plan number in the prompt wins over reference DWG.
+        try:
+            from agent.pdf_survey_plan import extract_user_requested_plan_number
+
+            user_plan_no = extract_user_requested_plan_number(scope)
+        except Exception:
+            user_plan_no = None
+        if user_plan_no:
+            prev = (meta.get("plan_number") or "").strip()
+            if prev and prev != user_plan_no:
+                notes.append(
+                    f"Using user-requested starting plan number {user_plan_no} "
+                    f"(overrides reference/composed plan no. {prev})."
+                )
+            meta["plan_number"] = user_plan_no
+
+        parcels = composed.get("parcels") or []
+        output_dwg = composed.get("output_dwg")
+
+        # Separate owner plans (Excel/CSV ownership blocks → one DWG each).
+        from agent.excel_cadastral import (
+            build_separate_owner_plan_jobs,
+            wants_separate_owner_plans,
+        )
+
+        if wants_separate_owner_plans(scope) and len(parcels) >= 1:
+            try:
+                from agent.pdf_survey_plan import (
+                    extract_user_requested_scale_denom,
+                    scrub_surveyor_metadata_value,
+                )
+
+                scope_scale = extract_user_requested_scale_denom(scope)
+            except Exception:
+                scrub_surveyor_metadata_value = None  # type: ignore
+                scope_scale = None
+            if not scope_scale:
+                try:
+                    scope_scale = int(meta.get("scale_denom") or 0) or None
+                except Exception:
+                    scope_scale = None
+            surv_nm = meta.get("surveyor_name", "")
+            surv_addr = meta.get("surveyor_address", "")
+            if scrub_surveyor_metadata_value is not None:
+                try:
+                    surv_nm = scrub_surveyor_metadata_value(surv_nm, max_len=100)
+                    surv_addr = scrub_surveyor_metadata_value(surv_addr, max_len=200)
+                except Exception:
+                    pass
+            jobs_built = build_separate_owner_plan_jobs(
+                parcels=parcels,
+                workspace=workspace,
+                location=meta.get("location", ""),
+                lga=meta.get("lga", ""),
+                state=meta.get("state", ""),
+                origin_crs=meta.get("origin_crs", "") or "UTM Zone 32N",
+                plan_number=meta.get("plan_number", ""),
+                surveyor_name=surv_nm,
+                surveyor_address=surv_addr,
+                certification_date=meta.get("certification_date", ""),
+                scale_denom=scope_scale,
+            )
+            if not jobs_built.get("success"):
+                return {
+                    "success": False,
+                    "error": jobs_built.get("error")
+                    or "Failed to compose per-owner cadastral prompts.",
+                    "notes": notes,
+                    "source_files": composed.get("source_files") or [],
+                    "mode": "separate_owner_plans",
+                }
+            plan_results: List[Dict[str, Any]] = []
+            ok = 0
+            batch_template: Optional[str] = None
+            batch_profile: Optional[str] = None
+            try:
+                mem = self._resolve_cadastral_template_from_memory(scope)
+                if mem:
+                    batch_template = mem.get("template_path") or None
+                    batch_profile = mem.get("profile_path") or None
+            except Exception:
+                pass
+            jobs_list = list(jobs_built.get("jobs") or [])
+            n_jobs = len(jobs_list)
+            for i, job in enumerate(jobs_list):
+                # True single-parcel route per owner; reuse CAD session/template after the first.
+                is_first = i == 0
+                is_last = i >= n_jobs - 1
+                plot = self._run_cadastral_cad_prompt_pipeline(
+                    job["subprompt"],
+                    skip_intent_assessment=True,
+                    # Parent scope keeps access-road / fence extras from the user prompt.
+                    user_scope_for_extras=scope,
+                    extra_parcels=[],
+                    extent_points=[],
+                    main_parcel_label="",
+                    skip_session_prep=not is_first,
+                    batch_mode=not is_first,
+                    template_override_path=batch_template,
+                    profile_override_path=batch_profile,
+                    # Close finished owner DWGs between plans so Documents does not wedge.
+                    close_output_after_save=not is_last,
+                    source_scale_denom=job.get("scale_denom") or scope_scale,
+                )
+                entry = {
+                    "owner_name": job.get("owner_name"),
+                    "plan_number": job.get("plan_number"),
+                    "output_dwg": plot.get("output_dwg") or job.get("output_dwg"),
+                    "success": bool(plot.get("success")),
+                    "error": plot.get("error"),
+                }
+                plan_results.append(entry)
+                if plot.get("success"):
+                    ok += 1
+                    self._last_cadastral_output_dwg = plot.get("output_dwg")
+                    self._last_cadastral_profile_path = plot.get("profile_path")
+                    if plot.get("template_path"):
+                        batch_template = str(plot.get("template_path"))
+                    if plot.get("profile_path"):
+                        batch_profile = str(plot.get("profile_path"))
+                    try:
+                        store_compose_example(
+                            getattr(self, "vector_store", None),
+                            query=scope,
+                            composed_subprompt=job["subprompt"],
+                            source_files=composed.get("source_files") or [],
+                        )
+                    except Exception:
+                        pass
+                elif not is_last:
+                    # Failed mid-batch: drop any half-open tab and recover COM before next owner.
+                    try:
+                        out_try = plot.get("output_dwg") or job.get("output_dwg")
+                        if out_try and hasattr(self.autocad, "save_and_close_drawing"):
+                            self.autocad.save_and_close_drawing(str(out_try), save=False)
+                        elif hasattr(self.autocad, "recover_com_session"):
+                            self.autocad.recover_com_session(reason="separate-owner plan failed")
+                    except Exception:
+                        pass
+
+            outputs = [r.get("output_dwg") for r in plan_results if r.get("success")]
+            return {
+                "success": ok > 0,
+                "output_dwg": outputs[-1] if outputs else None,
+                "output_dwgs": outputs,
+                "plans": plan_results,
+                "plans_total": n_jobs,
+                "plans_success": ok,
+                "plans_failed": n_jobs - ok,
+                "dup_xlsx": composed.get("dup_xlsx"),
+                "parcel_count": len(parcels),
+                "buyer_name": ", ".join(
+                    str(j.get("owner_name") or "") for j in jobs_list
+                ),
+                "reference_dwg": ref_dwg,
+                "source_files": composed.get("source_files") or [],
+                "compose_source": composed.get("compose_source"),
+                "notes": notes,
+                "mode": "separate_owner_plans",
+                "requested_scale": scope_scale,
+                "error": None
+                if ok > 0
+                else (plan_results[-1].get("error") if plan_results else "No owner plans plotted."),
+            }
+
+        if parcels:
+            try:
+                from agent.pdf_survey_plan import extract_user_requested_scale_denom
+
+                scope_scale = extract_user_requested_scale_denom(scope)
+            except Exception:
+                scope_scale = None
+            rebuilt = build_excel_cadastral_subprompt(
+                output_dwg=str(output_dwg),
+                parcels=parcels,
+                location=meta.get("location", ""),
+                lga=meta.get("lga", ""),
+                state=meta.get("state", ""),
+                origin_crs=meta.get("origin_crs", "") or "UTM Zone 32N",
+                plan_number=meta.get("plan_number", ""),
+                surveyor_name=meta.get("surveyor_name", ""),
+                surveyor_address=meta.get("surveyor_address", ""),
+                certification_date=meta.get("certification_date", ""),
+                scale_denom=scope_scale,
+            )
+            if not rebuilt.get("success"):
+                return {
+                    "success": False,
+                    "error": rebuilt.get("error") or "Failed to rebuild cadastral subprompt.",
+                    "notes": notes,
+                }
+            subprompt = rebuilt["subprompt"]
+            extra_parcels = rebuilt.get("extra_parcels") or []
+            extent_points = rebuilt.get("extent_points") or []
+            main_label = rebuilt.get("main_parcel_label") or ""
+            buyer_name = rebuilt.get("buyer_name") or composed.get("buyer_name")
+        else:
+            subprompt = build_subprompt_from_coordinates_blob(
+                output_dwg=str(output_dwg),
+                coordinates_blob=str(composed.get("coordinates_blob") or ""),
+                buyer_name=meta.get("buyer_name") or composed.get("buyer_name") or "Buyer",
+                location=meta.get("location", ""),
+                lga=meta.get("lga", ""),
+                state=meta.get("state", ""),
+                origin_crs=meta.get("origin_crs", "") or "UTM Zone 32N",
+                plan_number=meta.get("plan_number", ""),
+                surveyor_name=meta.get("surveyor_name", ""),
+                surveyor_address=meta.get("surveyor_address", ""),
+                certification_date=meta.get("certification_date", ""),
+                pillar_numbers=meta.get("pillar_numbers") or [],
+            )
+            extra_parcels = []
+            extent_points = []
+            main_label = ""
+            buyer_name = meta.get("buyer_name") or composed.get("buyer_name")
+
+        plot = self._run_cadastral_cad_prompt_pipeline(
+            subprompt,
+            skip_intent_assessment=True,
+            user_scope_for_extras=scope,
+            extra_parcels=extra_parcels,
+            extent_points=extent_points,
+            main_parcel_label=main_label,
+        )
+        if not plot.get("success"):
+            return {
+                "success": False,
+                "error": plot.get("error") or "Cadastral plot after intelligent composition failed.",
+                "composed_prompt": subprompt,
+                "dup_xlsx": composed.get("dup_xlsx"),
+                "notes": notes,
+                "source_files": composed.get("source_files") or [],
+            }
+
+        try:
+            store_compose_example(
+                getattr(self, "vector_store", None),
+                query=scope,
+                composed_subprompt=subprompt,
+                source_files=composed.get("source_files") or [],
+            )
+        except Exception:
+            pass
+
+        self._last_cadastral_output_dwg = plot.get("output_dwg")
+        self._last_cadastral_profile_path = plot.get("profile_path")
+        return {
+            "success": True,
+            "output_dwg": plot.get("output_dwg"),
+            "geometry": plot.get("geometry"),
+            "profile_path": plot.get("profile_path"),
+            "dup_xlsx": composed.get("dup_xlsx"),
+            "parcel_count": len(parcels) if parcels else 1,
+            "buyer_name": buyer_name,
+            "reference_dwg": ref_dwg,
+            "source_files": composed.get("source_files") or [],
+            "compose_source": composed.get("compose_source"),
+            "notes": notes,
+            "access_road_title": plot.get("access_road_title"),
+            "mode": "intelligent_compose",
+        }
+
+    def _run_excel_cadastral_pipeline(self, query: str) -> Dict[str, Any]:
+        """
+        Excel family/ownership parcels → optional normalized copy (any name the user asks) →
+        metadata from reference DWG → cadastral plot(s).
+
+        Semantic layout:
+        - Separate owner plans: one DWG per owner (buyer name = filename; plan nos. increment).
+        - Multi-parcel (default for multi-owner Excel when not separate): one DWG, all owners.
+
+        Plotting may use the input workbook directly; workbook choice is semantic
+        (real owners / family-block layout), not filename.
+        """
+        import re
+        from pathlib import Path
+
+        from agent.excel_cadastral import (
+            build_excel_cadastral_subprompt,
+            build_separate_owner_plan_jobs,
+            find_reference_dwg_from_query,
+            resolve_ownership_excel_for_plot,
+            wants_separate_owner_plans,
+            write_dup_xlsx_with_headers,
+        )
+        from agent.pdf_survey_plan import extract_plan_details_for_dwg
+
+        scope = self._cadastral_user_message_body(query)
+        workspace = Path.cwd().resolve()
+
+        # Hard gate: never invent a CAD drawing from a read/extract/deeper-search turn.
+        if not explicit_cadastral_plot_intent(scope):
+            return {
+                "success": False,
+                "error": (
+                    "Excel cadastral plotting was refused: the current request does not "
+                    "explicitly ask to generate/create/plot a CAD/.dwg plan. "
+                    "Continue with spreadsheet read/extract tools (or a deeper extract) instead. "
+                    "Only call excel_cadastral_plot after the user clearly requests a DWG/CAD plan."
+                ),
+                "refused_reason": "missing_explicit_cadastral_plot_intent",
+            }
+
+        resolved = resolve_ownership_excel_for_plot(scope, workspace)
+        if not resolved.get("success"):
+            return {
+                "success": False,
+                "error": resolved.get("error")
+                or (
+                    "Could not find a usable Excel ownership workbook in the workspace. "
+                    "Place the coordinates file in the active workspace (or quote its path) and retry."
+                ),
+            }
+        excel_path = Path(resolved["path"])
+        parcels = list(resolved.get("parcels") or [])
+
+        # Optional normalized copy — only when the user asked (any filename they choose).
+        dup_path = None
+        if resolved.get("write_copy"):
+            dup = write_dup_xlsx_with_headers(
+                excel_path,
+                dest_name=resolved.get("copy_name"),
+                parcels=parcels,
+                query=scope,
+            )
+            if not dup.get("success"):
+                return {
+                    "success": False,
+                    "error": dup.get("error") or "Failed to write the requested Excel copy.",
+                }
+            dup_path = dup.get("output_path")
+            # If the user asked for a copy, prefer plotting from the freshly written names.
+            try:
+                from agent.excel_cadastral import parse_family_parcels_from_excel
+
+                reparsed = parse_family_parcels_from_excel(dup_path)
+                if reparsed.get("success") and reparsed.get("parcels"):
+                    parcels = reparsed["parcels"]
+            except Exception:
+                pass
+
+        # Output DWG: honor Generate … .dwg; otherwise derive from first owner (never invent
+        # a fixed brand name such as Excel_Families.dwg).
+        out_name = default_excel_plot_output_name(scope, parcels)
+        output_dwg = str((workspace / out_name).resolve())
+
+        # Metadata from an existing plan named in the prompt (location/LGA/surveyor/plan no.).
+        location = lga = state = plan_number = surveyor_name = surveyor_address = ""
+        origin_crs = ""
+        m_crs = re.search(
+            r"(?:origin_crs|crs_origin)\s*[:=]\s*([^,\n]+)",
+            scope,
+            flags=re.IGNORECASE,
+        )
+        if m_crs:
+            origin_crs = m_crs.group(1).strip().strip("'\"")
+        cert_date = ""
+        try:
+            from agent.pdf_survey_plan import (
+                extract_user_requested_certification_date,
+                resolve_certification_date_from_query,
+            )
+
+            cert_date = (
+                extract_user_requested_certification_date(scope)
+                or resolve_certification_date_from_query(scope, scope_text=scope)
+                or ""
+            )
+        except Exception:
+            m_cert = re.search(
+                r"(?:date\s+on\s+the\s+certification|certification\s+date|\bdate)\s*[:=]\s*"
+                r"([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})",
+                scope,
+                flags=re.IGNORECASE,
+            )
+            if m_cert:
+                cert_date = m_cert.group(1).strip()
+
+        ref_dwg = find_reference_dwg_from_query(scope, workspace)
+        meta_notes: List[str] = []
+        if ref_dwg:
+            try:
+                # Warm AutoCAD COM on this worker thread before reference metadata open.
+                # Prevents RPC_E_CALL_REJECTED when the first COM call is Documents.Open.
+                self._ensure_autocad_connected()
+                llm, _model = self._try_openai_tier_llm("simple")
+                details = extract_plan_details_for_dwg(
+                    self.autocad,
+                    getattr(self, "dxf_fallback", None),
+                    str(ref_dwg),
+                    llm=llm or getattr(self, "llm_primary", None),
+                    run_with_timeout=self._run_with_timeout,
+                )
+                plan = details.get("survey_plan")
+                if plan is not None:
+                    location = (getattr(plan, "location", None) or "").strip()
+                    try:
+                        from agent.pdf_survey_plan import (
+                            ensure_surveyor_professional_title,
+                            normalize_lga_name,
+                        )
+
+                        lga = normalize_lga_name(getattr(plan, "lga", None) or "") or (
+                            getattr(plan, "lga", None) or ""
+                        ).strip()
+                    except Exception:
+                        ensure_surveyor_professional_title = None  # type: ignore
+                        lga = (getattr(plan, "lga", None) or "").strip()
+                    state = (getattr(plan, "state", None) or "").strip()
+                    plan_number = (getattr(plan, "plan_number", None) or "").strip()
+                    surveyor_name = (getattr(plan, "surveyor_name", None) or "").strip()
+                    if surveyor_name and ensure_surveyor_professional_title is not None:
+                        try:
+                            surveyor_name = ensure_surveyor_professional_title(surveyor_name) or surveyor_name
+                        except Exception:
+                            pass
+                    surveyor_address = (getattr(plan, "surveyor_address", None) or "").strip()
+                    try:
+                        from agent.pdf_survey_plan import scrub_surveyor_metadata_value
+
+                        surveyor_name = scrub_surveyor_metadata_value(surveyor_name, max_len=100)
+                        surveyor_address = scrub_surveyor_metadata_value(
+                            surveyor_address, max_len=200
+                        )
+                    except Exception:
+                        pass
+                    if not origin_crs:
+                        origin_crs = (getattr(plan, "origin_crs", None) or "").strip()
+                errs = details.get("errors") or []
+                if errs:
+                    meta_notes.append("Reference plan warnings: " + "; ".join(str(e) for e in errs[:3]))
+            except Exception as exc:
+                meta_notes.append(f"Could not fully extract metadata from {ref_dwg.name}: {exc}")
+        else:
+            meta_notes.append(
+                "No reference .dwg found in the workspace for location/surveyor/plan number; "
+                "title-block fields from the prompt (if any) will be used."
+            )
+
+        # Explicit starting / field plan number in the prompt ALWAYS wins over the
+        # reference DWG plan no. (e.g. "start from plan number 'RV/018/2026/SP'").
+        # "Take location/surveyor from existing plan" does NOT imply take plan number
+        # when the user also stated a start-from / plan-number base.
+        try:
+            from agent.pdf_survey_plan import extract_user_requested_plan_number
+
+            user_plan_no = extract_user_requested_plan_number(scope)
+        except Exception:
+            user_plan_no = None
+        if user_plan_no:
+            if plan_number and plan_number != user_plan_no:
+                meta_notes.append(
+                    f"Using user-requested starting plan number {user_plan_no} "
+                    f"(overrides reference plan no. {plan_number})."
+                )
+            elif not plan_number:
+                meta_notes.append(
+                    f"Using user-requested starting plan number {user_plan_no}."
+                )
+            plan_number = user_plan_no
+
+        # --- Separate owner plans: one DWG per Excel ownership block ---
+        if wants_separate_owner_plans(scope) and len(parcels) >= 1:
+            try:
+                from agent.pdf_survey_plan import extract_user_requested_scale_denom
+
+                scope_scale = extract_user_requested_scale_denom(scope)
+            except Exception:
+                scope_scale = None
+            jobs_built = build_separate_owner_plan_jobs(
+                parcels=parcels,
+                workspace=workspace,
+                location=location,
+                lga=lga,
+                state=state,
+                origin_crs=origin_crs or "UTM Zone 32N",
+                plan_number=plan_number,
+                surveyor_name=surveyor_name,
+                surveyor_address=surveyor_address,
+                certification_date=cert_date,
+                template_path=None,
+                scale_denom=scope_scale,
+            )
+            if not jobs_built.get("success"):
+                return {
+                    "success": False,
+                    "error": jobs_built.get("error")
+                    or "Failed to compose per-owner cadastral prompts from Excel.",
+                    "normalized_xlsx": dup_path,
+                    "dup_xlsx": dup_path,
+                    "notes": meta_notes,
+                    "mode": "separate_owner_plans",
+                }
+            if jobs_built.get("truncated"):
+                meta_notes.append(
+                    f"Plotted first {jobs_built.get('plan_count')} of "
+                    f"{jobs_built.get('usable_parcel_count')} owner parcels "
+                    "(separate-plan batch cap)."
+                )
+            plan_results: List[Dict[str, Any]] = []
+            ok = 0
+            batch_template: Optional[str] = None
+            batch_profile: Optional[str] = None
+            try:
+                mem = self._resolve_cadastral_template_from_memory(scope)
+                if mem:
+                    batch_template = mem.get("template_path") or None
+                    batch_profile = mem.get("profile_path") or None
+            except Exception:
+                pass
+            jobs_list = list(jobs_built.get("jobs") or [])
+            n_jobs = len(jobs_list)
+            for i, job in enumerate(jobs_list):
+                # True single-parcel route per owner; reuse CAD session/template after the first.
+                is_first = i == 0
+                is_last = i >= n_jobs - 1
+                plot = self._run_cadastral_cad_prompt_pipeline(
+                    job["subprompt"],
+                    skip_intent_assessment=True,
+                    # Parent scope keeps access-road / fence extras from the user prompt.
+                    user_scope_for_extras=scope,
+                    extra_parcels=[],
+                    extent_points=[],
+                    main_parcel_label="",
+                    skip_session_prep=not is_first,
+                    batch_mode=not is_first,
+                    template_override_path=batch_template,
+                    profile_override_path=batch_profile,
+                    # Close finished owner DWGs between plans so Documents does not wedge.
+                    close_output_after_save=not is_last,
+                    source_scale_denom=job.get("scale_denom") or scope_scale,
+                )
+                entry = {
+                    "owner_name": job.get("owner_name"),
+                    "plan_number": job.get("plan_number"),
+                    "output_dwg": plot.get("output_dwg") or job.get("output_dwg"),
+                    "success": bool(plot.get("success")),
+                    "error": plot.get("error"),
+                    "cancelled": bool(plot.get("cancelled")),
+                    "locked": bool(plot.get("locked")),
+                    "geometry": plot.get("geometry"),
+                    "profile_path": plot.get("profile_path"),
+                    "access_road_title": plot.get("access_road_title"),
+                }
+                plan_results.append(entry)
+                if plot.get("success"):
+                    ok += 1
+                    self._last_cadastral_output_dwg = plot.get("output_dwg")
+                    self._last_cadastral_profile_path = plot.get("profile_path")
+                    if plot.get("template_path"):
+                        batch_template = str(plot.get("template_path"))
+                    if plot.get("profile_path"):
+                        batch_profile = str(plot.get("profile_path"))
+                elif plot.get("cancelled") or plot.get("locked"):
+                    return {
+                        "success": False,
+                        "cancelled": bool(plot.get("cancelled")),
+                        "locked": bool(plot.get("locked")),
+                        "error": plot.get("error") or "CAD generation stopped.",
+                        "normalized_xlsx": dup_path,
+                        "dup_xlsx": dup_path,
+                        "plans": plan_results,
+                        "plans_success": ok,
+                        "plans_total": n_jobs,
+                        "parcel_count": len(parcels),
+                        "reference_dwg": str(ref_dwg) if ref_dwg else None,
+                        "excel_path": str(excel_path),
+                        "notes": meta_notes,
+                        "mode": "separate_owner_plans",
+                    }
+                elif not is_last:
+                    # Failed mid-batch: drop any half-open tab and recover COM before next owner.
+                    try:
+                        out_try = plot.get("output_dwg") or job.get("output_dwg")
+                        if out_try and hasattr(self.autocad, "save_and_close_drawing"):
+                            self.autocad.save_and_close_drawing(str(out_try), save=False)
+                        elif hasattr(self.autocad, "recover_com_session"):
+                            self.autocad.recover_com_session(reason="separate-owner plan failed")
+                    except Exception:
+                        pass
+
+            outputs = [r.get("output_dwg") for r in plan_results if r.get("success")]
+            return {
+                "success": ok > 0,
+                "output_dwg": outputs[-1] if outputs else None,
+                "output_dwgs": outputs,
+                "plans": plan_results,
+                "plans_total": n_jobs,
+                "plans_success": ok,
+                "plans_failed": n_jobs - ok,
+                "normalized_xlsx": dup_path,
+                "dup_xlsx": dup_path,
+                "parcel_count": len(parcels),
+                "buyer_name": ", ".join(
+                    str(j.get("owner_name") or "") for j in jobs_list
+                ),
+                "reference_dwg": str(ref_dwg) if ref_dwg else None,
+                "excel_path": str(excel_path),
+                "notes": meta_notes,
+                "mode": "separate_owner_plans",
+                "requested_scale": scope_scale,
+                "error": None
+                if ok > 0
+                else (plan_results[-1].get("error") if plan_results else "No owner plans plotted."),
+            }
+
+        try:
+            from agent.pdf_survey_plan import extract_user_requested_scale_denom
+
+            scope_scale = extract_user_requested_scale_denom(scope)
+        except Exception:
+            scope_scale = None
+        composed = build_excel_cadastral_subprompt(
+            output_dwg=output_dwg,
+            parcels=parcels,
+            location=location,
+            lga=lga,
+            state=state,
+            origin_crs=origin_crs or "UTM Zone 32N",
+            plan_number=plan_number,
+            surveyor_name=surveyor_name,
+            surveyor_address=surveyor_address,
+            certification_date=cert_date,
+            template_path=None,
+            scale_denom=scope_scale,
+        )
+        if not composed.get("success"):
+            return {
+                "success": False,
+                "error": composed.get("error") or "Failed to compose cadastral prompt from Excel.",
+            }
+
+        plot = self._run_cadastral_cad_prompt_pipeline(
+            composed["subprompt"],
+            skip_intent_assessment=True,
+            user_scope_for_extras=scope,
+            extra_parcels=composed.get("extra_parcels") or [],
+            extent_points=composed.get("extent_points") or [],
+            main_parcel_label=composed.get("main_parcel_label") or "",
+        )
+        if not plot.get("success"):
+            return {
+                "success": False,
+                "cancelled": bool(plot.get("cancelled")),
+                "locked": bool(plot.get("locked")),
+                "error": plot.get("error") or "Cadastral plot from Excel failed.",
+                "normalized_xlsx": dup_path,
+                "dup_xlsx": dup_path,
+                "composed_prompt": composed.get("subprompt"),
+                "notes": meta_notes,
+                "mode": "multi_parcel" if len(parcels) > 1 else "single",
+            }
+
+        self._last_cadastral_output_dwg = plot.get("output_dwg")
+        self._last_cadastral_profile_path = plot.get("profile_path")
+        return {
+            "success": True,
+            "output_dwg": plot.get("output_dwg"),
+            "geometry": plot.get("geometry"),
+            "profile_path": plot.get("profile_path"),
+            "normalized_xlsx": dup_path,
+            "dup_xlsx": dup_path,
+            "parcel_count": len(parcels),
+            "buyer_name": composed.get("buyer_name"),
+            "reference_dwg": str(ref_dwg) if ref_dwg else None,
+            "excel_path": str(excel_path),
+            "notes": meta_notes,
+            "access_road_title": plot.get("access_road_title"),
+            "mode": "multi_parcel" if len(parcels) > 1 else "single",
+        }
+
     def _should_fastpath_cadastral_cad(self, query: str) -> bool:
         import re
 
-        raw = query or ""
+        raw = self._cadastral_user_message_body(query or "")
         q = raw.lower()
         if ".dwg" not in q:
             return False
         if any(m in q for m in _CADASTRAL_FASTPATH_EXCLUDE_MARKERS):
+            return False
+        # Coordinates live in Excel/files — handled by excel-cadastral fastpath / LLM tools.
+        if coordinates_deferred_to_external_source(raw):
             return False
 
         has_generate = any(k in q for k in ["generate", "create", "produce", "save"])
@@ -3053,6 +4648,8 @@ class SurvyAIAgent:
         if ".dwg" not in ql:
             return False
         if any(m in ql for m in _CADASTRAL_FASTPATH_EXCLUDE_MARKERS):
+            return False
+        if coordinates_deferred_to_external_source(body):
             return False
         if "coordinates" not in ql:
             return False
@@ -3284,6 +4881,14 @@ class SurvyAIAgent:
         source_scale_denom: Optional[int] = None,
         skip_intent_assessment: bool = False,
         user_scope_for_extras: Optional[str] = None,
+        extra_parcels: Optional[List[Dict[str, Any]]] = None,
+        extent_points: Optional[List[Dict[str, Any]]] = None,
+        main_parcel_label: Optional[str] = None,
+        skip_session_prep: bool = False,
+        batch_mode: bool = False,
+        template_override_path: Optional[str] = None,
+        profile_override_path: Optional[str] = None,
+        close_output_after_save: bool = False,
     ) -> Dict[str, Any]:
         """
         Deterministic parser for your cadastral prompts.
@@ -3292,6 +4897,9 @@ class SurvyAIAgent:
         - ABSOLUTE: The survey template DWG is never modified; all edits are to a copy (output drawing).
         - Access road / fence extras: regex baseline plus optional vector-store + LLM assessment
           (see cadastral_intent_assessment_enabled) so varied prompt styles still plot correctly.
+        - Optional multi-parcel layouts: ``extra_parcels`` + ``main_parcel_label`` drawn in local
+          space (unique pegs, deduped traverse edges, owner labels) before the UTM move;
+          ``extent_points`` enlarge scale fit. Legacy post-move overlay is a fallback only.
         """
         import re
         from concurrent.futures import ThreadPoolExecutor
@@ -3301,6 +4909,10 @@ class SurvyAIAgent:
         cad_future = cad_pool.submit(self._ensure_autocad_connected)
 
         q = self._cadastral_user_message_body(query or "")
+        extra_parcels = list(extra_parcels or [])
+        extent_points = list(extent_points or [])
+        main_parcel_label = (main_parcel_label or "").strip()
+        close_output_after_save = bool(close_output_after_save)
 
         simple_override_llm: Any = None
         simple_override_model: Optional[str] = None
@@ -3412,32 +5024,40 @@ class SurvyAIAgent:
                 r"date\s+on\s+the\s+certification\s*[:=]\s*'([^']+)'",
                 r'date\s+on\s+the\s+certification\s*[:=]\s*"([^"]+)"',
                 r"date\s+on\s+the\s+certification\s*[:=]\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})",
+                r"(?:^|[\n,;])\s*date\s*[:=]\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})",
+                r"\bdate\s*[:=]\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})",
+                r"certification\s+date\s*[:=]\s*([0-9]{1,2}[/-][0-9]{1,2}[/-][0-9]{2,4})",
             ]
         )
         if not cert_date:
             try:
-                from agent.pdf_survey_plan import resolve_plan_overrides_from_query
+                from agent.pdf_survey_plan import (
+                    extract_user_requested_certification_date,
+                    resolve_plan_overrides_from_query,
+                )
 
-                cert_date = resolve_plan_overrides_from_query(
-                    q,
-                    scope_text=q,
-                    llm=_simple_override_llm(),
-                    run_with_timeout=self._run_with_timeout,
-                ).certification_date
+                cert_date = extract_user_requested_certification_date(q)
+                if not cert_date:
+                    cert_date = resolve_plan_overrides_from_query(
+                        q,
+                        scope_text=q,
+                        llm=_simple_override_llm(),
+                        run_with_timeout=self._run_with_timeout,
+                    ).certification_date
             except Exception:
                 cert_date = None
         surveyor = _pick(
             [
                 r"surveyor\s+name\s*[:=]\s*'([^']+)'",
                 r'surveyor\s+name\s*[:=]\s*"([^"]+)"',
-                r"surveyor\s+name\s*[:=]\s*(.+?)(?=\s*,\s*Surveyor\s+company\s+and\s+address|\s*Surveyor\s+company\s+and\s+address|\s*,\s*pillar|\Z)",
+                rf"surveyor\s+name\s*[:=]\s*(.+?){_CADASTRAL_NEXT_FIELD}",
             ]
         )
         surveyor_addr = _pick(
             [
                 r"surveyor\s+company\s+and\s+address\s*[:=]\s*'([^']+)'",
                 r'surveyor\s+company\s+and\s+address\s*[:=]\s*"([^"]+)"',
-                r"surveyor\s+company\s+and\s+address\s*[:=]\s*(.+?)(?=\s*,\s*pillar\s+numbers|\s*pillar\s+numbers|\Z)",
+                rf"surveyor\s+company\s+and\s+address\s*[:=]\s*(.+?){_CADASTRAL_NEXT_FIELD}",
             ]
         )
 
@@ -3520,24 +5140,26 @@ class SurvyAIAgent:
         cad_future.result()
         cad_pool.shutdown(wait=False)
 
-        # Parse user-requested plot scale — prefer explicit "Plot using scale 1:xxx" (PDF replot).
+        # Parse user-requested plot scale (honour explicit request; fit may coarsen later).
+        # Prefer the composed cadastral prompt, then the parent user scope (Excel/batch),
+        # then a PDF/source extraction — never let source overwrite an explicit prompt scale.
         user_scale_denom = None
-        scale_m = re.search(r"plot\s+using\s+scale\s+1\s*:\s*(\d+)", q, re.IGNORECASE)
-        if scale_m:
-            user_scale_denom = int(scale_m.group(1))
-        if not user_scale_denom:
-            scale_m = re.search(
-                r"(?:^|\n)\s*scale\s+1\s*:\s*(\d+)",
-                q,
-                re.IGNORECASE,
-            )
+        try:
+            from agent.pdf_survey_plan import extract_user_requested_scale_denom
+
+            user_scale_denom = extract_user_requested_scale_denom(q)
+            if not user_scale_denom and user_scope_for_extras:
+                user_scale_denom = extract_user_requested_scale_denom(user_scope_for_extras)
+        except Exception:
+            user_scale_denom = None
+            scale_m = re.search(r"plot\s+using\s+scale\s+1\s*:\s*(\d+)", q, re.IGNORECASE)
             if scale_m:
                 user_scale_denom = int(scale_m.group(1))
-        if not user_scale_denom:
-            scale_m = re.search(r"1\s*:\s*(\d+)\s*(?:scale|plot)", q, re.IGNORECASE)
-            if scale_m:
-                user_scale_denom = int(scale_m.group(1))
-        if source_scale_denom and int(source_scale_denom) > 0:
+            if not user_scale_denom:
+                scale_m = re.search(r"\bscale\s*[:=]?\s*1\s*:\s*(\d+)", q, re.IGNORECASE)
+                if scale_m:
+                    user_scale_denom = int(scale_m.group(1))
+        if not user_scale_denom and source_scale_denom and int(source_scale_denom) > 0:
             user_scale_denom = int(source_scale_denom)
 
         # Parse optional road title override for first road (e.g. "title as 'UMUAKURU-UMUALILI ROAD'")
@@ -3557,20 +5179,23 @@ class SurvyAIAgent:
             try:
                 from agent.pdf_survey_plan import trim_metadata_field
 
-                buyer = trim_metadata_field(buyer, max_len=140)
+                # Multi-owner Excel layouts: "AMADI (A), ODUOHA (B), ..." need a longer budget.
+                buyer_max = 900 if (buyer.count(",") >= 2 or re.search(r"\([A-Z]{1,3}\)", buyer)) else 140
+                buyer = trim_metadata_field(buyer, max_len=buyer_max)
             except Exception:
-                buyer = buyer.split("\n")[0].strip()[:140]
+                buyer = buyer.split("\n")[0].strip()[:900]
         if location:
             try:
                 from agent.pdf_survey_plan import trim_metadata_field
 
-                location = trim_metadata_field(location, max_len=120)
+                location = trim_metadata_field(location, max_len=200)
             except Exception:
-                location = location.split("\n")[0].strip()[:120]
+                location = location.split("\n")[0].strip()[:200]
         if lga:
             try:
-                from agent.pdf_survey_plan import trim_metadata_field
+                from agent.pdf_survey_plan import normalize_lga_name, trim_metadata_field
 
+                lga = normalize_lga_name(lga) or trim_metadata_field(lga, max_len=80)
                 lga = trim_metadata_field(lga, max_len=80)
             except Exception:
                 lga = lga.split("\n")[0].strip()[:80]
@@ -3588,8 +5213,29 @@ class SurvyAIAgent:
                 origin = trim_metadata_field(origin, max_len=60)
             except Exception:
                 origin = origin.split("\n")[0].strip()[:60]
+        if surveyor:
+            try:
+                from agent.pdf_survey_plan import (
+                    ensure_surveyor_professional_title,
+                    scrub_surveyor_metadata_value,
+                )
+
+                surveyor = ensure_surveyor_professional_title(
+                    scrub_surveyor_metadata_value(surveyor, max_len=100)
+                )
+            except Exception:
+                surveyor = (surveyor or "").strip()[:100]
+        if surveyor_addr:
+            try:
+                from agent.pdf_survey_plan import scrub_surveyor_metadata_value
+
+                surveyor_addr = scrub_surveyor_metadata_value(surveyor_addr, max_len=200)
+            except Exception:
+                surveyor_addr = (surveyor_addr or "").strip().split("\n")[0][:200]
 
         resolved_from_memory = None
+        if template_override_path:
+            template = str(template_override_path)
         if not template:
             resolved_from_memory = self._resolve_cadastral_template_from_memory(q)
             if resolved_from_memory:
@@ -3616,7 +5262,14 @@ class SurvyAIAgent:
         profile_dir = self._cad_template_profiles_dir()
         profile_dir.mkdir(parents=True, exist_ok=True)
         profile_path = None
-        if resolved_from_memory:
+        if profile_override_path:
+            try:
+                p_ov = Path(str(profile_override_path)).resolve()
+                if p_ov.exists():
+                    profile_path = p_ov
+            except Exception:
+                profile_path = None
+        if profile_path is None and resolved_from_memory:
             try:
                 p_mem = Path(str(resolved_from_memory.get("profile_path") or "")).resolve()
                 if p_mem.exists():
@@ -3678,6 +5331,12 @@ class SurvyAIAgent:
             fences=fences,
             access_road_title=access_road_title,
             user_scale_denom=user_scale_denom,
+            extra_parcels=extra_parcels,
+            extent_points=extent_points,
+            main_parcel_label=main_parcel_label,
+            skip_session_prep=bool(skip_session_prep),
+            batch_mode=bool(batch_mode),
+            close_output_after_save=bool(close_output_after_save),
         )
         if isinstance(result, dict) and result.get("success"):
             self._register_cad_template_memory(str(template_p), str(profile_path))
@@ -3857,10 +5516,22 @@ class SurvyAIAgent:
         fences: Optional[List[Dict[str, str]]] = None,
         access_road_title: Optional[str] = None,
         user_scale_denom: Optional[int] = None,
+        extra_parcels: Optional[List[Dict[str, Any]]] = None,
+        extent_points: Optional[List[Dict[str, Any]]] = None,
+        main_parcel_label: Optional[str] = None,
+        skip_session_prep: bool = False,
+        batch_mode: bool = False,
+        close_output_after_save: bool = False,
     ) -> Dict[str, Any]:
         # Normalize to list: support legacy single access_road
         roads_to_draw = access_roads if access_roads is not None else ([access_road] if access_road else [])
         fences_to_draw = fences or []
+        # Multi-parcel Excel/CSV overlays (must be locals here — not in the prompt parser above).
+        extra_parcels = list(extra_parcels or [])
+        extent_points = list(extent_points or [])
+        main_parcel_label = (main_parcel_label or "").strip()
+        skip_session_prep = bool(skip_session_prep or batch_mode)
+        close_output_after_save = bool(close_output_after_save)
         import json as _json
         import math
         import re
@@ -3918,21 +5589,29 @@ class SurvyAIAgent:
 
         # Save (and close) other open/unsaved drawings so they do not block the new run.
         # Protected templates stay open and are never written.
-        try:
-            self._ensure_protected_templates_loaded()
-            exclude = list(self._protected_template_paths) + [str(Path(template).resolve())]
-            prep = self.autocad.save_and_close_other_drawings(
-                exclude_paths=exclude,
-                close_after_save=True,
-            )
-            if prep.get("saved") or prep.get("closed"):
-                logger.info(
-                    "Prepared AutoCAD session for new output (saved=%s closed=%s)",
-                    prep.get("saved"),
-                    prep.get("closed"),
+        # Separate-owner batch skips the heavy session thrash after the first plan.
+        if not skip_session_prep:
+            try:
+                self._ensure_protected_templates_loaded()
+                exclude = list(self._protected_template_paths) + [str(Path(template).resolve())]
+                prep = self.autocad.save_and_close_other_drawings(
+                    exclude_paths=exclude,
+                    close_after_save=True,
                 )
-        except Exception as e:
-            logger.warning("save_and_close_other_drawings failed (continuing): %s", e)
+                if prep.get("saved") or prep.get("closed"):
+                    logger.info(
+                        "Prepared AutoCAD session for new output (saved=%s closed=%s)",
+                        prep.get("saved"),
+                        prep.get("closed"),
+                    )
+            except Exception as e:
+                logger.warning("save_and_close_other_drawings failed (continuing): %s", e)
+        else:
+            try:
+                # Soft prep: only close a prior output with the same basename if open.
+                self.autocad.close_drawing_if_open(str(outp), save_changes=False)
+            except Exception:
+                pass
 
         try:
             outp.parent.mkdir(parents=True, exist_ok=True)
@@ -3963,8 +5642,10 @@ class SurvyAIAgent:
                 }
             # Release any remaining AutoCAD lock on the target before disk overwrite.
             try:
+                if hasattr(self.autocad, "quiesce_autocad"):
+                    self.autocad.quiesce_autocad(esc_count=3)
                 self.autocad.close_drawing_if_open(str(outp), save_changes=False)
-                time.sleep(0.25)
+                time.sleep(0.35)
             except Exception:
                 pass
 
@@ -3975,13 +5656,17 @@ class SurvyAIAgent:
             except PermissionError:
                 # One retry after forcing the target closed (common when still locked).
                 try:
+                    if hasattr(self.autocad, "quiesce_autocad"):
+                        self.autocad.quiesce_autocad(esc_count=3)
                     self.autocad.close_drawing_if_open(str(outp), save_changes=False)
-                    time.sleep(0.4)
+                    time.sleep(0.5)
                     shutil.copy2(str(template), str(outp))
                     return None
                 except PermissionError:
                     return {
                         "success": False,
+                        "cancelled": False,
+                        "locked": True,
                         "error": (
                             f"Cannot write output DWG (still locked): {str(outp)}\n"
                             "Close the drawing in AutoCAD (or any other program using it), then retry."
@@ -3998,22 +5683,73 @@ class SurvyAIAgent:
 
         opened = self.autocad.open_drawing(str(outp))
         if not opened.get("success"):
-            return {"success": False, "error": opened.get("error", "Failed to open output drawing")}
+            # Documents may be wedged from a prior owner plan — recover once and retry open.
+            err = opened.get("error", "Failed to open output drawing")
+            try:
+                if hasattr(self.autocad, "recover_com_session") and hasattr(
+                    self.autocad, "_com_error_is_broken_proxy"
+                ):
+                    if self.autocad._com_error_is_broken_proxy(Exception(str(err))):
+                        self.autocad.recover_com_session(force=True, reason=str(err))
+                        time.sleep(0.5)
+                        opened = self.autocad.open_drawing(str(outp))
+            except Exception:
+                pass
+            if not opened.get("success"):
+                return {
+                    "success": False,
+                    "error": opened.get("error", "Failed to open output drawing"),
+                }
         self.autocad.set_workflow_document(str(outp))
-        time.sleep(0.3)
-        # With several DWGs open (template + prior outputs), the active tab can be wrong.
-        # Force the output we just copied to be active before any table/geometry edits.
-        act2 = self.autocad.open_drawing(str(outp), read_only=False)
-        if not act2.get("success"):
-            logger.warning("Could not re-activate output drawing before edits: %s", act2.get("error"))
-        self.autocad.ensure_workflow_document()
-        time.sleep(0.2)
+        if batch_mode or skip_session_prep:
+            # One open is enough; light re-activate (no second Documents.Open).
+            time.sleep(0.05)
+            self.autocad.ensure_workflow_document(light=True)
+        else:
+            time.sleep(0.3)
+            # With several DWGs open (template + prior outputs), the active tab can be wrong.
+            # Force the output we just copied to be active before any table/geometry edits.
+            act2 = self.autocad.open_drawing(str(outp), read_only=False)
+            if not act2.get("success"):
+                logger.warning("Could not re-activate output drawing before edits: %s", act2.get("error"))
+            self.autocad.ensure_workflow_document()
+            time.sleep(0.2)
 
         def _cad_checkpoint() -> None:
             try:
-                self.autocad.ensure_workflow_document()
+                # Batch / soft-prep: never call full open_drawing from checkpoints —
+                # that is what spam-logged <unknown>.Count/.Open when COM was wedged.
+                if batch_mode or skip_session_prep:
+                    self.autocad.ensure_workflow_document(light=True)
+                else:
+                    self.autocad.ensure_workflow_document()
             except Exception:
                 pass
+
+        def _release_output_tab(*, already_saved: bool = False) -> None:
+            """Save+close this plan's DWG so the next owner plot does not pile up tabs."""
+            if not close_output_after_save:
+                return
+            try:
+                if hasattr(self.autocad, "save_and_close_drawing"):
+                    self.autocad.save_and_close_drawing(
+                        str(outp),
+                        save=not already_saved,
+                    )
+                else:
+                    if not already_saved:
+                        self._ensure_output_saved(str(outp))
+                    self.autocad.close_drawing_if_open(str(outp), save_changes=False)
+                    self.autocad.set_workflow_document(None)
+                    self.autocad.doc = None
+                    time.sleep(0.35)
+            except Exception as release_exc:
+                logger.warning("Batch release of output DWG failed: %s", release_exc)
+                try:
+                    if hasattr(self.autocad, "recover_com_session"):
+                        self.autocad.recover_com_session(reason="batch release failed")
+                except Exception:
+                    pass
 
         # --- helpers for table formatting preservation ---
         def _get_cell(h: str, r: int, c: int = 0) -> str:
@@ -4067,11 +5803,26 @@ class SurvyAIAgent:
         east_h = str(((tables.get("coordinates") or {}).get("easting_table_handle")) or "")
         north_h = str(((tables.get("coordinates") or {}).get("northing_table_handle")) or "")
 
+        # Multi-parcel layout jobs are flagged early (extras / multi-owner title).
+        multi_parcel_layout = bool(extra_parcels) or bool(main_parcel_label) or (
+            (buyer_name or "").count(",") >= 2
+        )
+        # Provisional; refined with title-cell width before write (multi-owner packing).
         formatted_buyer_name = _format_buyer_name_for_titleblock(buyer_name)
         template_owner_cell_raw = ""
         template_owner_lines = 1
         template_scale_label_bottom = None
         title_scale_row = 8
+        # Snapshot title-band BEFORE writing many owners — expanded owner lists must not
+        # collapse usable plot height and force an absurdly small plan scale (e.g. 1:20000).
+        template_title_bb_for_scale: Optional[Dict[str, Any]] = None
+        try:
+            _tbb0 = self.autocad.get_modelspace_bbox(layers=["CADA_TITLEBLOCK"])
+            if _tbb0.get("success"):
+                template_title_bb_for_scale = _tbb0
+        except Exception:
+            template_title_bb_for_scale = None
+        bearing_road_height_native = float(bearing_road_height)
 
         tables_now = {}
         try:
@@ -4093,19 +5844,88 @@ class SurvyAIAgent:
                     template_scale_label_bottom = float(ext0["miny"])
             except Exception:
                 pass
+            # Pack consecutive owners into as many names per row as the cell width allows
+            # (no uneven per-name shrinking — vertical title height stays cartographic).
+            owner_max_chars = 38
+            try:
+                ext_owner = self.autocad.get_table_cell_extents(title_h, 2, 0, outer=True)
+                step_owner = self.autocad.get_table_cell_mtext_line_step(
+                    title_h, 2, 0, template_owner_cell_raw
+                )
+                if ext_owner.get("success"):
+                    ow = float(ext_owner.get("maxx", 0.0)) - float(ext_owner.get("minx", 0.0))
+                    oth = float((step_owner or {}).get("text_height") or 0.0)
+                    if multi_parcel_layout and oth > 0.05:
+                        oth = oth * 0.9  # matches uniform multi-parcel title shrink below
+                    if ow > 1.0 and oth > 0.05:
+                        owner_max_chars = max(
+                            16,
+                            int(ow / (oth * _CARTO_CHAR_WIDTH_FACTOR)),
+                        )
+            except Exception:
+                pass
+            formatted_buyer_name = _format_buyer_name_for_titleblock(
+                buyer_name, max_chars_per_line=owner_max_chars
+            )
             _set_cell(title_h, 2, 0, _mtxt_replace(template_owner_cell_raw, formatted_buyer_name))
             loc_cell = _get_cell(title_h, 4)
-            loc_val = location.strip().upper()
+            # Pack AT location into preferably ≤3 lines using measured cell width.
+            loc_max_chars = 36
+            try:
+                ext_loc = self.autocad.get_table_cell_extents(title_h, 4, 0, outer=True)
+                step_loc = self.autocad.get_table_cell_mtext_line_step(
+                    title_h, 4, 0, loc_cell or ""
+                )
+                if ext_loc.get("success"):
+                    lw = float(ext_loc.get("maxx", 0.0)) - float(ext_loc.get("minx", 0.0))
+                    lth = float((step_loc or {}).get("text_height") or 0.0)
+                    if lw > 1.0 and lth > 0.05:
+                        loc_max_chars = max(
+                            16,
+                            int(lw / (lth * _CARTO_CHAR_WIDTH_FACTOR)),
+                        )
+            except Exception:
+                pass
+            loc_val = _format_location_for_titleblock(
+                location,
+                max_chars_per_line=loc_max_chars,
+                preferred_max_lines=3,
+            )
             if loc_val:
                 if re.search(r"\bAT\b", loc_cell or "", re.IGNORECASE):
                     _set_cell(title_h, 4, 0, _replace_after_label(loc_cell, "AT", loc_val))
                 else:
                     _set_cell(title_h, 4, 0, _mtxt_replace(loc_cell, loc_val))
-            lga_u = lga.strip().upper()
-            lga_line = lga_u if "LOCAL GOVERNMENT AREA" in lga_u else f"{lga_u} LOCAL GOVERNMENT AREA"
-            _set_cell(title_h, 5, 0, _mtxt_replace(_get_cell(title_h, 5), lga_line))
+            # Bare LGA name only — template already carries / receives "LOCAL GOVERNMENT AREA".
+            try:
+                from agent.pdf_survey_plan import normalize_lga_name
+
+                lga_bare = normalize_lga_name(lga) or (lga or "").strip()
+            except Exception:
+                lga_bare = (lga or "").strip()
+            lga_u = lga_bare.upper()
+            lga_cell = _get_cell(title_h, 5)
+            if lga_u and re.search(r"\\P\s*LOCAL\s+GOVERNMENT\s+AREA", lga_cell or "", re.I):
+                # Preserve two-line template: NAME\PLOCAL GOVERNMENT AREA
+                lga_content = f"{lga_u}\\PLOCAL GOVERNMENT AREA"
+            elif lga_u:
+                lga_content = f"{lga_u} LOCAL GOVERNMENT AREA"
+            else:
+                lga_content = ""
+            if lga_content:
+                _set_cell(title_h, 5, 0, _mtxt_replace(lga_cell, lga_content))
             _set_cell(title_h, 6, 0, _mtxt_replace(_get_cell(title_h, 6), state.strip().upper()))
             _set_cell(title_h, 11, 0, _replace_after_label(_get_cell(title_h, 11), "ORIGIN:-", origin_crs.strip().upper()))
+            # Multi-parcel only: shrink title-block text up to 90% of template to fit many owners.
+            if multi_parcel_layout:
+                for _r in (2, 4, 5, 6):
+                    try:
+                        _hr = self.autocad.get_table_cell_text_height(title_h, _r, 0)
+                        _th = float((_hr or {}).get("text_height") or 0.0)
+                        if (_hr or {}).get("success") and _th > 0.05:
+                            self.autocad.set_table_cell_text_height(title_h, _r, 0, _th * 0.9)
+                    except Exception:
+                        pass
 
         # CADA_PLANNUMBER is fitted after sheet scaling (see _apply_plan_number_table_cell).
         template_plan_nominal_h: Optional[float] = None
@@ -4129,9 +5949,22 @@ class SurvyAIAgent:
                 pass
 
         if surv_h:
-            # Surveyor name: if it includes bracket text, render that bracket part at ~2/3 height.
+            # Surveyor name: keep professional title (SURV.) and optional bracket credentials.
             def _format_surveyor_name(raw: str) -> str:
-                s = (raw or "").strip().upper()
+                try:
+                    from agent.pdf_survey_plan import (
+                        ensure_surveyor_professional_title,
+                        scrub_surveyor_metadata_value,
+                    )
+
+                    s = ensure_surveyor_professional_title(
+                        scrub_surveyor_metadata_value(raw or "", max_len=100)
+                    )
+                except Exception:
+                    s = (raw or "").strip()
+                    if s and not re.match(r"^(?:surv\.?|surveyor)\b", s, flags=re.IGNORECASE):
+                        s = f"SURV. {s}"
+                s = s.upper()
                 if not s:
                     return s
                 # Prefer bracket at end: "SURV. ... (MNIS)"
@@ -4139,23 +5972,46 @@ class SurvyAIAgent:
                 if m:
                     main = m.group(1).strip()
                     br = m.group(2).strip()
-                    # Use grouped MTEXT height override limited to bracket portion
-                    # (keeps rest of cell style intact).
                     return f"{main} {{\\H0.67x;{br}}}".strip()
                 return s
 
-            _set_cell(
-                surv_h,
-                0,
-                0,
-                _mtext_preserve_style_set_content(
-                    _get_cell(surv_h, 0, 0),
-                    _format_surveyor_name(surveyor_name),
-                ),
-            )
+            surv_cell = _get_cell(surv_h, 0, 0)
+            surv_fmt = _format_surveyor_name(surveyor_name)
+            if re.search(r"\bSURV\.?\b", surv_cell or "", flags=re.IGNORECASE) and surv_fmt:
+                # Preserve template "SURV." label when present; replace the name tail.
+                name_tail = re.sub(
+                    r"^(?:SURV\.?|SURVEYOR)\s*",
+                    "",
+                    surv_fmt,
+                    count=1,
+                    flags=re.IGNORECASE,
+                ).strip()
+                _set_cell(
+                    surv_h,
+                    0,
+                    0,
+                    _replace_after_label(surv_cell, "SURV.", name_tail)
+                    if re.search(r"SURV\.", surv_cell or "", flags=re.IGNORECASE)
+                    else _mtext_preserve_style_set_content(surv_cell, surv_fmt),
+                )
+            else:
+                _set_cell(
+                    surv_h,
+                    0,
+                    0,
+                    _mtext_preserve_style_set_content(surv_cell, surv_fmt),
+                )
 
             # Surveyor address: pack horizontally (city + state on one line) and
             # vertically inside the cell — never one comma segment per line by default.
+            try:
+                from agent.pdf_survey_plan import scrub_surveyor_metadata_value
+
+                surveyor_company_address = scrub_surveyor_metadata_value(
+                    surveyor_company_address or "", max_len=200
+                )
+            except Exception:
+                surveyor_company_address = (surveyor_company_address or "").strip()
             addr_template = _get_cell(surv_h, 1, 0)
             addr_th = 0.6
             addr_step = 0.0
@@ -4452,6 +6308,7 @@ class SurvyAIAgent:
                     pass
 
         if coordinates and len(coord_pairs) < 3:
+            _release_output_tab(already_saved=False)
             return {
                 "success": False,
                 "error": (
@@ -4503,6 +6360,33 @@ class SurvyAIAgent:
             geometry["primary_vertex_index_original"] = int(primary_idx)
             geometry["primary_easting"] = float(e0)
             geometry["primary_northing"] = float(n0)
+
+            # Surveyor convention: bearings labelled clockwise around the parcel.
+            # Excel / CSV rings may be entered CCW — reverse (keeping primary at index 0)
+            # so bearing texts are never backbearings of the clockwise traverse.
+            def _signed_area_en(ring: List[Dict[str, Any]]) -> float:
+                a = 0.0
+                n = len(ring)
+                for i in range(n):
+                    j = (i + 1) % n
+                    a += float(ring[i]["e"]) * float(ring[j]["n"])
+                    a -= float(ring[j]["e"]) * float(ring[i]["n"])
+                return 0.5 * a
+
+            if len(pts) >= 3 and _signed_area_en(pts) > 0.0:
+                pts = [pts[0]] + list(reversed(pts[1:]))
+                if bearing_distance_legs and len(bearing_distance_legs) == len(pts):
+                    # Edges reverse with the ring; each leg becomes its backbearing.
+                    bearing_distance_legs = [
+                        {
+                            "bearing_deg": (float(L.get("bearing_deg", 0.0)) + 180.0) % 360.0,
+                            "distance": float(L.get("distance", 0.0)),
+                        }
+                        for L in reversed(bearing_distance_legs)
+                    ]
+                geometry["ring_reversed_to_clockwise"] = True
+            else:
+                geometry["ring_reversed_to_clockwise"] = False
 
             def _primary_survey_index(vertex_pts: List[Dict[str, Any]]) -> int:
                 best = 0
@@ -4589,9 +6473,11 @@ class SurvyAIAgent:
                 if not interior_bb.get("success"):
                     interior_bb = self.autocad.get_modelspace_bbox(block_name_contains="INTERIOR", prefer_largest=True)
 
-                # Boundary extents from user coordinates (meters)
-                es = [float(p.get("e", 0.0)) for p in pts]
-                ns = [float(p.get("n", 0.0)) for p in pts]
+                # Boundary extents from user coordinates (meters).
+                # Multi-parcel Excel layouts may pass extent_points covering every ownership ring.
+                extent_src = extent_points if len(extent_points) >= 3 else pts
+                es = [float(p.get("e", 0.0)) for p in extent_src]
+                ns = [float(p.get("n", 0.0)) for p in extent_src]
                 boundary_w = (max(es) - min(es)) if es else 0.0
                 boundary_h = (max(ns) - min(ns)) if ns else 0.0
 
@@ -4601,6 +6487,7 @@ class SurvyAIAgent:
                     "boundary_w": float(boundary_w),
                     "boundary_h": float(boundary_h),
                     "interior_found": bool(interior_bb.get("success")),
+                    "extent_point_count": int(len(extent_src)),
                 }
 
                 if interior_bb.get("success") and boundary_w > 1e-6 and boundary_h > 1e-6:
@@ -4638,11 +6525,15 @@ class SurvyAIAgent:
                     y_hi_interior = iy1 - margin * interior_h
                     y_hi = y_hi_interior
                     title_bb = self.autocad.get_modelspace_bbox(layers=["CADA_TITLEBLOCK"])
+                    # Multi-parcel: ignore the post-write expanded owner list when reserving the title band.
+                    title_bb_for_fit = title_bb
+                    if multi_parcel_layout and template_title_bb_for_scale and template_title_bb_for_scale.get("success"):
+                        title_bb_for_fit = template_title_bb_for_scale
                     title_gap = max(3.0, 0.02 * interior_h)
                     title_excluded = False
-                    if title_bb.get("success"):
-                        tminy = float(title_bb.get("miny", 0.0))
-                        tmaxy = float(title_bb.get("maxy", 0.0))
+                    if title_bb_for_fit.get("success"):
+                        tminy = float(title_bb_for_fit.get("miny", 0.0))
+                        tmaxy = float(title_bb_for_fit.get("maxy", 0.0))
                         t_cy = 0.5 * (tminy + tmaxy)
                         # If the title block sits in the upper part of the interior, reserve space below its bottom edge.
                         if tmaxy > iy0 and tminy < iy1 and t_cy > iy0 + 0.5 * interior_h:
@@ -4654,6 +6545,15 @@ class SurvyAIAgent:
                     usable_w_plot = float(interior_usable_w)
                     if usable_h_plot < 1e-3:
                         usable_h_plot = float(interior_usable_h)
+                    # Multi-parcel layouts need a stable plot band; never let title overflow
+                    # shrink usable height below ~55% of the interior usable band.
+                    if multi_parcel_layout:
+                        min_h = float(interior_usable_h) * 0.55
+                        min_w = float(interior_usable_w) * 0.85
+                        if usable_h_plot < min_h:
+                            usable_h_plot = min_h
+                        if usable_w_plot < min_w:
+                            usable_w_plot = min_w
                     geometry["scale_debug"].update({
                         "interior_w": float(interior_w),
                         "interior_h": float(interior_h),
@@ -4664,9 +6564,13 @@ class SurvyAIAgent:
                         "road_pad_m": float(road_pad_m),
                         "boundary_w_padded": float(boundary_w_pad),
                         "boundary_h_padded": float(boundary_h_pad),
-                        "title_bb_used": bool(title_bb.get("success")),
+                        "title_bb_used": bool(title_bb_for_fit.get("success")),
                         "title_excluded_upper": bool(title_excluded),
+                        "title_bb_pre_owner": bool(
+                            multi_parcel_layout and template_title_bb_for_scale is not None
+                        ),
                         "margin": float(margin),
+                        "multi_parcel_layout": bool(multi_parcel_layout),
                     })
                     if usable_w_plot > 1e-6 and usable_h_plot > 1e-6:
                         required_k = max(
@@ -4680,6 +6584,9 @@ class SurvyAIAgent:
                     user_scale_denom=user_scale_denom,
                     required_k=float(geometry["scale_debug"].get("required_k") or 0.0),
                     allowed_denoms=allowed_denoms,
+                    multi_parcel_layout=bool(multi_parcel_layout),
+                    boundary_w=float(boundary_w),
+                    boundary_h=float(boundary_h),
                 )
                 geometry["scale_debug"].update({
                     "chosen_denom": int(chosen_denom),
@@ -4687,6 +6594,20 @@ class SurvyAIAgent:
                     "scale_reason": scale_reason,
                     "user_scale_denom": user_scale_denom,
                 })
+                # Multi-parcel cartography: plot parcels first at template scale, then fit the
+                # sheet from the real drawn extent (avoids pre-plot 1:20000 / title overlap).
+                defer_multi_parcel_sheet_scale = bool(multi_parcel_layout)
+                if defer_multi_parcel_sheet_scale:
+                    geometry["scale_debug"]["deferred_plot_then_fit"] = True
+                    geometry["scale_debug"]["prefit_chosen_denom"] = int(chosen_denom)
+                    geometry["scale_debug"]["prefit_k"] = float(scale_k)
+                    geometry["scale_debug"]["prefit_reason"] = str(scale_reason)
+                    chosen_denom = int(template_denom)
+                    scale_k = 1.0
+                    scale_reason = "multi_parcel_defer_until_plot"
+                    geometry["scale_debug"]["chosen_denom"] = int(chosen_denom)
+                    geometry["scale_debug"]["k"] = float(scale_k)
+                    geometry["scale_debug"]["scale_reason"] = scale_reason
                 output_plan_denom = int(chosen_denom)
                 output_scale_k = float(scale_k)
                 geometry["output_plan_denom"] = int(output_plan_denom)
@@ -4822,45 +6743,150 @@ class SurvyAIAgent:
             except Exception as scale_exc:
                 logger.warning("Cadastral scale/title-block step failed (keeping resolved scale): %s", scale_exc)
 
-            # Keep CADA_SCALEBAR below the "SCALE:- 1:xxx" title-block cell (small gap).
-            if title_h and formatted_buyer_name:
+            # Always keep CADA_SCALEBAR below the "SCALE:- 1:xxx" cell. Owner and/or
+            # location growth can push the SCALE label down; the bar must follow.
+            if title_h:
                 try:
-                    owner_lines = _titleblock_owner_line_count(formatted_buyer_name)
-                    if owner_lines > template_owner_lines:
-                        scale_row = _find_title_scale_label_row(
-                            _get_cell, title_h, tables_now, default_row=title_scale_row
+                    scale_row = _find_title_scale_label_row(
+                        _get_cell, title_h, tables_now, default_row=title_scale_row
+                    )
+                    adj = self.autocad.adjust_scalebar_below_scale_label(
+                        title_h,
+                        scale_label_row=scale_row,
+                        scale_label_col=0,
+                        scalebar_layers=["CADA_SCALEBAR"],
+                        template_scale_label_bottom=template_scale_label_bottom,
+                        scale_base_y=base_y,
+                        scale_k=float(scale_k),
+                    )
+                    if not adj.get("success"):
+                        owner_lines = _titleblock_owner_line_count(formatted_buyer_name)
+                        extra_owner_lines = max(0, owner_lines - template_owner_lines)
+                        step_res = self.autocad.get_table_cell_mtext_line_step(
+                            title_h, 2, 0, template_owner_cell_raw
                         )
-                        adj = self.autocad.adjust_scalebar_below_scale_label(
-                            title_h,
-                            scale_label_row=scale_row,
-                            scale_label_col=0,
-                            scalebar_layers=["CADA_SCALEBAR"],
-                            template_scale_label_bottom=template_scale_label_bottom,
-                            scale_base_y=base_y,
-                            scale_k=float(scale_k),
-                        )
-                        if not adj.get("success"):
-                            extra_owner_lines = owner_lines - template_owner_lines
-                            step_res = self.autocad.get_table_cell_mtext_line_step(
-                                title_h, 2, 0, template_owner_cell_raw
+                        line_step = float(step_res.get("line_step") or 0.0)
+                        if line_step <= 0:
+                            th = float(step_res.get("text_height") or 0.0)
+                            if th > 0:
+                                line_step = th * (5.0 / 3.0)
+                        if line_step > 0 and extra_owner_lines > 0:
+                            self.autocad.move_modelspace_by_layers(
+                                0.0,
+                                -extra_owner_lines * line_step,
+                                ["CADA_SCALEBAR"],
                             )
-                            line_step = float(step_res.get("line_step") or 0.0)
-                            if line_step <= 0:
-                                th = float(step_res.get("text_height") or 0.0)
-                                if th > 0:
-                                    line_step = th * (5.0 / 3.0)
-                            if line_step > 0 and extra_owner_lines > 0:
-                                self.autocad.move_modelspace_by_layers(
-                                    0.0,
-                                    -extra_owner_lines * line_step,
-                                    ["CADA_SCALEBAR"],
-                                )
                 except Exception:
                     pass
 
             local_pts = [{"x": base_x + (p["e"] - e0), "y": base_y + (p["n"] - n0)} for p in pts]
 
+            # Multi-parcel Excel/CSV layouts: skip slow pillar-number TABLE cloning and
+            # bearing/distance annotation (COM-heavy). Owner labels + rings are enough.
+            # Geometry flag is extras/labels only (not multi-comma buyer titles alone).
+            multi_parcel_layout = bool(extra_parcels) or bool(main_parcel_label)
+            if multi_parcel_layout:
+                geometry["multi_parcel_layout"] = True
+
+            def _en_to_local(ring: List[Dict[str, Any]]) -> List[Dict[str, float]]:
+                out_l: List[Dict[str, float]] = []
+                for p in ring or []:
+                    if not isinstance(p, dict):
+                        continue
+                    try:
+                        ee = float(p.get("e", p.get("x")))
+                        nn = float(p.get("n", p.get("y")))
+                    except Exception:
+                        continue
+                    out_l.append({"x": float(base_x + (ee - e0)), "y": float(base_y + (nn - n0))})
+                return out_l
+
+            def _insert_pegs_at(points_xy: List[Dict[str, float]]) -> None:
+                blk_name = profile.get("blocks", {}).get("pillars", {}).get("block_name") or "PEG_SYMBOL"
+                inserted_ok = True
+                for p in points_xy:
+                    r = self.autocad.insert_block(
+                        str(blk_name),
+                        float(p["x"]),
+                        float(p["y"]),
+                        layer="CADA_PILLARS",
+                        xscale=float(scale_k),
+                        yscale=float(scale_k),
+                        zscale=float(scale_k),
+                    )
+                    if not r.get("success"):
+                        inserted_ok = False
+                        break
+                if inserted_ok:
+                    return
+                # Rebuild via clipboard seed (copied before CADA_PILLARS clear) — InsertBlock COM quirk.
+                try:
+                    import pythoncom
+                    pythoncom.CoInitialize()
+                except Exception:
+                    pass
+                try:
+                    out_doc = self.autocad.doc
+                    ms_out = out_doc.ModelSpace
+                    # Prefer pre-copied seed; else try any remaining peg.
+                    has_seed = _peg_seed_ent is not None
+                    if not has_seed:
+                        for ii in range(ms_out.Count):
+                            e = ms_out.Item(ii)
+                            if str(getattr(e, "Layer", "")).upper() == "CADA_PILLARS" and "BlockReference" in str(
+                                getattr(e, "ObjectName", "")
+                            ):
+                                e.Copy()
+                                has_seed = True
+                                break
+                    if not has_seed:
+                        return
+                    try:
+                        self.autocad.delete_entities("CADA_PILLARS")
+                    except Exception:
+                        pass
+                    for p in points_xy:
+                        new_ent = ms_out.Paste()
+                        try:
+                            new_ent.Layer = "CADA_PILLARS"
+                        except Exception:
+                            pass
+                        try:
+                            for attr in ("XScaleFactor", "YScaleFactor", "ZScaleFactor"):
+                                setattr(new_ent, attr, float(scale_k))
+                        except Exception:
+                            pass
+                        ip = getattr(new_ent, "InsertionPoint", None)
+                        if ip is not None:
+                            dxm = float(p["x"]) - float(ip[0])
+                            dym = float(p["y"]) - float(ip[1])
+                            try:
+                                new_ent.Move((0.0, 0.0, 0.0), (dxm, dym, 0.0))
+                            except Exception:
+                                pass
+                    try:
+                        out_doc.Activate()
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
             _cad_checkpoint()
+            # Preserve one template peg seed before clearing (InsertBlock often fails; clone needs a seed).
+            _peg_seed_ent = None
+            try:
+                _ms_seed = self.autocad.doc.ModelSpace
+                for _ii in range(_ms_seed.Count):
+                    _e = _ms_seed.Item(_ii)
+                    if str(getattr(_e, "Layer", "")).upper() == "CADA_PILLARS" and "BlockReference" in str(
+                        getattr(_e, "ObjectName", "")
+                    ):
+                        _peg_seed_ent = _e
+                        break
+                if _peg_seed_ent is not None:
+                    _peg_seed_ent.Copy()
+            except Exception:
+                _peg_seed_ent = None
             # Clear old parcel graphics (not tables/border)
             self.autocad.delete_entities("CADA_BEARING_DIST")
             self.autocad.delete_entities("CADA_BOUNDARY")
@@ -4868,97 +6894,404 @@ class SurvyAIAgent:
             self.autocad.delete_entities("CADA_ROAD")
             self.autocad.delete_entities("CADA_CWF")
             self.autocad.delete_entities("CADA_TEXT")
+            if multi_parcel_layout:
+                # Avoid leftover template pillar-number TABLEs cluttering layout plans.
+                try:
+                    self.autocad.delete_entities("CADA_PILLARNUMBERS")
+                except Exception:
+                    pass
             time.sleep(0.2)
             # IMPORTANT: Do NOT delete generic sheet/title layers; they are part of the template
             # border/title presentation and must remain aligned with the border boxes.
 
-            # Insert pillar blocks at EVERY boundary vertex (professional cadastral plan behavior).
-            # Use a robust strategy: first try AutoCAD InsertBlock; if it fails (common COM quirk),
-            # fall back to cloning one template peg block and moving it to each vertex.
-            blk = profile.get("blocks", {}).get("pillars", {}).get("block_name") or "PEG_SYMBOL"
-            inserted_ok = True
-            for p in local_pts:
-                r = self.autocad.insert_block(
-                    str(blk),
-                    p["x"],
-                    p["y"],
-                    layer="CADA_PILLARS",
-                    xscale=float(scale_k),
-                    yscale=float(scale_k),
-                    zscale=float(scale_k),
-                )
-                if not r.get("success"):
-                    inserted_ok = False
-                    break
-
-            if not inserted_ok:
-                # Rebuild from template pegs: open template, copy one peg, then paste multiple copies.
-                try:
-                    import pythoncom
-                    pythoncom.CoInitialize()
-                except Exception:
-                    pass
-                try:
-                    acad = self.autocad.acad
-                    out_doc = self.autocad.doc
-                    # Use the already-copied output drawing as the peg source.
-                    # This avoids opening the survey_plan_template*.dwg in AutoCAD UI.
-                    peg_ent = None
-                    ms_out = out_doc.ModelSpace
-                    for ii in range(ms_out.Count):
-                        e = ms_out.Item(ii)
-                        if str(getattr(e, "Layer", "")).upper() == "CADA_PILLARS" and "BlockReference" in str(getattr(e, "ObjectName", "")):
-                            peg_ent = e
-                            break
-                    if peg_ent is not None:
-                        # Copy seed peg first, then clear partial/seed entities, then paste clones.
-                        peg_ent.Copy()
-                        try:
-                            self.autocad.delete_entities("CADA_PILLARS")
-                        except Exception:
-                            pass
-                        for p in local_pts:
-                            new_ent = ms_out.Paste()
-                            try:
-                                new_ent.Layer = "CADA_PILLARS"
-                            except Exception:
-                                pass
-                            # Ensure pillar symbol scales to chosen plan scale
-                            try:
-                                for attr in ("XScaleFactor", "YScaleFactor", "ZScaleFactor"):
-                                    setattr(new_ent, attr, float(scale_k))
-                            except Exception:
-                                pass
-                            # move pasted peg so its insertion aligns to vertex
-                            ip = getattr(new_ent, "InsertionPoint", None)
-                            if ip is not None:
-                                dxm = float(p["x"]) - float(ip[0])
-                                dym = float(p["y"]) - float(ip[1])
-                                try:
-                                    new_ent.Move((0.0, 0.0, 0.0), (dxm, dym, 0.0))
-                                except Exception:
-                                    pass
-                    try:
-                        out_doc.Activate()
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-            time.sleep(0.15)
-
+            self.autocad.set_layer_color("CADA_BOUNDARY", 1)
             geometry["pillars_moved"] = 0
 
-            # Boundary: red by layer, closed polyline
-            self.autocad.set_layer_color("CADA_BOUNDARY", 1)
-            pl = self.autocad.create_lwpolyline(local_pts, layer="CADA_BOUNDARY", closed=True)
-            time.sleep(0.1)
-            if pl.get("success"):
-                geometry["boundary_redrawn"] = True
-                # Area -> title block
-                a = self.autocad.calculate_entity_area(str(pl.get("handle")))
-                if a.get("success") and title_h:
-                    sq_m = float(a.get("area_conversions", {}).get("sq_meters"))
-                    _set_cell(title_h, 12, 0, _replace_after_label(_get_cell(title_h, 12), "AREA:-", f"{sq_m:.3f} SQ. MTRS."))
+            if multi_parcel_layout:
+                # Cartographic multi-parcel: unique pegs → deduped traverse edges → owner labels.
+                # All in local/template space (same as single-parcel) so move_all keeps sheet alignment.
+                try:
+                    from agent.excel_cadastral import build_multi_parcel_layout_draw_ops
+
+                    layout_parcels: List[Dict[str, Any]] = []
+                    if local_pts and len(local_pts) >= 2:
+                        layout_parcels.append(
+                            {"label": main_parcel_label or "", "points": list(local_pts)}
+                        )
+                    for ep in extra_parcels:
+                        if not isinstance(ep, dict):
+                            continue
+                        loc_ring = _en_to_local(list(ep.get("points") or []))
+                        if len(loc_ring) < 2:
+                            continue
+                        layout_parcels.append(
+                            {
+                                "label": str(ep.get("label") or "").strip(),
+                                "points": loc_ring,
+                            }
+                        )
+                    draw_ops = build_multi_parcel_layout_draw_ops(layout_parcels)
+                    peg_xy = list(draw_ops.get("pegs") or [])
+                    if peg_xy:
+                        _insert_pegs_at(peg_xy)
+                    time.sleep(0.1)
+                    edges_drawn = 0
+                    for ed in draw_ops.get("edges") or []:
+                        a = ed.get("a") or {}
+                        b = ed.get("b") or {}
+                        pl_e = self.autocad.create_lwpolyline(
+                            [
+                                {"x": float(a.get("x", 0.0)), "y": float(a.get("y", 0.0))},
+                                {"x": float(b.get("x", 0.0)), "y": float(b.get("y", 0.0))},
+                            ],
+                            layer="CADA_BOUNDARY",
+                            closed=False,
+                        )
+                        if pl_e.get("success"):
+                            edges_drawn += 1
+                    # Owner labels sized from parcel spans (meters), not sheet scale_k —
+                    # avoids 1:20000-scale text drowning a few-hundred-metre layout.
+                    try:
+                        _lw = float((geometry.get("scale_debug") or {}).get("boundary_w") or 0.0)
+                        _lh = float((geometry.get("scale_debug") or {}).get("boundary_h") or 0.0)
+                    except Exception:
+                        _lw, _lh = 0.0, 0.0
+                    label_h_mp = _multi_parcel_owner_label_height(
+                        [list(p.get("points") or []) for p in layout_parcels],
+                        layout_w=_lw,
+                        layout_h=_lh,
+                        native_bearing_height=float(bearing_road_height_native or bearing_road_height or 1.2),
+                    )
+                    # Mild sheet-aware bump only (never * full scale_k).
+                    try:
+                        label_h_mp = float(label_h_mp) * max(1.0, min(float(scale_k), 2.5) ** 0.35)
+                    except Exception:
+                        pass
+                    labels_drawn = 0
+                    for lab in draw_ops.get("labels") or []:
+                        try:
+                            self.autocad.add_mtext(
+                                str(lab.get("label") or ""),
+                                float(lab.get("x", 0.0)),
+                                float(lab.get("y", 0.0)),
+                                layer="CADA_TEXT",
+                                height=float(label_h_mp),
+                                width=max(12.0, float(label_h_mp) * 12.0),
+                                attachment_point=5,
+                            )
+                            labels_drawn += 1
+                        except Exception:
+                            pass
+                    geometry["boundary_redrawn"] = edges_drawn > 0
+                    geometry["multi_parcel_pegs"] = int(len(peg_xy))
+                    geometry["multi_parcel_edges"] = int(edges_drawn)
+                    geometry["multi_parcel_labels"] = int(labels_drawn)
+                    geometry["multi_parcel_label_height"] = float(label_h_mp)
+                    geometry["multi_parcel_drawn_local"] = True
+                    # Title AREA from main ring (shoelace) — no single closed entity in edge mode.
+                    if title_h and local_pts and len(local_pts) >= 3:
+                        try:
+                            area_acc = 0.0
+                            nlp = len(local_pts)
+                            for i in range(nlp):
+                                x1 = float(local_pts[i]["x"])
+                                y1 = float(local_pts[i]["y"])
+                                x2 = float(local_pts[(i + 1) % nlp]["x"])
+                                y2 = float(local_pts[(i + 1) % nlp]["y"])
+                                area_acc += x1 * y2 - x2 * y1
+                            sq_m = abs(area_acc) * 0.5
+                            _set_cell(
+                                title_h,
+                                12,
+                                0,
+                                _replace_after_label(
+                                    _get_cell(title_h, 12), "AREA:-", f"{sq_m:.3f} SQ. MTRS."
+                                ),
+                            )
+                        except Exception:
+                            pass
+
+                    # ---- Plot-then-fit: enlarge/position sheet until it ENCLOSES plotted land ----
+                    try:
+                        geom_bb = self.autocad.get_modelspace_bbox(
+                            layers=["CADA_BOUNDARY", "CADA_PILLARS", "CADA_TEXT"]
+                        )
+                        if not geom_bb.get("success"):
+                            geom_bb = self.autocad.get_modelspace_bbox(layers=["CADA_BOUNDARY"])
+                        interior_bb2 = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBORDER"])
+                        if not interior_bb2.get("success"):
+                            interior_bb2 = self.autocad.get_modelspace_bbox(
+                                layers=["CADA_INTERIORBOUNDARY"]
+                            )
+                        title_bb2 = template_title_bb_for_scale
+                        if not (title_bb2 and title_bb2.get("success")):
+                            title_bb2 = self.autocad.get_modelspace_bbox(layers=["CADA_TITLEBLOCK"])
+                        win0 = _usable_plot_window_from_bboxes(interior_bb2, title_bb2)
+                        if geom_bb.get("success") and win0:
+                            g_minx = float(geom_bb.get("minx", 0.0))
+                            g_miny = float(geom_bb.get("miny", 0.0))
+                            g_maxx = float(geom_bb.get("maxx", 0.0))
+                            g_maxy = float(geom_bb.get("maxy", 0.0))
+                            g_w = max(1e-6, g_maxx - g_minx)
+                            g_h = max(1e-6, g_maxy - g_miny)
+                            g_cx = 0.5 * (g_minx + g_maxx)
+                            g_cy = 0.5 * (g_miny + g_maxy)
+                            # Cartographic margin: enclose all features with breathing room.
+                            g_w_pad = max(g_w * 1.12, g_w + 10.0)
+                            g_h_pad = max(g_h * 1.12, g_h + 10.0)
+                            usable_w2 = max(1e-6, float(win0["width"]))
+                            usable_h2 = max(1e-6, float(win0["height"]))
+                            iw0 = float(interior_bb2.get("maxx", 0.0)) - float(interior_bb2.get("minx", 0.0))
+                            ih0 = float(interior_bb2.get("maxy", 0.0)) - float(interior_bb2.get("miny", 0.0))
+                            td_fit = int(template_native_denom or template_denom or 500)
+                            n_parcels_fit = max(
+                                1,
+                                int(len(layout_parcels) or geometry.get("multi_parcel_labels") or 1),
+                            )
+                            # Primary: cartographic scale from ground span; fit is secondary/capped.
+                            chosen2, k2, reason2 = _choose_layout_plan_scale_after_plot(
+                                plotted_w=float(g_w),
+                                plotted_h=float(g_h),
+                                usable_w=float(usable_w2),
+                                usable_h=float(usable_h2),
+                                interior_w=float(iw0),
+                                interior_h=float(ih0),
+                                template_denom=td_fit,
+                                user_scale_denom=user_scale_denom,
+                                parcel_count=n_parcels_fit,
+                                allowed_denoms=_CADASTRAL_ALLOWED_SCALES,
+                            )
+                            carto_cap2 = _allowed_denom_steps_above(
+                                _cartographic_denom_for_layout_extent(
+                                    g_w,
+                                    g_h,
+                                    _CADASTRAL_ALLOWED_SCALES,
+                                    parcel_count=n_parcels_fit,
+                                    dense_title=n_parcels_fit >= 6,
+                                ),
+                                1,
+                                _CADASTRAL_ALLOWED_SCALES,
+                            )
+                            layers_fit = _cadastral_sheet_translate_layers(profile)
+                            # Scale sheet about the land centroid so the frame grows around the layout.
+                            # Primary crosshair is excluded so it stays locked to the primary peg.
+                            if float(k2) > 1.0 + 1e-9:
+                                sc2 = self.autocad.scale_modelspace_by_layers(
+                                    float(g_cx), float(g_cy), float(k2), layers_fit
+                                )
+                                geometry["scale_debug"]["scaled_entities"] = int(
+                                    sc2.get("scaled_entities", 0) or 0
+                                ) if sc2.get("success") else 0
+                                try:
+                                    sb_factor2 = float(chosen2) / float(td_fit)
+                                    if abs(sb_factor2 - 1.0) > 1e-9:
+                                        self.autocad.scale_scalebar_text_values(
+                                            sb_factor2, layers=["scalebar", "CADA_SCALEBAR"]
+                                        )
+                                except Exception:
+                                    pass
+                            # Position sheet so the usable plot window centers on the land.
+                            # Iterate: measure → translate → optionally grow one more scale step.
+                            cumulative_k = float(k2)
+                            for _fit_i in range(3):
+                                interior_now = self.autocad.get_modelspace_bbox(
+                                    layers=["CADA_INTERIORBORDER"]
+                                )
+                                if not interior_now.get("success"):
+                                    interior_now = self.autocad.get_modelspace_bbox(
+                                        layers=["CADA_INTERIORBOUNDARY"]
+                                    )
+                                title_now = self.autocad.get_modelspace_bbox(
+                                    layers=["CADA_TITLEBLOCK"]
+                                )
+                                win_now = _usable_plot_window_from_bboxes(interior_now, title_now)
+                                geom_now = self.autocad.get_modelspace_bbox(
+                                    layers=["CADA_BOUNDARY", "CADA_PILLARS", "CADA_TEXT"]
+                                )
+                                if not geom_now.get("success"):
+                                    geom_now = self.autocad.get_modelspace_bbox(
+                                        layers=["CADA_BOUNDARY"]
+                                    )
+                                if not (win_now and geom_now.get("success")):
+                                    break
+                                gx0 = float(geom_now.get("minx", 0.0))
+                                gy0 = float(geom_now.get("miny", 0.0))
+                                gx1 = float(geom_now.get("maxx", 0.0))
+                                gy1 = float(geom_now.get("maxy", 0.0))
+                                gcx = 0.5 * (gx0 + gx1)
+                                gcy = 0.5 * (gy0 + gy1)
+                                dx_fit = float(gcx) - float(win_now["center_x"])
+                                dy_fit = float(gcy) - float(win_now["center_y"])
+                                if abs(dx_fit) > 0.05 or abs(dy_fit) > 0.05:
+                                    self.autocad.move_modelspace_by_layers(
+                                        dx_fit, dy_fit, layers_fit
+                                    )
+                                    # Re-measure window after move
+                                    interior_now = self.autocad.get_modelspace_bbox(
+                                        layers=["CADA_INTERIORBORDER"]
+                                    )
+                                    if not interior_now.get("success"):
+                                        interior_now = self.autocad.get_modelspace_bbox(
+                                            layers=["CADA_INTERIORBOUNDARY"]
+                                        )
+                                    title_now = self.autocad.get_modelspace_bbox(
+                                        layers=["CADA_TITLEBLOCK"]
+                                    )
+                                    win_now = _usable_plot_window_from_bboxes(
+                                        interior_now, title_now
+                                    )
+                                if not win_now:
+                                    break
+                                # Enclosure test with a small tolerance.
+                                pad = 0.5
+                                enclosed = (
+                                    gx0 >= float(win_now["minx"]) - pad
+                                    and gy0 >= float(win_now["miny"]) - pad
+                                    and gx1 <= float(win_now["maxx"]) + pad
+                                    and gy1 <= float(win_now["maxy"]) + pad
+                                )
+                                if enclosed:
+                                    geometry["scale_debug"]["enclosed"] = True
+                                    break
+                                # Grow at most toward cartographic cap (never explode to 1:20000).
+                                next_denoms = [
+                                    d
+                                    for d in _CADASTRAL_ALLOWED_SCALES
+                                    if int(chosen2) < d <= int(carto_cap2)
+                                ]
+                                if not next_denoms:
+                                    geometry["scale_debug"]["enclosed"] = False
+                                    break
+                                next_d = int(next_denoms[0])
+                                step_k = float(next_d) / float(chosen2)
+                                self.autocad.scale_modelspace_by_layers(
+                                    gcx, gcy, step_k, layers_fit
+                                )
+                                try:
+                                    self.autocad.scale_scalebar_text_values(
+                                        step_k, layers=["scalebar", "CADA_SCALEBAR"]
+                                    )
+                                except Exception:
+                                    pass
+                                chosen2 = next_d
+                                cumulative_k *= step_k
+                                k2 = float(cumulative_k)
+                                reason2 = "layout_enclosure_grow"
+                            try:
+                                self.autocad.execute_command("REGEN")
+                            except Exception:
+                                pass
+                            # Peg symbols follow final plan scale (positions unchanged).
+                            try:
+                                ms_peg = self.autocad.doc.ModelSpace
+                                for ii in range(ms_peg.Count):
+                                    ent = ms_peg.Item(ii)
+                                    if str(getattr(ent, "Layer", "")).upper() != "CADA_PILLARS":
+                                        continue
+                                    if "BlockReference" not in str(getattr(ent, "ObjectName", "")):
+                                        continue
+                                    for attr in ("XScaleFactor", "YScaleFactor", "ZScaleFactor"):
+                                        try:
+                                            setattr(ent, attr, float(k2))
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                            chosen_denom = int(chosen2)
+                            scale_k = float(k2)
+                            scale_reason = str(reason2)
+                            output_plan_denom = int(chosen2)
+                            output_scale_k = float(k2)
+                            geometry["output_plan_denom"] = int(output_plan_denom)
+                            geometry["output_scale_k"] = float(output_scale_k)
+                            try:
+                                bearing_road_height = float(bearing_road_height_native) * float(k2)
+                            except Exception:
+                                pass
+                            geometry["scale_debug"].update({
+                                "plot_then_fit": True,
+                                "plotted_w": float(g_w),
+                                "plotted_h": float(g_h),
+                                "plotted_w_padded": float(g_w_pad),
+                                "plotted_h_padded": float(g_h_pad),
+                                "fit_usable_w": float(usable_w2),
+                                "fit_usable_h": float(usable_h2),
+                                "fit_required_k": float(
+                                    max(g_w_pad / usable_w2, g_h_pad / usable_h2)
+                                ),
+                                "carto_cap": int(carto_cap2),
+                                "chosen_denom": int(chosen2),
+                                "k": float(k2),
+                                "scale_reason": str(reason2),
+                            })
+                            if title_h:
+                                try:
+                                    scale_pattern = re.compile(r"1\s*:\s*\d+", re.IGNORECASE)
+                                    replacement = f"1:{chosen2}"
+                                    tbl = tables_now.get(title_h, {}) if isinstance(tables_now, dict) else {}
+                                    rows = int(tbl.get("rows", 25))
+                                    cols = int(tbl.get("cols", 2))
+                                    main_scale_cell = None
+                                    secondary_re = re.compile(r"\bSCALE\b\s*:.*\bto\b", re.IGNORECASE)
+                                    main_hint_re = re.compile(r"\bSCALE\b\s*[:-]", re.IGNORECASE)
+                                    for r in range(min(rows, 60)):
+                                        for c in range(min(cols, 10)):
+                                            cell = _get_cell(title_h, r, c) or ""
+                                            if not cell.strip():
+                                                continue
+                                            if secondary_re.search(cell) and scale_pattern.search(cell):
+                                                try:
+                                                    _set_cell(title_h, r, c, "")
+                                                except Exception:
+                                                    pass
+                                                continue
+                                            if (
+                                                main_scale_cell is None
+                                                and main_hint_re.search(cell)
+                                                and scale_pattern.search(cell)
+                                            ):
+                                                main_scale_cell = (r, c)
+                                    if main_scale_cell is None:
+                                        main_scale_cell = (8, 0)
+                                    mr, mc = main_scale_cell
+                                    title_scale_row = int(mr)
+                                    cell_main = _get_cell(title_h, mr, mc) or ""
+                                    new_cell_main = scale_pattern.sub(replacement, cell_main)
+                                    if new_cell_main != cell_main:
+                                        _set_cell(title_h, mr, mc, new_cell_main)
+                                    elif not (cell_main or "").strip():
+                                        _set_cell(title_h, mr, mc, f"SCALE:- {replacement}")
+                                except Exception:
+                                    pass
+                            # Mark so final recenter uses plot-window alignment, not raw frame center.
+                            geometry["multi_parcel_sheet_fitted"] = True
+                    except Exception as fit_exc:
+                        logger.warning("Multi-parcel plot-then-fit scale failed: %s", fit_exc)
+                except Exception as mp_exc:
+                    logger.warning("Multi-parcel local draw failed, falling back to main ring: %s", mp_exc)
+                    _insert_pegs_at(local_pts)
+                    pl = self.autocad.create_lwpolyline(local_pts, layer="CADA_BOUNDARY", closed=True)
+                    if pl.get("success"):
+                        geometry["boundary_redrawn"] = True
+            else:
+                # Single-parcel: insert peg at every vertex, then one closed boundary polyline.
+                _insert_pegs_at(local_pts)
+                time.sleep(0.15)
+                pl = self.autocad.create_lwpolyline(local_pts, layer="CADA_BOUNDARY", closed=True)
+                time.sleep(0.1)
+                if pl.get("success"):
+                    geometry["boundary_redrawn"] = True
+                    a = self.autocad.calculate_entity_area(str(pl.get("handle")))
+                    if a.get("success") and title_h:
+                        sq_m = float(a.get("area_conversions", {}).get("sq_meters"))
+                        _set_cell(
+                            title_h,
+                            12,
+                            0,
+                            _replace_after_label(
+                                _get_cell(title_h, 12), "AREA:-", f"{sq_m:.3f} SQ. MTRS."
+                            ),
+                        )
 
             # Update coordinate tables to primary
             def _replace_first_num(raw: str, val: float) -> str:
@@ -4980,14 +7313,38 @@ class SurvyAIAgent:
                 raw = (raw or "").strip()
                 if not raw:
                     return []
+                try:
+                    from agent.pdf_survey_plan import split_cadastral_pillar_label
+                except Exception:
+                    split_cadastral_pillar_label = None  # type: ignore
                 parts = [p.strip() for p in re.split(r"[,\n]+", raw) if p.strip()]
                 out = []
                 for p in parts:
-                    m = re.search(r"([A-Za-z]+\s*/\s*[A-Za-z]+)\s*([0-9]+)\b", p)
+                    split = None
+                    if split_cadastral_pillar_label is not None:
+                        try:
+                            split = split_cadastral_pillar_label(p)
+                        except Exception:
+                            split = None
+                    if split:
+                        out.append(
+                            {
+                                "prefix": str(split.get("prefix") or ""),
+                                "number": str(split.get("number") or ""),
+                            }
+                        )
+                        continue
+                    # Legacy fallback: Letter/Letter + digits only
+                    m = re.search(
+                        r"([A-Za-z]+\s*/\s*[A-Za-z]+)\s*([A-Za-z0-9]{3,12})\b",
+                        p,
+                    )
                     if not m:
                         continue
                     prefix = re.sub(r"\s+", "", m.group(1)).upper()
-                    num = m.group(2)
+                    num = m.group(2).upper()
+                    if not re.search(r"\d", num):
+                        continue
                     out.append({"prefix": prefix, "number": num})
                 return out
 
@@ -4997,27 +7354,36 @@ class SurvyAIAgent:
                 _prot = int(geometry.get("primary_vertex_index_original", 0) or 0)
                 if _prot and pn_list and len(pn_list) == len(local_pts):
                     pn_list = pn_list[_prot:] + pn_list[:_prot]
+                # Match clockwise ring reversal (primary stays at index 0).
+                if (
+                    geometry.get("ring_reversed_to_clockwise")
+                    and pn_list
+                    and len(pn_list) == len(local_pts)
+                    and len(pn_list) >= 2
+                ):
+                    pn_list = [pn_list[0]] + list(reversed(pn_list[1:]))
             except Exception:
                 pass
             # If the agent extracted fewer pillar numbers than vertices (often due to punctuation/quoting),
             # auto-extend sequentially using the last known prefix/number so we never drop pillar labels.
+            # Only when the peg token is pure digits (alphanumeric pegs like AS3459RP are not sequenced).
             try:
                 need_n = len(local_pts) if isinstance(local_pts, list) else 0
                 if need_n and pn_list and len(pn_list) < need_n:
                     last = pn_list[-1]
                     prefix = str(last.get("prefix") or "").strip() or "SP"
-                    try:
-                        start_num = int(str(last.get("number") or "0").strip())
-                    except Exception:
-                        start_num = 0
-                    k = start_num
-                    while len(pn_list) < need_n and k < start_num + 2000:
-                        k += 1
-                        pn_list.append({"prefix": prefix, "number": f"{k:04d}"})
+                    num_s = str(last.get("number") or "").strip()
+                    if num_s.isdigit():
+                        start_num = int(num_s)
+                        width = max(len(num_s), 4)
+                        k = start_num
+                        while len(pn_list) < need_n and k < start_num + 2000:
+                            k += 1
+                            pn_list.append({"prefix": prefix, "number": f"{k:0{width}d}"})
             except Exception:
                 pass
             pn_meta: List[Dict[str, Any]] = []
-            if pn_list:
+            if pn_list and not multi_parcel_layout:
                 # Compute a "template-typical" offset distance between a peg and its pillar-number table.
                 # This makes the placement look like the template: close to the peg, but not on it.
                 off = 4.0
@@ -5063,6 +7429,37 @@ class SurvyAIAgent:
                 # move them close (but not on) each new pillar, and delete any extras from the template.
                 t_res = self.autocad.list_tables(layer="CADA_PILLARNUMBERS")
                 pn_tables = (t_res.get("tables") or []) if isinstance(t_res, dict) else []
+                # Enforce modern CADA_PILLARNUMBERS column width (9.2 @ 1:500, scaled with plan).
+                # Older templates still at 8.0 are widened so long alphanumeric pegs fit on one line.
+                try:
+                    target_pn_w = _ideal_pillar_number_table_width(
+                        template_denom=int(template_denom or _CADASTRAL_TEMPLATE_REF_DENOM),
+                        chosen_denom=int(
+                            output_plan_denom
+                            or chosen_denom
+                            or template_denom
+                            or _CADASTRAL_TEMPLATE_REF_DENOM
+                        ),
+                    )
+                    widened = 0
+                    for t in pn_tables:
+                        h0 = str((t or {}).get("handle") or "")
+                        if not h0:
+                            continue
+                        cur = self.autocad.get_table_column_width(h0, 0)
+                        cur_w = float((cur or {}).get("width") or 0.0)
+                        if cur_w <= 0.0 or cur_w + 1e-6 < float(target_pn_w):
+                            sw = self.autocad.set_table_column_width(h0, 0, float(target_pn_w))
+                            if (sw or {}).get("success"):
+                                widened += 1
+                    if widened:
+                        geometry.setdefault("scale_debug", {})["pillar_number_width"] = {
+                            "target": float(target_pn_w),
+                            "widened_tables": int(widened),
+                            "ref_at_1_500": float(_CADASTRAL_TEMPLATE_PILLARNUMBER_REF_W),
+                        }
+                except Exception:
+                    pass
                 used_handles: set[str] = set()
                 pn_meta: List[Dict[str, Any]] = []
                 cxp = sum(p["x"] for p in local_pts) / len(local_pts)
@@ -5114,6 +7511,21 @@ class SurvyAIAgent:
                                 c = self.autocad.copy_entity_by_handle(seed, dx=0.0, dy=0.0, layer="CADA_PILLARNUMBERS")
                                 if (c or {}).get("success") and c.get("handle"):
                                     new_h = str(c.get("handle"))
+                                    try:
+                                        tw = _ideal_pillar_number_table_width(
+                                            template_denom=int(
+                                                template_denom or _CADASTRAL_TEMPLATE_REF_DENOM
+                                            ),
+                                            chosen_denom=int(
+                                                output_plan_denom
+                                                or chosen_denom
+                                                or template_denom
+                                                or _CADASTRAL_TEMPLATE_REF_DENOM
+                                            ),
+                                        )
+                                        self.autocad.set_table_column_width(new_h, 0, float(tw))
+                                    except Exception:
+                                        pass
                                     pn_tables.append({"handle": new_h, "layer": "CADA_PILLARNUMBERS", "insertion_point": c.get("insertion_point") or {}})
                                     cand = [t for t in pn_tables if t.get("handle") and str(t.get("handle")) not in used_handles]
                         except Exception:
@@ -5122,6 +7534,9 @@ class SurvyAIAgent:
                             # Hard fallback: create an MTEXT-based pillar-number label so we never drop a pillar number.
                             try:
                                 lbl = f"{pn_list[i_v]['prefix']}\\P{pn_list[i_v]['number']}"
+                                peg_tok = str(pn_list[i_v].get("number") or "")
+                                # Wider box for longer Nigerian peg tokens (up to ~9+ chars).
+                                mtext_w = 12.0 if len(peg_tok) <= 5 else min(28.0, 8.0 + 1.6 * len(peg_tok))
                                 self.autocad.add_mtext(
                                     f"{{\\fVerdana|b0|i0|c0|p34;{lbl}}}",
                                     vx + 2.0,
@@ -5129,7 +7544,7 @@ class SurvyAIAgent:
                                     layer="CADA_PILLARNUMBERS",
                                     rotation_rad=0.0,
                                     height=max(0.5, float(bearing_road_height) * 0.9),
-                                    width=12.0,
+                                    width=mtext_w,
                                     attachment_point=1,  # top-left
                                 )
                             except Exception:
@@ -5533,7 +7948,11 @@ class SurvyAIAgent:
                             return True
                 return False
 
-            for i in range(len(local_pts)):
+            # Multi-parcel layouts already flagged above — skip bearing/distance COM work.
+            if multi_parcel_layout:
+                geometry["bearing_mtext"] = 0
+
+            for i in range(0 if multi_parcel_layout else len(local_pts)):
                 p1 = local_pts[i]
                 p2 = local_pts[(i + 1) % len(local_pts)]
                 dx = p2["x"] - p1["x"]
@@ -6397,6 +8816,80 @@ class SurvyAIAgent:
             self.autocad.move_all_modelspace(dx_all, dy_all)
             time.sleep(0.15)
 
+            # Legacy post-move overlays only if local multi-parcel draw did not run
+            # (keeps single-parcel path untouched; avoids double-draw / coord-space mismatch).
+            if (extra_parcels or main_parcel_label) and not geometry.get("multi_parcel_drawn_local"):
+                try:
+                    overlay_count = 0
+                    label_h = None
+                    try:
+                        label_h = float((geometry.get("scale_debug") or {}).get("bearing_height") or 0.0)
+                    except Exception:
+                        label_h = None
+                    if not label_h or label_h <= 0:
+                        label_h = max(1.5, float(scale_k) * 2.5)
+
+                    def _draw_parcel_overlay(label: str, ring: List[Dict[str, Any]]) -> None:
+                        nonlocal overlay_count
+                        if not ring or len(ring) < 3:
+                            return
+                        xy = [{"x": float(p["e"]), "y": float(p["n"])} for p in ring]
+                        pl_r = self.autocad.create_lwpolyline(xy, layer="CADA_BOUNDARY", closed=True)
+                        if pl_r.get("success"):
+                            overlay_count += 1
+                        blk = profile.get("blocks", {}).get("pillars", {}).get("block_name") or "PEG_SYMBOL"
+                        for p in ring:
+                            try:
+                                self.autocad.insert_block(
+                                    str(blk),
+                                    float(p["e"]),
+                                    float(p["n"]),
+                                    layer="CADA_PILLARS",
+                                    xscale=float(scale_k),
+                                    yscale=float(scale_k),
+                                    zscale=float(scale_k),
+                                )
+                            except Exception:
+                                pass
+                        lab = (label or "").strip()
+                        if lab:
+                            cx = sum(float(p["e"]) for p in ring) / float(len(ring))
+                            cy = sum(float(p["n"]) for p in ring) / float(len(ring))
+                            self.autocad.add_mtext(
+                                lab,
+                                cx,
+                                cy,
+                                layer="CADA_TEXT",
+                                height=float(label_h),
+                                width=max(25.0, float(label_h) * 14.0),
+                                attachment_point=5,
+                            )
+
+                    if main_parcel_label and coord_pairs and len(coord_pairs) >= 3:
+                        cx = sum(float(p["e"]) for p in coord_pairs) / float(len(coord_pairs))
+                        cy = sum(float(p["n"]) for p in coord_pairs) / float(len(coord_pairs))
+                        self.autocad.add_mtext(
+                            main_parcel_label,
+                            cx,
+                            cy,
+                            layer="CADA_TEXT",
+                            height=float(label_h),
+                            width=max(20.0, float(label_h) * 12.0),
+                            attachment_point=5,
+                        )
+                    for ep in extra_parcels:
+                        if not isinstance(ep, dict):
+                            continue
+                        _draw_parcel_overlay(
+                            str(ep.get("label") or ""),
+                            list(ep.get("points") or []),
+                        )
+                    if overlay_count:
+                        geometry["extra_parcel_boundaries"] = int(overlay_count)
+                        geometry["boundary_redrawn"] = True
+                except Exception as overlay_exc:
+                    logger.warning("Multi-parcel overlay failed: %s", overlay_exc)
+
             # Re-center the SHEET (border + title block/tables/north arrow/etc) around the plotted
             # land boundary WITHOUT moving survey geometry layers.
             try:
@@ -6415,29 +8908,22 @@ class SurvyAIAgent:
                 if boundary_bb.get("success") and frame_bb.get("success"):
                     bc = boundary_bb.get("center") or {}
                     fc = frame_bb.get("center") or {}
-                    movable_layers = list(profile.get("sheet_layers") or []) or [
-                        "CADA_BORDER",
-                        "CADA_INTERIORBORDER",
-                        "CADA_SCALEBAR",      # includes BORDER_BLOCK + scalebar graphics
-                        "CADA_NORTHARROW",
-                        "CADA_EASTARROW",
-                        "CADA_TITLEBLOCK",
-                        "CADA_PLANNUMBER",
-                        "CADA_CERTIFICATION",
-                        "CADA_SURVEYOR",
-                        "CADA_COORDINATES",
-                        "CADA_NORTHCOORDINATES",
-                        "CADA_EASTCOORDINATES",
-                        "TITLE",
-                        "text",
-                    ]
-
-                    # Remove arrow layers AND coordinates from general sheet move so we can align them specifically
-                    arrow_layers = ["CADA_NORTHARROW", "CADA_EASTARROW", "CADA_COORDINATES", "CADA_NORTHCOORDINATES", "CADA_EASTCOORDINATES"]
-                    movable_layers = [L for L in movable_layers if L not in arrow_layers]
-                    # Never move survey geometry: boundary, bearings/distances, pillars, road (prevents displacement)
-                    survey_geometry_layers = ["CADA_BOUNDARY", "CADA_BEARING_DIST", "CADA_PILLARS", "CADA_PILLARNUMBERS", "CADA_ROAD", "CADA_CWF"]
-                    movable_layers = [L for L in movable_layers if L not in survey_geometry_layers]
+                    # Multi-parcel plot-then-fit: align the usable plot WINDOW (not full frame
+                    # center) to the land so parcels stay clear of the title block.
+                    use_plot_window = bool(geometry.get("multi_parcel_sheet_fitted"))
+                    if use_plot_window:
+                        interior_rc = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBORDER"])
+                        if not interior_rc.get("success"):
+                            interior_rc = self.autocad.get_modelspace_bbox(
+                                layers=["CADA_INTERIORBOUNDARY"]
+                            )
+                        title_rc = self.autocad.get_modelspace_bbox(layers=["CADA_TITLEBLOCK"])
+                        win_rc = _usable_plot_window_from_bboxes(interior_rc, title_rc)
+                        if win_rc:
+                            fc = {"x": float(win_rc["center_x"]), "y": float(win_rc["center_y"])}
+                    movable_layers = _cadastral_sheet_translate_layers(profile)
+                    # Primary crosshair + N/E arrows + coords are excluded from sheet recenter
+                    # so CADA_PRIMARYPILLAR_ARROWS stays on the primary peg after move_all.
 
                     # Apply the move and then do a quick correction pass (AutoCAD bbox can shift slightly).
                     total_dx_sheet = 0.0
@@ -6452,7 +8938,25 @@ class SurvyAIAgent:
                         total_dx_sheet += dx_sheet
                         total_dy_sheet += dy_sheet
 
-                        # Recompute frame center after the move
+                        # Recompute target frame/window center after the move
+                        if use_plot_window:
+                            interior_rc = self.autocad.get_modelspace_bbox(
+                                layers=["CADA_INTERIORBORDER"]
+                            )
+                            if not interior_rc.get("success"):
+                                interior_rc = self.autocad.get_modelspace_bbox(
+                                    layers=["CADA_INTERIORBOUNDARY"]
+                                )
+                            title_rc = self.autocad.get_modelspace_bbox(
+                                layers=["CADA_TITLEBLOCK"]
+                            )
+                            win_rc = _usable_plot_window_from_bboxes(interior_rc, title_rc)
+                            if win_rc:
+                                fc = {
+                                    "x": float(win_rc["center_x"]),
+                                    "y": float(win_rc["center_y"]),
+                                }
+                                continue
                         frame_bb = self.autocad.get_modelspace_bbox(layers=["CADA_BORDER"], prefer_largest=True)
                         if not frame_bb.get("success"):
                             frame_bb = self.autocad.get_modelspace_bbox(block_name_contains="BORDER", prefer_largest=True)
@@ -6460,11 +8964,17 @@ class SurvyAIAgent:
                             frame_bb = self.autocad.get_modelspace_bbox(layers=movable_layers, prefer_largest=False)
                         fc = (frame_bb.get("center") or {}) if frame_bb.get("success") else fc
 
-                    # Identify coordinate text handles
+                    # Identify coordinate text handles (layer-scoped — avoid full ModelSpace dump)
                     easting_handles = []
                     northing_handles = []
                     try:
-                        all_ents_res = self.autocad.get_all_entities()
+                        all_ents_res = self.autocad.get_entities_on_layers(
+                            [
+                                "CADA_COORDINATES",
+                                "CADA_EASTCOORDINATES",
+                                "CADA_NORTHCOORDINATES",
+                            ]
+                        )
                         if all_ents_res.get("success"):
                             for ent in all_ents_res.get("entities", []):
                                 lyr = str(ent.get("layer") or "").upper()
@@ -6570,7 +9080,14 @@ class SurvyAIAgent:
                 # - Vertical arrows: shift coordinate text vertically to align with primary pillar Y
                 try:
                     prim_x, prim_y = float(e0), float(n0)
-                    all_ents = self.autocad.get_all_entities()
+                    all_ents = self.autocad.get_entities_on_layers(
+                        [
+                            "CADA_PRIMARYPILLAR_ARROWS",
+                            "CADA_COORDINATES",
+                            "CADA_EASTCOORDINATES",
+                            "CADA_NORTHCOORDINATES",
+                        ]
+                    )
                     ents = (all_ents.get("entities") or []) if all_ents.get("success") else []
 
                     def _bbox_from_ent(ent: Dict[str, Any]) -> Optional[Dict[str, float]]:
@@ -6607,57 +9124,88 @@ class SurvyAIAgent:
                                 arrow_handles.append(h)
 
                     if arrow_handles:
-                        # Compute bbox of all primary pillar arrow entities
-                        arrow_bb = None
+                        # Crosshair = horizontal arm(s) + vertical arm(s). Align by
+                        # intersection of those arms — NOT the combined bbox centre
+                        # (unequal arm lengths make bbox-centre ≠ primary peg).
+                        horiz_ys: List[float] = []
+                        vert_xs: List[float] = []
                         for ent in ents:
-                            h = str(ent.get("handle") or "").upper()
-                            if h not in [ah.upper() for ah in arrow_handles]:
+                            h = str(ent.get("handle") or "").strip()
+                            if not h or h.upper() not in {ah.upper() for ah in arrow_handles}:
                                 continue
-                            bb = _bbox_from_ent(ent)
-                            if not bb:
+                            if str(ent.get("type") or "").upper() != "LINE":
                                 continue
-                            if arrow_bb is None:
-                                arrow_bb = dict(bb)
+                            coords = ent.get("coordinates") or {}
+                            s = coords.get("start") or {}
+                            e = coords.get("end") or {}
+                            try:
+                                x1, y1 = float(s.get("x")), float(s.get("y"))
+                                x2, y2 = float(e.get("x")), float(e.get("y"))
+                            except Exception:
+                                continue
+                            dx_l, dy_l = x2 - x1, y2 - y1
+                            if abs(dx_l) >= abs(dy_l):
+                                horiz_ys.append(0.5 * (y1 + y2))
                             else:
-                                arrow_bb["minx"] = min(arrow_bb["minx"], bb["minx"])
-                                arrow_bb["miny"] = min(arrow_bb["miny"], bb["miny"])
-                                arrow_bb["maxx"] = max(arrow_bb["maxx"], bb["maxx"])
-                                arrow_bb["maxy"] = max(arrow_bb["maxy"], bb["maxy"])
+                                vert_xs.append(0.5 * (x1 + x2))
 
-                        if arrow_bb:
-                            # Horizontal alignment: align X center of arrows with primary pillar X
-                            arrow_x_center = 0.5 * (arrow_bb["minx"] + arrow_bb["maxx"])
-                            dx_horiz = prim_x - arrow_x_center
-                            if abs(dx_horiz) > 1e-6:
+                        if horiz_ys and vert_xs:
+                            horiz_ys.sort()
+                            vert_xs.sort()
+                            ix = float(vert_xs[len(vert_xs) // 2])
+                            iy = float(horiz_ys[len(horiz_ys) // 2])
+                            dx_cross = prim_x - ix
+                            dy_cross = prim_y - iy
+                            if abs(dx_cross) > 1e-6 or abs(dy_cross) > 1e-6:
                                 move_h = [str(h) for h in arrow_handles]
                                 if east_h:
                                     move_h.append(str(east_h))
-                                # Also move coordinate text entities that should follow horizontally
-                                for ent in ents:
-                                    lyr = str(ent.get("layer") or "").upper()
-                                    txt = str(ent.get("text_content") or "").upper()
-                                    if (lyr == "CADA_COORDINATES" and ".E" in txt) or (lyr == "CADA_EASTCOORDINATES"):
-                                        h = str(ent.get("handle") or "").strip()
-                                        if h:
-                                            move_h.append(h)
-                                self.autocad.move_entities_by_handles(dx_horiz, 0.0, move_h)
-
-                            # Vertical alignment: align Y center of arrows with primary pillar Y
-                            arrow_y_center = 0.5 * (arrow_bb["miny"] + arrow_bb["maxy"])
-                            dy_vert = prim_y - arrow_y_center
-                            if abs(dy_vert) > 1e-6:
-                                move_h = [str(h) for h in arrow_handles]
                                 if north_h:
                                     move_h.append(str(north_h))
-                                # Also move coordinate text entities that should follow vertically
                                 for ent in ents:
                                     lyr = str(ent.get("layer") or "").upper()
                                     txt = str(ent.get("text_content") or "").upper()
-                                    if (lyr == "CADA_COORDINATES" and ".N" in txt) or (lyr == "CADA_NORTHCOORDINATES"):
-                                        h = str(ent.get("handle") or "").strip()
-                                        if h:
-                                            move_h.append(h)
-                                self.autocad.move_entities_by_handles(0.0, dy_vert, move_h)
+                                    h = str(ent.get("handle") or "").strip()
+                                    if not h:
+                                        continue
+                                    if (lyr == "CADA_COORDINATES" and (".E" in txt or ".N" in txt)) or (
+                                        lyr in ("CADA_EASTCOORDINATES", "CADA_NORTHCOORDINATES")
+                                    ):
+                                        move_h.append(h)
+                                self.autocad.move_entities_by_handles(dx_cross, dy_cross, move_h)
+                                geometry["primary_crosshair_snapped"] = True
+                                geometry["primary_crosshair_dx"] = float(dx_cross)
+                                geometry["primary_crosshair_dy"] = float(dy_cross)
+                        else:
+                            # Fallback: previous bbox-centre snap (templates without LINE arms).
+                            arrow_bb = None
+                            for ent in ents:
+                                h = str(ent.get("handle") or "").upper()
+                                if h not in [ah.upper() for ah in arrow_handles]:
+                                    continue
+                                bb = _bbox_from_ent(ent)
+                                if not bb:
+                                    continue
+                                if arrow_bb is None:
+                                    arrow_bb = dict(bb)
+                                else:
+                                    arrow_bb["minx"] = min(arrow_bb["minx"], bb["minx"])
+                                    arrow_bb["miny"] = min(arrow_bb["miny"], bb["miny"])
+                                    arrow_bb["maxx"] = max(arrow_bb["maxx"], bb["maxx"])
+                                    arrow_bb["maxy"] = max(arrow_bb["maxy"], bb["maxy"])
+
+                            if arrow_bb:
+                                arrow_x_center = 0.5 * (arrow_bb["minx"] + arrow_bb["maxx"])
+                                arrow_y_center = 0.5 * (arrow_bb["miny"] + arrow_bb["maxy"])
+                                dx_horiz = prim_x - arrow_x_center
+                                dy_vert = prim_y - arrow_y_center
+                                if abs(dx_horiz) > 1e-6 or abs(dy_vert) > 1e-6:
+                                    move_h = [str(h) for h in arrow_handles]
+                                    if east_h:
+                                        move_h.append(str(east_h))
+                                    if north_h:
+                                        move_h.append(str(north_h))
+                                    self.autocad.move_entities_by_handles(dx_horiz, dy_vert, move_h)
                 except Exception:
                     pass
             except Exception:
@@ -6760,6 +9308,7 @@ class SurvyAIAgent:
             pass
 
         if coordinates and not geometry.get("boundary_redrawn"):
+            _release_output_tab(already_saved=True)
             return {
                 "success": False,
                 "error": (
@@ -6771,9 +9320,16 @@ class SurvyAIAgent:
                 "profile_path": profile_path,
             }
 
-        out_result = {"success": True, "output_dwg": str(outp), "geometry": geometry, "profile_path": profile_path}
+        out_result = {
+            "success": True,
+            "output_dwg": str(outp),
+            "geometry": geometry,
+            "profile_path": profile_path,
+            "template_path": str(Path(template).resolve()) if template else None,
+        }
         if geometry.get("access_road_title"):
             out_result["access_road_title"] = geometry["access_road_title"]
+        _release_output_tab(already_saved=True)
         return out_result
 
     # ==========================================================================
@@ -7018,7 +9574,35 @@ class SurvyAIAgent:
                 title_h = str((tables.get("title_block") or {}).get("handle") or "")
                 if title_h:
                     cur = _get_cell(title_h, 2, 0)
-                    _set_cell(title_h, 2, 0, _mtxt_replace(cur, _format_buyer_name_for_titleblock(new_title)))
+                    owner_max_chars = 38
+                    try:
+                        ext_owner = self.autocad.get_table_cell_extents(title_h, 2, 0, outer=True)
+                        step_owner = self.autocad.get_table_cell_mtext_line_step(
+                            title_h, 2, 0, cur
+                        )
+                        if ext_owner.get("success"):
+                            ow = float(ext_owner.get("maxx", 0.0)) - float(
+                                ext_owner.get("minx", 0.0)
+                            )
+                            oth = float((step_owner or {}).get("text_height") or 0.0)
+                            if ow > 1.0 and oth > 0.05:
+                                owner_max_chars = max(
+                                    16,
+                                    int(ow / (oth * _CARTO_CHAR_WIDTH_FACTOR)),
+                                )
+                    except Exception:
+                        pass
+                    _set_cell(
+                        title_h,
+                        2,
+                        0,
+                        _mtxt_replace(
+                            cur,
+                            _format_buyer_name_for_titleblock(
+                                new_title, max_chars_per_line=owner_max_chars
+                            ),
+                        ),
+                    )
                     modifications_done.append("title")
                 else:
                     modifications_done.append("title_skip_no_handle")
@@ -7735,8 +10319,71 @@ class SurvyAIAgent:
                 text = text[:pos].strip()
         return text
 
+    def _extract_last_user_turn(self, query: str) -> str:
+        """Return the most recent user message from injected GUI history."""
+        block = self._extract_history_block(query)
+        idx = block.rfind("User:")
+        if idx == -1:
+            return ""
+        text = block[idx + len("User:"):].strip()
+        for marker in ("\nAssistant:", "\n--- End of History", "\n--- Exchange"):
+            pos = text.find(marker)
+            if pos != -1:
+                text = text[:pos].strip()
+        return text
+
+    @staticmethod
+    def _score_optional_offer(offer: str) -> int:
+        """Prefer analysis/search/deeper-extract offers over invented CAD plots."""
+        ol = (offer or "").lower()
+        if not ol:
+            return -999
+        score = 0
+        if any(
+            k in ol
+            for k in (
+                "search",
+                "internet",
+                "deeper",
+                "more detail",
+                "extract",
+                "read",
+                "dig",
+                "look up",
+                "look carefully",
+                "more thorough",
+                "full extraction",
+                "retrieve",
+                "transformation",
+                "crs",
+                "epsg",
+            )
+        ):
+            score += 10
+        if any(
+            k in ol
+            for k in (
+                ".dwg",
+                "cadastral",
+                "cad plan",
+                "cad drawing",
+                "plot a",
+                "plot the",
+                "generate a plan",
+                "generate cad",
+                "autocad",
+                "survey plan",
+            )
+        ):
+            score -= 8
+        return score
+
     def _extract_offer_from_assistant_text(self, assistant_text: str) -> str:
-        """Pull the optional next-step offer from the last assistant turn."""
+        """Pull the best optional next-step offer from the last assistant turn.
+
+        When several offers appear, prefer search / deeper extract / analysis over
+        CAD plotting so a bare "go ahead" after Excel inspect does not invent a DWG.
+        """
         t = (assistant_text or "").strip()
         if not t:
             return ""
@@ -7745,12 +10392,21 @@ class SurvyAIAgent:
             r"(?is)\bi can next\s+[^.?\n]+[.?\n]",
             r"(?is)\bwould you like me to\s+[^.?\n]+[.?\n]",
             r"(?is)\bshall i\s+[^.?\n]+[.?\n]",
+            r"(?is)\bi can(?: also)?\s+(?:try|do|run|perform|search|extract|read|dig)[^.?\n]+[.?\n]",
         )
+        offers: List[str] = []
+        seen: set[str] = set()
         for pat in patterns:
-            m = re.search(pat, t)
-            if m:
-                return re.sub(r"\s+", " ", m.group(0)).strip()
-        return ""
+            for m in re.finditer(pat, t):
+                cleaned = re.sub(r"\s+", " ", m.group(0)).strip()
+                key = cleaned.lower()
+                if cleaned and key not in seen:
+                    seen.add(key)
+                    offers.append(cleaned)
+        if not offers:
+            return ""
+        offers.sort(key=self._score_optional_offer, reverse=True)
+        return offers[0]
 
     def _is_bare_affirmative_reply(self, text: str) -> bool:
         """True for short replies like 'yes' / 'go ahead' with no new task wording."""
@@ -7758,6 +10414,34 @@ class SurvyAIAgent:
         if not t or len(t.split()) > 5:
             return False
         return self._is_affirmative_reply(t)
+
+    def _last_assistant_offered_deeper_analysis(self, query: str) -> bool:
+        """True when the last assistant turn offered deeper extract/search (not CAD)."""
+        last = (self._extract_last_assistant_turn(query) or "").lower()
+        if not last:
+            return False
+        markers = (
+            "deeper",
+            "dig deeper",
+            "more detail",
+            "more details",
+            "full extraction",
+            "document_get_text_force",
+            "look more carefully",
+            "more thorough",
+            "search the internet",
+            "try a deeper",
+            "extract more",
+            "read the spreadsheet again",
+            "force extraction",
+        )
+        if not any(m in last for m in markers):
+            return False
+        # If the only concrete offer is clearly a CAD plot, do not treat as deeper-analysis.
+        offer = self._extract_offer_from_assistant_text(last)
+        if offer and explicit_cadastral_plot_intent(offer) and self._score_optional_offer(offer) < 0:
+            return False
+        return True
 
     def _resolve_affirmative_to_last_offer(
         self, raw_query: str, routing_query: str
@@ -7775,18 +10459,57 @@ class SurvyAIAgent:
         last = self._extract_last_assistant_turn(raw_query)
         if not last:
             return None
+        prior_user = self._extract_last_user_turn(raw_query)
         offer = self._extract_offer_from_assistant_text(last)
+
+        # After an Excel/CSV inspect turn, bare "go ahead" means deepen analysis —
+        # never invent a CAD/.dwg deliverable the user did not request.
+        if (
+            prior_user
+            and is_tabular_inspect_only_request(prior_user)
+            and (
+                self._last_assistant_offered_deeper_analysis(raw_query)
+                or not (offer and explicit_cadastral_plot_intent(offer))
+                or self._score_optional_offer(offer or "") >= 0
+            )
+        ):
+            if offer and not explicit_cadastral_plot_intent(offer):
+                return (
+                    f"The user replied affirmatively ({rq!r}) to your last offer: {offer} "
+                    "Proceed with ONLY that offer using the same spreadsheet/files from the "
+                    "immediately preceding exchange. Do NOT create, plot, or save any CAD/.dwg "
+                    "file unless the user explicitly asked for a CAD plan."
+                )
+            return (
+                f"The user replied affirmatively ({rq!r}) after a spreadsheet read/extract turn. "
+                "Continue with a deeper extraction/analysis of that same workbook using "
+                "document/Excel read tools (or internet search only if you already asked and "
+                "they granted permission). Do NOT call excel_cadastral_plot / "
+                "cadastral_compose_and_plot / cadastral_generate_from_prompt and do NOT invent "
+                "a .dwg filename or CAD drawing."
+            )
+
+        if offer and explicit_cadastral_plot_intent(offer) and prior_user and is_tabular_inspect_only_request(prior_user):
+            return (
+                f"The user replied affirmatively ({rq!r}) after inspecting a spreadsheet. "
+                "Do NOT treat that as permission to plot CAD. Deepen the spreadsheet "
+                "extraction/analysis only. Call a cadastral plot tool only after an explicit "
+                "user request to generate/create/plot a .dwg/CAD plan."
+            )
+
         if offer:
             return (
                 f"The user replied affirmatively ({rq!r}) to your last offer: {offer} "
                 "Proceed with ONLY that offer using the same files and workspace from the "
                 "immediately preceding exchange. Do NOT switch to unrelated workflows "
-                "(e.g. do not run volume/CutFill if the active task is coordinate conversion)."
+                "(e.g. do not run volume/CutFill if the active task is coordinate conversion; "
+                "do not plot CAD if the offer was only deeper extract/search)."
             )
         return (
             f"The user replied affirmatively ({rq!r}) to your immediately prior message. "
             "Execute ONLY the optional next step you most recently offered there. "
-            "Do NOT resume older unrelated workflows from earlier in the session."
+            "Do NOT resume older unrelated workflows from earlier in the session. "
+            "Do NOT invent CAD/.dwg outputs the user did not request."
         )
 
     @staticmethod
@@ -9792,6 +12515,118 @@ class SurvyAIAgent:
             excel_coordinate_convert, arcgis_import_xy_points_from_excel, etc.
             """
             return str(self.excel_processor.csv_to_excel(csv_path, output_excel_path))
+
+        class CadastralGenerateFromPromptInput(BaseModel):
+            """Fully composed cadastral CAD prompt (inline coordinates required)."""
+            cadastral_prompt: str = Field(
+                description=(
+                    "Complete cadastral prompt including Generate 'Out.dwg', buyer/location/LGA/state, "
+                    "origin_crs, plan number, certification date, surveyor fields, pillar numbers, and "
+                    "coordinates for the points as (EmE, NmN) pairs and/or bearing/distance legs."
+                )
+            )
+
+        def cadastral_generate_from_prompt(cadastral_prompt: str) -> str:
+            """
+            Run the deterministic cadastral CAD pipeline on a fully composed prompt.
+
+            Use AFTER reading Excel / extracting metadata from a reference DWG, when you have
+            built a valid prompt with real EmE/NmN (or bearing/distance) geometry. Do NOT call
+            this with 'coordinates … extracted from excel' placeholders.
+            """
+            import json
+
+            result = self._run_cadastral_cad_prompt_pipeline(
+                cadastral_prompt or "",
+                skip_intent_assessment=False,
+            )
+            if result.get("success"):
+                self._last_cadastral_output_dwg = result.get("output_dwg")
+                self._last_cadastral_profile_path = result.get("profile_path")
+            return json.dumps(result, indent=2, default=str)
+
+        class ExcelCadastralPlotInput(BaseModel):
+            """Natural-language Excel → cadastral request (multi-parcel OR per-owner plans)."""
+            user_request: str = Field(
+                description=(
+                    "The user's full request: Excel ownership parcels, output .dwg name(s), "
+                    "optional reference plan for location/surveyor/plan number, certification date, CRS. "
+                    "May ask for one multi-parcel DWG or separate DWGs per owner."
+                )
+            )
+
+        def excel_cadastral_plot(user_request: str) -> str:
+            """
+            Parse family/ownership parcels from Excel (any workbook name), optionally write a
+            normalized copy when the user asks (any filename), pull title-block metadata from a
+            named reference DWG when present, then plot:
+            - SEPARATE owner plans when the user asks for different/unique CAD plans per owner
+              (each buyer's coordinates → that buyer's .dwg; plan numbers increment from the
+              user-stated start-from / plan-number base when present, else from the reference), OR
+            - one MULTI-PARCEL DWG when they want all owners on a single sheet with letter tags.
+            Field sources are independent: an explicit start-from plan number overrides the
+            reference DWG plan no. even when location/surveyor are taken from that DWG.
+            Plotting may use the input file directly.
+
+            REFUSES inspect-only / deeper-extract requests that do not explicitly ask for a
+            CAD/.dwg deliverable — never invent output drawings.
+            """
+            import json
+
+            req = user_request or ""
+            if not explicit_cadastral_plot_intent(req):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "refused_reason": "missing_explicit_cadastral_plot_intent",
+                        "error": (
+                            "excel_cadastral_plot refused: the request does not explicitly ask "
+                            "to generate/create/plot a CAD/.dwg plan. Use document/Excel read "
+                            "tools for extract/inspect/deeper-search turns. Only call this tool "
+                            "after a clear CAD deliverable request."
+                        ),
+                    },
+                    indent=2,
+                )
+            result = self._run_excel_cadastral_pipeline(req)
+            return json.dumps(result, indent=2, default=str)
+
+        class CadastralComposeAndPlotInput(BaseModel):
+            """Complex / multi-format deferred cadastral composition request."""
+            user_request: str = Field(
+                description=(
+                    "Full user request where coordinates/bearings live in Excel/CSV/TXT/DOCX "
+                    "(or a complex natural-language mix), plus Generate … .dwg and optional "
+                    "reference plan for location/surveyor/plan number."
+                )
+            )
+
+        def cadastral_compose_and_plot(user_request: str) -> str:
+            """
+            Intelligent composition: discover Excel/CSV/TXT/DOCX sources, extract geometry
+            (deterministic first, then one RAG-informed LLM pass if needed), compose a valid
+            cadastral prompt, and plot. Prefer for complex deferred-file prompts; use
+            cadastral_generate_from_prompt only when EmE/NmN are already fully composed.
+
+            REFUSES inspect-only / deeper-extract requests without an explicit CAD/.dwg ask.
+            """
+            import json
+
+            req = user_request or ""
+            if not explicit_cadastral_plot_intent(req):
+                return json.dumps(
+                    {
+                        "success": False,
+                        "refused_reason": "missing_explicit_cadastral_plot_intent",
+                        "error": (
+                            "cadastral_compose_and_plot refused: no explicit generate/create/"
+                            "plot CAD/.dwg request. Continue with file read/extract tools only."
+                        ),
+                    },
+                    indent=2,
+                )
+            result = self._run_intelligent_cadastral_pipeline(req)
+            return json.dumps(result, indent=2, default=str)
         
         # ==================================================================
         # DOCUMENT PROCESSING TOOLS (Atomic, AI-driven extraction)
@@ -9851,7 +12686,13 @@ class SurvyAIAgent:
         
         class DocumentCreateInput(BaseModel):
             """Input schema for document creation."""
-            file_path: str = Field(description="Full path where the Word document should be saved (.docx)")
+            file_path: str = Field(
+                description=(
+                    "Filename or path for the Word document (.docx). "
+                    "When the user gives only a name (no folder), use that filename only — "
+                    "SurvyAI saves it in the active workspace automatically."
+                )
+            )
             content: str = Field(description="Text content to write to the document")
             title: Optional[str] = Field(
                 default=None,
@@ -9860,7 +12701,12 @@ class SurvyAIAgent:
         
         class DocumentCreateStructuredInput(BaseModel):
             """Input schema for structured document creation."""
-            file_path: str = Field(description="Full path where the Word document should be saved (.docx)")
+            file_path: str = Field(
+                description=(
+                    "Filename or path for the Word document (.docx). "
+                    "Bare filenames are saved in the active SurvyAI workspace."
+                )
+            )
             title: str = Field(description="Document title")
             sections: List[Dict] = Field(
                 description="List of sections, each with heading, level, content, and optional table"
@@ -10031,13 +12877,19 @@ class SurvyAIAgent:
             When user says "save as [filename]" or "export as [filename]", use this tool immediately.
             
             Args:
-                file_path: Full path where document should be saved (include .docx extension)
+                file_path: Filename or path for the .docx. Bare filenames are saved in the active
+                    SurvyAI workspace (current working directory). Prefer workspace + filename
+                    when the user does not give a full folder path.
                 content: Text content to write - MUST be from CURRENT conversation response, not previous ones
                 title: Optional document title
                 
             Returns: Success message with file path
             """
-            result = self.document_processor.create_word_document(file_path, content, title)
+            try:
+                resolved = str(self._resolve_output_path_for_write(file_path))
+            except Exception:
+                resolved = file_path
+            result = self.document_processor.create_word_document(resolved, content, title)
             return str(result)
         
         def document_create_structured_word(
@@ -10053,15 +12905,19 @@ class SurvyAIAgent:
             More advanced than document_create_word - use when you have structured data.
             
             Args:
-                file_path: Full path where document should be saved
+                file_path: Filename or path for the .docx (bare names → active workspace)
                 title: Document title
                 sections: List of section dicts with 'heading', 'level', 'content', optional 'table'
                 metadata: Optional metadata dict
                 
             Returns: Success message with file path
             """
+            try:
+                resolved = str(self._resolve_output_path_for_write(file_path))
+            except Exception:
+                resolved = file_path
             result = self.document_processor.create_word_document_from_structure(
-                file_path, title, sections, metadata
+                resolved, title, sections, metadata
             )
             return str(result)
         
@@ -10110,8 +12966,12 @@ class SurvyAIAgent:
                 
             Returns: Success message with file path
             """
+            try:
+                resolved = str(self._resolve_output_path_for_write(file_path))
+            except Exception:
+                resolved = file_path
             result = self.document_processor.update_word_document(
-                file_path, new_content, title, overwrite
+                resolved, new_content, title, overwrite
             )
             return str(result)
         
@@ -10719,6 +13579,59 @@ class SurvyAIAgent:
                 ),
                 func=csv_to_excel,
                 args_schema=CsvToExcelInput,
+            ),
+            StructuredTool(
+                name="excel_cadastral_plot",
+                description=(
+                    "Excel family/ownership parcels → cadastral DWG(s). "
+                    "Use ONLY when the user explicitly wants Generate/create/plot … .dwg / CAD plan(s) "
+                    "and Easting/Northing/pillar values are in a spreadsheet (owner blocks "
+                    "separated by blank rows), optionally with metadata from an existing plan DWG. "
+                    "Do NOT use for read/extract/inspect/summarize Excel turns, or bare 'yes/go ahead' "
+                    "after those turns (that means deeper extract/search, not CAD). "
+                    "SEMANTICS (critical): "
+                    "(1) SEPARATE plans — phrases like 'different CAD plans', 'each owner … only that "
+                    "plan', 'buyer name as the name of that particular CAD drawing', plan-number "
+                    "increment → one .dwg per owner named after the buyer. "
+                    "(2) MULTI-PARCEL — 'all owner names', letter tags like 'AMADI (B)', parcels "
+                    "marked within one plan → a single multi-parcel DWG. "
+                    "(3) PLAN NUMBER — 'start from plan number …' / 'plan number: …' is the first "
+                    "plan and increments per owner; it overrides the reference DWG plan no. "
+                    "Taking location/surveyor from a reference plan does not imply taking its "
+                    "plan number when a start-from was stated. "
+                    "Chooses the best ownership workbook by content (real owner/family rows), not by "
+                    "filename. Writes a normalized Easting/Northing/Pillar/Owner copy only when asked. "
+                    "Prefer this over inventing coordinates or calling cadastral_generate_from_prompt "
+                    "with placeholders. Never invent a default DWG name the user did not request."
+                ),
+                func=excel_cadastral_plot,
+                args_schema=ExcelCadastralPlotInput,
+            ),
+            StructuredTool(
+                name="cadastral_compose_and_plot",
+                description=(
+                    "INTELLIGENT multi-format cadastral composition for complex prompts that "
+                    "explicitly ask to Generate/create/plot a .dwg/CAD plan: "
+                    "reads coordinates/bearings from Excel, CSV, TXT, or DOCX (deterministic extract first, "
+                    "then one RAG-informed LLM compose when structure is ambiguous), pulls metadata from a "
+                    "named reference DWG when asked, optionally writes a normalized workbook when requested, and plots the DWG. "
+                    "Use when the user did NOT paste inline EmE/NmN traverse text. "
+                    "Do NOT use for simple conventional Generate … prompts that already include coordinates/bearings. "
+                    "Do NOT use for spreadsheet read/extract/deeper-search-only turns."
+                ),
+                func=cadastral_compose_and_plot,
+                args_schema=CadastralComposeAndPlotInput,
+            ),
+            StructuredTool(
+                name="cadastral_generate_from_prompt",
+                description=(
+                    "Plot a cadastral plan from a FULLY COMPOSED prompt that already contains real "
+                    "coordinates for the points as (EmE, NmN) and/or bearing/distance legs. "
+                    "Use after you read Excel/CSV/TXT/DOCX / a reference DWG and assembled the canonical cadastral fields. "
+                    "Never pass 'extract coordinates from excel/csv/file' without numeric EmE/NmN values."
+                ),
+                func=cadastral_generate_from_prompt,
+                args_schema=CadastralGenerateFromPromptInput,
             ),
             # Document processing tools (atomic, AI-driven)
             StructuredTool(
@@ -12864,6 +15777,25 @@ class SurvyAIAgent:
                     "error": fast.get("error") if not fast.get("success") else None,
                 }
 
+            # FAST PATH (early): extract key details from a survey-plan PDF (vision for scans).
+            if _pre_intent != "knowledge" and self._should_fastpath_pdf_plan_key_details(
+                tool_routing_query
+            ):
+                logger.info("PDF survey key-details (vision) fast-path triggered")
+                fast = self._run_pdf_plan_key_details_pipeline(tool_routing_query)
+                llm_used = "fallback" if use_fallback else "primary"
+                return {
+                    "query": query,
+                    "response": fast.get("response") or fast.get("error") or str(fast),
+                    "llm_used": llm_used,
+                    "model_name": fast.get("model_name") or model_name_used,
+                    "complexity": "complex",
+                    "success": bool(fast.get("success")),
+                    "session_id": current_session_id,
+                    "context_retrieved": False,
+                    "error": fast.get("error") if not fast.get("success") else None,
+                }
+
             prompt_action = self._assess_prompt_action(
                 raw_query=query,
                 routing_query=routing_query,
@@ -13119,6 +16051,187 @@ class SurvyAIAgent:
                     "error": fast.get("error") if not fast.get("success") else None,
                 }
 
+            # FAST PATH: Excel ownership workbook → multi-parcel OR per-owner cadastral DWG(s)
+            if self._should_fastpath_excel_cadastral(tool_routing_query):
+                fast = self._run_excel_cadastral_pipeline(tool_routing_query)
+                llm_used = "fallback" if use_fallback else "primary"
+                if fast.get("success"):
+                    if fast.get("mode") == "separate_owner_plans":
+                        resp_lines = [
+                            "✅ Separate owner cadastral plans generated from Excel coordinates "
+                            "(one DWG per owner — not a multi-parcel layout).",
+                            f"- Plans succeeded: {fast.get('plans_success')}/{fast.get('plans_total')}",
+                            f"- Source Excel: {fast.get('excel_path')}",
+                            f"- Duplicate workbook: {fast.get('dup_xlsx')}",
+                            f"- Owners: {fast.get('buyer_name')}",
+                        ]
+                        for plan in (fast.get("plans") or [])[:25]:
+                            status = "OK" if plan.get("success") else "FAIL"
+                            resp_lines.append(
+                                f"  • [{status}] {plan.get('owner_name')}: "
+                                f"{plan.get('output_dwg')}"
+                                + (
+                                    f" (plan no. {plan.get('plan_number')})"
+                                    if plan.get("plan_number")
+                                    else ""
+                                )
+                            )
+                    else:
+                        resp_lines = [
+                            "✅ Multi-parcel cadastral plan generated from Excel coordinates.",
+                            f"- Output: {fast.get('output_dwg')}",
+                            f"- Source Excel: {fast.get('excel_path')}",
+                            f"- Duplicate workbook: {fast.get('dup_xlsx')}",
+                            f"- Parcels plotted: {fast.get('parcel_count')}",
+                            f"- Buyer/owner labels: {fast.get('buyer_name')}",
+                        ]
+                    if fast.get("reference_dwg"):
+                        resp_lines.append(f"- Metadata source plan: {fast.get('reference_dwg')}")
+                    for note in fast.get("notes") or []:
+                        resp_lines.append(f"- Note: {note}")
+                    if fast.get("access_road_title"):
+                        resp_lines.append(f"- Access road title (as plotted): {fast.get('access_road_title')!r}")
+                    resp_lines.append(
+                        "\nYou can request modifications in this session "
+                        "(e.g. add a road, change the title) without re-prompting."
+                    )
+                    return {
+                        "query": query,
+                        "response": "\n".join(resp_lines) + "\n",
+                        "llm_used": llm_used,
+                        "model_name": model_name_used,
+                        "complexity": complexity,
+                        "success": True,
+                        "session_id": self.get_session_id(),
+                        "context_retrieved": False,
+                        "output_path": fast.get("output_dwg"),
+                    }
+                # User declined overwrite / file still locked: stop here (do not re-prompt via compose).
+                err_txt = str(fast.get("error") or "")
+                if (
+                    fast.get("cancelled")
+                    or fast.get("locked")
+                    or "Kept existing drawing" in err_txt
+                    or "still locked" in err_txt.lower()
+                ):
+                    return {
+                        "query": query,
+                        "response": err_txt or "CAD generation stopped.",
+                        "llm_used": llm_used,
+                        "model_name": model_name_used,
+                        "complexity": complexity,
+                        "success": False,
+                        "session_id": self.get_session_id(),
+                        "context_retrieved": False,
+                        "error": err_txt,
+                    }
+                # Excel failed → try intelligent multi-format compose before full agent loop.
+                logger.warning(
+                    "Excel cadastral fastpath failed (%s); trying intelligent composition.",
+                    fast.get("error"),
+                )
+                intel = self._run_intelligent_cadastral_pipeline(tool_routing_query)
+                if intel.get("success"):
+                    if intel.get("mode") == "separate_owner_plans":
+                        resp_lines = [
+                            "✅ Separate owner cadastral plans generated via intelligent composition "
+                            "(one DWG per owner).",
+                            f"- Plans succeeded: {intel.get('plans_success')}/{intel.get('plans_total')}",
+                            f"- Sources: {', '.join(intel.get('source_files') or [])}",
+                            f"- Owners: {intel.get('buyer_name')}",
+                        ]
+                        for plan in (intel.get("plans") or [])[:25]:
+                            status = "OK" if plan.get("success") else "FAIL"
+                            resp_lines.append(
+                                f"  • [{status}] {plan.get('owner_name')}: {plan.get('output_dwg')}"
+                            )
+                    else:
+                        resp_lines = [
+                            "✅ Cadastral plan generated via intelligent file composition.",
+                            f"- Output: {intel.get('output_dwg')}",
+                            f"- Sources: {', '.join(intel.get('source_files') or [])}",
+                            f"- Compose mode: {intel.get('compose_source')}",
+                            f"- Parcels plotted: {intel.get('parcel_count')}",
+                            f"- Buyer/owner labels: {intel.get('buyer_name')}",
+                        ]
+                    if intel.get("dup_xlsx"):
+                        resp_lines.append(f"- Duplicate workbook: {intel.get('dup_xlsx')}")
+                    if intel.get("reference_dwg"):
+                        resp_lines.append(f"- Metadata source plan: {intel.get('reference_dwg')}")
+                    for note in intel.get("notes") or []:
+                        resp_lines.append(f"- Note: {note}")
+                    return {
+                        "query": query,
+                        "response": "\n".join(resp_lines) + "\n",
+                        "llm_used": llm_used,
+                        "model_name": model_name_used,
+                        "complexity": complexity,
+                        "success": True,
+                        "session_id": self.get_session_id(),
+                        "context_retrieved": False,
+                        "output_path": intel.get("output_dwg"),
+                    }
+                logger.warning(
+                    "Intelligent cadastral composition also failed (%s); falling through to agent tools.",
+                    intel.get("error"),
+                )
+
+            # FAST PATH: complex / CSV|TXT|DOCX deferred coords → RAG+LLM compose → CAD plot
+            # (Simple inline cadastral prompts never enter here — deferred detection is False.)
+            if self._should_fastpath_intelligent_cadastral(tool_routing_query):
+                fast = self._run_intelligent_cadastral_pipeline(tool_routing_query)
+                llm_used = "fallback" if use_fallback else "primary"
+                if fast.get("success"):
+                    if fast.get("mode") == "separate_owner_plans":
+                        resp_lines = [
+                            "✅ Separate owner cadastral plans generated via intelligent composition "
+                            "(one DWG per owner).",
+                            f"- Plans succeeded: {fast.get('plans_success')}/{fast.get('plans_total')}",
+                            f"- Sources: {', '.join(fast.get('source_files') or [])}",
+                            f"- Owners: {fast.get('buyer_name')}",
+                        ]
+                        for plan in (fast.get("plans") or [])[:25]:
+                            status = "OK" if plan.get("success") else "FAIL"
+                            resp_lines.append(
+                                f"  • [{status}] {plan.get('owner_name')}: {plan.get('output_dwg')}"
+                            )
+                    else:
+                        resp_lines = [
+                            "✅ Cadastral plan generated via intelligent file composition.",
+                            f"- Output: {fast.get('output_dwg')}",
+                            f"- Sources: {', '.join(fast.get('source_files') or [])}",
+                            f"- Compose mode: {fast.get('compose_source')}",
+                            f"- Parcels plotted: {fast.get('parcel_count')}",
+                            f"- Buyer/owner labels: {fast.get('buyer_name')}",
+                        ]
+                    if fast.get("dup_xlsx"):
+                        resp_lines.append(f"- Duplicate workbook: {fast.get('dup_xlsx')}")
+                    if fast.get("reference_dwg"):
+                        resp_lines.append(f"- Metadata source plan: {fast.get('reference_dwg')}")
+                    for note in fast.get("notes") or []:
+                        resp_lines.append(f"- Note: {note}")
+                    if fast.get("access_road_title"):
+                        resp_lines.append(f"- Access road title (as plotted): {fast.get('access_road_title')!r}")
+                    resp_lines.append(
+                        "\nYou can request modifications in this session "
+                        "(e.g. add a road, change the title) without re-prompting."
+                    )
+                    return {
+                        "query": query,
+                        "response": "\n".join(resp_lines) + "\n",
+                        "llm_used": llm_used,
+                        "model_name": model_name_used,
+                        "complexity": complexity,
+                        "success": True,
+                        "session_id": self.get_session_id(),
+                        "context_retrieved": False,
+                        "output_path": fast.get("output_dwg"),
+                    }
+                logger.warning(
+                    "Intelligent cadastral fastpath failed (%s); falling through to agent tools.",
+                    fast.get("error"),
+                )
+
             # FAST PATH: cadastral CAD prompt (template DWG -> output DWG with parcel replot)
             if self._should_fastpath_cadastral_cad_batch(tool_routing_query):
                 fast = self._run_cadastral_cad_batch_pipeline(tool_routing_query)
@@ -13210,18 +16323,34 @@ class SurvyAIAgent:
                         "context_retrieved": False,
                         "output_path": fast.get("output_dwg"),
                     }
-                return {
-                    "query": query,
-                    "response": str(fast),
-                    "llm_used": llm_used,
-                    "model_name": model_name_used,
-                    "complexity": complexity,
-                    "success": False,
-                    "session_id": self.get_session_id(),
-                    "context_retrieved": False,
-                    "output_path": None,
-                    "error": fast.get("error") if isinstance(fast, dict) else "Fastpath cadastral pipeline failed",
-                }
+                # Do not hard-fail when the prompt only *mentioned* coordinates but left
+                # values in Excel/files — let the agent compose a valid cadastral prompt.
+                err_txt = str((fast or {}).get("error") or "")
+                if coordinates_deferred_to_external_source(tool_routing_query) or (
+                    "could not parse coordinates" in err_txt.lower()
+                    and any(
+                        k in (tool_routing_query or "").lower()
+                        for k in ("excel", ".xlsx", ".xls", "spreadsheet")
+                    )
+                ):
+                    logger.warning(
+                        "Cadastral fastpath failed on deferred/Excel coords (%s); "
+                        "falling through to agent tools.",
+                        err_txt,
+                    )
+                else:
+                    return {
+                        "query": query,
+                        "response": str(fast),
+                        "llm_used": llm_used,
+                        "model_name": model_name_used,
+                        "complexity": complexity,
+                        "success": False,
+                        "session_id": self.get_session_id(),
+                        "context_retrieved": False,
+                        "output_path": None,
+                        "error": fast.get("error") if isinstance(fast, dict) else "Fastpath cadastral pipeline failed",
+                    }
 
             # FAST PATH: in-session CAD plan modifications (add road, change title, etc.)
             # Template remains read-only; modifications apply to the output plan file (even if open).

@@ -284,13 +284,92 @@ def enrich_extraction_coordinates(
     return extraction
 
 
-# Nigerian cadastral pillar prefixes (SC/BV, SC/CK, SP/RV, …).
+# Nigerian cadastral pillar labels (CADA_PILLARNUMBERS top/bottom cells).
+# Classic: SC/AS 2457, SP/RV 33567. Longer district: SC/AKAB 19155.
+# Alphanumeric peg tokens: SC/DT AS3459RP, SC/RV OA94567KL, SC/EN IL3456PX.
+# Also seen: RV/SP 2345 (series before slash is not always SC/SP).
+_PILLAR_SERIES = r"(?:SC|SP|RV|RP)"
+_PILLAR_DISTRICT = r"[A-Z]{1,6}"
+_PILLAR_PEG_TOKEN = r"[A-Z0-9]{3,12}"
 _PILLAR_ID_TEXT_RE = re.compile(
-    r"(?:SC|SP)\s*/?\s*[A-Z]{1,3}\s*\d{3,5}",
+    rf"(?:{_PILLAR_SERIES})\s*/?\s*{_PILLAR_DISTRICT}\s*{_PILLAR_PEG_TOKEN}",
     re.IGNORECASE,
 )
-_PILLAR_PREFIX_TOKEN_RE = re.compile(r"^(SC|SP)\s*/?\s*([A-Z]{1,3})$", re.IGNORECASE)
-_PILLAR_NUMBER_TOKEN_RE = re.compile(r"^(\d{3,5})$")
+_PILLAR_PREFIX_TOKEN_RE = re.compile(
+    rf"^({_PILLAR_SERIES})\s*/?\s*({_PILLAR_DISTRICT})$",
+    re.IGNORECASE,
+)
+_PILLAR_NUMBER_TOKEN_RE = re.compile(rf"^({_PILLAR_PEG_TOKEN})$", re.IGNORECASE)
+
+
+def split_cadastral_pillar_label(raw: str) -> Optional[Dict[str, str]]:
+    """
+    Split a Nigerian cadastral pillar id into CADA_PILLARNUMBERS table cells.
+
+    Returns ``{{"prefix": "SC/DT", "number": "AS3459RP"}}`` (top / bottom rows).
+    Accepts classic digit pegs and longer alphanumeric peg tokens (up to ~9+ chars).
+    """
+    text = re.sub(r"\s+", " ", (raw or "").strip())
+    if not text:
+        return None
+    # Spaced form: "SC/AKAB 19155", "SC/DT AS3459RP", "RV/SP 2345"
+    m = re.match(
+        rf"^({_PILLAR_SERIES})\s*/\s*({_PILLAR_DISTRICT})\s+({_PILLAR_PEG_TOKEN})$",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        prefix = f"{m.group(1).upper()}/{m.group(2).upper()}"
+        number = m.group(3).upper()
+        if not re.search(r"\d", number):
+            return None
+        return {"prefix": prefix, "number": number}
+
+    compact = re.sub(r"\s+", "", text.upper())
+    m_head = re.match(rf"^({_PILLAR_SERIES})/?(.*)$", compact)
+    if not m_head:
+        # Last resort: any "XX/YYY rest" with a digit somewhere in rest
+        m = re.match(
+            r"^([A-Za-z]{1,4}\s*/\s*[A-Za-z]{1,6})\s+([A-Za-z0-9]{3,12})$",
+            text,
+        )
+        if m and re.search(r"\d", m.group(2)):
+            prefix = re.sub(r"\s+", "", m.group(1)).upper()
+            return {"prefix": prefix, "number": m.group(2).upper()}
+        return None
+
+    series = m_head.group(1)
+    rest = m_head.group(2) or ""
+    digit_hit: Optional[Dict[str, str]] = None
+    alpha_hit: Optional[Dict[str, str]] = None
+    alpha_peg_re = re.compile(r"^[A-Z]{2,4}\d{3,9}[A-Z]{0,4}$")
+    for dlen in range(1, min(6, max(0, len(rest) - 2)) + 1):
+        district = rest[:dlen]
+        peg = rest[dlen:]
+        if not re.fullmatch(r"[A-Z]{1,6}", district):
+            continue
+        if not re.fullmatch(r"[A-Z0-9]{3,12}", peg) or not re.search(r"\d", peg):
+            continue
+        cand = {"prefix": f"{series}/{district}", "number": peg}
+        if peg.isdigit() and 3 <= len(peg) <= 9:
+            # Prefer longest district for classic digit pegs (SC/BV 6015 over SC/B V6015).
+            digit_hit = cand
+        elif alpha_peg_re.match(peg):
+            # Prefer longest district for alphanumeric pegs (SC/DT AS3459RP).
+            alpha_hit = cand
+    if digit_hit:
+        return digit_hit
+    if alpha_hit:
+        return alpha_hit
+
+    m = re.match(
+        r"^([A-Za-z]{1,4}\s*/\s*[A-Za-z]{1,6})\s+([A-Za-z0-9]{3,12})$",
+        text,
+    )
+    if m and re.search(r"\d", m.group(2)):
+        prefix = re.sub(r"\s+", "", m.group(1)).upper()
+        return {"prefix": prefix, "number": m.group(2).upper()}
+    return None
 
 
 def _parse_pillar_token(tok: str, next_tok: str = "") -> Optional[str]:
@@ -298,12 +377,13 @@ def _parse_pillar_token(tok: str, next_tok: str = "") -> Optional[str]:
     raw = (tok or "").strip()
     if not raw:
         return None
-    compact = re.sub(r"\s+", "", raw.upper())
-    m = re.match(r"^(SC|SP)/?([A-Z]{1,3})(\d{3,5})$", compact)
-    if m:
-        return _normalize_pillar_id(f"{m.group(1)}/{m.group(2)} {m.group(3)}")
-    if _PILLAR_PREFIX_TOKEN_RE.match(raw) and _PILLAR_NUMBER_TOKEN_RE.match((next_tok or "").strip()):
-        return _normalize_pillar_id(f"{raw} {next_tok.strip()}")
+    split = split_cadastral_pillar_label(raw)
+    if split:
+        return _normalize_pillar_id(f"{split['prefix']} {split['number']}")
+    if _PILLAR_PREFIX_TOKEN_RE.match(raw):
+        nxt = (next_tok or "").strip()
+        if _PILLAR_NUMBER_TOKEN_RE.match(nxt) and re.search(r"\d", nxt):
+            return _normalize_pillar_id(f"{raw} {nxt}")
     m2 = _PILLAR_ID_TEXT_RE.match(raw)
     if m2:
         return _normalize_pillar_id(m2.group(0))
@@ -496,12 +576,17 @@ def validate_subprompt_geometry(subprompt: str) -> List[str]:
 
 
 # Stop metadata captures at the next labelled field — newline OR comma-separated (prompt-to-CAD).
+# Includes scale / Plot-using so surveyor name/address never swallow plan-scale lines.
 CADASTRAL_FIELD_BOUNDARY = (
     r"(?=(?:,\s*|\n\s*)"
     r"(?:location|local\s+(?:govt\.?|government)\s+area|state|"
     r"crs_?origin|origin_?crs|plan\s*(?:no\.?|number)|Surveyor\s+name|"
     r"Surveyor\s+company\s+and\s+address|Surveyor\s+company|pillar\s+numbers?|"
-    r"coordinates\s+for|title\s+as|Plot\s+using|date\s+on\s+the)\s*[:=]"
+    r"coordinates\s+for|title\s+as|Plot\s+using(?:\s+scale)?|date\s+on\s+the|"
+    r"buyer\s*'?s?\s*name|"
+    r"scale\s*[:=]\s*1\s*[:/]\s*\d+|"
+    r"scale\s+1\s*[:/]\s*\d+"
+    r")(?:\s*[:=]|\b)"
     r"|,\s*(?:Add\s+(?:an?\s+)?access|Add\s+\d+)\b"
     r"|\Z)"
 )
@@ -625,6 +710,7 @@ _METADATA_JUNK_RE = re.compile(
     r"coordinates\s+for|bearing\s+\d|pillar\s+numbers|traverse|add\s+access|"
     r"\d{1,3}\s*deg\s+\d|surveyor\s+name|plan\s+number|certification|"
     r"crs_?origin|origin_?crs|plot\s+using\s+scale|title\s+as|"
+    r"\bscale\s*[:=]\s*1\s*[:/]|\bscale\s+1\s*[:/]|"
     r"local\s+(?:govt\.?|government)\s+area\s*[:=]|\bstate\s*[:=]",
     re.IGNORECASE,
 )
@@ -650,13 +736,149 @@ def sanitize_metadata_field(text: str, *, max_len: int = 160) -> str:
     return trim_metadata_field(text, max_len=max_len)
 
 
+def scrub_surveyor_metadata_value(text: str, *, max_len: int = 200) -> str:
+    """
+    Surveyor name/address must never retain plan-scale or other title-block fields.
+
+    Guards against greedy captures that swallowed ``Plot using scale 1:250`` /
+    ``scale: 1:250`` when those lines sat between surveyor address and pillars.
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+    # Cut at first leaked scale / next-field token even across newlines.
+    s = re.split(
+        r"(?i)(?:\n|,)\s*(?:Plot\s+using\s+scale|scale\s*[:=]\s*1\s*[:/]|scale\s+1\s*[:/]|"
+        r"pillar\s+numbers|coordinates\s+for|plan\s*(?:no\.?|number)|"
+        r"date\s+on\s+the|buyer\s*'?s?\s*name|Generate\b)",
+        s,
+        maxsplit=1,
+    )[0].strip(" ,;:-")
+    return sanitize_metadata_field(s, max_len=max_len)
+
+
+_LGA_TRAILING_RE = re.compile(
+    r"\s*[,\-]?\s*(?:"
+    r"local\s+government\s+area|"
+    r"local\s+govt\.?\s*(?:area)?|"
+    r"l\.?\s*g\.?\s*a\.?|"
+    r"lga"
+    r")\s*$",
+    re.IGNORECASE,
+)
+_LGA_AS_PRINTED_RE = re.compile(r"\s*\(?\s*as\s+printed\s*\)?\s*", re.IGNORECASE)
+_LGA_PAREN_RE = re.compile(
+    r"\(([^)]*(?:local|govt|government|l\.?\s*g\.?\s*a|lga)[^)]*)\)",
+    re.IGNORECASE,
+)
+
+
+def normalize_lga_name(raw: str) -> str:
+    """
+    Return only the bare Local Government Area name.
+
+    Template CAD already carries the ``LOCAL GOVERNMENT AREA`` label — callers
+    must not pass through suffixes like ``LGA``, ``Local Govt. Area``, or
+    ``as printed``.
+
+    Examples:
+      ``Iro LGA`` → ``Iro``
+      ``Boki Local Govt. area`` → ``Boki``
+      ``Obio/Akpor Local government area`` → ``Obio/Akpor``
+      ``Khana L.G.A`` → ``Khana``
+      ``EMUOHA LOCAL GOVT. AREA AS PRINTED`` → ``EMUOHA``
+      ``ODUOHA (EMUOHA LOCAL GOVT. AREA AS PRINTED)`` → ``EMUOHA``
+    """
+    s = re.sub(r"\s+", " ", (raw or "").strip())
+    if not s:
+        return ""
+    # Prefer parenthetical core when it looks like an LGA phrase.
+    m_par = _LGA_PAREN_RE.search(s)
+    if m_par:
+        s = m_par.group(1).strip()
+    s = _LGA_AS_PRINTED_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip(" ,;:-()")
+    # Strip trailing LGA labels (may appear more than once after dirty extracts).
+    for _ in range(3):
+        nxt = _LGA_TRAILING_RE.sub("", s).strip(" ,;:-")
+        if nxt == s:
+            break
+        s = nxt
+    return s.strip()
+
+
+def ensure_surveyor_professional_title(name: str) -> str:
+    """
+    Ensure a Nigerian cadastral surveyor display name keeps a professional title.
+
+    Bare names become ``SURV. <NAME>``. Existing ``SURV.`` / ``SURVEYOR`` titles
+    are normalized to ``SURV.`` without inventing a different person.
+    """
+    s = re.sub(r"\s+", " ", (name or "").strip())
+    if not s:
+        return ""
+    # Prefer ``surveyor`` before ``surv``; require ``surv.`` or a word-boundary ``surv``
+    # so "Surveyor X" / "SURV. X" normalize cleanly and "Survive" is left alone.
+    m = re.match(r"^surveyor\b\.?\s*", s, flags=re.IGNORECASE)
+    if not m:
+        m = re.match(r"^surv(?:\.|\b)\s*", s, flags=re.IGNORECASE)
+    if m:
+        rest = s[m.end() :].strip().lstrip(".").strip()
+        return f"SURV. {rest}".strip() if rest else "SURV."
+    return f"SURV. {s}"
+
+
+_LGA_LINE_RE = re.compile(
+    r"(?:"
+    r"local\s+government\s+area|"
+    r"local\s+govt\.?\s*(?:area)?|"
+    r"l\.?\s*g\.?\s*a\.?|"
+    r"\blga\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
 def extract_location_from_text(text: str) -> str:
-    """Extract location from Nigerian plan PDF text (AT / LOCATION labels)."""
+    """
+    Extract location from Nigerian plan text (everything after AT until LGA).
+
+    Collects all location clauses (e.g. site line + community line). Does not
+    include the Local Government Area line — that is a separate title-block field.
+    """
     raw = text or ""
+    # Prefer structured AT … until LGA (accept LOCAL GOVT. AREA / L.G.A / LGA).
+    m_block = re.search(
+        r"\bAT\b\s*(.*?)(?=\n\s*[^\n]*(?:local\s+government\s+area|local\s+govt\.?\s*(?:area)?|"
+        r"l\.?\s*g\.?\s*a\.?|\blga\b)|\Z)",
+        raw,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m_block:
+        block = m_block.group(1) or ""
+        parts: List[str] = []
+        for line in re.split(r"[\n\r]+", block):
+            line = re.sub(r"\s+", " ", line).strip(" ,;:-")
+            if not line or re.search(r"\.{3,}", line):
+                continue
+            if _LGA_LINE_RE.search(line) and not re.search(
+                r"\b(?:in|at|near|along)\b", line, flags=re.IGNORECASE
+            ):
+                # Pure LGA line — stop (should already be excluded by lookahead).
+                continue
+            # Drop a trailing LGA phrase glued onto the last location line.
+            line = _LGA_TRAILING_RE.sub("", line).strip(" ,;:-")
+            if line:
+                parts.append(line)
+        if parts:
+            loc = ", ".join(parts)
+            if len(loc) <= 200:
+                return loc.upper()
+
     patterns = [
-        re.compile(r"\bAT\s+(.+?)(?:\n|$)", re.IGNORECASE),
         re.compile(
-            r"\bAT\s+(.+?)(?:\s*,\s*LOCAL\s+GOVERNMENT|\s+LOCAL\s+GOVERNMENT\s+AREA|$)",
+            r"\bAT\s+(.+?)(?:\s*,\s*LOCAL\s+GOV(?:ERNMENT|T\.?)\s*AREA|\s+LOCAL\s+GOVERNMENT\s+AREA|"
+            r"\s+L\.?\s*G\.?\s*A\.?|\s+LGA\b|$)",
             re.IGNORECASE | re.DOTALL,
         ),
         re.compile(
@@ -672,7 +894,8 @@ def extract_location_from_text(text: str) -> str:
         m = pat.search(raw)
         if m:
             loc = re.sub(r"\s+", " ", m.group(1)).strip(" ,;:-")
-            if loc and len(loc) <= 120:
+            loc = _LGA_TRAILING_RE.sub("", loc).strip(" ,;:-")
+            if loc and len(loc) <= 200:
                 return loc.upper()
     return ""
 
@@ -698,6 +921,150 @@ def extract_scale_denom_from_text(text: str) -> Optional[int]:
         return d if d > 0 else None
     except Exception:
         return None
+
+
+# Common Nigerian cadastral plotting scales SurvyAI will honour from prompts.
+_USER_SCALE_ALLOWED_DENOMS = frozenset(
+    {250, 500, 1000, 2000, 2500, 5000, 10000, 20000, 25000}
+)
+
+_USER_SCALE_REQUEST_PATTERNS: tuple[str, ...] = (
+    # "Plot using scale 1:250" / "plot at scale of 1:250"
+    r"plot\s+(?:using\s+|at\s+)?(?:a\s+)?scale\s*(?:of\s*)?1\s*[:/]\s*(\d+)",
+    # "scale: 1:250" / "scale = 1:250" / "scale 1:250" (comma- or line-delimited fields)
+    r"(?:^|[\n,;])\s*scale\s*[:=]\s*1\s*[:/]\s*(\d+)",
+    r"(?:^|[\n,;])\s*scale\s+1\s*[:/]\s*(\d+)",
+    # Mid-sentence field: "... origin_crs: UTM Zone 32N, scale: 1:250, plan number: ..."
+    r"\bscale\s*[:=]\s*1\s*[:/]\s*(\d+)",
+    # "use scale 1:250" / "using a scale of 1:250" / "at a scale of 1:250"
+    r"(?:use|using|with|at)\s+(?:a\s+)?scale\s*(?:of\s*)?1\s*[:/]\s*(\d+)",
+    # "scale should (now) be 1:250" / "change the scale to 1:250"
+    r"scale\s+should\s+(?:now\s+)?be\s+1\s*[:/]\s*(\d+)",
+    r"(?:change|update|set)\s+(?:the\s+)?scale\s+to\s+1\s*[:/]\s*(\d+)",
+    # Title-block style inside a user prompt: "SCALE:- 1:250"
+    r"\bSCALE\s*:?-?\s*1\s*:\s*(\d+)",
+)
+
+
+def extract_user_requested_scale_denom(text: str) -> Optional[int]:
+    """
+    Extract an explicit user-requested plan scale denominator from free text.
+
+    Recognises varied prompt styles (``scale: 1:250``, ``Plot using scale 1:250``,
+    ``at a scale of 1:250``, etc.). Ignores secondary ``SCALE: to 1:xxxx`` lines.
+    Returns only common survey denoms (250…25000).
+    """
+    raw = text or ""
+    if not raw.strip():
+        return None
+
+    def _accept(raw_denom: str) -> Optional[int]:
+        try:
+            d = int(raw_denom)
+        except Exception:
+            return None
+        if d in _USER_SCALE_ALLOWED_DENOMS:
+            return d
+        return None
+
+    for pat in _USER_SCALE_REQUEST_PATTERNS:
+        for m in re.finditer(pat, raw, flags=re.IGNORECASE | re.MULTILINE):
+            # Skip secondary title-block labels like "SCALE: to 1:1000" on this line only.
+            line_start = raw.rfind("\n", 0, m.start()) + 1
+            line_end = raw.find("\n", m.end())
+            line = raw[line_start : line_end if line_end != -1 else len(raw)]
+            if re.search(r"\bscale\b\s*:\s*to\b", line, flags=re.IGNORECASE):
+                continue
+            got = _accept(m.group(1))
+            if got is not None:
+                return got
+    return None
+
+
+# Plan-number token: RV/018/2026/SP, AB-1234, etc. (not a bare year or single word).
+_PLAN_NUMBER_TOKEN = r"([A-Za-z][A-Za-z0-9]*(?:[/\-][A-Za-z0-9]+){1,6})"
+
+_USER_PLAN_NUMBER_START_PATTERNS: tuple[str, ...] = (
+    # Highest priority: explicit starting / base plan number for a batch.
+    rf"start(?:ing)?\s+from\s+plan\s*(?:no\.?|number|#)?\s*[:=]?\s*['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"start(?:ing)?\s+with\s+plan\s*(?:no\.?|number|#)?\s*[:=]?\s*['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"begin(?:ning)?\s+(?:from|with)\s+plan\s*(?:no\.?|number|#)?\s*[:=]?\s*['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"(?:base|initial|first)\s+plan\s*(?:no\.?|number|#)\s*[:=]?\s*['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"plan\s*(?:no\.?|number|#)\s+(?:to\s+)?start(?:s|ing)?\s+(?:from|at|with)\s*[:=]?\s*['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"start(?:ing)?\s+from\s*['\"]{_PLAN_NUMBER_TOKEN}['\"]",
+)
+
+_USER_PLAN_NUMBER_FIELD_PATTERNS: tuple[str, ...] = (
+    rf"use\s+plan\s*(?:no\.?|number|#)\s*[:=]?\s*['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"using\s+plan\s*(?:no\.?|number|#)\s*[:=]?\s*['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"plan\s*(?:no\.?|number|#)\s*[:=]\s*['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    # "… and plan number to RV/NEW/002" / "change the plan number to …"
+    rf"plan\s*(?:no\.?|number|#)\s+to\s+['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"plan\s*(?:no\.?|number|#)\s+should\s+(?:now\s+)?be\s+['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"plan\s*(?:no\.?|number|#)\s+now\s+is\s+['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+    rf"(?:change|update|set)\s+(?:the\s+)?plan\s*(?:no\.?|number|#)\s+to\s+['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+)
+
+_TAKE_PLAN_FROM_REFERENCE_RE = re.compile(
+    r"take\s+(?:the\s+)?plan\s*(?:no\.?|number|#)\s+from\s+(?:the\s+)?"
+    r"(?:existing|reference|current|same)\b",
+    flags=re.IGNORECASE,
+)
+
+
+def extract_user_requested_plan_number(text: str) -> Optional[str]:
+    """
+    Extract an explicit user-requested plan number (or batch starting number) from free text.
+
+    Precedence (semantic, not keyword-only):
+    1. ``start from plan number 'RV/018/2026/SP'`` / ``starting with plan no …``
+    2. Field-style ``plan number: …`` / ``use plan number …`` / override phrasing
+    3. Never treat ``e.g. if plan A is '…'`` illustrations as the base when the user
+       also said to take the plan number from an existing/reference CAD plan.
+
+    Returns a normalized plan number string, or None when the prompt does not state one.
+    """
+    raw = text or ""
+    if not raw.strip():
+        return None
+
+    def _from_patterns(patterns: tuple[str, ...]) -> Optional[str]:
+        for pat in patterns:
+            m = re.search(pat, raw, flags=re.IGNORECASE)
+            if not m:
+                continue
+            token = (m.group(1) or "").strip().strip("'\"")
+            # Skip obvious "e.g. if plan A is …" illustration hits for field patterns
+            # when the match sits inside an e.g./for example clause.
+            window_start = max(0, m.start() - 48)
+            prefix = raw[window_start : m.start()]
+            if re.search(r"\b(?:e\.g\.|eg\.|for\s+example)\b", prefix, flags=re.IGNORECASE):
+                continue
+            normalized = normalize_plan_number(token)
+            if normalized:
+                return normalized
+        return None
+
+    started = _from_patterns(_USER_PLAN_NUMBER_START_PATTERNS)
+    if started:
+        return started
+
+    fielded = _from_patterns(_USER_PLAN_NUMBER_FIELD_PATTERNS)
+    if fielded:
+        return fielded
+
+    # Illustrative "e.g. if plan A is 'RV/…'" only when the user did NOT redirect
+    # plan number to the reference DWG.
+    if not _TAKE_PLAN_FROM_REFERENCE_RE.search(raw):
+        m_eg = re.search(
+            rf"(?:e\.g\.|eg\.|for\s+example)\s+"
+            rf"(?:if\s+)?plan\s+[A-Za-z]\s+is\s+['\"]?{_PLAN_NUMBER_TOKEN}['\"]?",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m_eg:
+            return normalize_plan_number(m_eg.group(1).strip().strip("'\"")) or None
+    return None
 
 
 def normalize_plan_number(raw: str) -> str:
@@ -882,16 +1249,39 @@ def _compute_relative_traverse_vertices(
 
 
 def _is_plausible_pillar_id(pillar: str) -> bool:
-    nums = re.findall(r"\d+", pillar or "")
+    """
+    Lightweight gate for PDF/layout pillar candidates.
+
+    Accepts classic SC/SP (and RV/RP) labels with digit pegs up to 9 digits, and
+    alphanumeric peg tokens such as AS3459RP / OA94567KL.
+    """
+    split = split_cadastral_pillar_label(pillar or "")
+    if not split:
+        # Fall back for already-normalized ids
+        if not re.search(r"^(?:SC|SP|RV|RP)\s*/", pillar or "", re.IGNORECASE):
+            return False
+        nums = re.findall(r"\d+", pillar or "")
+        if not nums:
+            return False
+        try:
+            num = int(nums[-1])
+        except Exception:
+            return False
+        return 100 <= num <= 999_999_999
+    number = split["number"]
+    nums = re.findall(r"\d+", number)
     if not nums:
         return False
     try:
-        num = int(nums[-1])
+        num = int(max(nums, key=len))
     except Exception:
         return False
-    if num < 100 or num > 50000:
+    # 3–9 digit runs are common; reject tiny/noise values.
+    if num < 100 or num > 999_999_999:
         return False
-    return bool(re.search(r"^(SC|SP)\s*/", pillar or "", re.IGNORECASE))
+    if len(max(nums, key=len)) > 9:
+        return False
+    return True
 
 
 def _filter_plausible_pillars(pillars: Sequence[str]) -> List[str]:
@@ -2986,13 +3376,18 @@ def prepare_extraction_for_cadastral(
 ) -> SurveyPlanExtraction:
     """Sanitize metadata, normalize plan number, and infer access roads for CAD plotting."""
     extraction.buyer_name = sanitize_metadata_field(extraction.buyer_name, max_len=140)
-    extraction.location = sanitize_metadata_field(extraction.location, max_len=120)
+    extraction.location = sanitize_metadata_field(extraction.location, max_len=200)
     if not extraction.location:
         extraction.location = extract_location_from_text(combined_text)
-        extraction.location = sanitize_metadata_field(extraction.location, max_len=120)
-    extraction.lga = sanitize_metadata_field(extraction.lga, max_len=80)
+        extraction.location = sanitize_metadata_field(extraction.location, max_len=200)
+    extraction.lga = sanitize_metadata_field(
+        normalize_lga_name(extraction.lga) or extraction.lga, max_len=80
+    )
     extraction.state = sanitize_metadata_field(extraction.state, max_len=40)
-    extraction.surveyor_name = sanitize_metadata_field(extraction.surveyor_name, max_len=80)
+    extraction.surveyor_name = sanitize_metadata_field(
+        ensure_surveyor_professional_title(extraction.surveyor_name or ""),
+        max_len=100,
+    )
     extraction.surveyor_address = sanitize_metadata_field(extraction.surveyor_address, max_len=120)
     extraction.plan_number = normalize_plan_number(extraction.plan_number)
     if not extraction.scale_denom:
@@ -3260,6 +3655,16 @@ def extract_heuristics_from_layout_text(layout_text: str) -> SurveyPlanExtractio
         flags=re.IGNORECASE,
     )
 
+    surveyor = _field("SURV") or _field("SURVEYOR")
+    if not surveyor:
+        m_surv = re.search(
+            r"\b(SURV\.?\s+[A-Z][A-Z\s\.\-']{2,80})",
+            text or "",
+            flags=re.IGNORECASE,
+        )
+        if m_surv:
+            surveyor = re.sub(r"\s+", " ", m_surv.group(1)).strip(" ,;:-")
+
     conf = 0.35
     if anchor_e and anchor_n:
         conf += 0.2
@@ -3275,7 +3680,7 @@ def extract_heuristics_from_layout_text(layout_text: str) -> SurveyPlanExtractio
         state=_field("STATE"),
         origin_crs=_field("UTM") or ("UTM ZONE 32N" if "UTM" in upper or "ZONE 32" in upper else ""),
         plan_number=normalize_plan_number(plan_m.group(1).strip() if plan_m else _field("PLAN NO")),
-        surveyor_name=_field("SURV") or _field("SURVEYOR"),
+        surveyor_name=ensure_surveyor_professional_title(surveyor) if surveyor else "",
         scale_denom=scale_denom,
         pillar_numbers=pillar_list,
         anchor_easting=anchor_e,
@@ -3424,9 +3829,13 @@ def _coerce_legs(raw: Any) -> List[SurveyTraverseLeg]:
 
 def _normalize_pillar_id(raw: str) -> str:
     text = re.sub(r"\s+", " ", (raw or "").strip().replace("\n", " "))
+    split = split_cadastral_pillar_label(text)
+    if split:
+        return f"{split['prefix']} {split['number']}"
     compact = re.sub(r"\s+", "", text.upper())
-    m = re.match(r"^(SC|SP)/?([A-Z]{1,3})(\d{3,5})$", compact)
-    if m:
+    # Legacy compact SC/BV6015 (3–5 digit) still covered by split; keep soft fallbacks.
+    m = re.match(r"^(SC|SP|RV|RP)/?([A-Z]{1,6})([A-Z0-9]{3,12})$", compact)
+    if m and re.search(r"\d", m.group(3)):
         return f"{m.group(1)}/{m.group(2)} {m.group(3)}"
     text = (
         text.replace("SCCR", "SC/CR")
@@ -3441,9 +3850,13 @@ def _normalize_pillar_id(raw: str) -> str:
         .replace("Sp/Rv", "SP/RV")
     )
     text = re.sub(r"\s+", " ", text).strip()
-    m2 = re.match(r"^(SC|SP)\s*/?\s*([A-Z]{1,3})\s+(\d{3,5})$", text, re.IGNORECASE)
-    if m2:
-        return f"{m2.group(1).upper()}/{m2.group(2).upper()} {m2.group(3)}"
+    m2 = re.match(
+        r"^(SC|SP|RV|RP)\s*/?\s*([A-Z]{1,6})\s+([A-Z0-9]{3,12})$",
+        text,
+        re.IGNORECASE,
+    )
+    if m2 and re.search(r"\d", m2.group(3)):
+        return f"{m2.group(1).upper()}/{m2.group(2).upper()} {m2.group(3).upper()}"
     return text
 
 
@@ -4062,6 +4475,237 @@ def should_fastpath_dwg_plan_extract_to_docx(query: str) -> bool:
     return bool(wants_extract and wants_word)
 
 
+_PDF_KEY_DETAIL_EXTRACT_MARKERS = (
+    "extract",
+    "key details",
+    "important details",
+    "plan details",
+    "details in the plan",
+    "title block",
+    "metadata",
+    "read the plan",
+    "survey plan details",
+    "all the details",
+    "all details",
+    "what does the plan",
+    "summarise the plan",
+    "summarize the plan",
+)
+
+_PDF_KEY_DETAIL_PLAN_MARKERS = (
+    "survey",
+    "cadastral",
+    "site plan",
+    "deed",
+    "pillar",
+    "bearing",
+    "parcel",
+    "landed property",
+    "plan shewing",
+    "plan showing",
+)
+
+_PDF_KEY_DETAIL_EXCLUDE = (
+    "replot",
+    "plot using",
+    "arcgis",
+    "arcpy",
+    "cutfill",
+    "cut fill",
+    "geodatabase",
+)
+
+
+def should_fastpath_pdf_plan_key_details(query: str) -> bool:
+    """
+    True when the user wants key survey-plan details from a PDF (not a CAD replot).
+
+    Scanned/image PDFs often have no text layer — those must use layout+vision
+    extraction rather than document_get_text alone.
+    """
+    q = (query or "").lower().strip()
+    if ".pdf" not in q:
+        return False
+    if any(m in q for m in _PDF_KEY_DETAIL_EXCLUDE):
+        return False
+    # Replot-to-DWG is handled by the PDF→CAD fast path.
+    if ".dwg" in q and any(k in q for k in ("replot", "generate", "create", "draw", "plot")):
+        return False
+    wants_extract = any(k in q for k in _PDF_KEY_DETAIL_EXTRACT_MARKERS)
+    if not wants_extract:
+        return False
+    looks_like_plan = any(k in q for k in _PDF_KEY_DETAIL_PLAN_MARKERS) or bool(
+        re.search(
+            r"[\\/][^\\/\"']*(?:plan|survey|cadastral|deed|site)[^\\/\"']*\.pdf",
+            q,
+            flags=re.IGNORECASE,
+        )
+    )
+    # "extract all the key details" + a .pdf is enough for SurvyAI's survey workflow
+    # when the filename or wording already signals a plan document.
+    return bool(looks_like_plan or "key details" in q or "important details" in q or "plan details" in q)
+
+
+def extraction_has_usable_key_details(plan: SurveyPlanExtraction) -> bool:
+    """True when vision/layout extraction produced at least one verified plan field."""
+    if plan is None:
+        return False
+    if plan.buyer_name or plan.location or plan.plan_number or plan.surveyor_name:
+        return True
+    if plan.lga or plan.state or plan.certification_date or plan.origin_crs:
+        return True
+    if plan.scale_denom or plan.area_sq_m is not None:
+        return True
+    if plan.pillar_numbers or plan.traverse_legs:
+        return True
+    if plan.anchor_easting is not None and plan.anchor_northing is not None:
+        return True
+    if plan.access_roads or plan.fences:
+        return True
+    return False
+
+
+def format_survey_plan_key_details_report(
+    plan: SurveyPlanExtraction,
+    pdf_path: str,
+) -> str:
+    """Format structured PDF survey extraction as a surveyor-facing key-details report."""
+    path = Path(pdf_path)
+    section = survey_plan_to_word_section(
+        plan,
+        source_file=str(path),
+        plan_label=path.stem or "Survey plan",
+    )
+    lines: List[str] = [
+        f"## Key details from `{path.name}`",
+        "",
+        f"**Source:** `{path}`",
+        "",
+        "### Title block / metadata",
+    ]
+    content_lines = [
+        str(x).strip()
+        for x in (section.get("content") or [])
+        if str(x).strip() and not str(x).strip().lower().startswith("source file:")
+    ]
+    if content_lines:
+        for item in content_lines:
+            lines.append(f"- {item}")
+    else:
+        lines.append("- (No title-block fields verified)")
+
+    table = section.get("table")
+    if isinstance(table, list) and len(table) > 1:
+        lines.append("")
+        lines.append("### Traverse (bearings & distances)")
+        lines.append("")
+        lines.append("| From | To | Bearing | Distance (m) |")
+        lines.append("|---|---|---|---|")
+        for row in table[1:]:
+            if not isinstance(row, (list, tuple)) or len(row) < 4:
+                continue
+            lines.append(
+                f"| {row[0]} | {row[1]} | {row[2]} | {row[3]} |"
+            )
+
+    src = (plan.source or "vision").strip() or "vision"
+    conf = float(plan.confidence or 0.0)
+    lines.append("")
+    lines.append(
+        f"_Extraction method: {src}"
+        + (f"; confidence ≈ {conf:.0%}" if conf > 0 else "")
+        + ". Scanned/image PDFs are read with layout text + vision — "
+        "not plain text extraction alone._"
+    )
+    lines.append("")
+    lines.append(
+        "If you want, I can **replot this plan to a DWG**, or **save these details to a Word document**."
+    )
+    return "\n".join(lines)
+
+
+def run_pdf_plan_key_details_extract(
+    *,
+    query: str,
+    extract_fn: Callable[..., Any],
+    full_query: str = "",
+) -> Dict[str, Any]:
+    """
+    Resolve a survey-plan PDF and extract key details via layout + vision.
+
+    ``extract_fn`` should match agent ``_extract_pdf_survey_plan_with_tier_fallback``
+    signature: ``(pdf_path, *, user_notes, timeout_s) -> (SurveyPlanExtraction, model_name)``.
+    """
+    scope = (query or "").strip()
+    full = (full_query or scope).strip()
+    resolution = resolve_pdf_path_for_replot(scope, full)
+    if not resolution.get("success"):
+        err = str(resolution.get("error") or "Could not resolve the PDF path.")
+        return {
+            "success": False,
+            "error": err,
+            "response": err,
+            "needs_user_approval": bool(resolution.get("needs_user_approval")),
+            "similar": resolution.get("similar") or [],
+        }
+
+    pdf_path = str(resolution["path"])
+    try:
+        extraction, model_name = extract_fn(
+            pdf_path,
+            user_notes=scope,
+            timeout_s=120,
+        )
+    except TypeError:
+        # Allow simpler callables used in unit tests.
+        extraction, model_name = extract_fn(pdf_path)
+    except Exception as exc:
+        logger.exception("PDF key-details extraction failed for %s", pdf_path)
+        return {
+            "success": False,
+            "error": str(exc),
+            "response": (
+                f"I found `{pdf_path}` but vision/layout extraction failed:\n{exc}\n\n"
+                "Try again, or provide a DWG/DXF or a text-readable PDF if available."
+            ),
+            "pdf_path": pdf_path,
+        }
+
+    if not isinstance(extraction, SurveyPlanExtraction):
+        return {
+            "success": False,
+            "error": "Invalid extraction result",
+            "response": f"Extraction returned an unexpected result for `{pdf_path}`.",
+            "pdf_path": pdf_path,
+            "model_name": model_name,
+        }
+
+    if not extraction_has_usable_key_details(extraction):
+        notes = (extraction.notes or "").strip()
+        return {
+            "success": False,
+            "error": notes or "no_usable_key_details",
+            "response": (
+                f"I inspected `{pdf_path}` with **layout text + vision** "
+                "(scanned survey-plan route), but could not verify usable key fields "
+                "(owner, location, plan number, bearings, coordinates, etc.).\n\n"
+                + (f"Notes: {notes}\n\n" if notes else "")
+                + "If you have a DWG/DXF of the same plan, I can extract from that instead."
+            ),
+            "pdf_path": pdf_path,
+            "model_name": model_name,
+            "extraction": extraction,
+        }
+
+    return {
+        "success": True,
+        "response": format_survey_plan_key_details_report(extraction, pdf_path),
+        "pdf_path": pdf_path,
+        "model_name": model_name,
+        "extraction": extraction,
+    }
+
+
 def _normalize_dwg_list_separators(text: str) -> str:
     """Turn '&' list separators into commas so each .dwg is parsed individually."""
     t = text or ""
@@ -4399,7 +5043,8 @@ def parse_dwg_title_block_fields(text: str) -> Dict[str, str]:
         )
 
     loc_m = re.search(
-        r"\bAT\s*\n?\s*(.+?)\s*\n\s*(.+?)\s+LOCAL\s+GOVERNMENT\s+AREA",
+        r"\bAT\s*\n?\s*(.+?)\s*\n\s*(.+?)\s+(?:LOCAL\s+GOVERNMENT\s+AREA|LOCAL\s+GOVT\.?\s*AREA|"
+        r"L\.?\s*G\.?\s*A\.?|LGA)\b",
         raw,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -4408,12 +5053,24 @@ def parse_dwg_title_block_fields(text: str) -> Dict[str, str]:
             re.sub(r"\s+", " ", loc_m.group(1)).strip(" ,;:-"),
             re.sub(r"\s+", " ", loc_m.group(2)).strip(" ,;:-"),
         ]
-        loc_parts = [p for p in loc_parts if p and not re.search(r"\.{3,}", p)]
+        loc_parts = [
+            p
+            for p in loc_parts
+            if p and not re.search(r"\.{3,}", p) and not _LGA_LINE_RE.fullmatch(p)
+        ]
+        # Drop trailing LGA glued onto last clause
+        loc_parts = [_LGA_TRAILING_RE.sub("", p).strip(" ,;:-") for p in loc_parts]
+        loc_parts = [p for p in loc_parts if p]
         if loc_parts:
-            fields["location"] = sanitize_metadata_field(", ".join(loc_parts), max_len=120)
+            fields["location"] = sanitize_metadata_field(", ".join(loc_parts), max_len=200)
+    else:
+        # Fallback: use shared AT…until-LGA extractor
+        loc_fb = extract_location_from_text(raw)
+        if loc_fb:
+            fields["location"] = sanitize_metadata_field(loc_fb, max_len=200)
 
     lga_m = re.search(
-        r"(.+?)\s+LOCAL\s+GOVERNMENT\s+AREA",
+        r"(.+?)\s+(?:LOCAL\s+GOVERNMENT\s+AREA|LOCAL\s+GOVT\.?\s*AREA|L\.?\s*G\.?\s*A\.?|LGA)\b",
         raw,
         flags=re.IGNORECASE | re.DOTALL,
     )
@@ -4421,7 +5078,10 @@ def parse_dwg_title_block_fields(text: str) -> Dict[str, str]:
         lga = re.sub(r"\s+", " ", lga_m.group(1)).strip(" ,;:-")
         lga = re.split(r"\n", lga)[-1].strip()
         if lga and not re.search(r"\.{3,}", lga):
-            fields["lga"] = sanitize_metadata_field(f"{lga} Local Government Area", max_len=80)
+            # Store bare LGA name only; CAD template attaches "LOCAL GOVERNMENT AREA".
+            bare = normalize_lga_name(lga)
+            if bare:
+                fields["lga"] = sanitize_metadata_field(bare, max_len=80)
 
     state_m = re.search(
         r"(.+?)\s+STATE\s*,\s*NIGERIA",
@@ -4531,6 +5191,12 @@ def extract_survey_plan_from_dwg_layout(
                 data["scale_denom"] = int(val)
             except Exception:
                 pass
+        elif key == "location" and val:
+            # Prefer fuller multi-clause AT location over a short first-line heuristic.
+            cur = str(data.get("location") or "").strip()
+            cand = str(val).strip()
+            if not cur or (len(cand) > len(cur) + 3) or ("," in cand and "," not in cur):
+                data["location"] = cand
         elif val and not data.get(key):
             data[key] = val
 
@@ -4788,7 +5454,12 @@ def extract_plan_details_for_dwg(
     run_with_timeout: Optional[Callable[..., Any]] = None,
     field_context: str = "",
 ) -> Dict[str, Any]:
-    """Open a DWG (COM or ezdxf fallback) and extract structured plan details."""
+    """Open a DWG (COM or ezdxf fallback) and extract structured plan details.
+
+    Uses resilient AutoCAD open (retry + COM recover) so reference-plan metadata
+    is not lost to intermittent ``Call was rejected by callee`` errors while
+    AutoCAD is busy/modal. Falls back to ezdxf+ODA only when COM cannot open.
+    """
     path = Path(file_path).resolve()
     if not path.exists():
         return {
@@ -4798,15 +5469,51 @@ def extract_plan_details_for_dwg(
             "errors": [f"File not found: {path}"],
         }
 
-    opened = autocad.open_drawing(str(path), read_only=True)
+    # Warm COM on this thread before the open (critical for Excel→CAD metadata).
+    try:
+        if autocad is not None and hasattr(autocad, "connect") and not getattr(
+            autocad, "is_connected", False
+        ):
+            autocad.connect()
+    except Exception as conn_exc:
+        logger.debug("AutoCAD pre-connect before reference open failed: %s", conn_exc)
+
+    opened: Dict[str, Any] = {"success": False, "error": "open not attempted"}
+    try:
+        if autocad is not None and hasattr(autocad, "open_drawing_resilient"):
+            opened = autocad.open_drawing_resilient(
+                str(path), read_only=True, attempts=3
+            )
+        elif autocad is not None and hasattr(autocad, "open_drawing"):
+            opened = autocad.open_drawing(str(path), read_only=True)
+            if not opened.get("success") and hasattr(autocad, "recover_com_session"):
+                try:
+                    autocad.recover_com_session(
+                        force=True, reason="extract_plan_details_for_dwg retry"
+                    )
+                except Exception:
+                    pass
+                opened = autocad.open_drawing(str(path), read_only=False)
+    except Exception as open_exc:
+        opened = {"success": False, "error": str(open_exc)}
+
     if opened.get("success"):
-        return extract_plan_details_from_open_dwg(
-            autocad,
-            file_path=str(path),
-            llm=llm,
-            run_with_timeout=run_with_timeout,
-            field_context=field_context,
-        )
+        try:
+            details = extract_plan_details_from_open_dwg(
+                autocad,
+                file_path=str(path),
+                llm=llm,
+                run_with_timeout=run_with_timeout,
+                field_context=field_context,
+            )
+        finally:
+            # Release the reference tab so subsequent template/plot opens are not blocked.
+            try:
+                if autocad is not None and hasattr(autocad, "close_drawing_if_open"):
+                    autocad.close_drawing_if_open(str(path), save_changes=False)
+            except Exception:
+                pass
+        return details
 
     err = opened.get("error") or "open_drawing failed"
     if dxf_fallback and getattr(dxf_fallback, "is_available", False):
@@ -5120,6 +5827,45 @@ def _normalize_cert_date_text(raw: str) -> str:
     return f"{dd}-{mm}-{yy}"
 
 
+_CERT_DATE_TOKEN = r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})"
+
+# Explicit numeric certification / plan dates in free-form user prompts.
+_USER_CERT_DATE_PATTERNS: tuple[str, ...] = (
+    # Field-style: "date= 31/07/2026", "date: 31/07/2026", mid-sentence ", date=…"
+    rf"(?:^|[\n,;])\s*date\s*[:=]\s*{_CERT_DATE_TOKEN}",
+    rf"\bdate\s*[:=]\s*{_CERT_DATE_TOKEN}",
+    # Conventional cadastral phrasing
+    rf"date\s+on\s+the\s+certification\s*[:=]\s*{_CERT_DATE_TOKEN}",
+    rf"certification\s+date\s*[:=]\s*{_CERT_DATE_TOKEN}",
+    rf"date\s+on\s+the\s+(?:plan|certification)\s*(?:to|as|[:=])\s*{_CERT_DATE_TOKEN}",
+    rf"date\s+(?:on\s+the\s+(?:plan|certification)\s+)?to\s+{_CERT_DATE_TOKEN}",
+    rf"(?:the\s+)?date\s+should\s+(?:now\s+)?be\s+{_CERT_DATE_TOKEN}",
+    rf"date\s+should\s+be\s+changed\s+to\s+{_CERT_DATE_TOKEN}",
+    rf"(?:change|update|set)\s+(?:the\s+)?(?:plan\s+|certification\s+)?date\s+to\s+{_CERT_DATE_TOKEN}",
+)
+
+
+def extract_user_requested_certification_date(text: str) -> Optional[str]:
+    """
+    Extract an explicit certification/plan date from free text.
+
+    Accepts varied prompt styles (``date= 31/07/2026``, ``date: 31/07/2026``,
+    ``date on the certification: …``, ``the date should now be …``, etc.).
+    Returns Nigerian cadastral ``DD-MM-YYYY``, or None when no explicit date is stated.
+    """
+    raw = text or ""
+    if not raw.strip():
+        return None
+    for pat in _USER_CERT_DATE_PATTERNS:
+        m = re.search(pat, raw, flags=re.IGNORECASE | re.MULTILINE)
+        if not m:
+            continue
+        normalized = _normalize_cert_date_text(m.group(1).strip())
+        if re.match(r"^\d{2}-\d{2}-\d{4}$", normalized):
+            return normalized
+    return None
+
+
 def _add_months(dt: datetime, months: int) -> datetime:
     """Calendar-aware month add/subtract (preserves day-of-month when possible)."""
     month_index = dt.month - 1 + int(months)
@@ -5138,7 +5884,9 @@ def _certification_date_change_requested(scope: str) -> bool:
             r"\bcertification\s+date\b|"
             r"\b(?:the\s+)?date\s+should\s+(?:now\s+)?be\b|"
             r"\bdate\s+should\s+be\s+changed\s+to\b|"
-            r"\bdate\s+should\s+(?:now\s+)?(?:read|show|say)\b",
+            r"\bdate\s+should\s+(?:now\s+)?(?:read|show|say)\b|"
+            # Field-style dates in CAD prompts: "date= 31/07/2026", "date: 31/07/2026"
+            r"\bdate\s*[:=]\s*\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
             ql,
         )
     )
@@ -5287,6 +6035,11 @@ def _resolve_certification_date_fast(scope: str) -> Optional[str]:
     """Cheap deterministic paths — today/tomorrow/yesterday/explicit numeric dates (scope only)."""
     ql = (scope or "").lower()
 
+    # Explicit numeric field dates first (date= / date: / date on the certification: …).
+    explicit_field = extract_user_requested_certification_date(scope)
+    if explicit_field:
+        return explicit_field
+
     if re.search(r"\btomorrow(?:['\u2019]s)?(?:\s+date)?\b", ql) or re.search(
         r"date\s+(?:on\s+the\s+plan\s+)?to\s+tomorrow\b", ql
     ):
@@ -5309,29 +6062,6 @@ def _resolve_certification_date_fast(scope: str) -> Optional[str]:
             )
         ) or re.search(r"date\s+(?:on\s+the\s+plan\s+)?to\s+today\b", ql):
             return today_certification_date_str()
-
-    explicit = re.search(
-        r"date\s+(?:on\s+the\s+(?:plan|certification)\s+)?to\s+"
-        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-        ql,
-    )
-    if explicit:
-        return _normalize_cert_date_text(explicit.group(1))
-
-    should_be = re.search(
-        r"(?:and\s+)?(?:the\s+)?date\s+should\s+(?:now\s+)?be\s+"
-        r"(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-        ql,
-    )
-    if should_be:
-        return _normalize_cert_date_text(should_be.group(1))
-
-    changed_to = re.search(
-        r"date\s+should\s+be\s+changed\s+to\s+(\d{1,2}[/-]\d{1,2}[/-]\d{2,4})",
-        ql,
-    )
-    if changed_to:
-        return _normalize_cert_date_text(changed_to.group(1))
 
     return None
 
@@ -5545,7 +6275,7 @@ def _resolve_plan_overrides_fast(scope: str) -> SurveyPlanOverrides:
         ),
     )
     if location:
-        _set("location", sanitize_metadata_field(location, max_len=120))
+        _set("location", sanitize_metadata_field(location, max_len=200))
 
     lga = _pick_cadastral_value(
         text,
@@ -5557,7 +6287,7 @@ def _resolve_plan_overrides_fast(scope: str) -> SurveyPlanOverrides:
         ),
     )
     if lga:
-        _set("lga", sanitize_metadata_field(lga, max_len=80))
+        _set("lga", sanitize_metadata_field(normalize_lga_name(lga) or lga, max_len=80))
 
     state = _pick_cadastral_value(
         text,
@@ -5582,44 +6312,51 @@ def _resolve_plan_overrides_fast(scope: str) -> SurveyPlanOverrides:
     if origin:
         _set("origin_crs", sanitize_metadata_field(origin, max_len=60))
 
-    plan_no = _pick_cadastral_value(
-        text,
-        (
-            r"plan\s*(?:no\.?|number)\s*[:=]\s*'([^']+)'",
-            r'plan\s*(?:no\.?|number)\s*[:=]\s*"([^"]+)"',
-            r"plan\s*(?:no\.?|number)\s*[:=]\s*([A-Z0-9][A-Z0-9/\-]+)",
-            r"plan\s*(?:no\.?|number)\s+should\s+(?:now\s+)?be\s+['\"]?([A-Z0-9][A-Z0-9/\-]+)['\"]?",
-            r"plan\s*(?:no\.?|number)\s+now\s+is\s+['\"]?([A-Z0-9][A-Z0-9/\-]+)['\"]?",
-            r"(?:change|update|set)\s+(?:the\s+)?plan\s*(?:no\.?|number)\s+to\s+['\"]?([A-Z0-9][A-Z0-9/\-]+)['\"]?",
-        ),
-    )
+    plan_no = extract_user_requested_plan_number(text)
+    if not plan_no:
+        plan_no = _pick_cadastral_value(
+            text,
+            (
+                r"plan\s*(?:no\.?|number)\s*[:=]\s*'([^']+)'",
+                r'plan\s*(?:no\.?|number)\s*[:=]\s*"([^"]+)"',
+                r"plan\s*(?:no\.?|number)\s*[:=]\s*([A-Z0-9][A-Z0-9/\-]+)",
+                r"plan\s*(?:no\.?|number)\s+should\s+(?:now\s+)?be\s+['\"]?([A-Z0-9][A-Z0-9/\-]+)['\"]?",
+                r"plan\s*(?:no\.?|number)\s+now\s+is\s+['\"]?([A-Z0-9][A-Z0-9/\-]+)['\"]?",
+                r"(?:change|update|set)\s+(?:the\s+)?plan\s*(?:no\.?|number)\s+to\s+['\"]?([A-Z0-9][A-Z0-9/\-]+)['\"]?",
+            ),
+        )
     if plan_no:
-        _set("plan_number", normalize_plan_number(plan_no.split("\n")[0].strip()))
+        _set("plan_number", normalize_plan_number(str(plan_no).split("\n")[0].strip()))
 
     surveyor = _pick_cadastral_value(
         text,
         (
             r"surveyor\s+name\s*[:=]\s*'([^']+)'",
             r'surveyor\s+name\s*[:=]\s*"([^"]+)"',
-            r"surveyor\s+name\s*[:=]\s*(.+?)(?=\s*,\s*Surveyor\s+company|\s*Surveyor\s+company|\s*,\s*pillar|\Z)",
+            rf"surveyor\s+name\s*[:=]\s*(.+?){CADASTRAL_FIELD_BOUNDARY}",
             r"surveyor(?:'s)?\s+name\s+should\s+(?:now\s+)?be\s+['\"]([^'\"]+)['\"]",
             r"(?:change|update|set)\s+(?:the\s+)?surveyor(?:'s)?\s+name\s+to\s+['\"]([^'\"]+)['\"]",
         ),
     )
     if surveyor:
-        _set("surveyor_name", sanitize_metadata_field(surveyor, max_len=80))
+        _set(
+            "surveyor_name",
+            scrub_surveyor_metadata_value(
+                ensure_surveyor_professional_title(surveyor), max_len=100
+            ),
+        )
 
     surveyor_addr = _pick_cadastral_value(
         text,
         (
             r"surveyor\s+company\s+and\s+address\s*[:=]\s*'([^']+)'",
             r'surveyor\s+company\s+and\s+address\s*[:=]\s*"([^"]+)"',
-            r"surveyor\s+company\s+and\s+address\s*[:=]\s*(.+?)(?=\s*,\s*pillar\s+numbers|\s*pillar\s+numbers|\Z)",
+            rf"surveyor\s+company\s+and\s+address\s*[:=]\s*(.+?){CADASTRAL_FIELD_BOUNDARY}",
             r"surveyor(?:'s)?\s+(?:company\s+and\s+)?address\s+should\s+(?:now\s+)?be\s+['\"]([^'\"]+)['\"]",
         ),
     )
     if surveyor_addr:
-        _set("surveyor_address", sanitize_metadata_field(surveyor_addr, max_len=200))
+        _set("surveyor_address", scrub_surveyor_metadata_value(surveyor_addr, max_len=200))
 
     pillar_list: List[str] = []
     m_p = re.search(
@@ -5656,6 +6393,13 @@ def _resolve_plan_overrides_fast(scope: str) -> SurveyPlanOverrides:
         scale_m = re.search(r"scale\s+should\s+(?:now\s+)?be\s+1\s*:\s*(\d+)", text, re.IGNORECASE)
     if scale_m:
         _set("scale_denom", int(scale_m.group(1)))
+    else:
+        try:
+            sd = extract_user_requested_scale_denom(text)
+            if sd:
+                _set("scale_denom", int(sd))
+        except Exception:
+            pass
 
     coords_blob = extract_coordinates_blob_from_cadastral_query(text)
     if coords_blob:
@@ -5735,6 +6479,8 @@ def _plan_overrides_from_llm_dict(data: Dict[str, Any]) -> SurveyPlanOverrides:
         ("access_road_title", 80),
     ):
         val = sanitize_metadata_field(str(data.get(meta_field) or "").strip(), max_len=max_len)
+        if meta_field == "lga" and val:
+            val = sanitize_metadata_field(normalize_lga_name(val) or val, max_len=max_len)
         if val:
             _set(meta_field, val)
 

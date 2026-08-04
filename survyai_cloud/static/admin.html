@@ -106,12 +106,26 @@
     .hidden { display: none; }
     .checks { display: flex; flex-wrap: wrap; gap: 0.75rem 1.25rem; margin: 0.5rem 0 0.75rem; }
     .checks label { display: flex; gap: 0.35rem; align-items: center; color: var(--ink); }
+    .toolbar { display: flex; flex-wrap: wrap; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem; }
+    .toolbar .grow { flex: 1; color: var(--muted); font-size: 0.9rem; }
+    .actions { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+    button.small { padding: 0.35rem 0.55rem; font-size: 0.82rem; }
+    tr.selected { background: #ecfdf5; }
+    .pill {
+      display: inline-block;
+      padding: 0.1rem 0.45rem;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      background: #ccfbf1;
+      color: #115e59;
+      font-weight: 600;
+    }
   </style>
 </head>
 <body>
   <header>
     <h1>SurvyAI Support Admin</h1>
-    <p class="sub">Subscriptions, devices, usage, diagnostics, and billing overrides. Requires <code>X-SurvyAI-Admin-Key</code>.</p>
+    <p class="sub">Subscriptions, privileged access, devices, usage, and billing overrides. Requires <code>X-SurvyAI-Admin-Key</code>.</p>
   </header>
   <main>
     <section>
@@ -127,7 +141,17 @@
     </section>
 
     <section>
-      <h2>2. Lookup user</h2>
+      <h2>2. Privileged access</h2>
+      <div class="toolbar">
+        <div class="grow" id="privSummary">Save an admin key, then refresh to list users with admin-granted access.</div>
+        <button type="button" class="secondary" id="refreshPrivBtn">Refresh list</button>
+      </div>
+      <div id="privWrap"><p class="sub">No privileged users loaded yet.</p></div>
+      <div id="privMsg" class="msg"></div>
+    </section>
+
+    <section>
+      <h2>3. Lookup user</h2>
       <div class="row">
         <div>
           <label for="email">Customer email</label>
@@ -139,15 +163,16 @@
     </section>
 
     <section id="userSection" class="hidden">
-      <h2>3. Subscription snapshot</h2>
+      <h2>4. Subscription snapshot</h2>
       <div id="snapshot" class="kv"></div>
     </section>
 
     <section id="overrideSection" class="hidden">
-      <h2>4. Overrides</h2>
+      <h2>5. Overrides</h2>
       <div class="checks">
         <label><input type="checkbox" id="applyPro" /> Apply Pro defaults</label>
         <label><input type="checkbox" id="applyFree" /> Apply Free defaults</label>
+        <label><input type="checkbox" id="revokePrivilege" /> Revoke privilege (Free)</label>
         <label><input type="checkbox" id="resetCredits" /> Reset credits used</label>
         <label><input type="checkbox" id="clearGrace" /> Clear grace</label>
         <label><input type="checkbox" id="clearPeriod" /> Clear period end</label>
@@ -182,6 +207,10 @@
           <label for="graceEnd">grace_period_ends_at (ISO)</label>
           <input id="graceEnd" placeholder="optional" />
         </div>
+        <div>
+          <label for="privNote">admin_privilege_note</label>
+          <input id="privNote" placeholder="optional support note" />
+        </div>
       </div>
       <p style="margin: 0.75rem 0 0;">
         <button type="button" id="applyOverrideBtn">Apply overrides</button>
@@ -190,18 +219,18 @@
     </section>
 
     <section id="devicesSection" class="hidden">
-      <h2>5. Devices</h2>
+      <h2>6. Devices</h2>
       <div id="devicesWrap"></div>
       <div id="devicesMsg" class="msg"></div>
     </section>
 
     <section id="usageSection" class="hidden">
-      <h2>6. Recent usage</h2>
+      <h2>7. Recent usage</h2>
       <div id="usageWrap"></div>
     </section>
 
     <section id="diagSection" class="hidden">
-      <h2>7. Diagnostics uploads</h2>
+      <h2>8. Diagnostics uploads</h2>
       <div id="diagWrap"></div>
     </section>
   </main>
@@ -209,6 +238,7 @@
   <script>
     const KEY_STORAGE = "survyai_admin_key";
     let currentUserId = null;
+    let privilegeRows = [];
 
     function apiBase() {
       // Same origin as this page (e.g. https://host/admin/ui → https://host)
@@ -254,6 +284,23 @@
       return String(v);
     }
 
+    function money(v) {
+      const n = Number(v);
+      if (!Number.isFinite(n)) return "—";
+      return "$" + n.toFixed(2);
+    }
+
+    function addDaysIso(iso, days) {
+      const base = iso ? new Date(iso) : new Date();
+      if (Number.isNaN(base.getTime())) {
+        const d = new Date();
+        d.setUTCDate(d.getUTCDate() + days);
+        return d.toISOString();
+      }
+      base.setUTCDate(base.getUTCDate() + days);
+      return base.toISOString();
+    }
+
     function renderSnapshot(u) {
       currentUserId = u.id;
       const pairs = [
@@ -262,6 +309,8 @@
         ["display_name", u.display_name],
         ["plan_slug", u.plan_slug],
         ["subscription_status", u.subscription_status],
+        ["admin_privilege", u.admin_privilege_active ? "yes" : "no"],
+        ["privilege_note", u.admin_privilege_note],
         ["period_end", u.subscription_current_period_end],
         ["grace_ends", u.grace_period_ends_at],
         ["credits_usd", u.monthly_credits_usd],
@@ -285,11 +334,125 @@
       document.getElementById("maxDevices").value = u.max_devices ?? "";
       document.getElementById("periodEnd").value = u.subscription_current_period_end || "";
       document.getElementById("graceEnd").value = u.grace_period_ends_at || "";
+      document.getElementById("privNote").value = u.admin_privilege_note || "";
+      document.getElementById("email").value = u.email || "";
       show("userSection", true);
       show("overrideSection", true);
       show("devicesSection", true);
       show("usageSection", true);
       show("diagSection", true);
+      highlightPrivilegeRow(u.id);
+    }
+
+    function highlightPrivilegeRow(userId) {
+      document.querySelectorAll("#privWrap tr[data-user-id]").forEach((tr) => {
+        tr.classList.toggle("selected", tr.getAttribute("data-user-id") === String(userId));
+      });
+    }
+
+    function renderPrivileges(rows) {
+      privilegeRows = rows || [];
+      const summary = document.getElementById("privSummary");
+      if (!privilegeRows.length) {
+        summary.textContent = "No admin-managed privileges yet. Lookup a user and Apply overrides to grant access.";
+        document.getElementById("privWrap").innerHTML = "<p class='sub'>No privileged users.</p>";
+        return;
+      }
+      summary.textContent = privilegeRows.length + " privileged user" + (privilegeRows.length === 1 ? "" : "s") + ". Click Open to edit, Extend to add 7 days, or Revoke to restore Free.";
+      let html = "<table><thead><tr>"
+        + "<th>User</th><th>Plan</th><th>Status</th><th>Pool</th><th>Used</th><th>Period end</th><th>Note</th><th></th>"
+        + "</tr></thead><tbody>";
+      for (const u of privilegeRows) {
+        const selected = currentUserId && String(currentUserId) === String(u.id) ? " selected" : "";
+        html += "<tr class='" + selected.trim() + "' data-user-id='" + u.id + "'>"
+          + "<td><div>" + fmt(u.email) + "</div><div class='mono' style='color:var(--muted)'>" + fmt(u.display_name) + "</div></td>"
+          + "<td><span class='pill'>" + fmt(u.plan_slug) + "</span></td>"
+          + "<td>" + fmt(u.subscription_status) + "</td>"
+          + "<td class='mono'>" + money(u.monthly_credits_usd) + "</td>"
+          + "<td class='mono'>" + money(u.monthly_credits_used_usd) + "</td>"
+          + "<td class='mono'>" + fmt(u.subscription_current_period_end) + "</td>"
+          + "<td>" + fmt(u.admin_privilege_note) + "</td>"
+          + "<td><div class='actions'>"
+          + "<button type='button' class='small secondary' data-act='open' data-id='" + u.id + "'>Open</button>"
+          + "<button type='button' class='small' data-act='extend' data-id='" + u.id + "'>+7 days</button>"
+          + "<button type='button' class='small danger' data-act='revoke' data-id='" + u.id + "'>Revoke</button>"
+          + "</div></td>"
+          + "</tr>";
+      }
+      html += "</tbody></table>";
+      document.getElementById("privWrap").innerHTML = html;
+      document.querySelectorAll("#privWrap button[data-act]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          const id = btn.getAttribute("data-id");
+          const act = btn.getAttribute("data-act");
+          if (act === "open") openPrivilegeUser(id);
+          else if (act === "extend") extendPrivilege(id);
+          else if (act === "revoke") revokePrivilege(id);
+        });
+      });
+    }
+
+    async function refreshPrivileges() {
+      setMsg("privMsg", "");
+      try {
+        const rows = await api("/v1/admin/privileges?limit=200");
+        renderPrivileges(rows);
+        setMsg("privMsg", "Privileged list updated.", true);
+      } catch (e) {
+        setMsg("privMsg", e.message || String(e), false);
+      }
+    }
+
+    async function openPrivilegeUser(userId) {
+      setMsg("privMsg", "");
+      try {
+        const user = await api("/v1/admin/users/" + userId);
+        renderSnapshot(user);
+        await loadRelated();
+        setMsg("lookupMsg", "Opened " + user.email + " from privileged list.", true);
+        document.getElementById("overrideSection").scrollIntoView({ behavior: "smooth", block: "start" });
+      } catch (e) {
+        setMsg("privMsg", e.message || String(e), false);
+      }
+    }
+
+    async function extendPrivilege(userId) {
+      if (!confirm("Extend this user's period end by 7 days?")) return;
+      setMsg("privMsg", "");
+      try {
+        const user = await api("/v1/admin/users/" + userId);
+        const next = addDaysIso(user.subscription_current_period_end, 7);
+        await api("/v1/admin/users/" + userId + "/billing", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ subscription_current_period_end: next }),
+        });
+        await refreshPrivileges();
+        if (String(currentUserId) === String(userId)) {
+          const refreshed = await api("/v1/admin/users/" + userId);
+          renderSnapshot(refreshed);
+        }
+        setMsg("privMsg", "Extended period end to " + next, true);
+      } catch (e) {
+        setMsg("privMsg", e.message || String(e), false);
+      }
+    }
+
+    async function revokePrivilege(userId) {
+      if (!confirm("Revoke privileged access and restore Free defaults for this user?")) return;
+      setMsg("privMsg", "");
+      try {
+        await api("/v1/admin/privileges/" + userId, { method: "DELETE" });
+        await refreshPrivileges();
+        if (String(currentUserId) === String(userId)) {
+          const refreshed = await api("/v1/admin/users/" + userId);
+          renderSnapshot(refreshed);
+          await loadRelated();
+        }
+        setMsg("privMsg", "Privilege revoked.", true);
+      } catch (e) {
+        setMsg("privMsg", e.message || String(e), false);
+      }
     }
 
     function renderDevices(rows) {
@@ -411,6 +574,7 @@
       const body = {};
       if (document.getElementById("applyPro").checked) body.apply_pro_defaults = true;
       if (document.getElementById("applyFree").checked) body.apply_free_defaults = true;
+      if (document.getElementById("revokePrivilege").checked) body.revoke_privilege = true;
       if (document.getElementById("resetCredits").checked) body.reset_credits_used = true;
       if (document.getElementById("clearGrace").checked) body.clear_grace = true;
       if (document.getElementById("clearPeriod").checked) body.clear_period_end = true;
@@ -429,6 +593,8 @@
       if (pe !== undefined) body.subscription_current_period_end = pe;
       const ge = optionalString("graceEnd");
       if (ge !== undefined) body.grace_period_ends_at = ge;
+      const note = optionalString("privNote");
+      if (note !== undefined) body.admin_privilege_note = note;
       try {
         const result = await api("/v1/admin/users/" + currentUserId + "/billing", {
           method: "PATCH",
@@ -439,6 +605,7 @@
         const user = await api("/v1/admin/users/" + currentUserId);
         renderSnapshot(user);
         await loadRelated();
+        await refreshPrivileges();
       } catch (e) {
         setMsg("overrideMsg", e.message || String(e), false);
       }
@@ -452,9 +619,11 @@
       }
       sessionStorage.setItem(KEY_STORAGE, key);
       setMsg("keyMsg", "Admin key saved for this browser session.", true);
+      refreshPrivileges();
     });
     document.getElementById("lookupBtn").addEventListener("click", lookup);
     document.getElementById("applyOverrideBtn").addEventListener("click", applyOverrides);
+    document.getElementById("refreshPrivBtn").addEventListener("click", refreshPrivileges);
     document.getElementById("email").addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") lookup();
     });
@@ -463,6 +632,7 @@
     if (existing) {
       document.getElementById("adminKey").value = existing;
       setMsg("keyMsg", "Admin key loaded from sessionStorage.", true);
+      refreshPrivileges();
     }
   </script>
 </body>
