@@ -43,6 +43,9 @@ class ExcelProcessor:
         (and optionally first row of data). Use this to discover actual sheet and column
         names before calling ArcGIS/Excel tools—match user terms (e.g. "Pre-fill", "X/Y/Z")
         to real names (e.g. "Pre_Fill_2024", "EASTING", "NORTHING", "RL").
+
+        Also reports ownership/family-block layout when present so agents normalize before
+        CRS conversion or GIS import (header=0 alone mislabels owner title rows).
         """
         file_path = Path(file_path)
         if not file_path.exists():
@@ -60,8 +63,51 @@ class ExcelProcessor:
                 except Exception as e:
                     workbook["sheets"][name] = {"columns": [], "error": str(e)}
             xl.close()
+
+            ownership: Dict[str, Any] = {}
+            try:
+                from agent.excel_cadastral import assess_ownership_workbook
+
+                assessment = assess_ownership_workbook(file_path)
+                if assessment.get("success") or int(assessment.get("point_count") or 0) > 0:
+                    layout = str(assessment.get("layout_kind") or "unknown")
+                    owners = list(assessment.get("owner_names") or [])[:40]
+                    ownership = {
+                        "layout_kind": layout,
+                        "owner_count": int(assessment.get("real_owner_count") or len(owners) or 0),
+                        "owners": owners,
+                        "point_count": int(assessment.get("point_count") or 0),
+                        "placeholder_only": bool(assessment.get("placeholder_only")),
+                        "score": assessment.get("score"),
+                    }
+                    unnamedish = any(
+                        "unnamed" in str(c).lower()
+                        for sheet in workbook["sheets"].values()
+                        for c in (sheet.get("columns") or [])
+                    )
+                    headed_xy = any(
+                        str(c).strip().lower() in {"easting", "northing", "x", "y", "east", "north"}
+                        for sheet in workbook["sheets"].values()
+                        for c in (sheet.get("columns") or [])
+                    )
+                    needs_normalize = layout in {
+                        "family_blocks",
+                        "coordinate_blocks",
+                    } or (ownership["owner_count"] > 0 and (unnamedish or not headed_xy))
+                    if needs_normalize:
+                        ownership["hint"] = (
+                            "Family/owner-block layout detected. Call "
+                            "excel_normalize_ownership_workbook BEFORE "
+                            "excel_coordinate_converter or ArcGIS XY import."
+                        )
+            except Exception as own_exc:
+                logger.debug("Ownership assessment during inspect skipped: %s", own_exc)
+
             logger.info(f"Inspected workbook {file_path}: {list(workbook['sheets'].keys())}")
-            return {"success": True, "workbook": workbook}
+            out: Dict[str, Any] = {"success": True, "workbook": workbook}
+            if ownership:
+                out["ownership"] = ownership
+            return out
         except Exception as e:
             logger.error(f"Error inspecting workbook: {e}")
             return {"success": False, "error": str(e), "workbook": {}}

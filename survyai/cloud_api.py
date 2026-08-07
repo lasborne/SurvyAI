@@ -89,9 +89,19 @@ def _parse_json(resp: requests.Response, *, what: str) -> Any:
             raise CloudApiError(
                 f"{what}: empty response (HTTP {resp.status_code}). "
                 "Is the SurvyAI cloud server running? Check the base URL "
-                "(e.g. https://survyai-api.onrender.com orhttp://127.0.0.1:8088 with no trailing path)."
+                "(e.g. https://survyai-api.onrender.com or http://127.0.0.1:8088 with no trailing path)."
             ) from exc
         preview = text[:500].replace("\n", " ")
+        # Render/nginx often returns plain "Internal Server Error" for worker crashes.
+        if resp.status_code >= 500 and what.startswith("POST /v1/llm/chat"):
+            raise CloudApiError(
+                f"{what}: hosted LLM proxy returned HTTP {resp.status_code} "
+                f"(non-JSON: {preview}). "
+                "Usually the SurvyAI cloud LLM worker failed upstream (OpenAI key/quota, "
+                "timeout, or oversized tool payload). Try: Sign in again (Account), "
+                "confirm Pro + credits remain, retry the prompt; if it persists, "
+                "switch Primary LLM to Ollama for offline work or contact support."
+            ) from exc
         raise CloudApiError(
             f"{what}: expected JSON but got HTTP {resp.status_code}: {preview}"
         ) from exc
@@ -631,7 +641,24 @@ def proxy_llm_chat(
     body = _parse_json(resp, what="POST /v1/llm/chat")
     if resp.status_code == 401:
         raise CloudApiError("Unauthorized (access token expired or invalid)")
+    if resp.status_code == 402:
+        raise CloudApiError(
+            _api_error_detail(body, status_code=resp.status_code)
+            or "Subscription API credit balance exhausted for this period"
+        )
+    if resp.status_code == 403:
+        raise CloudApiError(
+            _api_error_detail(body, status_code=resp.status_code)
+            or "Hosted LLM access denied (Pro subscription / registered device required)"
+        )
     if not resp.ok:
-        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
+        detail = _api_error_detail(body, status_code=resp.status_code)
+        if resp.status_code >= 500:
+            raise CloudApiError(
+                f"Hosted LLM proxy error (HTTP {resp.status_code}): {detail}. "
+                "Try Sign in again, confirm Pro credits, then retry. "
+                "Or switch Primary LLM to Ollama for local offline work."
+            )
+        raise CloudApiError(detail)
     return body if isinstance(body, dict) else {}
 

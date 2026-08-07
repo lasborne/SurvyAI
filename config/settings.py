@@ -183,42 +183,40 @@ class Settings(BaseSettings):
     )
     
     openai_model: str = Field(
-        default="gpt-4o-mini",
+        default="gpt-5.6-terra",
         env="OPENAI_MODEL",
         description=(
             "OpenAI model name (legacy - used as fallback if tiered models not set).\n"
-            "For tiered model selection, use OPENAI_MODEL_NANO, OPENAI_MODEL_MINI, OPENAI_MODEL_COMPLEX instead."
+            "For tiered model selection, use OPENAI_MODEL_NANO, OPENAI_MODEL_MINI, OPENAI_MODEL_COMPLEX instead.\n"
+            "Catalog includes gpt-5.6-sol/terra/luna, gpt-5.5, gpt-5.4(-mini/-nano), gpt-5*, gpt-4.1*, gpt-4o*."
         )
     )
     
     # Tiered OpenAI models for intelligent complexity-based selection
     openai_model_nano: str = Field(
-        default="gpt-5.4-nano",
+        default="gpt-5.6-luna",
         env="OPENAI_MODEL_NANO",
         description=(
-            "OpenAI model for simple tasks (e.g., basic questions, simple lookups).\n"
-            "Default: gpt-5.4-nano (cost-effective for trivial tasks).\n"
-            "If unavailable, falls back to OPENAI_MODEL or gpt-4o-mini."
+            "OpenAI model for simple tasks (lookups, short Q&A).\n"
+            "Default: gpt-5.6-luna (cost-efficient high-volume). Fallbacks: gpt-5.4-nano, gpt-4o-mini."
         )
     )
     
     openai_model_mini: str = Field(
-        default="gpt-5.4-mini",
+        default="gpt-5.6-terra",
         env="OPENAI_MODEL_MINI",
         description=(
-            "OpenAI model for average complexity tasks (e.g., coordinate conversions, basic calculations).\n"
-            "Default: gpt-5.4-mini (balanced cost and capability).\n"
-            "If unavailable, falls back to OPENAI_MODEL or gpt-4o-mini."
+            "OpenAI model for average tasks (CRS convert, GIS tool orchestration, drafting).\n"
+            "Default: gpt-5.6-terra (balance of intelligence and cost). Fallbacks: gpt-5.4-mini, gpt-5-mini."
         )
     )
     
     openai_model_complex: str = Field(
-        default="gpt-5.4",
+        default="gpt-5.6-sol",
         env="OPENAI_MODEL_COMPLEX",
         description=(
-            "OpenAI model for very complex tasks (e.g., multi-step analysis, complex reasoning).\n"
-            "Default: gpt-5.4 (highest capability for complex tasks).\n"
-            "If unavailable, falls back to OPENAI_MODEL or gpt-4o."
+            "OpenAI model for complex reasoning / hard agentic work.\n"
+            "Default: gpt-5.6-sol (flagship). Fallbacks on quota: gpt-5.5, gpt-5.6-terra, gpt-5.4, gpt-5.4-mini."
         )
     )
     

@@ -906,29 +906,60 @@ def better_ownership_excel_nearby(path: str | Path) -> Optional[Path]:
 sibling_source_excel = better_ownership_excel_nearby
 
 
-def extract_requested_workbook_copy_name(query: str) -> Optional[str]:
-    """
-    Detect a user-requested normalized workbook filename from natural language.
+def _ensure_excel_basename(name: str) -> Optional[str]:
+    """Return a safe Excel basename; append .xlsx when the extension is omitted."""
+    raw = (name or "").strip().strip("'\"")
+    if not raw:
+        return None
+    base = Path(raw).name
+    if not base or base.lower().startswith("~$"):
+        return None
+    if Path(base).suffix.lower() not in {".xlsx", ".xls", ".xlsm"}:
+        base = f"{base}.xlsx"
+    return base
 
-    Examples: save as 'owners_clean.xlsx', duplicate it as coords.xlsx, copy to book.xlsx.
+
+def extract_requested_excel_output_name(query: str) -> Optional[str]:
+    """
+    Detect a user-requested Excel output filename from natural language.
+
+    Tolerates missing extensions and phrasing like:
+    save file as 'coords_midbelt' excel file / save as owners_clean.xlsx
     """
     q = query or ""
     patterns = (
-        r"(?:duplicate|copy|save|write|export)\s+(?:it\s+)?(?:and\s+)?(?:save\s+)?(?:it\s+)?"
-        r"(?:as|to)\s+['\"]([^'\"]+\.(?:xlsx|xls|xlsm))['\"]",
-        r"(?:duplicate|copy|save|write|export)\s+(?:it\s+)?(?:and\s+)?(?:save\s+)?(?:it\s+)?"
-        r"(?:as|to)\s+([A-Za-z0-9 _\-]+\.(?:xlsx|xls|xlsm))",
+        # Quoted name, optional "excel/workbook/spreadsheet file" trailer
+        r"(?:duplicate|copy|save|write|export)\s+(?:(?:it|file|workbook|the\s+file)\s+)?"
+        r"(?:and\s+)?(?:save\s+)?(?:it\s+)?"
+        r"(?:as|to)\s+['\"]([^'\"]+)['\"]"
+        r"(?:\s+(?:excel|workbook|spreadsheet)(?:\s+file)?)?",
+        # Unquoted name with explicit Excel extension
+        r"(?:duplicate|copy|save|write|export)\s+(?:(?:it|file|workbook|the\s+file)\s+)?"
+        r"(?:and\s+)?(?:save\s+)?(?:it\s+)?"
+        r"(?:as|to)\s+([A-Za-z0-9 _\-]+\.(?:xlsx|xls|xlsm))\b",
+        # Unquoted stem + excel/workbook/spreadsheet file
+        r"(?:duplicate|copy|save|write|export)\s+(?:(?:it|file|workbook|the\s+file)\s+)?"
+        r"(?:and\s+)?(?:save\s+)?(?:it\s+)?"
+        r"(?:as|to)\s+([A-Za-z0-9 _\-]+)\s+(?:excel|workbook|spreadsheet)(?:\s+file)?\b",
         r"(?:save|write|export)\s+(?:a\s+)?(?:copy|duplicate)\s+(?:as|to)\s+"
-        r"['\"]?([^'\"\s]+\.(?:xlsx|xls|xlsm))['\"]?",
+        r"['\"]?([^'\"\s]+)['\"]?",
     )
     for pat in patterns:
         m = re.search(pat, q, flags=re.IGNORECASE)
         if m:
-            name = Path(m.group(1).strip()).name
-            if name.lower().startswith("~$"):
-                continue
-            return name
+            name = _ensure_excel_basename(m.group(1))
+            if name:
+                return name
     return None
+
+
+def extract_requested_workbook_copy_name(query: str) -> Optional[str]:
+    """
+    Detect a user-requested normalized/copy workbook filename from natural language.
+
+    Examples: save as 'owners_clean.xlsx', duplicate it as coords.xlsx, copy to book.xlsx.
+    """
+    return extract_requested_excel_output_name(query)
 
 
 def query_requests_workbook_copy(query: str) -> bool:
@@ -1021,6 +1052,66 @@ def resolve_ownership_excel_for_plot(
         "write_copy": bool(query_requests_workbook_copy(q)),
         "copy_name": copy_name,
     }
+
+
+def normalize_ownership_workbook(
+    source_path: str | Path | None = None,
+    *,
+    workspace: str | Path | None = None,
+    dest_name: Optional[str] = None,
+    query: str = "",
+) -> Dict[str, Any]:
+    """
+    Normalize a family/owner-block (or headed ownership) workbook to
+    Easting/Northing/Pillar/Owner for CRS conversion and GIS tools.
+
+    General helper — not CAD-specific. Use whenever inspect shows Unnamed columns
+    or owner-like first headers before excel_coordinate_converter / ArcGIS import.
+    """
+    ws = Path(workspace or Path.cwd()).resolve()
+    src: Optional[Path] = None
+    if source_path:
+        p = Path(source_path)
+        if not p.is_absolute():
+            p = (ws / p).resolve()
+        else:
+            p = p.resolve()
+        if p.exists():
+            src = p
+        else:
+            # Soft resolve by stem in workspace (e.g. ODUOHA_FAMILY_BOUNDARY1 → *_1.xlsx).
+            stem = p.stem.lower().replace(" ", "_")
+            for cand in list_excel_workbooks(ws):
+                cstem = cand.stem.lower().replace(" ", "_")
+                if cstem == stem or stem in cstem or cstem in stem:
+                    src = cand
+                    break
+    if src is None:
+        resolved = resolve_ownership_excel_for_plot(query or "", ws, preferred=source_path)
+        if not resolved.get("success"):
+            return {
+                "success": False,
+                "error": resolved.get("error")
+                or "Could not resolve an ownership Excel workbook to normalize.",
+            }
+        src = Path(resolved["path"])
+        parcels = list(resolved.get("parcels") or [])
+    else:
+        parcels = None
+
+    out = write_dup_xlsx_with_headers(
+        src,
+        dest_name=dest_name,
+        parcels=parcels,
+        query=query or "",
+    )
+    if out.get("success"):
+        out["layout_kind"] = "ownership_normalized"
+        out["hint"] = (
+            "Use columns Easting/Northing (and Owner) for excel_coordinate_converter "
+            "or ArcGIS XY import. Do not re-parse family blocks inside ArcPy."
+        )
+    return out
 
 
 def write_dup_xlsx_with_headers(

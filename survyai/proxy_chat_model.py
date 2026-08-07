@@ -132,18 +132,24 @@ class SurvyAIProxyChatModel(BaseChatModel):
         if isinstance(message, AIMessage):
             tool_calls = []
             for tc in message.tool_calls or []:
-                if not isinstance(tc, dict):
+                if isinstance(tc, dict):
+                    name = tc.get("name")
+                    args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+                    tid = tc.get("id")
+                else:
+                    name = getattr(tc, "name", None)
+                    raw_args = getattr(tc, "args", None)
+                    args = raw_args if isinstance(raw_args, dict) else {}
+                    tid = getattr(tc, "id", None)
+                if not name:
                     continue
-                tool_calls.append(
-                    {
-                        "id": tc.get("id"),
-                        "name": tc.get("name"),
-                        "args": tc.get("args") if isinstance(tc.get("args"), dict) else {},
-                    }
-                )
+                tool_calls.append({"id": tid, "name": name, "args": args})
+            content = message.content
+            if content is not None and not isinstance(content, (str, list, dict, int, float, bool)):
+                content = str(content)
             return {
                 "role": "assistant",
-                "content": message.content,
+                "content": content if content is not None else "",
                 "tool_calls": tool_calls,
             }
         return {"role": "user", "content": getattr(message, "content", str(message))}

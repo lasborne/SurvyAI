@@ -139,6 +139,11 @@ from survyai.ollama_support import (
     start_pull_model,
     try_connect_ollama,
 )
+from survyai.gis_session_intent import (
+    looks_like_full_gis_workflow_request as _looks_like_full_gis_workflow_request,
+    looks_like_gis_session_followup as _looks_like_gis_session_followup,
+    prior_assistant_reported_gis_success as _prior_assistant_reported_gis_success,
+)
 from survyai.types import AgentRunResult
 from survyai.updater import (
     UPDATE_CHECK_INTERVAL_HOURS,
@@ -218,17 +223,38 @@ def _fu_short_affirm(t: str) -> bool:
     aff = {
         "yes", "y", "yep", "yeah", "ok", "okay", "sure", "please", "proceed", "go",
         "agreed", "alright", "right", "correct", "continue", "absolutely", "sounds", "if",
+        "ahead",
     }
     w0 = w[0].strip(".,;:!?")
     if len(w) <= 2 and w0 in aff:
         return True
     if len(w) <= 4 and w0 in aff and w[-1] == "want":
         return True
-    if t in ("yes, i want", "yes i want", "ok do it", "go ahead", "sounds good"):
+    if t in (
+        "yes, i want",
+        "yes i want",
+        "ok do it",
+        "go ahead",
+        "sounds good",
+        "yes go ahead",
+        "yes, go ahead",
+        "yeah go ahead",
+        "ok go ahead",
+        "sure go ahead",
+        "yes please go ahead",
+        "yes go ahead and search",
+    ):
         return True
     if len(w) <= 3 and {x.strip(".,;:!?") for x in w} <= aff:
         return True
-    if len(w) <= 7 and (t.startswith("yes,") or t.startswith("ok,") or t.startswith("please ") or t.startswith("i want you")):
+    if len(w) <= 7 and (
+        t.startswith("yes,")
+        or t.startswith("ok,")
+        or t.startswith("please ")
+        or t.startswith("i want you")
+        or t.startswith("yes go")
+        or t.startswith("yes please")
+    ):
         return True
     return len(w) <= 5 and t.startswith("go ahead")
 
@@ -241,12 +267,15 @@ def _assistant_asked_internet_permission(assistant_text: str) -> bool:
         "browse the web",
         "may i search",
         "you may search",
-        "permission",
+        "permission to search",
+        "need explicit permission",
+        "internet search permission",
         "(yes/no)",
         "latest official",
-        "up-to-date",
+        "up-to-date information",
         "latest confirmed",
     )
+    # Avoid matching generic "permission" / "up-to-date" in unrelated GIS replies.
     return any(m in body for m in markers)
 
 
@@ -262,6 +291,8 @@ def _is_permission_affirmation(raw_query: str) -> bool:
         "permission granted",
         "go ahead and search",
         "please search",
+        "yes go ahead",
+        "yes, go ahead",
     )
     return any(g in t for g in grants)
 
@@ -273,7 +304,9 @@ def _fu_anaphora(t: str) -> bool:
         " the survey", " the same", "as above", "as discussed", "further to", "additionally",
         "the output", "the workspace", " the plan", " the cad", "word document", "appropriate title",
         "export it", " save it", " the dwg", " this pdf", "as word", " the polygons",
-        " these points", " the points",
+        " these points", " the points", " open arcgis", " the parcels", " each of them",
+        " each parcel", " each polygon", "fit comparison", "gis-based fit", "gis based fit",
+        "practical gis", "footprint", "deep learning",
     ):
         if p in s:
             return True
@@ -285,7 +318,10 @@ def _fu_anaphora(t: str) -> bool:
 
 def _fu_shared_paths(history: str, raw: str) -> bool:
     h, r = history.lower(), (raw or "").lower()
-    for pat in (r"([a-z]:\\[^:\n*\"<>|]{3,}[\w.])", r"([/\w.:/\\\-]+\.(?:pdf|docx?|xlsx?|dwg|dxf|csv))"):
+    for pat in (
+        r"([a-z]:\\[^:\n*\"<>|]{3,}[\w.])",
+        r"([/\w.:/\\\-]+\.(?:pdf|docx?|xlsx?|dwg|dxf|csv|aprx|gdb))",
+    ):
         ih, ir_ = set(re.findall(pat, h, re.I)), set(re.findall(pat, r, re.I))
         if ih and ir_ and (ih & ir_ or any(x in h for x in ir_) or any(x in r for x in ih)):
             return True
@@ -337,6 +373,8 @@ def _is_clearly_new_topic(raw_query: str, last_exchange_messages: list) -> bool:
     - Either a new-topic keyword is detected  OR  the query has ≥12 words and
       shares no significant tokens with the last exchange.
     """
+    if _looks_like_gis_session_followup(raw_query):
+        return False
     if _fu_anaphora(raw_query):
         return False
     prev_text = " ".join((m.content or "") for m in last_exchange_messages)
@@ -359,23 +397,65 @@ def _is_standalone_knowledge_question(raw_query: str) -> bool:
     q = (raw_query or "").strip().lower()
     if not q:
         return False
-    if re.search(r"[a-z]:\\|/[^ \n]+\.(dwg|dxf|docx|pdf|xlsx?|csv|txt|json)\b", q, flags=re.I):
+    # GIS session follow-ups / fit tests must keep prior verified layers.
+    if _looks_like_gis_session_followup(raw_query):
+        return False
+    if re.search(r"[a-z]:\\|/[^ \n]+\.(dwg|dxf|docx|pdf|xlsx?|csv|txt|json|aprx|gdb)\b", q, flags=re.I):
         return False
     task_markers = (
         "plot", "draw", "modify", "open autocad", "cad", "dwg", "dxf",
         "save", "export", "create a file", "generate a plan", "replot",
         "use this", "template", "summarize this document", "attached",
+        "arcgis", "geopandas", "buffer", "overlap", "convert",
     )
     if any(marker in q for marker in task_markers):
         return False
+    # Word-boundary markers only — "comparison" must NOT match "compare".
     question_markers = (
-        "what is", "what are", "explain", "describe", "define", "principle",
-        "history of", "brief history", "difference between", "compare",
-        "how does", "why does", "as a surveyor", "surveying",
+        r"\bwhat is\b",
+        r"\bwhat are\b",
+        r"\bexplain\b",
+        r"\bdescribe\b",
+        r"\bdefine\b",
+        r"\bprinciple\b",
+        r"\bhistory of\b",
+        r"\bbrief history\b",
+        r"\bdifference between\b",
+        r"\bcompare\b",
+        r"\bhow does\b",
+        r"\bwhy does\b",
+        r"\bas a surveyor\b",
     )
-    if any(marker in q for marker in question_markers):
+    if any(re.search(p, q) for p in question_markers):
         return True
     return bool(q.endswith("?") and len(q.split()) >= 6)
+
+
+def _assistant_offered_session_gis_analysis(prior_text: str) -> bool:
+    """True when the prior assistant turn offered a GIS fit/analysis using session files."""
+    t = (prior_text or "").lower()
+    if not t:
+        return False
+    markers = (
+        "verified parcel",
+        "gis session",
+        "session files",
+        "fit check",
+        "fit comparison",
+        "footprint approximation",
+        "geometric fit",
+        "practical gis",
+        "eiffel",
+        "using the verified",
+        "parcel data already",
+        "current gis session",
+        "if you want, i can still",
+        "i can still do this next",
+        "ascertain if",
+        "deep learning",
+        "open arcgis result",
+    )
+    return any(m in t for m in markers)
 
 
 def _should_inject_conversation_context(raw: str, prior_user_assistant_text: str) -> bool:
@@ -384,6 +464,16 @@ def _should_inject_conversation_context(raw: str, prior_user_assistant_text: str
     prev = (prior_user_assistant_text or "").strip()
     if not raw or not prev:
         return False
+    # Full GIS workflow restatements keep history (for CRS/paths) but are re-executed — not no-ops.
+    if _looks_like_full_gis_workflow_request(raw):
+        return True
+    # Always keep full recent history for GIS fit / open-result continuations.
+    if _looks_like_gis_session_followup(raw):
+        return True
+    # Bare "go ahead" / "yes" after a GIS fit offer must keep the full session (aprx/gdb/xlsx),
+    # not only the last failed CURRENT-map exchange.
+    if _fu_short_affirm(raw) and _assistant_offered_session_gis_analysis(prev):
+        return True
     nw = len(raw.split())
     nt = _fu_topic_score(raw, prev)
     if _fu_short_affirm(raw):
@@ -4762,8 +4852,12 @@ class MainWindow(QMainWindow):
     _MAX_MSG_CHARS_ESSAY_SAVE = 1_000_000  # preserve full assistant answers for essay export
 
     def _try_resolve_internet_permission_reply(self, raw_query: str) -> Optional[str]:
-        """If the user is answering a prior internet-permission ask, return a clean
-        tagged query for the agent (skips history injection that confuses routing)."""
+        """If the user is answering a prior internet-permission ask, return a tagged
+        query that keeps session GIS context while forcing the grant through.
+
+        Bare ``[GRANTED] + underlying`` without history caused Living Atlas / land-cover
+        follow-ups to lose `.aprx`/`.gdb` paths and re-ask permission as a fresh turn.
+        """
         conv = self._active_conversation()
         prior = conv.messages[:-1] if conv.messages else []
         last_assistant = ""
@@ -4785,7 +4879,13 @@ class MainWindow(QMainWindow):
             underlying = users[0]
         if not underlying:
             return None
-        return f"[INTERNET_PERMISSION_GRANTED]\n{underlying}"
+        # Rebuild with ACTIVE GIS SESSION history when the underlying task needs
+        # prior parcels/project paths; keep the grant tag so the agent cannot re-ask.
+        try:
+            enriched = self._build_continuation_query(underlying)
+        except Exception:
+            enriched = underlying
+        return f"[INTERNET_PERMISSION_GRANTED]\n{enriched or underlying}"
 
     @staticmethod
     def _clean_question_from_enhanced(q: str) -> str:
@@ -4868,6 +4968,56 @@ class MainWindow(QMainWindow):
             "   explicitly asks for it.",
             "",
         ]
+        prior_blob = "\n".join(
+            (t.content or "") for t in turns if getattr(t, "role", "") in ("user", "assistant")
+        )
+        if _looks_like_full_gis_workflow_request(raw_query) and _prior_assistant_reported_gis_success(
+            prior_blob
+        ):
+            # User restated a full GIS job even though a prior run succeeded — re-execute.
+            parts = [
+                "=== CONVERSATION CONTEXT (PRIOR RUN — RE-EXECUTE CURRENT REQUEST) ===",
+                "A prior turn may show an earlier successful GIS run. That does NOT mean skip work.",
+                "Rules:",
+                "1. The CURRENT REQUEST at the bottom is a full operational GIS workflow — EXECUTE it",
+                "   again with tools (convert → polygons → buffers → overlaps / as asked).",
+                "2. Do NOT reply 'Already completed' / only re-list old paths. Users often re-run",
+                "   because outputs were deleted, moved, or not useful.",
+                "3. Do NOT create Report.docx / a Word essay unless the user explicitly asked for a",
+                "   Word report — this is a GIS tool workflow, not a narrative report job.",
+                "4. You may overwrite same-named outputs or write refreshed siblings; verify new",
+                "   RESULT_* lines from THIS run before claiming success.",
+                "5. Prior outputs are reference for paths/CRS defaults only — not permission to no-op.",
+                "",
+            ]
+        elif _looks_like_gis_session_followup(raw_query) or (
+            _fu_short_affirm(raw_query) and _assistant_offered_session_gis_analysis(prior_blob)
+        ):
+            parts = [
+                "=== CONVERSATION CONTEXT (ACTIVE GIS SESSION — MUST USE) ===",
+                "This message continues an in-progress geospatial analysis. Rules:",
+                "1. REUSE verified .aprx / .gdb / Excel / CSV paths from the history below",
+                "   (including earlier successful convert/plot turns — not only the last message).",
+                "2. Do NOT ask the user to re-send parcel layers or project paths already listed.",
+                "3. Prefer path-based analysis (converted Excel Owner+X/Y, GDB feature classes,",
+                "   summary CSVs) via geopandas_execute or arcgis_execute_python_code with full paths.",
+                "   Do NOT depend on ArcGISProject('CURRENT') / open-map layers when session files exist.",
+                "4. Do NOT answer with a generic tools comparison essay (GeoPandas vs ArcGIS vs",
+                "   AutoCAD). Execute the parcel/landmark geometric fit (or the GIS step asked).",
+                "5. If the user asks for Living Atlas / a pretrained land-cover model: do NOT",
+                "   collapse that into parcel-area geometry. Source/catalog the model (internet",
+                "   permission already handled by SurvyAI when granted), then classify/clip to",
+                "   session parcels via arcgis_execute_python_code. Only fall back to geometric",
+                "   open-parcel area when Living Atlas/imagery/model access is verified unavailable.",
+                "6. Otherwise, interpret bare 'deep learning' without a model as rigorous GIS geometry.",
+                "7. Answer the CURRENT REQUEST at the bottom using the session layers above.",
+                "8. Never re-ask internet permission after the user already said yes this turn.",
+                "9. If the CURRENT REQUEST only supplies .aprx/.shp/.gdb paths after a fit ask,",
+                "   run the geometric fit on those files — do NOT re-run convert/plot/buffer.",
+                "10. Local SurvyAI missing arcpy is normal; use arcgis_execute_python_code or",
+                "    geopandas_execute with the listed paths. Never stop on arcgis_get_project_info.",
+                "",
+            ]
         preserve_full_assistant = _is_save_session_docx_request(raw_query)
         exchange = 0
         for t in turns:
@@ -5094,10 +5244,39 @@ class MainWindow(QMainWindow):
         box.setDefaultButton(allow)
         box.exec()
 
+        tagged_body = (q or "").strip()
+        # Keep the history-enriched body so ACTIVE GIS SESSION / .aprx / shapefile
+        # paths survive the Allow/Don't-allow re-run. Stripping to clean_q alone
+        # caused fit follow-ups to forget verified parcels and ask for paths again.
+        if not tagged_body or len(tagged_body) < 8:
+            tagged_body = clean_q
+        else:
+            # Prefer full enriched query when present; otherwise rebuild from clean ask.
+            has_hist = any(
+                m in tagged_body
+                for m in (
+                    "=== CONVERSATION CONTEXT",
+                    "--- Exchange",
+                    "NOW, the user wants you to continue with this new request:",
+                    "ACTIVE GIS SESSION",
+                )
+            )
+            if not has_hist and clean_q:
+                try:
+                    tagged_body = self._build_continuation_query(clean_q) or clean_q
+                except Exception:
+                    tagged_body = clean_q
+        for tag in (
+            "[INTERNET_PERMISSION_GRANTED]",
+            "[INTERNET_PERMISSION_DENIED]",
+            "[INTERNET_PERMISSION_REQUEST]",
+        ):
+            tagged_body = tagged_body.replace(tag, "").strip()
+
         tagged = (
-            f"[INTERNET_PERMISSION_GRANTED]\n{clean_q}"
+            f"[INTERNET_PERMISSION_GRANTED]\n{tagged_body}"
             if box.clickedButton() == allow
-            else f"[INTERNET_PERMISSION_DENIED]\n{clean_q}"
+            else f"[INTERNET_PERMISSION_DENIED]\n{tagged_body}"
         )
         self._append_activity("Permission dialog answered.")
         self._append_system_line("Running (with your choice)…")

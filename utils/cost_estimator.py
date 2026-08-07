@@ -54,10 +54,57 @@ OPENAI_PRICING: Dict[str, Dict[str, float]] = {
         "output": 0.80,
         "cached_input": 0.05,
     },
+    # GPT-5.6 family (OpenAI Models docs, 2026)
+    "gpt-5.6-sol": {
+        "input": 5.00,
+        "output": 30.00,
+        "cached_input": 0.50,
+    },
+    "gpt-5.6": {
+        "input": 5.00,
+        "output": 30.00,
+        "cached_input": 0.50,
+    },
+    "gpt-5.6-terra": {
+        "input": 2.00,
+        "output": 12.00,
+        "cached_input": 0.20,
+    },
+    "gpt-5.6-luna": {
+        "input": 0.20,
+        "output": 1.20,
+        "cached_input": 0.05,
+    },
+    # GPT-5.5 family
+    "gpt-5.5": {
+        "input": 5.00,
+        "output": 30.00,
+        "cached_input": 0.50,
+    },
+    "gpt-5.5-pro": {
+        "input": 30.00,
+        "output": 180.00,
+        "cached_input": 3.00,
+    },
     "gpt-5.4": {
         "input": 2.50,
         "output": 15.00,
         "cached_input": 0.25,
+    },
+    "gpt-5.4-pro": {
+        "input": 15.00,
+        "output": 90.00,
+        "cached_input": 1.50,
+    },
+    "gpt-5.4-mini": {
+        "input": 0.75,
+        "output": 4.50,
+        "cached_input": 0.075,
+    },
+    "gpt-5.4-nano": {
+        "input": 0.20,
+        "output": 1.25,
+        "cached_input": 0.02,
     },
     "gpt-5.2": {
         "input": 2.50,
@@ -73,6 +120,16 @@ OPENAI_PRICING: Dict[str, Dict[str, float]] = {
         "input": 2.50,
         "output": 15.00,
         "cached_input": 0.25,
+    },
+    "gpt-4.1": {
+        "input": 2.00,
+        "output": 8.00,
+        "cached_input": 0.50,
+    },
+    "gpt-4.1-mini": {
+        "input": 0.40,
+        "output": 1.60,
+        "cached_input": 0.10,
     },
 
     # Claude family (approximate published USD rates per 1M tokens)

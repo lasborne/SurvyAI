@@ -4451,25 +4451,42 @@ print("RESULT_FINALIZATION_COMPLETE")
             "stdout": stdout,
         }
     
-    def get_project_info(self) -> Dict[str, Any]:
+    def get_project_info(self, project_path: Optional[str] = None) -> Dict[str, Any]:
         """
-        Get information about the current project.
-        
+        Get information about a project.
+
+        Args:
+            project_path: Optional explicit .aprx path. When omitted, uses
+                self.current_project if set.
+
         Returns:
             Dictionary with project details
         """
+        target = (project_path or "").strip() or (self.current_project or "")
+        if target:
+            self.current_project = target
+
         if not self.arcpy:
             return {
                 "success": False,
-                "error": "arcpy not available - cannot get project info",
+                "error": "arcpy not available in the SurvyAI process - cannot inspect via get_project_info",
                 "arcgis_installed": self.is_installed,
-                "arcgis_path": str(self.arcgis_pro_path) if self.arcgis_pro_path else None
+                "arcgis_path": str(self.arcgis_pro_path) if self.arcgis_pro_path else None,
+                "project_path": target or None,
+                "guidance": (
+                    "Use arcgis_execute_python_code with the .aprx path, or geopandas_execute "
+                    "on parcel .shp/.xlsx paths. Missing local arcpy is not a reason to stop."
+                ),
             }
         
         if not self.current_project:
             return {
                 "success": False,
-                "error": "No project is currently open"
+                "error": "No project is currently open",
+                "guidance": (
+                    "Pass project_path to this tool, or analyze parcel files with "
+                    "geopandas_execute / arcgis_execute_python_code using verified session paths."
+                ),
             }
         
         try:

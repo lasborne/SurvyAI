@@ -2458,19 +2458,69 @@ class SurvyAIAgent:
 
     def _should_fastpath_docx_report(self, query: str) -> bool:
         """
-        Fast-path: user asks for a generated report and to save it to a .docx,
+        Fast-path: user asks for a generated narrative report and to save it to a .docx,
         without providing an input document to summarize.
+
+        Must NEVER hijack operational GIS/CAD/Excel workflows that merely contain the
+        word "save" (e.g. save converted coordinates as an .xlsx) or re-execute
+        instructions that mention conversation "history".
         """
-        q = (query or "").lower()
-        has_output_docx = ".docx" in q or "history.docx" in q or "save" in q
-        wants_save = any(k in q for k in ["save", "saved", "export", "into the folder", "project folder", "same folder", "workspace"])
-        is_report_like = any(
-            k in q
-            for k in [
-                "report", "trace", "history", "explain", "overview", "process",
-                "licens", "licensing", "practice", "essay", "well-structured",
-                "turn this", "write-up", "write up",
-            ]
+        from survyai.gis_session_intent import looks_like_full_gis_workflow_request
+
+        q = (query or "").strip()
+        ql = q.lower()
+        if not ql:
+            return False
+
+        # Operational GIS/CAD/Excel jobs are tool workflows — never Report.docx.
+        if looks_like_full_gis_workflow_request(q):
+            return False
+        if self._looks_like_operational_workflow_request(q):
+            return False
+        if ql.startswith("re-execute full gis workflow") or "re-execute full gis workflow" in ql:
+            return False
+        if ql.startswith("continuation (retain session gis context"):
+            return False
+
+        # Require an actual Word deliverable intent — bare "save" is not enough
+        # (users often "save as … excel file" inside GIS jobs).
+        has_output_docx = (
+            ".docx" in ql
+            or "history.docx" in ql
+            or "word document" in ql
+            or "word doc" in ql
+            or bool(re.search(r"\bas\s+a\s+word\b", ql))
+            or bool(re.search(r"\b(?:save|export|write)\s+(?:it\s+)?(?:as\s+)?(?:a\s+)?(?:word\s+)?report\b", ql))
+        )
+        wants_save = any(
+            k in ql
+            for k in (
+                "save",
+                "saved",
+                "export",
+                "write a report",
+                "write the report",
+                "create a report",
+                "generate a report",
+            )
+        )
+        # Word-boundary report markers — avoid matching "history" inside GIS re-run
+        # preambles or "process" inside unrelated words.
+        is_report_like = bool(
+            re.search(
+                r"\b(?:report|essay|write-?up|overview|licensing|well-structured)\b",
+                ql,
+            )
+            or any(
+                k in ql
+                for k in (
+                    "trace the history",
+                    "brief history",
+                    "explain the process",
+                    "turn this into",
+                    "turn the previous",
+                )
+            )
         )
         has_input_doc = bool(self._extract_document_paths(query))
         return bool(has_output_docx and wants_save and is_report_like and not has_input_doc)
@@ -2492,6 +2542,13 @@ class SurvyAIAgent:
         """True only when the user clearly asks to save a prior essay/report to .docx."""
         q = (routing_query or "").lower().strip()
         if not q:
+            return False
+        # Never treat GIS Excel "save as …xlsx" as a Word essay save.
+        from survyai.gis_session_intent import looks_like_full_gis_workflow_request
+
+        if looks_like_full_gis_workflow_request(routing_query):
+            return False
+        if self._looks_like_operational_workflow_request(routing_query) and ".docx" not in q and "word" not in q:
             return False
         has_docx = ".docx" in q or bool(re.search(r"\bessay[\w\-]*\.docx\b", q, flags=re.IGNORECASE))
         wants_word = has_docx or "word document" in q or "word doc" in q
@@ -2515,14 +2572,28 @@ class SurvyAIAgent:
 
     def _looks_like_operational_workflow_request(self, routing_query: str) -> bool:
         """True for GIS/CAD/file automation jobs that must never route to essay-save."""
+        from survyai.gis_session_intent import looks_like_full_gis_workflow_request
+
         q = (routing_query or "").lower()
+        if looks_like_full_gis_workflow_request(routing_query):
+            return True
         if not looks_like_file_driven_task(routing_query):
+            # Still catch ArcGIS/buffer/overlap jobs that omit an explicit file extension.
+            soft_markers = (
+                "arcgis", "arcpy", "buffer", "overlap", "polygon", "utm",
+                "mid-belt", "midbelt", "geodatabase", ".aprx", ".gdb",
+                "convert", "easting", "northing", "owner",
+            )
+            if sum(1 for m in soft_markers if m in q) >= 3:
+                return True
             return False
         operational_markers = (
             "arcgis", "arcpy", "cutfill", "cut fill", "cut/fill", "tin", "idw",
             "volume", "point feature", "feature class", "geodatabase", "create a copy",
             "copy each", "import", "compute", "calculate", "generate point",
-            "borrow pit", "surface", "exported result",
+            "borrow pit", "surface", "exported result", "buffer", "overlap",
+            "polygon", "utm", "mid-belt", "midbelt", "convert", "crs",
+            "fill color", "symbology", ".aprx", ".gdb", "excel",
         )
         return any(m in q for m in operational_markers)
 
@@ -10357,6 +10428,11 @@ class SurvyAIAgent:
                 "transformation",
                 "crs",
                 "epsg",
+                "fit comparison",
+                "gis-based fit",
+                "geometric fit",
+                "footprint",
+                "large enough",
             )
         ):
             score += 10
@@ -10388,11 +10464,12 @@ class SurvyAIAgent:
         if not t:
             return ""
         patterns = (
-            r"(?is)\bif you want,?\s+i can(?: also)?\s+[^.?\n]+[.?\n]",
+            r"(?is)\bif you want,?\s+i can(?: also| still)?\s+[^.?\n]+[.?\n]",
             r"(?is)\bi can next\s+[^.?\n]+[.?\n]",
+            r"(?is)\bi can still\s+[^.?\n]+[.?\n]",
             r"(?is)\bwould you like me to\s+[^.?\n]+[.?\n]",
             r"(?is)\bshall i\s+[^.?\n]+[.?\n]",
-            r"(?is)\bi can(?: also)?\s+(?:try|do|run|perform|search|extract|read|dig)[^.?\n]+[.?\n]",
+            r"(?is)\bi can(?: also| still)?\s+(?:try|do|run|perform|search|extract|read|dig)[^.?\n]+[.?\n]",
         )
         offers: List[str] = []
         seen: set[str] = set()
@@ -10451,6 +10528,9 @@ class SurvyAIAgent:
         if not self._is_bare_affirmative_reply(rq):
             return None
         if self._last_assistant_asked_internet_permission(raw_query):
+            return None
+        # Let GIS fit affirmation reconstruction own this turn (keeps session artifacts).
+        if self._last_assistant_offered_gis_fit(raw_query):
             return None
         if self._last_assistant_offered_session_docx_save(raw_query):
             return None
@@ -10537,21 +10617,636 @@ class SurvyAIAgent:
         )
         return any(m in last_assistant for m in markers)
 
-    def _underlying_question_from_history(self, query: str) -> Optional[str]:
-        """Recover the real question the assistant was about to answer when it
-        asked for internet permission (the last substantive user turn), so an
-        affirmative "yes" resolves to that question rather than the bare "yes"."""
+    @staticmethod
+    def _parse_option_selection(text: str) -> Optional[int]:
+        """Return 1-based option index when the user selects a numbered menu item."""
+        t = " ".join((text or "").strip().lower().split())
+        if not t:
+            return None
+        patterns = (
+            r"\b(?:go\s+ahead\s+with|proceed\s+with|use|choose|pick|select|with)\s+"
+            r"(?:option|choice|method|approach)\s*(?:#|no\.?|number)?\s*(\d+)\b",
+            r"\b(?:option|choice|method|approach)\s*(?:#|no\.?|number)?\s*(\d+)\b",
+            r"^\s*(\d+)\s*[.)]?\s*$",
+        )
+        for pat in patterns:
+            m = re.search(pat, t, flags=re.IGNORECASE)
+            if m:
+                try:
+                    n = int(m.group(1))
+                except Exception:
+                    continue
+                if 1 <= n <= 20:
+                    return n
+        return None
+
+    @staticmethod
+    def _extract_numbered_options(assistant_text: str) -> Dict[int, str]:
+        """Parse '1. … / 2. …' style menus from the last assistant turn."""
+        text = assistant_text or ""
+        options: Dict[int, str] = {}
+        for m in re.finditer(
+            r"(?m)^\s*(?:[-*]\s*)?(\d{1,2})[.)]\s+([^\n]+)",
+            text,
+        ):
+            try:
+                n = int(m.group(1))
+            except Exception:
+                continue
+            body = re.sub(r"\s+", " ", (m.group(2) or "").strip())
+            if body and 1 <= n <= 20:
+                options[n] = body
+        # Fallback: inline "1. foo 2. bar" when not line-broken.
+        if len(options) < 2:
+            for m in re.finditer(
+                r"(?:^|[\s;])(\d{1,2})[.)]\s+([^0-9].+?)(?=(?:[\s;]\d{1,2}[.)]\s+)|\Z)",
+                text,
+                flags=re.S,
+            ):
+                try:
+                    n = int(m.group(1))
+                except Exception:
+                    continue
+                body = re.sub(r"\s+", " ", (m.group(2) or "").strip())
+                if body and 1 <= n <= 20:
+                    options[n] = body
+        return options
+
+    @staticmethod
+    def _looks_like_gis_followup_analysis(text: str) -> bool:
+        """True for fit/containment / open-result follow-ups (not the original convert/plot job)."""
+        tl = (text or "").lower()
+        if not tl:
+            return False
+        # Living Atlas / pretrained land-cover is a different follow-up class — never
+        # rewrite it into a landmark-fit instruction just because it says "deep learning".
+        try:
+            from survyai.gis_session_intent import looks_like_living_atlas_or_landcover_dl
+            if looks_like_living_atlas_or_landcover_dl(text):
+                return False
+        except Exception:
+            pass
+        fit_markers = (
+            "would fit",
+            "fit within",
+            "fit inside",
+            "fit the",
+            "fit comparison",
+            "gis-based fit",
+            "gis based fit",
+            "practical gis",
+            "footprint",
+            "contain",
+            "within each",
+            "open arcgis result",
+            "open arcgis",
+            "ascertain if",
+            "can it fit",
+            "would they fit",
+            "fit the eiffel",
+            "structure within",
+            "large enough",
+            "footprint approximation",
+        )
+        # Bare "deep learning" alone is too broad (matches land-cover asks). Require a
+        # fit/open-result companion phrase when that is the only DL cue.
+        if "deep learning" in tl and any(
+            p in tl
+            for p in (
+                "fit",
+                "ascertain",
+                "footprint",
+                "open arcgis",
+                "would",
+                "large enough",
+                "tower",
+                "landmark",
+            )
+        ):
+            return True
+        if any(p in tl for p in fit_markers):
+            return True
+        has_ref = any(
+            k in tl
+            for k in (
+                "tower",
+                "building",
+                "stadium",
+                "structure",
+                "monument",
+                "bridge",
+                "arena",
+            )
+        )
+        has_parcel = any(
+            k in tl for k in ("parcel", "polygon", "each of them", "each owner", "owner polygon")
+        )
+        return has_ref and has_parcel
+
+    def _last_assistant_offered_gis_fit(self, query: str) -> bool:
+        """True when the last assistant turn offered a practical GIS/parcel fit test."""
+        last = (self._extract_last_assistant_turn(query) or "").lower()
+        if not last:
+            return False
+        markers = (
+            "gis-based fit",
+            "gis based fit",
+            "fit comparison",
+            "practical gis",
+            "footprint approximation",
+            "parcel-vs-",
+            "parcels are large enough",
+            "which parcels",
+            "geometric fit",
+            "eiffel",
+            "fit test",
+            "fit comparison next",
+            "fit check",
+            "verified parcel",
+            "gis session",
+            "session files",
+            "using the verified",
+            "parcel data already",
+            "i can still do this next",
+            "if you want, i can still",
+            "result_polygon_layer_count",
+        )
+        return any(m in last for m in markers)
+
+    def _resolve_gis_fit_offer_affirmation(
+        self, raw_query: str, routing_query: str
+    ) -> Optional[str]:
+        """
+        Bind 'yes do a practical GIS-based fit comparison' (and similar) to the
+        prior parcel/landmark fit goal + verified session GIS artifacts.
+        Prevents the model from answering with a tools-comparison essay.
+        """
+        rq = (routing_query or "").strip()
+        if not rq:
+            return None
+        # Affirmation of a fit offer, or explicit fit-comparison wording.
+        affirming = (
+            self._is_affirmative_permission_reply(rq)
+            or rq.lower().startswith("yes")
+            or rq.lower().startswith("ok")
+            or rq.lower().startswith("sure")
+            or rq.lower().startswith("please")
+            or rq.lower().startswith("proceed")
+        )
+        fit_words = self._looks_like_gis_followup_analysis(rq)
+        offered = self._last_assistant_offered_gis_fit(raw_query)
+        if not ((affirming and offered) or (fit_words and (
+            affirming or offered or self._extract_verified_gis_artifacts_from_history(raw_query)
+        ))):
+            return None
+        artifacts = self._extract_verified_gis_artifacts_from_history(raw_query)
+        # Recover the original landmark/parcel ask from history when present.
+        analysis_ask = ""
+        block = self._extract_history_block(raw_query)
+        for line in block.splitlines():
+            s = line.strip()
+            if s.startswith("User:"):
+                u = s[len("User:"):].strip()
+                if self._looks_like_gis_followup_analysis(u) and "fit comparison" not in u.lower():
+                    analysis_ask = u
+        if not analysis_ask:
+            analysis_ask = (
+                "Perform a geometric fit test of the reference structure against each "
+                "owner/parcel polygon from the open ArcGIS result in this conversation."
+            )
+        option_note = ""
+        if fit_words:
+            option_note = rq
+        elif offered:
+            option_note = (
+                "Practical GIS-based geometric fit comparison of the reference footprint "
+                "against each existing owner/parcel polygon (NOT a comparison of GIS software tools)."
+            )
+        return self._build_gis_fit_continuation(
+            analysis_ask=analysis_ask,
+            artifacts=artifacts,
+            option_note=option_note,
+        )
+
+    def _extract_gis_paths_from_text(self, text: str) -> List[str]:
+        """Extract GIS/file paths from a free-text blob (history or current message)."""
+        paths: List[str] = []
+        seen: set[str] = set()
+        patterns = (
+            r"`([A-Za-z]:\\[^`\n]+?\.(?:aprx|gdb|xlsx|csv|shp|geojson|gpkg|docx))`",
+            r"`(/(?:[^`\n]+?\.(?:aprx|gdb|xlsx|csv|shp|geojson|gpkg|docx)))`",
+            r"(?<![`\w])([A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n]+\\)*[^\\/:*?\"<>|\r\n]*?\.(?:aprx|gdb|xlsx|csv|shp|geojson|gpkg|docx))",
+            r"(?<![`\w])(/(?:[\w.\-]+/)*[\w.\-]+\.(?:aprx|gdb|xlsx|csv|shp|geojson|gpkg|docx))",
+        )
+        for pat in patterns:
+            for m in re.finditer(pat, text or "", flags=re.IGNORECASE):
+                p = (m.group(1) if m.lastindex else m.group(0)).rstrip(".,);:]")
+                key = p.lower()
+                if key not in seen and len(p) > 4:
+                    seen.add(key)
+                    paths.append(p)
+        return paths[:20]
+
+    def _extract_verified_gis_artifacts_from_history(self, query: str) -> List[str]:
+        """Collect verified GIS output paths mentioned in recent assistant turns."""
+        return self._extract_gis_paths_from_text(self._extract_history_block(query))
+
+    def _assistant_asked_for_gis_paths(self, query: str) -> bool:
+        """True when the last assistant turn asked the user for .aprx / parcel layer paths."""
+        last = (self._extract_last_assistant_turn(query) or "").lower()
+        if not last:
+            return False
+        markers = (
+            "project path",
+            "parcel layer",
+            "polygon layer",
+            "layer/file",
+            "layer file",
+            "need the arcgis",
+            "need either",
+            "send me the",
+            "provide the open",
+            "arcgis project path",
+            "open arcgis project path",
+            "relevant polygon",
+            "cannot be inspected",
+            "arcpy isn't available",
+            "arcpy isn",
+            "arcpy not available",
+        )
+        return any(m in last for m in markers)
+
+    def _looks_like_gis_path_provision(self, text: str) -> bool:
+        """True when the user is supplying GIS file paths (often after being asked)."""
+        t = (text or "").strip()
+        if not t:
+            return False
+        paths = self._extract_gis_paths_from_text(t)
+        if not paths:
+            return False
+        # At least one spatial/project artifact (not only a random .docx).
+        spatial = any(
+            p.lower().endswith(ext)
+            for p in paths
+            for ext in (".aprx", ".gdb", ".shp", ".xlsx", ".csv", ".geojson", ".gpkg")
+        )
+        if not spatial:
+            return False
+        tl = t.lower()
+        provision_cues = (
+            "here are the details",
+            "project to use",
+            "owner polygons",
+            "arcgis pro project",
+            "use these",
+            "use this",
+            "path:",
+            ".aprx",
+            ".shp",
+            ".gdb",
+        )
+        # Path-heavy paste (2+ GIS files) counts even without cue phrases.
+        return len(paths) >= 2 or any(c in tl for c in provision_cues)
+
+    def _recover_pending_gis_fit_ask(self, query: str) -> str:
+        """Recover the last parcel/landmark fit ask from injected history."""
+        block = self._extract_history_block(query)
+        for line in reversed(block.splitlines()):
+            s = line.strip()
+            if s.startswith("User:"):
+                u = s[len("User:"):].strip()
+                if self._looks_like_gis_followup_analysis(u) and "fit comparison" not in u.lower():
+                    return u
+        last = (self._extract_last_assistant_turn(query) or "").lower()
+        if "eiffel" in last or "fit test" in last or "fit comparison" in last:
+            return (
+                "Perform a geometric fit test of the reference structure (e.g. Eiffel Tower) "
+                "against each owner/parcel polygon from the open ArcGIS result in this conversation."
+            )
+        return (
+            "Perform a geometric fit test of the reference structure against each "
+            "owner/parcel polygon from the open ArcGIS / GIS result in this conversation."
+        )
+
+    def _enrich_gis_paths_for_pending_fit(
+        self, raw_query: str, routing_query: str
+    ) -> Optional[str]:
+        """
+        When the user pastes .aprx/.shp/.gdb paths after the agent asked for them
+        (or after offering a fit test), bind those paths to the pending FIT analysis —
+        never re-run the full convert/plot/buffer workflow.
+        """
+        current = (routing_query or "").strip()
+        if not current or current.startswith("CONTINUATION (retain session GIS context"):
+            return None
+        if not self._looks_like_gis_path_provision(current):
+            return None
+        # Don't hijack an explicit full GIS job restatement.
+        try:
+            from survyai.gis_session_intent import looks_like_full_gis_workflow_request
+            if looks_like_full_gis_workflow_request(current):
+                return None
+        except Exception:
+            pass
+        # Require a fit-related prior turn (asked for paths / offered fit / prior fit ask).
+        hist_users = [
+            s[len("User:"):].strip()
+            for s in self._extract_history_block(raw_query).splitlines()
+            if s.strip().startswith("User:")
+        ]
+        if not (
+            self._assistant_asked_for_gis_paths(raw_query)
+            or self._last_assistant_offered_gis_fit(raw_query)
+            or any(self._looks_like_gis_followup_analysis(u) for u in hist_users)
+        ):
+            return None
+
+        artifacts = self._extract_gis_paths_from_text(current)
+        for p in self._extract_verified_gis_artifacts_from_history(raw_query):
+            if p not in artifacts:
+                artifacts.append(p)
+        analysis_ask = self._recover_pending_gis_fit_ask(raw_query)
+        return self._build_gis_fit_continuation(
+            analysis_ask=analysis_ask,
+            artifacts=artifacts,
+            option_note=(
+                "User supplied the ArcGIS/GIS file paths below — run the geometric fit "
+                "analysis now. Do NOT re-execute the convert/plot/buffer workflow."
+            ),
+        )
+
+    def _build_gis_fit_continuation(
+        self,
+        *,
+        analysis_ask: str,
+        artifacts: Sequence[str],
+        option_note: str = "",
+    ) -> str:
+        """Instruction block that keeps verified GIS outputs in scope for fit tests."""
+        parts = [
+            "CONTINUATION (retain session GIS context — do not restart as a blank task):",
+            f"Original analysis request: {analysis_ask or '(see conversation history)'}",
+        ]
+        if option_note:
+            parts.append(f"User-selected approach: {option_note}")
+        if artifacts:
+            parts.append(
+                "Already-verified GIS outputs from this conversation (REUSE these; "
+                "do NOT ask the user to re-send parcel layers):\n- "
+                + "\n- ".join(list(artifacts)[:20])
+            )
+        else:
+            parts.append(
+                "Search conversation history for verified .aprx / .gdb / converted .xlsx / "
+                "Owner_Areas*.csv / .shp paths from the earlier successful GIS run and use those."
+            )
+        parts.append(
+            "OBSERVE → THINK → ACT as an expert surveyor/GIS analyst:\n"
+            "1) OBSERVE: parcels already exist as session files (converted Excel Owner+X/Y, "
+            "owner polygon .shp/.gdb, and/or .aprx). A CURRENT open map with 0 layers is NOT "
+            "a reason to stop. ArcGIS Pro may already be open — still use the file paths above.\n"
+            "2) THINK: interpret 'deep learning' as rigorous spatial analysis unless a model was "
+            "supplied. Source reference footprint/base dimensions (ask once if the user has a "
+            "file; else ask internet permission for published dimensions).\n"
+            "3) ACT: run geometric fit (AABB or oriented rectangle of the reference vs each "
+            "owner polygon) in the project CRS.\n"
+            "4) Prefer geopandas_execute on parcel .shp or converted Excel (Owner + X/Y). Use "
+            "arcgis_execute_python_code with explicit .aprx/.gdb/.shp paths (Pro's Python has "
+            "arcpy). NEVER gate on arcgis_get_project_info / local `import arcpy` / "
+            "ArcGISProject('CURRENT') layer counts when session files exist.\n"
+            "5) Print RESULT_FIT / RESULT_PARCEL_AREA / RESULT_REF_FOOTPRINT per owner.\n"
+            "6) Do NOT ask for parcel/.aprx paths again when listed above. Do NOT invent a DL "
+            "model. Do NOT write a tools-comparison essay (GeoPandas vs ArcGIS vs AutoCAD). "
+            "Do NOT re-run the full Excel→convert→buffer→overlap job unless the user asked to."
+        )
+        return "\n".join(parts)
+
+    def _reconstruct_gis_followup_intent(
+        self, query: str, *, selected_option_text: str = ""
+    ) -> Optional[str]:
+        """
+        Rebuild a multi-turn GIS follow-up (option pick + prior analysis ask +
+        verified layers) so permission/option affirmations do not lose context.
+        """
         block = self._extract_history_block(query)
         users: List[str] = []
         for line in block.splitlines():
             s = line.strip()
             if s.startswith("User:"):
                 users.append(s[len("User:"):].strip())
+        analysis_ask = ""
+        option_reply = ""
+        for u in reversed(users):
+            if not u or self._is_affirmative_permission_reply(u) or self._is_negative_permission_reply(u):
+                continue
+            if self._parse_option_selection(u) is not None and not option_reply:
+                option_reply = u
+                continue
+            if self._looks_like_gis_followup_analysis(u):
+                analysis_ask = u
+                break
+        # Only reconstruct when this really is a GIS follow-up / option chain.
+        if not analysis_ask and not (
+            option_reply and self._extract_verified_gis_artifacts_from_history(query)
+        ) and not selected_option_text:
+            return None
+
+        artifacts = self._extract_verified_gis_artifacts_from_history(query)
+        option_note = selected_option_text or ""
+        if not option_note and option_reply:
+            n = self._parse_option_selection(option_reply)
+            last = self._extract_last_assistant_turn(query)
+            options = self._extract_numbered_options(last)
+            if n and n not in options:
+                for m in re.finditer(r"Assistant:(.*?)(?=\nUser:|\Z)", block, flags=re.S | re.I):
+                    cand = self._extract_numbered_options(m.group(1) or "")
+                    if n in cand:
+                        options = cand
+                        break
+            if n and n in options:
+                option_note = options[n]
+            else:
+                option_note = option_reply
+
+        return self._build_gis_fit_continuation(
+            analysis_ask=analysis_ask or "(see conversation history)",
+            artifacts=artifacts,
+            option_note=option_note,
+        )
+
+    def _enrich_current_gis_fit_followup(
+        self, raw_query: str, routing_query: str
+    ) -> Optional[str]:
+        """
+        First-turn enrichment: when the CURRENT ask is a parcel/landmark fit follow-up
+        and this chat already verified GIS outputs, bind those paths into the task.
+        """
+        current = (routing_query or "").strip()
+        if not current or not self._looks_like_gis_followup_analysis(current):
+            return None
+        # Already enriched / continuation block present.
+        if current.startswith("CONTINUATION (retain session GIS context"):
+            return None
+        artifacts = self._extract_verified_gis_artifacts_from_history(raw_query)
+        for p in self._extract_gis_paths_from_text(current):
+            if p not in artifacts:
+                artifacts.append(p)
+        if not artifacts:
+            return None
+        return self._build_gis_fit_continuation(
+            analysis_ask=current,
+            artifacts=artifacts,
+            option_note="",
+        )
+
+    def _enrich_repeated_full_gis_workflow(
+        self, raw_query: str, routing_query: str
+    ) -> Optional[str]:
+        """Force tool re-execution when the user restates a full GIS job after a prior success."""
+        from survyai.gis_session_intent import (
+            build_gis_workflow_rerun_instruction,
+            looks_like_full_gis_workflow_request,
+            prior_assistant_reported_gis_success,
+        )
+
+        current = (routing_query or "").strip()
+        if not current or not looks_like_full_gis_workflow_request(current):
+            return None
+        if current.startswith("RE-EXECUTE FULL GIS WORKFLOW"):
+            return None
+        hist = self._extract_history_block(raw_query)
+        if not prior_assistant_reported_gis_success(hist):
+            return None
+        return build_gis_workflow_rerun_instruction(current)
+
+    def _underlying_question_from_history(self, query: str) -> Optional[str]:
+        """Recover the real question the assistant was about to answer when it
+        asked for internet permission (the last substantive user turn), so an
+        affirmative "yes" resolves to that question rather than the bare "yes".
+
+        When the last user turn is an option pick (e.g. "go ahead with option 2")
+        after a GIS fit follow-up, reconstruct the full analysis intent + verified layers.
+        Do NOT rewrite Living Atlas / land-cover / pretrained-model asks into fit jobs.
+        """
+        block = self._extract_history_block(query)
+        users: List[str] = []
+        for line in block.splitlines():
+            s = line.strip()
+            if s.startswith("User:"):
+                users.append(s[len("User:"):].strip())
+        last_user: Optional[str] = None
         for u in reversed(users):
             if u and len(u) >= 8 and not self._is_affirmative_permission_reply(u) \
                     and not self._is_negative_permission_reply(u):
-                return u
-        return users[0] if users else None
+                last_user = u
+                break
+        if not last_user:
+            return users[0] if users else None
+
+        try:
+            from survyai.gis_session_intent import looks_like_living_atlas_or_landcover_dl
+            if looks_like_living_atlas_or_landcover_dl(last_user):
+                return last_user
+        except Exception:
+            pass
+
+        if self._parse_option_selection(last_user) is not None or self._looks_like_gis_followup_analysis(
+            last_user
+        ):
+            reconstructed = self._reconstruct_gis_followup_intent(query)
+            if reconstructed:
+                return reconstructed
+        return last_user
+
+    @staticmethod
+    def _response_is_internet_permission_ask_only(text: str) -> bool:
+        """True when the model output is essentially only the internet permission ask."""
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        if "may i search the internet" not in t and "[internet_permission_request]" not in t:
+            return False
+        # If the reply already contains substantive GIS/work content, keep it.
+        if any(
+            k in t
+            for k in (
+                "result_",
+                ".aprx",
+                ".gdb",
+                "living atlas",
+                "grassland",
+                "proceeding",
+                "i will",
+                "internet-sourced",
+                "verified",
+            )
+        ):
+            return False
+        lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+        return len(lines) <= 8
+
+    @staticmethod
+    def _wants_external_catalog_or_web(text: str) -> bool:
+        """True when the task needs web/Living Atlas/catalog lookup (not only local files)."""
+        tl = (text or "").lower()
+        if not tl:
+            return False
+        try:
+            from survyai.gis_session_intent import looks_like_living_atlas_or_landcover_dl
+            if looks_like_living_atlas_or_landcover_dl(text):
+                return True
+        except Exception:
+            pass
+        keys = (
+            "search the internet",
+            "search online",
+            "web search",
+            "browse the web",
+            "living atlas",
+            "pretrained",
+            "pre-trained",
+            "already-trained",
+            "trained model",
+            "look it up online",
+        )
+        return any(k in tl for k in keys)
+
+    def _internet_search_seed_from_intent(self, intent_text: str) -> str:
+        """Prefer a compact web-search seed (reference object dims) over option prose."""
+        text = intent_text or ""
+        # Pull an explicit "Original analysis request:" line when present.
+        m = re.search(
+            r"Original analysis request:\s*(.+?)(?:\nUser-selected|\nAlready-verified|\nExecute as|\Z)",
+            text,
+            flags=re.S | re.I,
+        )
+        ask = (m.group(1).strip() if m else text).strip()
+        ask_l = ask.lower()
+        # Generic landmark/structure fit phrasing → search for footprint/dimensions.
+        fit = re.search(
+            r"(?:fit|fitting|contain|inside|within).{0,40}?"
+            r"(?:the\s+)?([A-Z][\w]*(?:\s+[A-Z][\w]*){0,4}|eiffel\s+tower|"
+            r"[A-Za-z][\w\-]*(?:\s+[A-Za-z][\w\-]*){0,3}\s+"
+            r"(?:tower|building|stadium|arena|bridge|monument|footprint|structure))",
+            ask,
+            flags=re.I,
+        )
+        if fit:
+            obj = re.sub(r"\s+", " ", fit.group(1)).strip(" .")
+            if obj:
+                return f"{obj} footprint dimensions meters base width length"
+        if any(k in ask_l for k in ("footprint", "dimension", "fit", "tower", "structure")):
+            # Strip GIS-local noise for search.
+            cleaned = re.sub(
+                r"\b(arcgis|polygon|parcel|owner|buffer|overlap|deep learning analysis)\b",
+                " ",
+                ask,
+                flags=re.I,
+            )
+            cleaned = re.sub(r"\s+", " ", cleaned).strip()
+            if cleaned:
+                return f"{cleaned} footprint dimensions meters"
+        return ask
 
     @staticmethod
     def _extract_clean_question(text: str) -> str:
@@ -11131,11 +11826,11 @@ class SurvyAIAgent:
         query_lower = (query or "").lower()
         raw = query or ""
 
-        # Production GIS / volumetric / multi-file jobs → complex tier (best reasoning model when tiered).
+        # Production GIS volumetric / raster / multi-path jobs → complex tier.
         if len(re.findall(r"[a-zA-Z]:\\", raw)) >= 3:
             return "complex"
 
-        _gis_sig = (
+        _gis_heavy = (
             "cutfill",
             "cut fill",
             "cut/fill",
@@ -11146,14 +11841,43 @@ class SurvyAIAgent:
             "raster",
             "volume between",
             "pre and post",
-            "feature class",
+            "living atlas",
+            "deep learning model",
+            "land cover",
+            "landcover",
+        )
+        _gis_tool_orchestration = (
+            "polygon",
+            "buffer",
+            "overlap",
+            "symbology",
+            "fill color",
+            "tight-fitting",
+            "tight fitting",
+            "owner",
+            "convert",
+            "mid-belt",
+            "midbelt",
+            "utm",
+            "arcgis",
+            "arcgis pro",
             "geodatabase",
             ".gdb",
-            "arcpy",
+            "feature class",
         )
-        if "arcgis" in query_lower or "arcgis pro" in query_lower:
-            if any(s in query_lower for s in _gis_sig):
-                return "complex"
+        # Heavy raster / DL / volume analysis needs the complex tier.
+        if any(s in query_lower for s in _gis_heavy) and (
+            "arcgis" in query_lower or "arcpy" in query_lower or "raster" in query_lower
+        ):
+            return "complex"
+        # Multi-step Excel→CRS→polygons→buffers→overlaps is primarily tool orchestration:
+        # prefer the balanced (average) tier for cost/speed, escalate on failure.
+        gis_hits = sum(1 for s in _gis_tool_orchestration if s in query_lower)
+        if gis_hits >= 3 or (
+            ("arcgis" in query_lower or "arcgis pro" in query_lower)
+            and any(s in query_lower for s in ("buffer", "overlap", "polygon", "convert"))
+        ):
+            return "average"
         if "arcpy" in query_lower and any(s in query_lower for s in ("raster", "idw", "cut", "fill", "gdb")):
             return "complex"
 
@@ -11268,8 +11992,18 @@ class SurvyAIAgent:
             "find information", "look up on the web",
             "standards", "regulations", "requirements",
             "country-specific", "national standard", "local standard",
+            # External geospatial catalogs / pretrained models
+            "living atlas", "livingatlas", "pretrained", "pre-trained", "pre trained",
+            "already-trained", "already trained", "trained model", "deep learning model",
+            "esri land cover", "land cover model", "landcover model",
         ]
         wants_internet = any(s in ql for s in internet_signals)
+        try:
+            from survyai.gis_session_intent import looks_like_living_atlas_or_landcover_dl
+            if looks_like_living_atlas_or_landcover_dl(q):
+                wants_internet = True
+        except Exception:
+            pass
 
         # Current real-world facts (office holders, latest appointments, "as of now"
         # / "who is the …") almost always need live data. Detect them so the
@@ -11331,7 +12065,8 @@ class SurvyAIAgent:
 
         # If it's a file-driven workflow (doc/dwg/xlsx), don't auto-retrieve unless user
         # explicitly wants memory/context. This prevents irrelevant injection.
-        if file_driven and not wants_vector:
+        # Still allow internet when Living Atlas / pretrained model / web catalog is asked.
+        if file_driven and not wants_vector and not wants_internet:
             return RAGRouteDecision(
                 route="llm_only",
                 use_vector=False,
@@ -11379,23 +12114,14 @@ class SurvyAIAgent:
         Determine the tier of a model (nano, mini, or complex).
         
         Args:
-            model_name: Model name (e.g., "gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.4")
+            model_name: Model name (e.g., "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
             
         Returns:
             "nano", "mini", or "complex"
         """
-        if not model_name:
-            return "mini"  # Default
-        
-        model_lower = model_name.lower()
-        if "nano" in model_lower:
-            return "nano"
-        elif "mini" in model_lower or "4o-mini" in model_lower:
-            return "mini"
-        elif "5.1" in model_lower or ("5" in model_lower and "nano" not in model_lower and "mini" not in model_lower) or "4o" in model_lower or "4-turbo" in model_lower:
-            return "complex"
-        else:
-            return "mini"  # Default to mini for unknown models
+        from survyai.openai_models import infer_tier
+
+        return infer_tier(model_name)
     
     def _escalate_model_tier(self, current_tier: str) -> Optional[str]:
         """
@@ -11407,12 +12133,31 @@ class SurvyAIAgent:
         Returns:
             Model name for next tier, or None if already at highest tier
         """
-        if current_tier == "nano":
-            return getattr(self.settings, "openai_model_mini", "gpt-5.4-mini")
-        elif current_tier == "mini":
-            return getattr(self.settings, "openai_model_complex", "gpt-5.4")
-        else:
-            return None  # Already at highest tier
+        from survyai.openai_models import escalate_tier_model
+
+        return escalate_tier_model(
+            current_tier if current_tier in ("nano", "mini", "complex") else "mini",
+            mini=getattr(self.settings, "openai_model_mini", None),
+            complex_model=getattr(self.settings, "openai_model_complex", None),
+        )
+
+    def _next_openai_failover_model(
+        self,
+        current_model: Optional[str],
+        complexity: str,
+    ) -> Optional[str]:
+        """Next alternate OpenAI model after quota / proxy failure (not capability escalate)."""
+        from survyai.openai_models import next_fallback_model
+
+        tried = list(getattr(self, "_openai_models_tried_this_query", []) or [])
+        if current_model and current_model not in tried:
+            tried.append(current_model)
+        nxt = next_fallback_model(
+            current_model,
+            complexity=complexity if complexity in ("simple", "average", "complex") else "average",
+            tried=tried,
+        )
+        return nxt
     
     def _switch_model_and_retry(
         self,
@@ -11429,24 +12174,29 @@ class SurvyAIAgent:
         context_retrieved: bool,
         switch_reason: str,
         tools_to_bind: List[BaseTool],
+        target_model: Optional[str] = None,
     ) -> Dict:
         """
-        Switch to a higher-tier model and retry the query.
-        
-        This preserves state and seamlessly continues with a more capable model.
+        Switch to another OpenAI model and retry the query.
+
+        If ``target_model`` is set (quota/proxy failover), use it. Otherwise escalate
+        capability tier (nano→mini→complex).
         """
-        current_tier = self._get_model_tier(current_model)
-        escalated_model = self._escalate_model_tier(current_tier)
+        if target_model:
+            escalated_model = target_model
+        else:
+            current_tier = self._get_model_tier(current_model)
+            escalated_model = self._escalate_model_tier(current_tier)
         
         if not escalated_model:
-            logger.warning("⚠ Already at highest model tier - cannot escalate further")
+            logger.warning("⚠ No alternate OpenAI model available for retry")
             # Return error instead of switching
             return {
                 "query": original_query,
                 "response": (
                     f"Query failed with {switch_reason}. "
-                    "Already using the most capable model available. "
-                    "The query may be too complex or require manual intervention."
+                    "No alternate OpenAI model remains to try. "
+                    "Wait for quota reset, or set Primary LLM to Ollama for offline work."
                 ),
                 "success": False,
                 "error": switch_reason,
@@ -11456,9 +12206,19 @@ class SurvyAIAgent:
                 "llm_cost_usd": 0.0,
             }
         
-        logger.info(f"🔄 Switching from {current_model} (tier: {current_tier}) to {escalated_model} (tier: {self._get_model_tier(escalated_model)})")
+        tried = list(getattr(self, "_openai_models_tried_this_query", []) or [])
+        if current_model and current_model not in tried:
+            tried.append(current_model)
+        if escalated_model not in tried:
+            tried.append(escalated_model)
+        self._openai_models_tried_this_query = tried
+
+        logger.info(
+            f"🔄 Switching from {current_model} to {escalated_model} "
+            f"(reason: {switch_reason}; tried={tried})"
+        )
         
-        # Mark that we've switched to prevent infinite switching
+        # Mark that we've switched to prevent infinite switching loops of escalate-only path
         self._model_switched_this_query = True
         
         # Initialize new model
@@ -11547,25 +12307,22 @@ class SurvyAIAgent:
             complexity: Task complexity level ("simple", "average", or "complex")
             
         Returns:
-            Model name string (e.g., "gpt-5.4-nano", "gpt-5.4-mini", "gpt-5.4")
+            Model name string (e.g., "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
         """
+        from survyai.openai_models import resolve_model_for_complexity
+
         if not getattr(self.settings, "enable_tiered_models", True):
             # Fallback to legacy single model configuration
-            return getattr(self.settings, "openai_model", "gpt-4o-mini")
-        
-        # Map complexity to model tier
-        model_mapping = {
-            "simple": getattr(self.settings, "openai_model_nano", "gpt-5.4-nano"),
-            "average": getattr(self.settings, "openai_model_mini", "gpt-5.4-mini"),
-            "complex": getattr(self.settings, "openai_model_complex", "gpt-5.4"),
-        }
-        
-        selected_model = model_mapping.get(complexity, getattr(self.settings, "openai_model_mini", "gpt-5.4-mini"))
-        
-        # Fallback to legacy model if tiered model is not set
-        if not selected_model or selected_model.strip() == "":
-            selected_model = getattr(self.settings, "openai_model", "gpt-4o-mini")
-        
+            return getattr(self.settings, "openai_model", "gpt-5.6-terra")
+
+        selected_model = resolve_model_for_complexity(
+            complexity,
+            nano=getattr(self.settings, "openai_model_nano", None),
+            mini=getattr(self.settings, "openai_model_mini", None),
+            complex_model=getattr(self.settings, "openai_model_complex", None),
+            legacy=getattr(self.settings, "openai_model", None),
+        )
+        logger.info(f"Selected OpenAI model '{selected_model}' for complexity level '{complexity}'")
         return selected_model
 
     def _try_openai_tier_llm(
@@ -11817,19 +12574,29 @@ class SurvyAIAgent:
                     "gpt-4o-2024-08-06": 16384,
                     "gpt-4o-mini": 16384,
                     "gpt-4o-mini-2024-07-18": 16384,
-                    # GPT-5 series (symbolic / preview names)
+                    "gpt-4.1": 32768,
+                    "gpt-4.1-mini": 32768,
+                    # GPT-5 series
                     "gpt-5-nano": 16384,
                     "gpt-5-mini": 16384,
                     "gpt-5": 16384,
                     "gpt-5.1": 16384,
-                    # GPT-5.4 family (versioned preview names used in .env)
+                    "gpt-5.2": 16384,
+                    # GPT-5.4 family
                     "gpt-5.4-nano": 16384,
                     "gpt-5.4-mini": 16384,
                     "gpt-5.4": 16384,
-                    # GPT-5.5 family (forward-compat)
+                    "gpt-5.4-pro": 16384,
+                    # GPT-5.5 family
+                    "gpt-5.5": 32768,
+                    "gpt-5.5-pro": 32768,
                     "gpt-5.5-nano": 16384,
                     "gpt-5.5-mini": 16384,
-                    "gpt-5.5": 16384,
+                    # GPT-5.6 family (OpenAI Models docs)
+                    "gpt-5.6": 32768,
+                    "gpt-5.6-sol": 32768,
+                    "gpt-5.6-terra": 32768,
+                    "gpt-5.6-luna": 32768,
                 }
 
                 # Cap max_tokens to model's actual API limit — INFO, not WARNING,
@@ -12470,11 +13237,52 @@ class SurvyAIAgent:
             MANDATORY FIRST STEP when the user refers to named data (e.g. 'Pre-fill', 'Post-fill',
             'coordinates', 'X/Y/Z'): call this to discover actual sheet and column names, then
             reason to map user terms to real names (e.g. 'Pre Fill' -> 'Pre_fill_2024', X/Y/Z -> EASTING, NORTHING, RL).
+            Also reports ownership/family-block layout when present — if ownership.hint says normalize,
+            call excel_normalize_ownership_workbook before CRS conversion or ArcGIS import.
             Only after this deep research should you call ArcGIS/Excel tools or report that data was not found.
             """
             import json
             out = self.excel_processor.inspect_workbook(file_path)
-            return json.dumps(out, indent=2)
+            return json.dumps(out, indent=2, default=str)
+
+        class ExcelNormalizeOwnershipInput(BaseModel):
+            """Normalize family/owner-block Excel into headed Easting/Northing/Pillar/Owner."""
+            file_path: Optional[str] = Field(
+                default=None,
+                description="Path or basename of the ownership workbook (optional if sole Excel in workspace)",
+            )
+            output_name: Optional[str] = Field(
+                default=None,
+                description="Output .xlsx filename (e.g. ownership_normalized.xlsx). Defaults if omitted.",
+            )
+            user_request: Optional[str] = Field(
+                default=None,
+                description="Optional user wording (helps resolve which workbook / output name).",
+            )
+
+        def excel_normalize_ownership_workbook(
+            file_path: Optional[str] = None,
+            output_name: Optional[str] = None,
+            user_request: Optional[str] = None,
+        ) -> str:
+            """
+            Parse family/owner-block or headed ownership Excel into a clean table with columns
+            Easting, Northing, Pillar, Owner. Required before excel_coordinate_converter or ArcGIS
+            XY import when inspect shows Unnamed columns or owner-name 'headers'.
+            Does NOT plot CAD — use for CRS conversion, GIS polygons/buffers/overlaps, etc.
+            """
+            import json
+            from pathlib import Path
+
+            from agent.excel_cadastral import normalize_ownership_workbook
+
+            result = normalize_ownership_workbook(
+                file_path,
+                workspace=Path.cwd(),
+                dest_name=output_name,
+                query=user_request or "",
+            )
+            return json.dumps(result, indent=2, default=str)
 
         class ExcelInput(BaseModel):
             """Input schema for Excel processing."""
@@ -13237,6 +14045,13 @@ class SurvyAIAgent:
                            "If False (default), use pyproj. Only set to True if user explicitly "
                            "requests Geographic Calculator in their query."
             )
+            user_request: Optional[str] = Field(
+                default=None,
+                description=(
+                    "Optional full user wording. Used only to infer a save-as Excel output name "
+                    "when output_path is omitted (e.g. save file as 'coords_midbelt' excel file)."
+                ),
+            )
         
         def excel_coordinate_convert(**kwargs) -> str:
             """
@@ -13251,11 +14066,94 @@ class SurvyAIAgent:
             
             The system automatically resolves informal CRS names (e.g., "MINNA_NTM_MIDBELT")
             to proper EPSG codes for accurate conversions.
+
+            When the sheet is a family/owner-block layout (no Easting/Northing headers),
+            SurvyAI auto-normalizes once, then converts — do not re-parse inside ArcPy.
             """
             try:
+                from pathlib import Path
+
+                from agent.excel_cadastral import (
+                    extract_requested_excel_output_name,
+                    normalize_ownership_workbook,
+                )
+
                 # Extract use_geographic_calculator if provided, default to False
-                use_geocalc = kwargs.pop('use_geographic_calculator', False)
-                result = self.blue_marble.convert_excel_file(use_geographic_calculator=use_geocalc, **kwargs)
+                use_geocalc = kwargs.pop("use_geographic_calculator", False)
+                user_request = str(kwargs.pop("user_request", None) or "")
+                # Alias cleanup — convert_excel_file only accepts excel_path.
+                if not kwargs.get("excel_path") and kwargs.get("file_path"):
+                    kwargs["excel_path"] = kwargs.pop("file_path")
+                else:
+                    kwargs.pop("file_path", None)
+
+                if not kwargs.get("output_path") and user_request:
+                    requested_out = extract_requested_excel_output_name(user_request)
+                    if requested_out:
+                        src = Path(str(kwargs.get("excel_path") or ""))
+                        kwargs["output_path"] = str(
+                            (src.parent / requested_out) if src.parent.exists() else requested_out
+                        )
+
+                # Keep only kwargs accepted by convert_excel_file
+                allowed = {
+                    "excel_path",
+                    "x_column",
+                    "y_column",
+                    "source_crs",
+                    "target_crs",
+                    "source_zone",
+                    "target_zone",
+                    "output_path",
+                    "sheet_name",
+                    "output_schema",
+                    "output_x_column",
+                    "output_y_column",
+                    "include_crs_metadata",
+                    "include_error_column",
+                }
+                kwargs = {k: v for k, v in kwargs.items() if k in allowed and v is not None}
+
+                try:
+                    result = self.blue_marble.convert_excel_file(
+                        use_geographic_calculator=use_geocalc, **kwargs
+                    )
+                except Exception as first_exc:
+                    msg = str(first_exc).lower()
+                    needs_normalize = any(
+                        s in msg
+                        for s in (
+                            "no valid coordinates",
+                            "column not found",
+                            "could not find",
+                            "not found in",
+                            "no coordinates",
+                        )
+                    )
+                    if not needs_normalize:
+                        raise
+
+                    excel_path = kwargs.get("excel_path") or ""
+                    # Intermediate headed table only — never steal the user-named converted file.
+                    norm = normalize_ownership_workbook(
+                        excel_path,
+                        workspace=Path.cwd(),
+                        dest_name="ownership_normalized.xlsx",
+                        query="",
+                    )
+                    if not norm.get("success"):
+                        raise first_exc
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs["excel_path"] = norm["output_path"]
+                    retry_kwargs["x_column"] = "Easting"
+                    retry_kwargs["y_column"] = "Northing"
+                    # Preserve Owner through conversion when the converter keeps extra columns.
+                    result = self.blue_marble.convert_excel_file(
+                        use_geographic_calculator=use_geocalc, **retry_kwargs
+                    )
+                    result = dict(result)
+                    result["normalized_input"] = norm.get("output_path")
+                    result["owners"] = norm.get("owners")
                 return (
                     f"✓ Excel coordinate conversion completed successfully!\n\n"
                     f"Input file: {result['input_file']}\n"
@@ -13267,9 +14165,24 @@ class SurvyAIAgent:
                     f"Source CRS: {result['source_crs']}\n"
                     f"Target CRS: {result['target_crs']}\n"
                     f"Output columns: {', '.join(result['output_columns'])}"
+                    + (
+                        f"\nNormalized ownership workbook first: {result.get('normalized_input')}"
+                        if result.get("normalized_input")
+                        else ""
+                    )
+                    + (
+                        f"\nOwners preserved: {', '.join(result.get('owners') or [])}"
+                        if result.get("owners")
+                        else ""
+                    )
                 )
             except Exception as e:
-                return f"✗ Excel coordinate conversion failed: {str(e)}"
+                return (
+                    f"✗ Excel coordinate conversion failed: {str(e)}\n"
+                    "If the sheet uses owner title rows + E/N blocks without headers, call "
+                    "excel_normalize_ownership_workbook first, then retry with "
+                    "x_column=Easting, y_column=Northing."
+                )
 
         class ExcelConvertAndAreaInput(BaseModel):
             """Convert coordinates in an Excel file (including DMS) and compute area automatically."""
@@ -13558,6 +14471,9 @@ class SurvyAIAgent:
                     "Inspect Excel workbook structure: list all sheet names and each sheet's column headers. "
                     "MANDATORY FIRST when the user refers to named sheets or data (e.g. 'Pre-fill', 'Post-fill', "
                     "'coordinates', 'X/Y/Z'): discover actual names, then reason to map user intent to real sheet/column names. "
+                    "Also returns ownership.layout_kind / ownership.hint when the sheet is family/owner-block "
+                    "(owner title rows + E/N/pillar). If hint says normalize, call excel_normalize_ownership_workbook "
+                    "BEFORE excel_coordinate_converter or ArcGIS XY import. "
                     "Only report errors or ask for names after this deep research."
                 ),
                 func=excel_inspect_workbook,
@@ -13579,6 +14495,20 @@ class SurvyAIAgent:
                 ),
                 func=csv_to_excel,
                 args_schema=CsvToExcelInput,
+            ),
+            StructuredTool(
+                name="excel_normalize_ownership_workbook",
+                description=(
+                    "Normalize family/owner-block Excel (owner title rows + Easting/Northing/pillar blocks, "
+                    "often shown as Unnamed columns by excel_inspect_workbook) into a headed workbook with "
+                    "columns Easting, Northing, Pillar, Owner. "
+                    "Call this BEFORE excel_coordinate_converter, arcgis_import_xy_points, or ArcPy polygon/"
+                    "buffer/overlap workflows when the sheet is not already headed. "
+                    "Does NOT create CAD/.dwg plans — for GIS/CRS/analysis preparation only. "
+                    "Never re-implement family-block parsing inside arcgis_execute_python_code."
+                ),
+                func=excel_normalize_ownership_workbook,
+                args_schema=ExcelNormalizeOwnershipInput,
             ),
             StructuredTool(
                 name="excel_cadastral_plot",
@@ -13812,12 +14742,20 @@ class SurvyAIAgent:
                     "Convert coordinates in an Excel file using pyproj (default). "
                     "Reads coordinates from specified columns, converts them using pyproj, "
                     "and saves results with converted coordinates as new columns. "
-                    "Supports specialized coordinate systems like Nigerian NTM (Minna MidBelt, etc.). "
+                    "Supports specialized coordinate systems like Nigerian NTM (Minna MidBelt / EPSG:26392, etc.). "
                     "Uses pyproj by default for fast, reliable conversions. "
-                    "Only use Geographic Calculator COM if user explicitly requests it in their query "
-                    "(set use_geographic_calculator=True). Always falls back to pyproj if COM is unavailable. "
-                    "Parameters: excel_path (required), x_column (default: 'X'), y_column (default: 'Y'), "
+                    "If excel_inspect_workbook reports ownership.family_blocks / Unnamed columns, call "
+                    "excel_normalize_ownership_workbook first (or pass the raw file — SurvyAI will auto-normalize "
+                    "on 'no valid coordinates' and retry with Easting/Northing). "
+                    "For GIS follow-on (polygons/buffers/overlaps), convert the normalized/headed workbook, "
+                    "keep the Owner column, then use geopandas_execute or arcgis_execute_python_code on the "
+                    "converted file — never use arcgis_fill_volume_* for polygon/buffer/overlap work. "
+                    "Only use Geographic Calculator COM if user explicitly requests it "
+                    "(set use_geographic_calculator=True). "
+                    "Parameters: excel_path (required), x_column (default: 'X'; use 'Easting' after normalize), "
+                    "y_column (default: 'Y'; use 'Northing' after normalize), "
                     "source_crs, target_crs, source_zone, target_zone (optional), output_path (optional), "
+                    "user_request (optional; used to infer save-as output name when output_path omitted), "
                     "sheet_name (optional), use_geographic_calculator (default: False)."
                 ),
                 func=excel_coordinate_convert,
@@ -14375,14 +15313,41 @@ class SurvyAIAgent:
             # --- Tool: Get Project Info ---
             class ArcGISProjectInfoInput(BaseModel):
                 """Input schema for getting project info."""
-                pass
+                project_path: Optional[str] = Field(
+                    None,
+                    description=(
+                        "Optional full path to a .aprx project. Prefer this over relying on "
+                        "an in-process CURRENT project. If local arcpy is unavailable, do not "
+                        "stop — use arcgis_execute_python_code or geopandas_execute with "
+                        "session parcel paths instead."
+                    ),
+                )
             
-            def arcgis_get_project_info() -> str:
+            def arcgis_get_project_info(project_path: Optional[str] = None) -> str:
                 """
-                Get information about the current ArcGIS Pro project.
-                Returns map names, coordinate systems, and other metadata.
+                Get information about an ArcGIS Pro project.
+
+                Prefer passing project_path (.aprx). Do NOT treat a local-process
+                'arcpy not available' result as a hard stop — for analysis use
+                arcgis_execute_python_code (Pro's Python) or geopandas_execute on
+                verified .shp/.xlsx/.gdb paths from the session instead.
                 """
-                result = self.arcgis_processor.get_project_info()
+                result = self.arcgis_processor.get_project_info(project_path=project_path)
+                if isinstance(result, dict) and not result.get("success"):
+                    err = str(result.get("error") or "")
+                    if "arcpy" in err.lower() or "not available" in err.lower():
+                        result = dict(result)
+                        result["guidance"] = (
+                            "Local SurvyAI missing arcpy is normal and NOT a blocker. "
+                            "Do not ask the user for paths again if .aprx/.shp/.gdb/.xlsx "
+                            "are already in this conversation. Proceed with "
+                            "arcgis_execute_python_code(project_path=...) or "
+                            "geopandas_execute on the parcel shapefile/Excel paths."
+                        )
+                        result["next_tools"] = [
+                            "arcgis_execute_python_code",
+                            "geopandas_execute",
+                        ]
                 return str(result)
             
             # --- Tool: List Coordinate Systems ---
@@ -14900,8 +15865,11 @@ class SurvyAIAgent:
                 StructuredTool(
                     name="arcgis_get_project_info",
                     description=(
-                        "Get information about the current ArcGIS Pro project. "
-                        "Returns maps, coordinate systems, and project details."
+                        "Optionally inspect an ArcGIS Pro .aprx (pass project_path). "
+                        "Local SurvyAI often has no arcpy — that failure is NOT a blocker. "
+                        "For parcel fit / buffer / overlap analysis on known .aprx/.shp/.gdb/"
+                        ".xlsx paths, prefer arcgis_execute_python_code or geopandas_execute; "
+                        "do not ask the user to re-send paths already listed in the chat."
                     ),
                     func=arcgis_get_project_info,
                     args_schema=ArcGISProjectInfoInput
@@ -15522,6 +16490,7 @@ class SurvyAIAgent:
         
         # Reset model switch flag for new query
         self._model_switched_this_query = False
+        self._openai_models_tried_this_query = []
         self._force_internet_search_this_query = False
 
         # Handle internet permission markers from interactive CLI
@@ -15548,7 +16517,8 @@ class SurvyAIAgent:
         pending_permission = self._pending_permission_requests.get(current_session_id)
         if pending_permission and isinstance(query, str):
             stripped_reply = query.strip()
-            if self._is_affirmative_reply(stripped_reply):
+            # Use the lenient permission affirm detector so "yes go ahead" counts.
+            if self._is_affirmative_permission_reply(stripped_reply):
                 if pending_permission.get("kind") == "internet":
                     self._internet_permission_granted = True
                     self._force_internet_search_this_query = True
@@ -15557,7 +16527,7 @@ class SurvyAIAgent:
                     original_query = str(pending_permission.get("query") or original_query)
                     logger.info("✓ Applied plain-text approval reply to pending internet permission request")
                 self._pending_permission_requests.pop(current_session_id, None)
-            elif self._is_negative_reply(stripped_reply):
+            elif self._is_negative_permission_reply(stripped_reply):
                 if pending_permission.get("kind") == "internet":
                     self._internet_permission_granted = False
                     query = f"[INTERNET_PERMISSION_DENIED]\n{pending_permission.get('query', '')}".strip()
@@ -15628,8 +16598,50 @@ class SurvyAIAgent:
                 )
 
         # Bare "yes" / "go ahead" → bind to the LAST assistant optional offer only.
+        # Numbered option picks ("go ahead with option 2") → bind to that menu item + GIS context.
         if "[INTERNET_PERMISSION_GRANTED]" not in q_upper and "[INTERNET_PERMISSION_DENIED]" not in q_upper:
-            offer_resolution = self._resolve_affirmative_to_last_offer(query, actual_query_for_routing)
+            option_n = self._parse_option_selection(actual_query_for_routing)
+            option_resolution = None
+            if option_n is not None and not self._last_assistant_asked_internet_permission(query):
+                last = self._extract_last_assistant_turn(query)
+                options = self._extract_numbered_options(last)
+                selected = options.get(option_n) or ""
+                option_resolution = self._reconstruct_gis_followup_intent(
+                    query, selected_option_text=selected or actual_query_for_routing
+                )
+                if not option_resolution and selected:
+                    option_resolution = (
+                        f"The user selected option {option_n} from your last message: {selected} "
+                        "Proceed with ONLY that approach. Reuse verified files/layers already "
+                        "produced in this conversation — do not ask the user to re-send them."
+                    )
+            offer_resolution = option_resolution
+            if not offer_resolution:
+                # Prefer GIS fit binding over generic affirmative expansion so
+                # "Go ahead" after a fit offer keeps session .aprx/.gdb/.xlsx paths.
+                offer_resolution = self._resolve_gis_fit_offer_affirmation(
+                    query, actual_query_for_routing
+                )
+            if not offer_resolution:
+                offer_resolution = self._resolve_affirmative_to_last_offer(
+                    query, actual_query_for_routing
+                )
+            if not offer_resolution:
+                # User pasted .aprx/.shp paths after being asked — bind to pending FIT.
+                offer_resolution = self._enrich_gis_paths_for_pending_fit(
+                    query, actual_query_for_routing
+                )
+            if not offer_resolution:
+                # User restated a full convert/plot/buffer job after a prior success → re-run.
+                offer_resolution = self._enrich_repeated_full_gis_workflow(
+                    query, actual_query_for_routing
+                )
+            if not offer_resolution:
+                # First-turn GIS fit follow-up ("would X fit in the open ArcGIS result?")
+                # — bind verified .aprx/.gdb/Excel paths from this chat immediately.
+                offer_resolution = self._enrich_current_gis_fit_followup(
+                    query, actual_query_for_routing
+                )
             if offer_resolution:
                 actual_query_for_routing = offer_resolution
                 marker = "NOW, the user wants you to continue with this new request:"
@@ -15644,7 +16656,7 @@ class SurvyAIAgent:
                 else:
                     query = offer_resolution
                 logger.info(
-                    "Affirmative reply resolved to last assistant offer: %s",
+                    "Affirmative/option/GIS-fit reply resolved with session context: %s",
                     offer_resolution[:180],
                 )
 
@@ -15662,6 +16674,41 @@ class SurvyAIAgent:
             query = query.replace("[INTERNET_PERMISSION_DENIED]", "").replace("[internet_permission_denied]", "").strip()
             actual_query_for_routing = actual_query_for_routing.replace("[INTERNET_PERMISSION_DENIED]", "").replace("[internet_permission_denied]", "").strip()
             logger.info("✓ Internet permission denied - permission tag removed from query")
+
+        # After an internet-permission grant/deny, the offer-resolution block above is
+        # skipped (tag present). Still bind session GIS artifacts for fit / open-result
+        # asks so Allow → search does not forget .aprx/.shp paths.
+        if (
+            ("CONTINUATION (retain session GIS context" not in (actual_query_for_routing or ""))
+            and ("RE-EXECUTE FULL GIS WORKFLOW" not in (actual_query_for_routing or ""))
+        ):
+            post_perm_enrich = (
+                self._enrich_gis_paths_for_pending_fit(query, actual_query_for_routing)
+                or self._enrich_current_gis_fit_followup(query, actual_query_for_routing)
+            )
+            if post_perm_enrich:
+                actual_query_for_routing = post_perm_enrich
+                marker = "NOW, the user wants you to continue with this new request:"
+                # Prefer preserving any history already on `query` / `original_query`.
+                hist_src = query
+                if marker not in hist_src and marker in (original_query or ""):
+                    hist_src = original_query
+                if marker in hist_src:
+                    query = (
+                        hist_src.split(marker)[0].rstrip()
+                        + "\n"
+                        + marker
+                        + "\n"
+                        + post_perm_enrich
+                    )
+                elif "=== CONVERSATION CONTEXT" in (hist_src or ""):
+                    query = hist_src.rstrip() + "\n" + marker + "\n" + post_perm_enrich
+                else:
+                    query = post_perm_enrich
+                logger.info(
+                    "Post-permission GIS fit enrichment applied: %s",
+                    post_perm_enrich[:180],
+                )
         
         try:
             logger.info(f"Processing query: {query[:200]}...")
@@ -15673,12 +16720,10 @@ class SurvyAIAgent:
             # ==================================================================
             early_rag_decision = self._decide_rag_route(actual_query_for_routing, interactive_mode=interactive_mode)
             # Safety override: explicit local file/tool workflows should not trigger
-            # internet permission prompts unless the user explicitly asks for web search.
+            # internet permission prompts unless the user explicitly asks for web /
+            # Living Atlas / pretrained land-cover catalog lookup.
             local_file_driven = looks_like_file_driven_task(actual_query_for_routing)
-            explicit_web_intent = any(
-                k in (actual_query_for_routing or "").lower()
-                for k in ("search the internet", "search online", "web search", "browse the web")
-            )
+            explicit_web_intent = self._wants_external_catalog_or_web(actual_query_for_routing)
             if local_file_driven and not explicit_web_intent:
                 if early_rag_decision.use_internet:
                     logger.info("🔧 File-driven workflow detected - suppressing internet permission prompt")
@@ -15690,15 +16735,33 @@ class SurvyAIAgent:
             if getattr(self, "_internet_permission_granted", False) and (
                 getattr(self, "_force_internet_search_this_query", False)
                 or early_rag_decision.use_internet
+                or explicit_web_intent
                 or self._is_current_fact_question(
                     self._extract_clean_question(actual_query_for_routing) or actual_query_for_routing
                 )
             ):
                 early_rag_decision.use_internet = True
                 clean_q = self._extract_clean_question(actual_query_for_routing) or actual_query_for_routing
+                # For GIS follow-ups, search the reference object dimensions — not "option 2" prose.
+                # For Living Atlas / land-cover, keep a catalog-oriented seed.
+                search_seed = self._internet_search_seed_from_intent(clean_q) or clean_q
+                try:
+                    from survyai.gis_session_intent import looks_like_living_atlas_or_landcover_dl
+                    if looks_like_living_atlas_or_landcover_dl(clean_q):
+                        search_seed = (
+                            "Esri Living Atlas pretrained land cover deep learning model "
+                            "grassland classification ArcGIS Pro"
+                        )
+                except Exception:
+                    pass
                 if not getattr(early_rag_decision, "internet_query", None):
-                    variants = self._optimize_internet_search_queries(clean_q)
-                    early_rag_decision.internet_query = variants[0] if variants else clean_q
+                    variants = self._optimize_internet_search_queries(search_seed)
+                    early_rag_decision.internet_query = variants[0] if variants else search_seed
+                else:
+                    # Prefer a tighter seed when the router kept option-selection wording.
+                    routed = str(early_rag_decision.internet_query or "")
+                    if self._parse_option_selection(routed) is not None or "option" in routed.lower():
+                        early_rag_decision.internet_query = search_seed
                 if early_rag_decision.route == "llm_only":
                     early_rag_decision.route = "internet"
                 elif early_rag_decision.route == "vector":
@@ -16029,7 +17092,11 @@ class SurvyAIAgent:
                 }
 
             # FAST PATH: report generation to .docx (avoids LangGraph recursion/tool loops)
-            if self._should_fastpath_docx_report(tool_routing_query):
+            # Never hijack operational GIS/CAD/Excel convert-plot-buffer workflows.
+            if (
+                self._should_fastpath_docx_report(tool_routing_query)
+                and not self._looks_like_operational_workflow_request(tool_routing_query)
+            ):
                 out_candidate = self._extract_any_output_docx(tool_routing_query) or "Report.docx"
                 fast = self._run_docx_report_pipeline(
                     query=tool_routing_query,
@@ -16568,6 +17635,25 @@ class SurvyAIAgent:
                 "- If output location is ambiguous, prefer this workspace.\n"
                 "---\n"
             )
+            # Session GIS artifacts for fit / open-result follow-ups (anti-context-loss).
+            try:
+                _gis_arts = self._extract_verified_gis_artifacts_from_history(query)
+                _fit_now = self._looks_like_gis_followup_analysis(
+                    self._extract_clean_question(actual_query_for_routing) or actual_query_for_routing
+                ) or "CONTINUATION (retain session GIS context" in (actual_query_for_routing or "")
+                if _gis_arts and _fit_now:
+                    enhanced_system_prompt += (
+                        "\n\n---\n"
+                        "**SESSION GIS ARTIFACTS (VERIFIED EARLIER IN THIS CHAT — REUSE, DO NOT RE-ASK):**\n"
+                        + "\n".join(f"- `{p}`" for p in _gis_arts)
+                        + "\n- Prefer geopandas_execute on converted Excel Owner+X/Y or these GDB/CSV paths.\n"
+                        "- arcgis_execute_python_code uses Pro's Python — local missing arcpy is NOT a blocker.\n"
+                        "- Do NOT ask for .aprx/parcel paths already listed here.\n"
+                        "---\n"
+                    )
+            except Exception as _gis_inj_exc:
+                logger.debug("Session GIS artifact injection skipped: %s", _gis_inj_exc)
+
             if document_preflight_info:
                 doc_context = "\n\n---\n**DOCUMENT PRE-FLIGHT ANALYSIS (AUTOMATIC):**\n"
                 doc_context += "The following document(s) were detected in the user's query. Resource estimation has been performed:\n\n"
@@ -16619,6 +17705,27 @@ class SurvyAIAgent:
                     "7. If you reference external information, cite it from the results above."
                 )
                 logger.info("✓ Internet results injected into system prompt (permission granted)")
+            elif getattr(self, "_internet_permission_granted", False) or getattr(
+                self, "_force_internet_search_this_query", False
+            ):
+                # Permission was granted this turn but evidence pack was empty / failed.
+                # Still forbid re-asking — the LLM must call internet_search or proceed
+                # with ArcGIS Living Atlas / ArcPy online content / honest offline fallback.
+                enhanced_system_prompt += (
+                    "\n\n---\n"
+                    "**INTERNET PERMISSION STATUS: GRANTED FOR THIS TURN (ANTI-LOOP)**\n"
+                    "- The user already answered YES to internet search permission.\n"
+                    "- NEVER output: \"May I search the internet for up-to-date information? (yes/no)\"\n"
+                    "- NEVER claim permission is missing or inactive.\n"
+                    "- If you still need external catalog info: call `internet_search` immediately "
+                    "OR use ArcGIS Living Atlas / ArcGIS Online / pretrained land-cover tools via "
+                    "`arcgis_execute_python_code` with the session `.aprx`/`.gdb` paths.\n"
+                    "- If Living Atlas / imagery / the pretrained model is unavailable after a real "
+                    "attempt, state that honestly and fall back to verified parcel geometry — "
+                    "do not invent deep-learning class areas.\n"
+                    "---\n"
+                )
+                logger.info("✓ Internet-permission-granted anti-loop instructions injected (no evidence pack)")
 
             # Strong ArcGIS routing augmentation for the common "two files + DWG mask + IDW/CutFill" case.
             ql_for_arcgis = (actual_query_for_routing or query or "").lower()
@@ -16869,6 +17976,21 @@ class SurvyAIAgent:
                 response_text = self._extract_response(result)
                 tools_used = self._graph_result_used_tools(result)
                 graph_success = True
+                if (
+                    getattr(self, "_internet_permission_granted", False)
+                    and self._response_is_internet_permission_ask_only(response_text)
+                ):
+                    logger.warning(
+                        "Suppressed internet-permission re-ask after grant (anti-loop)"
+                    )
+                    response_text = (
+                        "Internet permission was already granted for this request — I will not ask again.\n\n"
+                        "Please resend your Living Atlas / land-cover (or other analysis) goal once. "
+                        "I will proceed under that already-granted permission using session `.aprx` / `.gdb` "
+                        "parcels plus internet/Living Atlas catalog access, without another yes/no prompt. "
+                        "If Living Atlas/imagery/model access fails after a real attempt, I will say so "
+                        "honestly instead of inventing deep-learning class areas."
+                    )
                 if self._response_looks_like_unverified_task_completion(
                     routing_query, response_text, tools_used
                 ):
@@ -16977,15 +18099,24 @@ class SurvyAIAgent:
                         "complexity": complexity if 'complexity' in locals() else None
                     }
 
-                # Detect quota exhaustion (429 errors / account quota)
+                # Detect quota exhaustion / model unavailable (429, quota, proxy 5xx)
                 is_quota_error = (
-                    "429" in str(e) or 
-                    "quota" in error_str or 
-                    "rate limit" in error_str or
-                    "resourceexhausted" in error_str
+                    "429" in str(e)
+                    or "quota" in error_str
+                    or "rate limit" in error_str
+                    or "resourceexhausted" in error_str
                 )
-                
-                if is_quota_error:
+                is_proxy_or_model_dead = (
+                    "model_not_found" in error_str
+                    or "does not exist" in error_str
+                    or "invalid model" in error_str
+                    or (
+                        ("/v1/llm/chat" in error_str or "hosted llm proxy" in error_str)
+                        and any(code in error_str for code in ("500", "502", "503"))
+                    )
+                )
+
+                if is_quota_error or is_proxy_or_model_dead:
                     # Determine current model name based on LLM type
                     if model_name_used:
                         current_model = model_name_used
@@ -16995,27 +18126,76 @@ class SurvyAIAgent:
                         current_model = self._current_openai_model or getattr(self.settings, "openai_model", "unknown")
                     else:
                         current_model = "unknown"
-                    
-                    logger.warning(f"Quota exhausted for model: {current_model}")
-                    
-                    # Return helpful message instead of retrying
+
+                    logger.warning(
+                        "Model unavailable/quota for %s (quota=%s proxy=%s)",
+                        current_model,
+                        is_quota_error,
+                        is_proxy_or_model_dead,
+                    )
+
+                    # Intelligent OpenAI failover: try next catalog model before giving up.
+                    using_openai = (
+                        (not use_fallback and self.settings.primary_llm == "openai")
+                        or (use_fallback and self.settings.fallback_llm == "openai")
+                        or bool(getattr(self, "_cloud_proxy_enabled", False))
+                    )
+                    if (
+                        using_openai
+                        and current_model
+                        and current_model != "unknown"
+                        and "initial_messages" in locals()
+                    ):
+                        nxt = self._next_openai_failover_model(
+                            current_model,
+                            complexity if "complexity" in locals() else "average",
+                        )
+                        tried_n = len(getattr(self, "_openai_models_tried_this_query", []) or [])
+                        if nxt and tried_n < 6:
+                            logger.info(
+                                "🔄 OpenAI failover %s → %s after %s",
+                                current_model,
+                                nxt,
+                                "quota" if is_quota_error else "proxy/model error",
+                            )
+                            return self._switch_model_and_retry(
+                                query=query,
+                                original_query=original_query if "original_query" in locals() else query,
+                                current_model=current_model,
+                                current_llm=llm_to_use if "llm_to_use" in locals() else self.llm_primary,
+                                complexity=complexity if "complexity" in locals() else "average",
+                                enhanced_system_prompt=enhanced_system_prompt if "enhanced_system_prompt" in locals() else self._system_prompt,
+                                initial_messages=initial_messages,
+                                current_session_id=current_session_id,
+                                use_fallback=use_fallback,
+                                interactive_mode=interactive_mode if "interactive_mode" in locals() else False,
+                                context_retrieved=context_retrieved if "context_retrieved" in locals() else False,
+                                switch_reason="quota_or_proxy_failover",
+                                tools_to_bind=tools_to_bind if "tools_to_bind" in locals() else self.tools,
+                                target_model=nxt,
+                            )
+
+                    # No alternate model left — surface a clear message.
                     return {
                         "query": query,
                         "response": (
-                            f"⚠️ **API Quota Exhausted**\n\n"
-                            f"Your API quota for `{current_model}` has been exhausted.\n\n"
+                            f"⚠️ **API Quota / Model Unavailable**\n\n"
+                            f"The hosted model `{current_model}` could not complete this request "
+                            f"(quota exhausted or upstream proxy error).\n\n"
+                            f"SurvyAI already tried alternate OpenAI models in the failover chain "
+                            f"when available.\n\n"
                             f"**Options:**\n"
-                            f"1. **Wait for quota reset** - Quotas typically reset daily\n"
-                            f"2. **Try a different model** - Adjust model settings in your .env file\n"
-                            f"3. **Upgrade your plan** - Check your API provider's pricing page\n\n"
-                            f"**Current model:** {current_model}\n"
-                            f"**Error:** {str(e)[:200]}..."
+                            f"1. **Wait for quota reset** — provider quotas often reset daily\n"
+                            f"2. **Retry later** — or Sign in again if the cloud session expired\n"
+                            f"3. **Use Ollama** — set Primary LLM to a local model for offline work\n\n"
+                            f"**Tried / current:** {current_model}\n"
+                            f"**Error:** {str(e)[:240]}..."
                         ),
                         "success": False,
                         "error": "quota_exhausted",
                         "llm_used": "fallback" if use_fallback else "primary",
-                        "model_name": model_name_used if 'model_name_used' in locals() else current_model,
-                        "complexity": complexity if 'complexity' in locals() else None
+                        "model_name": model_name_used if "model_name_used" in locals() else current_model,
+                        "complexity": complexity if "complexity" in locals() else None,
                     }
                 
                 # Try fallback if primary failed (and it's not a quota error)
@@ -17045,11 +18225,29 @@ class SurvyAIAgent:
         
         except Exception as e:
             logger.error(f"Error in process_query: {e}")
+            err = str(e)
+            low = err.lower()
+            if (
+                "/v1/llm/chat" in low
+                or "hosted llm proxy" in low
+                or ("unauthorized" in low and "token" in low)
+            ):
+                response = (
+                    f"{err}\n\n"
+                    "What to try:\n"
+                    "1. Account → Sign in again (refresh hosted LLM access).\n"
+                    "2. Confirm your Pro subscription still has API credits.\n"
+                    "3. Retry this prompt.\n"
+                    "4. If hosted LLM stays down, set Primary LLM to Ollama for local/offline work "
+                    "(needs enough free RAM)."
+                )
+            else:
+                response = f"Error processing query: {err}"
             return {
                 "query": query,
-                "response": f"Error processing query: {str(e)}",
+                "response": response,
                 "success": False,
-                "error": str(e),
+                "error": err,
                 "llm_cost_usd": 0.0,
             }
     

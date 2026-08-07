@@ -53,94 +53,185 @@ async def run_proxy_chat(
             detail="Subscription API credit balance exhausted for this period",
         )
 
-    llm, resolved_model, resolved_provider = _build_server_chat_model(body, settings)
-    llm_to_invoke = llm.bind_tools(list(body.tools or [])) if body.tools else llm
-    messages = [_to_langchain_message(msg) for msg in body.messages]
-    response = await asyncio.to_thread(llm_to_invoke.invoke, messages)
-    ai_message = response if isinstance(response, AIMessage) else AIMessage(content=str(response))
+    try:
+        llm, resolved_model, resolved_provider = _build_server_chat_model(body, settings)
+        llm_to_invoke = llm.bind_tools(list(body.tools or [])) if body.tools else llm
+        messages = [_to_langchain_message(msg) for msg in body.messages]
+        try:
+            response = await asyncio.to_thread(llm_to_invoke.invoke, messages)
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise _http_error_from_upstream_llm(exc) from exc
 
-    usage = _usage_dict_from_message(ai_message, body)
-    usage_is_reported = not bool(usage.get("estimated"))
-    billed_cost_usd = 0.0
-    if usage_is_reported:
-        billed_cost_usd = round(
-            estimate_token_cost_usd(
-                str(
-                    resolved_model
-                    or body.model
-                    or ai_message.response_metadata.get("model_name")
-                    or ""
+        ai_message = response if isinstance(response, AIMessage) else AIMessage(content=str(response))
+
+        usage = _usage_dict_from_message(ai_message, body)
+        usage_is_reported = not bool(usage.get("estimated"))
+        billed_cost_usd = 0.0
+        if usage_is_reported:
+            billed_cost_usd = round(
+                estimate_token_cost_usd(
+                    str(
+                        resolved_model
+                        or body.model
+                        or (ai_message.response_metadata or {}).get("model_name")
+                        or ""
+                    ),
+                    int(usage.get("input_tokens") or 0),
+                    int(usage.get("output_tokens") or 0),
+                    cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
                 ),
-                int(usage.get("input_tokens") or 0),
-                int(usage.get("output_tokens") or 0),
-                cached_input_tokens=int(usage.get("cached_input_tokens") or 0),
-            ),
-            6,
-        )
-    markup_cost_usd = round(billed_cost_usd * settings.credit_markup_multiplier, 6)
-    budget = float(user.monthly_credits_usd or 0.0)
-    used_before = float(user.monthly_credits_used_usd or 0.0)
-    used_after = used_before
-    credit_exhausted = bool(budget > 0 and used_before >= budget - 1e-6)
-    if budget > 0 and markup_cost_usd > 0:
-        used_after = round(min(budget, used_before + markup_cost_usd), 6)
-        user.monthly_credits_used_usd = used_after
-        credit_exhausted = used_after >= budget - 1e-6
-        db.add(user)
-        # Flip Pro → Free as soon as the pool is spent so /me and desktop agree.
-        reconcile_pro_access(user, settings, db=db)
+                6,
+            )
+        markup_cost_usd = round(billed_cost_usd * settings.credit_markup_multiplier, 6)
+        budget = float(user.monthly_credits_usd or 0.0)
+        used_before = float(user.monthly_credits_used_usd or 0.0)
+        used_after = used_before
+        credit_exhausted = bool(budget > 0 and used_before >= budget - 1e-6)
+        if budget > 0 and markup_cost_usd > 0:
+            used_after = round(min(budget, used_before + markup_cost_usd), 6)
+            user.monthly_credits_used_usd = used_after
+            credit_exhausted = used_after >= budget - 1e-6
+            db.add(user)
+            # Flip Pro → Free as soon as the pool is spent so /me and desktop agree.
+            reconcile_pro_access(user, settings, db=db)
 
-    event_meta = {
-        "provider": resolved_provider,
-        "model": str(resolved_model or body.model or ""),
-        "input_tokens": int(usage.get("input_tokens") or 0),
-        "output_tokens": int(usage.get("output_tokens") or 0),
-        "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
-        "billing_basis": "llm_proxy_provider_reported_usage"
-        if usage_is_reported
-        else "llm_proxy_estimated_usage_not_billed",
-        "markup_cost_usd": markup_cost_usd,
-        "usage_estimated": bool(usage.get("estimated")),
-    }
-    db.add(
-        UsageEvent(
-            user_id=user.id,
-            kind="llm_proxy_turn",
-            quantity=1,
-            cost_usd=billed_cost_usd,
-            meta=event_meta,
-            device_id=device.id,
-        )
-    )
-
-    tool_calls: list[LlmToolCallOut] = []
-    for tc in ai_message.tool_calls or []:
-        if not isinstance(tc, dict):
-            continue
-        tool_calls.append(
-            LlmToolCallOut(
-                id=tc.get("id"),
-                name=str(tc.get("name") or ""),
-                args=tc.get("args") if isinstance(tc.get("args"), dict) else {},
+        event_meta = {
+            "provider": resolved_provider,
+            "model": str(resolved_model or body.model or ""),
+            "input_tokens": int(usage.get("input_tokens") or 0),
+            "output_tokens": int(usage.get("output_tokens") or 0),
+            "cached_input_tokens": int(usage.get("cached_input_tokens") or 0),
+            "billing_basis": "llm_proxy_provider_reported_usage"
+            if usage_is_reported
+            else "llm_proxy_estimated_usage_not_billed",
+            "markup_cost_usd": markup_cost_usd,
+            "usage_estimated": bool(usage.get("estimated")),
+        }
+        db.add(
+            UsageEvent(
+                user_id=user.id,
+                kind="llm_proxy_turn",
+                quantity=1,
+                cost_usd=billed_cost_usd,
+                meta=event_meta,
+                device_id=device.id,
             )
         )
 
-    billing = {
-        "cost_usd": billed_cost_usd,
-        "markup_cost_usd": markup_cost_usd,
-        "monthly_credits_used_usd": round(float(used_after), 6),
-        "monthly_credits_usd": budget,
-        "credit_exhausted": credit_exhausted,
-    }
-    usage["cost_usd"] = billed_cost_usd
-    return LlmProxyChatOut(
-        provider=resolved_provider,
-        model=str(resolved_model or body.model or ""),
-        content=ai_message.content,
-        tool_calls=tool_calls,
-        usage=usage,
-        billing=billing,
+        tool_calls = _normalize_tool_calls(ai_message)
+        safe_content = _json_safe_content(ai_message.content)
+
+        billing = {
+            "cost_usd": billed_cost_usd,
+            "markup_cost_usd": markup_cost_usd,
+            "monthly_credits_used_usd": round(float(used_after), 6),
+            "monthly_credits_usd": budget,
+            "credit_exhausted": credit_exhausted,
+        }
+        usage["cost_usd"] = billed_cost_usd
+        return LlmProxyChatOut(
+            provider=resolved_provider,
+            model=str(resolved_model or body.model or ""),
+            content=safe_content,
+            tool_calls=tool_calls,
+            usage=usage,
+            billing=billing,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # Never leak a plain-text/HTML 500 to the desktop — always JSON detail.
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Hosted LLM proxy failed: {str(exc)[:800]}",
+        ) from exc
+
+
+def _http_error_from_upstream_llm(exc: Exception) -> HTTPException:
+    err = str(exc or "").strip() or exc.__class__.__name__
+    low = err.lower()
+    if any(k in low for k in ("rate limit", "rate_limit", "429", "too many requests")):
+        return HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Upstream LLM rate limited: {err[:700]}",
+        )
+    if any(k in low for k in ("unauthorized", "invalid api key", "incorrect api key", "401", "auth")):
+        return HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Upstream LLM authentication failed on the SurvyAI server: {err[:700]}",
+        )
+    if any(
+        k in low
+        for k in (
+            "context length",
+            "maximum context",
+            "token limit",
+            "too many tokens",
+            "max_tokens",
+            "context_window",
+            "request too large",
+        )
+    ):
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Upstream LLM rejected the request size/context: {err[:700]}",
+        )
+    return HTTPException(
+        status_code=status.HTTP_502_BAD_GATEWAY,
+        detail=f"Upstream LLM call failed: {err[:700]}",
     )
+
+
+def _json_safe_content(content: Any) -> Any:
+    """Coerce LangChain content (incl. content blocks) into JSON-safe values."""
+    if content is None:
+        return ""
+    if isinstance(content, (str, int, float, bool)):
+        return content
+    if isinstance(content, list):
+        out: list[Any] = []
+        for item in content:
+            if isinstance(item, (str, int, float, bool)) or item is None:
+                out.append(item)
+            elif isinstance(item, dict):
+                out.append(item)
+            elif hasattr(item, "model_dump"):
+                try:
+                    out.append(item.model_dump())
+                    continue
+                except Exception:
+                    pass
+            out.append(str(item))
+        return out
+    if isinstance(content, dict):
+        return content
+    if hasattr(content, "model_dump"):
+        try:
+            return content.model_dump()
+        except Exception:
+            pass
+    return str(content)
+
+
+def _normalize_tool_calls(ai_message: AIMessage) -> list[LlmToolCallOut]:
+    """Accept dict tool_calls and LangChain tool-call objects."""
+    tool_calls: list[LlmToolCallOut] = []
+    for tc in getattr(ai_message, "tool_calls", None) or []:
+        if isinstance(tc, dict):
+            name = str(tc.get("name") or "").strip()
+            args = tc.get("args") if isinstance(tc.get("args"), dict) else {}
+            tid = tc.get("id")
+        else:
+            name = str(getattr(tc, "name", "") or "").strip()
+            raw_args = getattr(tc, "args", None)
+            args = raw_args if isinstance(raw_args, dict) else {}
+            tid = getattr(tc, "id", None)
+        if not name:
+            continue
+        tool_calls.append(LlmToolCallOut(id=tid, name=name, args=args))
+    return tool_calls
 
 
 def _build_server_chat_model(body: LlmProxyChatIn, settings: CloudSettings) -> tuple[Any, str, str]:
@@ -212,27 +303,30 @@ def _provider_has_platform_key(provider: str, settings: CloudSettings) -> bool:
 
 def _to_langchain_message(msg: LlmMessageIn) -> Any:
     role = str(msg.role or "").strip().lower()
+    content = msg.content if msg.content is not None else ""
     if role == "system":
-        return SystemMessage(content=msg.content)
+        return SystemMessage(content=content)
     if role == "assistant":
-        return AIMessage(
-            content=msg.content,
-            tool_calls=[
+        tool_calls = []
+        for tc in msg.tool_calls or []:
+            name = str(getattr(tc, "name", "") or "").strip()
+            if not name:
+                continue
+            tool_calls.append(
                 {
                     "id": tc.id,
-                    "name": tc.name,
+                    "name": name,
                     "args": dict(tc.args or {}),
                     "type": "tool_call",
                 }
-                for tc in (msg.tool_calls or [])
-            ],
-        )
+            )
+        return AIMessage(content=content, tool_calls=tool_calls)
     if role == "tool":
         return ToolMessage(
-            content=msg.content,
+            content=content if isinstance(content, str) else str(content),
             tool_call_id=str(msg.tool_call_id or ""),
         )
-    return HumanMessage(content=msg.content)
+    return HumanMessage(content=content)
 
 
 def _usage_dict_from_message(message: AIMessage, body: LlmProxyChatIn) -> dict[str, Any]:

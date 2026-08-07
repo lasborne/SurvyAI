@@ -203,19 +203,19 @@ class CloudSettings(BaseSettings):
     platform_google_api_key: str = Field(default="")
     platform_deepseek_api_key: str = Field(default="")
     platform_openai_model: str = Field(
-        default="gpt-4o-mini",
+        default="gpt-5.6-terra",
         description="Legacy single OpenAI model name (used when tiered models are disabled).",
     )
     platform_openai_model_nano: str = Field(
-        default="gpt-5.4-nano",
+        default="gpt-5.6-luna",
         description="OpenAI model for trivial tasks (desktop tiered selection).",
     )
     platform_openai_model_mini: str = Field(
-        default="gpt-5.4-mini",
+        default="gpt-5.6-terra",
         description="OpenAI model for normal tasks (desktop tiered selection).",
     )
     platform_openai_model_complex: str = Field(
-        default="gpt-5.4",
+        default="gpt-5.6-sol",
         description="OpenAI model for very complex tasks (desktop tiered selection).",
     )
     platform_enable_tiered_models: bool = Field(
