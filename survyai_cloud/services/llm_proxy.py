@@ -22,6 +22,10 @@ from survyai_cloud.services.entitlements import (
 )
 from utils.cost_estimator import estimate_token_cost_usd, estimate_tokens, extract_message_token_usage
 
+# Process-level Chat* client cache (provider, model, temp, max_tokens) → client.
+# Safe: platform keys are stable for the cloud process lifetime; tools are bound per request.
+_SERVER_CHAT_MODEL_CACHE: dict[tuple, Any] = {}
+
 
 async def run_proxy_chat(
     *,
@@ -234,6 +238,80 @@ def _normalize_tool_calls(ai_message: AIMessage) -> list[LlmToolCallOut]:
     return tool_calls
 
 
+def _server_chat_cache_key(
+    provider: str,
+    resolved_model: str,
+    *,
+    temperature: float | None,
+    max_tokens: int | None,
+) -> tuple:
+    return (
+        str(provider or "").strip().lower(),
+        str(resolved_model or "").strip(),
+        float(temperature if temperature is not None else 0.0),
+        int(max_tokens or 0),
+    )
+
+
+def _get_or_create_server_chat_model(
+    *,
+    provider: str,
+    resolved_model: str,
+    body: LlmProxyChatIn,
+    settings: CloudSettings,
+) -> Any:
+    """Reuse Chat* clients across proxy requests with identical provider/model/temp/max_tokens."""
+    cache_key = _server_chat_cache_key(
+        provider,
+        resolved_model,
+        temperature=body.temperature,
+        max_tokens=body.max_tokens,
+    )
+    cached = _SERVER_CHAT_MODEL_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    if provider == "openai":
+        llm = ChatOpenAI(
+            model=resolved_model,
+            api_key=settings.platform_openai_api_key,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+        )
+    elif provider == "deepseek":
+        llm = ChatOpenAI(
+            model=resolved_model,
+            api_key=settings.platform_deepseek_api_key,
+            base_url=settings.platform_deepseek_base_url,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+        )
+    elif provider == "claude":
+        llm = ChatAnthropic(
+            model=resolved_model,
+            anthropic_api_key=settings.platform_anthropic_api_key,
+            temperature=body.temperature,
+            max_tokens=body.max_tokens,
+        )
+    elif provider == "gemini":
+        llm = ChatGoogleGenerativeAI(
+            model=resolved_model,
+            google_api_key=settings.platform_google_api_key,
+            temperature=body.temperature,
+            max_output_tokens=body.max_tokens,
+        )
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+
+    _SERVER_CHAT_MODEL_CACHE[cache_key] = llm
+    return llm
+
+
+def clear_server_chat_model_cache() -> None:
+    """Test helper: drop process-level Chat* cache."""
+    _SERVER_CHAT_MODEL_CACHE.clear()
+
+
 def _build_server_chat_model(body: LlmProxyChatIn, settings: CloudSettings) -> tuple[Any, str, str]:
     provider = str(body.provider or "").strip().lower()
     requested_provider = provider
@@ -247,44 +325,69 @@ def _build_server_chat_model(body: LlmProxyChatIn, settings: CloudSettings) -> t
     if provider == "openai":
         if not settings.platform_openai_api_key.strip():
             raise HTTPException(status_code=503, detail="Server missing platform OpenAI configuration")
-        resolved_model = model or settings.platform_openai_model
-        return ChatOpenAI(
-            model=resolved_model,
-            api_key=settings.platform_openai_api_key,
-            temperature=body.temperature,
-            max_tokens=body.max_tokens,
-        ), resolved_model, provider
+        if model:
+            resolved_model = model
+        else:
+            try:
+                from survyai.openai_models import migrate_legacy_platform_model
+
+                resolved_model = migrate_legacy_platform_model(
+                    "openai_model", settings.platform_openai_model
+                ) or settings.platform_openai_model
+            except Exception:
+                resolved_model = settings.platform_openai_model
+        return (
+            _get_or_create_server_chat_model(
+                provider=provider,
+                resolved_model=resolved_model,
+                body=body,
+                settings=settings,
+            ),
+            resolved_model,
+            provider,
+        )
     if provider == "deepseek":
         if not settings.platform_deepseek_api_key.strip():
             raise HTTPException(status_code=503, detail="Server missing platform DeepSeek configuration")
         resolved_model = model or "deepseek-chat"
-        return ChatOpenAI(
-            model=resolved_model,
-            api_key=settings.platform_deepseek_api_key,
-            base_url=settings.platform_deepseek_base_url,
-            temperature=body.temperature,
-            max_tokens=body.max_tokens,
-        ), resolved_model, provider
+        return (
+            _get_or_create_server_chat_model(
+                provider=provider,
+                resolved_model=resolved_model,
+                body=body,
+                settings=settings,
+            ),
+            resolved_model,
+            provider,
+        )
     if provider == "claude":
         if not settings.platform_anthropic_api_key.strip():
             raise HTTPException(status_code=503, detail="Server missing platform Anthropic configuration")
         resolved_model = model or settings.platform_claude_model
-        return ChatAnthropic(
-            model=resolved_model,
-            anthropic_api_key=settings.platform_anthropic_api_key,
-            temperature=body.temperature,
-            max_tokens=body.max_tokens,
-        ), resolved_model, provider
+        return (
+            _get_or_create_server_chat_model(
+                provider=provider,
+                resolved_model=resolved_model,
+                body=body,
+                settings=settings,
+            ),
+            resolved_model,
+            provider,
+        )
     if provider == "gemini":
         if not settings.platform_google_api_key.strip():
             raise HTTPException(status_code=503, detail="Server missing platform Google configuration")
         resolved_model = model or settings.platform_gemini_model
-        return ChatGoogleGenerativeAI(
-            model=resolved_model,
-            google_api_key=settings.platform_google_api_key,
-            temperature=body.temperature,
-            max_output_tokens=body.max_tokens,
-        ), resolved_model, provider
+        return (
+            _get_or_create_server_chat_model(
+                provider=provider,
+                resolved_model=resolved_model,
+                body=body,
+                settings=settings,
+            ),
+            resolved_model,
+            provider,
+        )
     raise HTTPException(status_code=400, detail=f"Unsupported provider: {body.provider}")
 
 

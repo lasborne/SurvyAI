@@ -342,6 +342,115 @@ def escalate_tier_model(
     return None
 
 
+# Prior SurvyAI platform defaults (pre GPT-5.6 luna/terra/sol). Remap only when
+# a bootstrap/settings *slot* still carries the exact retired product default for
+# that slot — never rewrite an intentional cross-tier choice (e.g. complex=gpt-5.4-mini).
+_LEGACY_SLOT_DEFAULTS: Dict[str, Dict[str, str]] = {
+    "openai_model_nano": {
+        "gpt-5.4-nano": DEFAULT_MODEL_FOR_COMPLEXITY["simple"],
+        "gpt-5-nano": DEFAULT_MODEL_FOR_COMPLEXITY["simple"],
+    },
+    "openai_model_mini": {
+        "gpt-5.4-mini": DEFAULT_MODEL_FOR_COMPLEXITY["average"],
+        "gpt-5-mini": DEFAULT_MODEL_FOR_COMPLEXITY["average"],
+    },
+    "openai_model_complex": {
+        "gpt-5.4": DEFAULT_MODEL_FOR_COMPLEXITY["complex"],
+        "gpt-5.4-pro": DEFAULT_MODEL_FOR_COMPLEXITY["complex"],
+        "gpt-5": DEFAULT_MODEL_FOR_COMPLEXITY["complex"],
+    },
+    "openai_model": {
+        "gpt-5.4": DEFAULT_MODEL_FOR_COMPLEXITY["average"],
+        "gpt-5.4-mini": DEFAULT_MODEL_FOR_COMPLEXITY["average"],
+        "gpt-4o-mini": DEFAULT_MODEL_FOR_COMPLEXITY["average"],
+    },
+}
+
+
+def migrate_legacy_platform_model(slot: str, model_id: Optional[str]) -> str:
+    """
+    Rewrite a retired SurvyAI platform default in ``slot`` to the current catalog default.
+
+    Safe for cloud bootstrap that still ships gpt-5.4* / gpt-4o-mini from older env files.
+    Leaves any non-default value untouched.
+    """
+    raw = str(model_id or "").strip()
+    if not raw:
+        return ""
+    key = normalize_model_id(raw) or raw
+    slot_map = _LEGACY_SLOT_DEFAULTS.get(str(slot or "").strip())
+    if not slot_map:
+        return key
+    for legacy, replacement in slot_map.items():
+        if key.lower() == legacy.lower():
+            return replacement
+    return key
+
+
+def migrate_legacy_platform_models(models: Dict[str, Optional[str]]) -> Dict[str, str]:
+    """Apply :func:`migrate_legacy_platform_model` to a settings/bootstrap model dict."""
+    out: Dict[str, str] = {}
+    for slot, value in (models or {}).items():
+        if value is None:
+            continue
+        migrated = migrate_legacy_platform_model(str(slot), value)
+        if migrated:
+            out[str(slot)] = migrated
+    return out
+
+
+def openai_tier_models_for_display(
+    *,
+    nano: Optional[str] = None,
+    mini: Optional[str] = None,
+    complex_model: Optional[str] = None,
+    legacy: Optional[str] = None,
+    enable_tiered: bool = True,
+) -> Dict[str, str]:
+    """
+    Exact model IDs shown for Low / Medium / Advanced task tiers.
+
+    Keys: ``low``, ``medium``, ``advanced`` (product labels) plus ``legacy``.
+    """
+    if enable_tiered:
+        low = resolve_model_for_complexity("simple", nano=nano, mini=mini, complex_model=complex_model, legacy=legacy)
+        medium = resolve_model_for_complexity("average", nano=nano, mini=mini, complex_model=complex_model, legacy=legacy)
+        advanced = resolve_model_for_complexity("complex", nano=nano, mini=mini, complex_model=complex_model, legacy=legacy)
+    else:
+        single = normalize_model_id(legacy) or (legacy or "").strip() or default_model_for_complexity("average")
+        low = medium = advanced = single
+    return {
+        "low": low,
+        "medium": medium,
+        "advanced": advanced,
+        "legacy": normalize_model_id(legacy) or (legacy or "").strip() or medium,
+    }
+
+
+def format_openai_tier_summary(
+    *,
+    nano: Optional[str] = None,
+    mini: Optional[str] = None,
+    complex_model: Optional[str] = None,
+    legacy: Optional[str] = None,
+    enable_tiered: bool = True,
+) -> str:
+    """One-line Low/Medium/Advanced summary for Settings / Credits."""
+    tiers = openai_tier_models_for_display(
+        nano=nano,
+        mini=mini,
+        complex_model=complex_model,
+        legacy=legacy,
+        enable_tiered=enable_tiered,
+    )
+    if not enable_tiered:
+        return f"openai ({tiers['legacy']})"
+    return (
+        f"openai — Low: {tiers['low']} · Medium: {tiers['medium']} · "
+        f"Advanced: {tiers['advanced']}"
+    )
+
+
 __all__ = [
     "Complexity",
     "TierName",
@@ -358,4 +467,8 @@ __all__ = [
     "fallback_models_for",
     "next_fallback_model",
     "escalate_tier_model",
+    "migrate_legacy_platform_model",
+    "migrate_legacy_platform_models",
+    "openai_tier_models_for_display",
+    "format_openai_tier_summary",
 ]

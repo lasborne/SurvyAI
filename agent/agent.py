@@ -1824,7 +1824,11 @@ class SurvyAIAgent:
 
         # Lightweight caches to avoid expensive re-initialization/re-compilation
         # (No functional impact; improves latency and reduces mid-flight churn.)
-        self._openai_llm_cache: Dict[tuple, BaseChatModel] = {}
+        # Key: (provider, transport, model, temp, max_tokens, auth_fingerprint)
+        self._llm_client_cache: Dict[tuple, BaseChatModel] = {}
+        # Back-compat alias used by older call sites / tests.
+        self._openai_llm_cache = self._llm_client_cache
+        self._gemini_models_cache: Optional[List[str]] = None
         self._app_signature: Optional[tuple] = None
         self._pipeline_llm_cost_usd: float = 0.0
         # Serialize LLM invokes so a timed-out Ollama/HTTP call cannot stack
@@ -2029,36 +2033,71 @@ class SurvyAIAgent:
         self.memory = MemorySaver()
         self.app = self.graph.compile(checkpointer=self.memory)
 
-        # Pre-warm the OpenAI LLM cache for all tier models so the first query
-        # never triggers a fresh _initialize_llm call or a graph rebuild.
-        # This eliminates per-query "initialising LLM" log noise and the startup
-        # max_tokens clamping messages for unknown-to-the-cache tier models.
-        if self.settings.primary_llm == "openai" and getattr(self.settings, "enable_tiered_models", True):
-            for _tier in ("simple", "average", "complex"):
-                _tier_model = self._get_openai_model_for_complexity(_tier)
-                try:
-                    self._initialize_llm("openai", model_name=_tier_model)
-                    logger.info(f"✓ Pre-warmed OpenAI LLM cache: {_tier_model} ({_tier})")
-                except Exception as _e:
-                    logger.debug(f"Could not pre-warm tier '{_tier}' model '{_tier_model}': {_e}")
+        # Pre-warm paid-provider tier models so the first query avoids cold init.
+        try:
+            from survyai.provider_models import PAID_PROVIDERS as _PAID_WARM
 
-        # Set the _app_signature to the *complex* tier model so the first complex
-        # GIS query reuses the already-compiled graph without rebuilding.
-        if self.settings.primary_llm == "openai" and getattr(self.settings, "enable_tiered_models", True):
+            _warm_prov = str(getattr(self.settings, "primary_llm", "") or "").strip().lower()
+            if _warm_prov in _PAID_WARM and getattr(self.settings, "enable_tiered_models", True):
+                for _tier in ("simple", "average", "complex"):
+                    _tier_model = self._get_model_for_complexity(_warm_prov, _tier)
+                    try:
+                        self._initialize_llm(_warm_prov, model_name=_tier_model)
+                        logger.debug(
+                            "Pre-warmed %s LLM cache: %s (%s)",
+                            _warm_prov,
+                            _tier_model,
+                            _tier,
+                        )
+                    except Exception as _e:
+                        logger.debug(
+                            "Could not pre-warm %s tier '%s' model '%s': %s",
+                            _warm_prov,
+                            _tier,
+                            _tier_model,
+                            _e,
+                        )
+        except Exception:
+            pass
+
+        # Bind the average (typical) tier at startup so common GIS/CAD queries
+        # reuse the compiled graph; complex tier binds lazily on first hard query.
+        try:
+            from survyai.provider_models import PAID_PROVIDERS as _PAID_BIND
+
+            _bind_prov = str(getattr(self.settings, "primary_llm", "") or "").strip().lower()
+            if _bind_prov in _PAID_BIND and getattr(self.settings, "enable_tiered_models", True):
+                try:
+                    _avg_model = self._get_model_for_complexity(_bind_prov, "average")
+                    _avg_llm = self._initialize_llm(_bind_prov, model_name=_avg_model)
+                    self.llm_with_tools = _avg_llm.bind_tools(self.tools)
+                    self.graph = self._build_graph()
+                    self.app = self.graph.compile(checkpointer=self.memory)
+                    model_sig = _avg_model
+                    logger.debug(
+                        "App bound to average-tier %s model at startup: %s",
+                        _bind_prov,
+                        _avg_model,
+                    )
+                except Exception as _e:
+                    logger.debug("Could not bind average-tier model at startup: %s", _e)
+                    model_sig = (
+                        getattr(self.llm_primary, "model", None)
+                        or getattr(self.settings, "openai_model", None)
+                        or self.settings.primary_llm
+                    )
+            else:
+                try:
+                    model_sig = (
+                        getattr(self.llm_primary, "model", None)
+                        or getattr(self.settings, "openai_model", None)
+                        or self.settings.primary_llm
+                    )
+                except Exception:
+                    model_sig = self.settings.primary_llm
+        except Exception:
             try:
-                _complex_model = self._get_openai_model_for_complexity("complex")
-                _complex_llm = self._initialize_llm("openai", model_name=_complex_model)
-                self.llm_with_tools = _complex_llm.bind_tools(self.tools)
-                self.graph = self._build_graph()
-                self.app = self.graph.compile(checkpointer=self.memory)
-                model_sig = _complex_model
-                logger.info(f"✓ App bound to complex-tier model at startup: {_complex_model}")
-            except Exception as _e:
-                logger.debug(f"Could not bind complex-tier model at startup: {_e}")
-                model_sig = getattr(self.llm_primary, "model", None) or getattr(self.settings, "openai_model", None) or self.settings.primary_llm
-        else:
-            try:
-                model_sig = getattr(self.llm_primary, "model", None) or getattr(self.settings, "openai_model", None) or self.settings.primary_llm
+                model_sig = getattr(self.llm_primary, "model", None) or self.settings.primary_llm
             except Exception:
                 model_sig = self.settings.primary_llm
 
@@ -11830,6 +11869,55 @@ class SurvyAIAgent:
         if len(re.findall(r"[a-zA-Z]:\\", raw)) >= 3:
             return "complex"
 
+        # Cheap accurate tier: short historic / definitional lookups (no tool orchestration).
+        _historic_simple = (
+            "historic",
+            "historical",
+            "in history",
+            "what year",
+            "who was",
+            "old standard",
+            "define ",
+            "definition of",
+            "what does",
+            "meaning of",
+        )
+        _toolish = (
+            "autocad",
+            "arcgis",
+            "excel",
+            "convert",
+            "buffer",
+            "polygon",
+            "dwg",
+            "dxf",
+            "gdb",
+            "shapefile",
+        )
+        if (
+            any(s in query_lower for s in _historic_simple)
+            and not any(s in query_lower for s in _toolish)
+            and len(query_lower.split()) <= 40
+        ):
+            return "simple"
+
+        # Unordered / multi-step geospatial with unclear sequence → complex (max accuracy).
+        _unordered = (
+            "in any order",
+            "no particular order",
+            "not sure which first",
+            "whichever first",
+            "multiple difficult",
+            "several difficult",
+            "no order",
+            "unordered",
+        )
+        if any(s in query_lower for s in _unordered) and any(
+            s in query_lower
+            for s in ("gis", "geospatial", "arcgis", "survey", "cadastral", "coordinate", "polygon")
+        ):
+            return "complex"
+
         _gis_heavy = (
             "cutfill",
             "cut fill",
@@ -12123,22 +12211,61 @@ class SurvyAIAgent:
 
         return infer_tier(model_name)
     
-    def _escalate_model_tier(self, current_tier: str) -> Optional[str]:
+    def _active_llm_provider(self, use_fallback: bool = False) -> str:
+        """Concrete provider id for the current primary/fallback selection."""
+        if use_fallback:
+            return str(getattr(self.settings, "fallback_llm", "") or "").strip().lower()
+        return str(getattr(self.settings, "primary_llm", "") or "").strip().lower()
+
+    def _escalate_model_tier(self, current_tier: str, provider: Optional[str] = None) -> Optional[str]:
         """
-        Get the next higher tier model for escalation.
-        
+        Get the next higher tier model for escalation (same provider).
+
         Args:
             current_tier: Current tier ("nano", "mini", or "complex")
-            
+            provider: Provider id (default: primary LLM)
+
         Returns:
             Model name for next tier, or None if already at highest tier
         """
         from survyai.openai_models import escalate_tier_model
+        from survyai.provider_models import escalate_provider_from_model
 
-        return escalate_tier_model(
-            current_tier if current_tier in ("nano", "mini", "complex") else "mini",
-            mini=getattr(self.settings, "openai_model_mini", None),
-            complex_model=getattr(self.settings, "openai_model_complex", None),
+        prov = (provider or self._active_llm_provider(False) or "openai").strip().lower()
+        if prov == "openai":
+            return escalate_tier_model(
+                current_tier if current_tier in ("nano", "mini", "complex") else "mini",
+                mini=getattr(self.settings, "openai_model_mini", None),
+                complex_model=getattr(self.settings, "openai_model_complex", None),
+            )
+        # For non-OpenAI, map nano/mini/complex → simple/average/complex model ids.
+        tier_to_complexity = {"nano": "simple", "mini": "average", "complex": "complex"}
+        c = tier_to_complexity.get(current_tier, "average")
+        # Build a synthetic "current" model at this tier, then escalate one step.
+        current = self._get_model_for_complexity(prov, c)  # type: ignore[arg-type]
+        return escalate_provider_from_model(prov, current, settings=self.settings)
+
+    def _next_provider_failover_model(
+        self,
+        provider: str,
+        current_model: Optional[str],
+        complexity: str,
+        *,
+        elevated_average: bool = False,
+    ) -> Optional[str]:
+        """Next alternate model for the active provider after quota / proxy failure."""
+        from survyai.provider_models import next_provider_failover_model
+
+        tried = list(getattr(self, "_openai_models_tried_this_query", []) or [])
+        if current_model and current_model not in tried:
+            tried.append(current_model)
+        return next_provider_failover_model(
+            provider,
+            current_model,
+            complexity=complexity if complexity in ("simple", "average", "complex") else "average",
+            tried=tried,
+            settings=self.settings,
+            elevated_average=elevated_average,
         )
 
     def _next_openai_failover_model(
@@ -12146,19 +12273,9 @@ class SurvyAIAgent:
         current_model: Optional[str],
         complexity: str,
     ) -> Optional[str]:
-        """Next alternate OpenAI model after quota / proxy failure (not capability escalate)."""
-        from survyai.openai_models import next_fallback_model
+        """Back-compat wrapper: OpenAI-only failover."""
+        return self._next_provider_failover_model("openai", current_model, complexity)
 
-        tried = list(getattr(self, "_openai_models_tried_this_query", []) or [])
-        if current_model and current_model not in tried:
-            tried.append(current_model)
-        nxt = next_fallback_model(
-            current_model,
-            complexity=complexity if complexity in ("simple", "average", "complex") else "average",
-            tried=tried,
-        )
-        return nxt
-    
     def _switch_model_and_retry(
         self,
         query: str,
@@ -12175,27 +12292,35 @@ class SurvyAIAgent:
         switch_reason: str,
         tools_to_bind: List[BaseTool],
         target_model: Optional[str] = None,
+        provider: Optional[str] = None,
     ) -> Dict:
         """
-        Switch to another OpenAI model and retry the query.
+        Switch to another model on the same paid provider and retry the query.
 
         If ``target_model`` is set (quota/proxy failover), use it. Otherwise escalate
-        capability tier (nano→mini→complex).
+        capability tier (simple→average→complex / nano→mini→complex).
         """
+        prov = (provider or self._active_llm_provider(use_fallback) or "openai").strip().lower()
         if target_model:
             escalated_model = target_model
         else:
-            current_tier = self._get_model_tier(current_model)
-            escalated_model = self._escalate_model_tier(current_tier)
-        
+            from survyai.provider_models import PAID_PROVIDERS, escalate_provider_from_model
+
+            if prov in PAID_PROVIDERS and prov != "openai":
+                escalated_model = escalate_provider_from_model(
+                    prov, current_model, settings=self.settings
+                )
+            else:
+                current_tier = self._get_model_tier(current_model)
+                escalated_model = self._escalate_model_tier(current_tier, provider=prov)
+
         if not escalated_model:
-            logger.warning("⚠ No alternate OpenAI model available for retry")
-            # Return error instead of switching
+            logger.warning("⚠ No alternate %s model available for retry", prov)
             return {
                 "query": original_query,
                 "response": (
                     f"Query failed with {switch_reason}. "
-                    "No alternate OpenAI model remains to try. "
+                    f"No alternate {prov} model remains to try. "
                     "Wait for quota reset, or set Primary LLM to Ollama for offline work."
                 ),
                 "success": False,
@@ -12205,7 +12330,7 @@ class SurvyAIAgent:
                 "session_id": current_session_id,
                 "llm_cost_usd": 0.0,
             }
-        
+
         tried = list(getattr(self, "_openai_models_tried_this_query", []) or [])
         if current_model and current_model not in tried:
             tried.append(current_model)
@@ -12214,27 +12339,25 @@ class SurvyAIAgent:
         self._openai_models_tried_this_query = tried
 
         logger.info(
-            f"🔄 Switching from {current_model} to {escalated_model} "
+            f"🔄 Switching {prov} from {current_model} to {escalated_model} "
             f"(reason: {switch_reason}; tried={tried})"
         )
-        
-        # Mark that we've switched to prevent infinite switching loops of escalate-only path
+
         self._model_switched_this_query = True
-        
-        # Initialize new model
+
         try:
-            new_llm = self._initialize_llm("openai", model_name=escalated_model)
-            self._current_openai_model = escalated_model
-            
-            # Rebind tools with new LLM
+            new_llm = self._initialize_llm(prov, model_name=escalated_model)
+            if prov == "openai":
+                self._current_openai_model = escalated_model
+            elif prov == "gemini":
+                self._current_gemini_model = escalated_model
+
             self.llm_with_tools = new_llm.bind_tools(tools_to_bind)
             self.graph = self._build_graph()
             self.app = self.graph.compile(checkpointer=self.memory)
-            
-            logger.info(f"✓ Switched to {escalated_model} - retrying query")
-            
-            # Retry with new model; use a fresh per-invocation thread_id so the
-            # new graph starts from a clean checkpoint (no accumulated tool history).
+
+            logger.info(f"✓ Switched to {escalated_model} ({prov}) - retrying query")
+
             thread_id = f"{current_session_id}:retry:{uuid.uuid4().hex}"
             max_iterations = getattr(self.settings, 'agent_max_iterations', 20)
             recursion_limit = getattr(self.settings, "agent_recursion_limit", max(50, (max_iterations * 3)))
@@ -12242,14 +12365,10 @@ class SurvyAIAgent:
                 "configurable": {"thread_id": thread_id},
                 "recursion_limit": recursion_limit,
             }
-            
-            # Use the same initial messages (state is preserved via session_id)
+
             initial_state = {"messages": initial_messages}
-            
-            # Invoke with new model
             result = self.app.invoke(initial_state, config=config)
-            
-            # Extract response
+
             response_text = self._extract_response(result)
             input_hint, _ = estimate_message_tokens(initial_messages, escalated_model)
             llm_cost_usd = self._estimate_llm_cost_usd_from_graph_result(
@@ -12258,8 +12377,7 @@ class SurvyAIAgent:
                 response_text,
                 initial_messages_token_hint=input_hint,
             )
-            
-            # Store conversation
+
             llm_used = "fallback" if use_fallback else "primary"
             self._store_conversation(
                 query=query,
@@ -12267,9 +12385,9 @@ class SurvyAIAgent:
                 session_id=current_session_id,
                 llm_used=llm_used
             )
-            
+
             logger.info(f"✓ Model switch successful - query completed with {escalated_model}")
-            
+
             return {
                 "query": query,
                 "response": response_text,
@@ -12284,10 +12402,9 @@ class SurvyAIAgent:
                 "switch_reason": switch_reason,
                 "llm_cost_usd": llm_cost_usd,
             }
-            
+
         except Exception as e:
             logger.error(f"❌ Model switch failed: {e}")
-            # Return error
             return {
                 "query": original_query,
                 "response": f"Query failed and model switch also failed: {e}",
@@ -12298,51 +12415,65 @@ class SurvyAIAgent:
                 "session_id": current_session_id,
                 "llm_cost_usd": 0.0,
             }
-    
-    def _get_openai_model_for_complexity(self, complexity: Literal["simple", "average", "complex"]) -> str:
-        """
-        Select appropriate OpenAI model based on task complexity.
-        
-        Args:
-            complexity: Task complexity level ("simple", "average", or "complex")
-            
-        Returns:
-            Model name string (e.g., "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol")
-        """
-        from survyai.openai_models import resolve_model_for_complexity
 
-        if not getattr(self.settings, "enable_tiered_models", True):
-            # Fallback to legacy single model configuration
-            return getattr(self.settings, "openai_model", "gpt-5.6-terra")
+    def _get_model_for_complexity(
+        self,
+        provider: str,
+        complexity: Literal["simple", "average", "complex"],
+        *,
+        elevated_average: bool = False,
+    ) -> str:
+        """Select the exact model id for any paid provider + complexity bucket."""
+        from survyai.provider_models import resolve_provider_model_for_complexity
 
-        selected_model = resolve_model_for_complexity(
+        selected = resolve_provider_model_for_complexity(
+            provider,
             complexity,
-            nano=getattr(self.settings, "openai_model_nano", None),
-            mini=getattr(self.settings, "openai_model_mini", None),
-            complex_model=getattr(self.settings, "openai_model_complex", None),
-            legacy=getattr(self.settings, "openai_model", None),
+            settings=self.settings,
+            enable_tiered=bool(getattr(self.settings, "enable_tiered_models", True)),
+            elevated_average=elevated_average,
         )
-        logger.info(f"Selected OpenAI model '{selected_model}' for complexity level '{complexity}'")
-        return selected_model
+        logger.info(
+            "Selected %s model '%s' for complexity '%s'%s",
+            provider,
+            selected,
+            complexity,
+            " (elevated average)" if elevated_average and complexity == "average" else "",
+        )
+        return selected
+
+    def _get_openai_model_for_complexity(
+        self,
+        complexity: Literal["simple", "average", "complex"],
+        *,
+        elevated_average: bool = False,
+    ) -> str:
+        """Back-compat: OpenAI complexity → model id."""
+        return self._get_model_for_complexity(
+            "openai", complexity, elevated_average=elevated_average
+        )
 
     def _try_openai_tier_llm(
         self,
         complexity: Literal["simple", "average", "complex"],
     ) -> Tuple[Optional[BaseChatModel], Optional[str]]:
-        """Initialize a tiered OpenAI model when enabled; otherwise return primary LLM."""
+        """Initialize a tiered model for the primary paid provider when enabled."""
         model_name: Optional[str] = None
+        prov = str(getattr(self.settings, "primary_llm", "") or "").strip().lower()
         try:
-            if self.settings.primary_llm == "openai" and getattr(
-                self.settings, "enable_tiered_models", True
-            ):
-                model_name = self._get_openai_model_for_complexity(complexity)
-                return self._initialize_llm("openai", model_name=model_name), model_name
+            from survyai.provider_models import PAID_PROVIDERS
+
+            if prov in PAID_PROVIDERS and getattr(self.settings, "enable_tiered_models", True):
+                model_name = self._get_model_for_complexity(prov, complexity)
+                return self._initialize_llm(prov, model_name=model_name), model_name
         except Exception:
             pass
         primary = getattr(self, "llm_primary", None)
         if primary is not None:
-            model_name = getattr(self, "_current_openai_model", None) or getattr(
-                self.settings, "openai_model", "gpt-5.4-mini"
+            model_name = (
+                getattr(self, "_current_openai_model", None)
+                or getattr(self, "_current_gemini_model", None)
+                or self._resolve_provider_model_name(prov or "openai")
             )
             return primary, model_name
         return None, None
@@ -12403,31 +12534,166 @@ class SurvyAIAgent:
         except Exception:
             pass
 
+    def apply_runtime_auth(self, settings: Any) -> None:
+        """
+        Hot-swap rotating cloud auth onto this agent without rebuilding tools/graph.
+
+        Updates ``settings``, proxy enablement, and in-place ``access_token`` on
+        cached SurvyAIProxyChatModel clients (re-keys the LLM cache).
+        """
+        if settings is None:
+            return
+        self.settings = settings
+        self._cloud_proxy_enabled = bool(
+            getattr(self.settings, "survyai_llm_proxy_enabled", False)
+            and str(getattr(self.settings, "survyai_api_base_url", "") or "").strip()
+            and str(getattr(self.settings, "survyai_access_token", "") or "").strip()
+        )
+        new_tok = str(getattr(self.settings, "survyai_access_token", "") or "").strip()
+        new_base = str(getattr(self.settings, "survyai_api_base_url", "") or "").strip()
+        new_dev = str(getattr(self.settings, "survyai_device_id", "") or "").strip()
+        new_path = (
+            str(getattr(self.settings, "survyai_llm_proxy_path", "/v1/llm/chat") or "/v1/llm/chat").strip()
+            or "/v1/llm/chat"
+        )
+        cache = getattr(self, "_llm_client_cache", None) or {}
+        rebuilt: Dict[tuple, Any] = {}
+        for key, llm in list(cache.items()):
+            transport = ""
+            provider = ""
+            if isinstance(key, tuple) and len(key) >= 2:
+                provider = str(key[0] or "")
+                transport = str(key[1] or "")
+            if transport == "proxy" and llm is not None:
+                try:
+                    if hasattr(llm, "access_token"):
+                        llm.access_token = new_tok
+                    if hasattr(llm, "base_url"):
+                        llm.base_url = new_base
+                    if hasattr(llm, "device_id"):
+                        llm.device_id = new_dev
+                    if hasattr(llm, "proxy_path"):
+                        llm.proxy_path = new_path
+                except Exception:
+                    # Drop broken proxy client; next call will recreate.
+                    continue
+                try:
+                    new_key = (
+                        key[0],
+                        key[1],
+                        key[2],
+                        key[3],
+                        key[4],
+                        self._llm_auth_fingerprint(provider, proxy=True),
+                    )
+                    rebuilt[new_key] = llm
+                except Exception:
+                    rebuilt[key] = llm
+            else:
+                rebuilt[key] = llm
+        self._llm_client_cache = rebuilt
+        self._openai_llm_cache = rebuilt
+        logger.debug("Hot-swapped runtime cloud auth onto warm agent (proxy cache re-keyed)")
+
+    def _llm_auth_fingerprint(self, llm_type: str, *, proxy: bool) -> str:
+        """Short stable fingerprint so token/key rotation invalidates client cache."""
+        if proxy:
+            tok = str(getattr(self.settings, "survyai_access_token", "") or "").strip()
+            return f"tok:{tok[-12:]}" if tok else "tok:"
+        if llm_type == "openai":
+            key = str(getattr(self.settings, "openai_api_key", "") or "").strip()
+        elif llm_type == "claude":
+            key = str(getattr(self.settings, "anthropic_api_key", "") or "").strip()
+        elif llm_type == "gemini":
+            key = str(getattr(self.settings, "google_api_key", "") or "").strip()
+        elif llm_type == "deepseek":
+            key = str(getattr(self.settings, "deepseek_api_key", "") or "").strip()
+        else:
+            key = str(getattr(self.settings, "ollama_base_url", "") or "").strip()
+        return f"key:{key[-12:]}" if key else "key:"
+
+    def _llm_client_cache_key(
+        self,
+        llm_type: str,
+        *,
+        transport: str,
+        model_name: str,
+        max_tokens: int,
+    ) -> tuple:
+        return (
+            str(llm_type or "").strip().lower(),
+            str(transport or "direct").strip().lower(),
+            str(model_name or "").strip(),
+            float(getattr(self.settings, "agent_temperature", 0.3) or 0.0),
+            int(max_tokens or 0),
+            self._llm_auth_fingerprint(
+                llm_type, proxy=(str(transport).lower() == "proxy")
+            ),
+        )
+
+    def _get_cached_llm(self, cache_key: tuple) -> Optional[BaseChatModel]:
+        cache = getattr(self, "_llm_client_cache", None)
+        if cache is None:
+            cache = getattr(self, "_openai_llm_cache", None) or {}
+            self._llm_client_cache = cache
+        return cache.get(cache_key)
+
+    def _store_cached_llm(self, cache_key: tuple, llm: BaseChatModel) -> BaseChatModel:
+        try:
+            cache = getattr(self, "_llm_client_cache", None)
+            if cache is None:
+                cache = {}
+                self._llm_client_cache = cache
+                self._openai_llm_cache = cache
+            cache[cache_key] = llm
+        except Exception:
+            pass
+        return llm
+
+    def _resolve_proxy_model_name(
+        self, llm_type: str, model_name: Optional[str] = None
+    ) -> str:
+        requested = str(model_name or "").strip()
+        if requested:
+            return requested
+        if llm_type == "openai":
+            return str(getattr(self.settings, "openai_model", "gpt-5.6-terra") or "gpt-5.6-terra")
+        if llm_type == "claude":
+            return str(
+                getattr(self.settings, "claude_model", "claude-3-5-sonnet-20241022")
+                or "claude-3-5-sonnet-20241022"
+            )
+        if llm_type == "gemini":
+            return str(getattr(self.settings, "gemini_model", "gemini-2.0-flash") or "gemini-2.0-flash")
+        return str(getattr(self.settings, "deepseek_model", None) or "deepseek-chat")
+
     def _make_cloud_proxy_llm(
         self, llm_type: str, model_name: Optional[str] = None
     ) -> BaseChatModel:
-        if llm_type == "openai":
-            resolved_model = model_name or getattr(self.settings, "openai_model", "gpt-4o-mini")
-        elif llm_type == "claude":
-            resolved_model = model_name or getattr(
-                self.settings, "claude_model", "claude-3-5-sonnet-20241022"
-            )
-        elif llm_type == "gemini":
-            resolved_model = model_name or getattr(
-                self.settings, "gemini_model", "gemini-2.0-flash"
-            )
-        else:
-            resolved_model = model_name or "deepseek-chat"
-        return SurvyAIProxyChatModel(
+        resolved_model = self._resolve_proxy_model_name(llm_type, model_name)
+        max_tokens = int(getattr(self.settings, "agent_max_tokens", 0) or 0)
+        cache_key = self._llm_client_cache_key(
+            llm_type,
+            transport="proxy",
+            model_name=resolved_model,
+            max_tokens=max_tokens,
+        )
+        cached = self._get_cached_llm(cache_key)
+        if cached is not None:
+            logger.debug("Using cached proxy LLM (%s / %s)", llm_type, resolved_model)
+            return cached
+        logger.debug("Initializing %s via SurvyAI cloud LLM proxy (%s)", llm_type, resolved_model)
+        llm = SurvyAIProxyChatModel(
             base_url=str(getattr(self.settings, "survyai_api_base_url", "") or "").strip(),
             access_token=str(getattr(self.settings, "survyai_access_token", "") or "").strip(),
             device_id=str(getattr(self.settings, "survyai_device_id", "") or "").strip(),
             provider=llm_type,
             model_name=str(resolved_model).strip(),
             temperature=float(self.settings.agent_temperature),
-            max_tokens=int(self.settings.agent_max_tokens),
+            max_tokens=max_tokens,
             proxy_path=str(getattr(self.settings, "survyai_llm_proxy_path", "/v1/llm/chat") or "/v1/llm/chat").strip() or "/v1/llm/chat",
         )
+        return self._store_cached_llm(cache_key, llm)
     
     def _initialize_llm(self, llm_type: str, model_name: Optional[str] = None) -> BaseChatModel:
         """
@@ -12452,51 +12718,83 @@ class SurvyAIAgent:
         """
         try:
             if self._cloud_proxy_enabled and llm_type in {"openai", "claude", "gemini", "deepseek"}:
-                logger.info("Initializing %s via SurvyAI cloud LLM proxy", llm_type)
                 return self._make_cloud_proxy_llm(llm_type, model_name=model_name)
             if llm_type == "deepseek":
                 # DeepSeek uses an OpenAI-compatible API
                 # We use ChatOpenAI with a custom base_url
                 if not self.settings.deepseek_api_key:
                     raise ValueError("DEEPSEEK_API_KEY is required but not set")
-                
-                logger.info("Initializing DeepSeek LLM")
-                return ChatOpenAI(
-                    model="deepseek-chat",
+
+                resolved = (
+                    str(model_name or "").strip()
+                    or str(getattr(self.settings, "deepseek_model", None) or "").strip()
+                    or "deepseek-chat"
+                )
+                max_tokens = int(getattr(self.settings, "agent_max_tokens", 0) or 0)
+                cache_key = self._llm_client_cache_key(
+                    "deepseek",
+                    transport="direct",
+                    model_name=resolved,
+                    max_tokens=max_tokens,
+                )
+                cached = self._get_cached_llm(cache_key)
+                if cached is not None:
+                    logger.debug("Using cached DeepSeek LLM (%s)", resolved)
+                    return cached
+                logger.debug("Initializing DeepSeek LLM (%s)", resolved)
+                llm = ChatOpenAI(
+                    model=resolved,
                     api_key=self.settings.deepseek_api_key,
                     base_url=self.settings.deepseek_base_url,
                     temperature=self.settings.agent_temperature,
-                    max_tokens=self.settings.agent_max_tokens
+                    max_tokens=max_tokens,
                 )
+                return self._store_cached_llm(cache_key, llm)
                 
             elif llm_type == "gemini":
-                # Google Gemini - we check which models are available
+                # Google Gemini - honor caller model_name (tiered routing); fall back to settings.
                 if not self.settings.google_api_key:
                     raise ValueError("GOOGLE_API_KEY is required but not set")
-                
-                model_name = getattr(self.settings, "gemini_model", "gemini-2.0-flash")
-                
-                # Query available models from Google's API
+
+                resolved = (
+                    str(model_name or "").strip()
+                    or str(getattr(self.settings, "gemini_model", "gemini-2.0-flash") or "gemini-2.0-flash")
+                )
+
+                # Query available models from Google's API (cached for process lifetime)
                 available = self._list_gemini_models()
-                
+
                 # If configured model isn't available, pick a fallback
-                if available and model_name not in available:
+                if available and resolved not in available:
                     # Preference order for fallback models (flash models have better free tier limits)
                     preferred = ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-2.0-flash-exp", "gemini-pro-latest"]
                     selected = next((m for m in preferred if m in available), available[0])
-                    logger.warning(f"Model '{model_name}' not available; using '{selected}'")
-                    model_name = selected
-                
-                logger.info(f"Initializing Gemini LLM with model: {model_name}")
-                
+                    logger.warning(f"Model '{resolved}' not available; using '{selected}'")
+                    resolved = selected
+
+                max_tokens = int(getattr(self.settings, "agent_max_tokens", 0) or 0)
+                cache_key = self._llm_client_cache_key(
+                    "gemini",
+                    transport="direct",
+                    model_name=resolved,
+                    max_tokens=max_tokens,
+                )
+                cached = self._get_cached_llm(cache_key)
+                if cached is not None:
+                    logger.debug("Using cached Gemini LLM (%s)", resolved)
+                    self._current_gemini_model = resolved
+                    return cached
+
+                logger.debug("Initializing Gemini LLM with model: %s", resolved)
+
                 llm = ChatGoogleGenerativeAI(
-                    model=model_name,
+                    model=resolved,
                     google_api_key=self.settings.google_api_key,
                     temperature=self.settings.agent_temperature,
-                    max_output_tokens=self.settings.agent_max_tokens
+                    max_output_tokens=max_tokens,
                 )
-                self._current_gemini_model = model_name
-                return llm
+                self._current_gemini_model = resolved
+                return self._store_cached_llm(cache_key, llm)
                 
             elif llm_type == "claude":
                 # Anthropic Claude models (Opus, Sonnet, Haiku)
@@ -12505,8 +12803,14 @@ class SurvyAIAgent:
                         "ANTHROPIC_API_KEY is required but not set. "
                         "Please set ANTHROPIC_API_KEY in your .env file or environment variables."
                     )
-                
-                model_name = getattr(self.settings, "claude_model", "claude-3-5-sonnet-20241022")
+
+                resolved = (
+                    str(model_name or "").strip()
+                    or str(
+                        getattr(self.settings, "claude_model", "claude-3-5-sonnet-20241022")
+                        or "claude-3-5-sonnet-20241022"
+                    )
+                )
                 
                 # Model-specific max output-token limits for Claude
                 # https://docs.anthropic.com/en/docs/about-claude/models
@@ -12523,32 +12827,39 @@ class SurvyAIAgent:
                     "claude-3-7-sonnet-20250219": 16000,
                 }
                 
-                # Cap max_tokens to model's actual API limit — log at INFO, not WARNING,
+                # Cap max_tokens to model's actual API limit — log at DEBUG,
                 # because clamping is the expected behaviour when agent_max_tokens is a
                 # generous ceiling rather than an exact target.
-                model_max = claude_max_tokens_limits.get(model_name, 4096)
+                model_max = claude_max_tokens_limits.get(resolved, 4096)
                 requested_tokens = self.settings.agent_max_tokens
                 actual_max_tokens = min(requested_tokens, model_max)
+
+                cache_key = self._llm_client_cache_key(
+                    "claude",
+                    transport="direct",
+                    model_name=resolved,
+                    max_tokens=actual_max_tokens,
+                )
+                cached = self._get_cached_llm(cache_key)
+                if cached is not None:
+                    logger.debug("Using cached Claude LLM (%s)", resolved)
+                    return cached
                 
                 if requested_tokens > model_max:
-                    logger.info(
+                    logger.debug(
                         f"Clamping max_tokens from {requested_tokens} → {actual_max_tokens} "
-                        f"(model '{model_name}' limit)."
+                        f"(model '{resolved}' limit)."
                     )
                 
-                logger.info(f"Initializing Claude LLM with model: {model_name}")
-                logger.info(f"Max tokens: {actual_max_tokens} (model limit: {model_max})")
-                logger.info(f"Using Anthropic API key: {'*' * 10}{self.settings.anthropic_api_key[-4:] if len(self.settings.anthropic_api_key) > 4 else '****'}")
+                logger.debug("Initializing Claude LLM with model: %s", resolved)
                 
                 llm = ChatAnthropic(
-                    model=model_name,
+                    model=resolved,
                     anthropic_api_key=self.settings.anthropic_api_key,
                     temperature=self.settings.agent_temperature,
                     max_tokens=actual_max_tokens
                 )
-                
-                logger.info(f"✓ Claude LLM ({model_name}) initialized successfully")
-                return llm
+                return self._store_cached_llm(cache_key, llm)
                 
             elif llm_type == "openai":
                 # OpenAI models (GPT-4, GPT-4o, GPT-4o-mini, GPT-5, GPT-5-mini, GPT-5-nano, GPT-5.1)
@@ -12559,8 +12870,9 @@ class SurvyAIAgent:
                     )
                 
                 # Use provided model_name or fallback to settings
-                if model_name is None:
-                    model_name = getattr(self.settings, "openai_model", "gpt-4o-mini")
+                if not str(model_name or "").strip():
+                    model_name = getattr(self.settings, "openai_model", "gpt-5.6-terra")
+                model_name = str(model_name).strip()
                 
                 # Model-specific max output-token limits for OpenAI.
                 # Conservative values aligned with known API limits.
@@ -12599,28 +12911,30 @@ class SurvyAIAgent:
                     "gpt-5.6-luna": 32768,
                 }
 
-                # Cap max_tokens to model's actual API limit — INFO, not WARNING,
+                # Cap max_tokens to model's actual API limit — DEBUG, not WARNING,
                 # because clamping is the expected, harmless behaviour.
                 model_max = openai_max_tokens_limits.get(model_name, 16384)
                 requested_tokens = self.settings.agent_max_tokens
                 actual_max_tokens = min(requested_tokens, model_max)
 
-                # Cache key: model + token cap + temperature
-                cache_key = (model_name, actual_max_tokens, float(self.settings.agent_temperature))
-                cached = getattr(self, "_openai_llm_cache", {}).get(cache_key)
+                cache_key = self._llm_client_cache_key(
+                    "openai",
+                    transport="direct",
+                    model_name=model_name,
+                    max_tokens=actual_max_tokens,
+                )
+                cached = self._get_cached_llm(cache_key)
                 if cached is not None:
-                    logger.info(f"✓ Using cached OpenAI LLM ({model_name})")
+                    logger.debug("Using cached OpenAI LLM (%s)", model_name)
                     return cached
                 
                 if requested_tokens > model_max:
-                    logger.info(
+                    logger.debug(
                         f"Clamping max_tokens from {requested_tokens} → {actual_max_tokens} "
                         f"(model '{model_name}' limit)."
                     )
                 
-                logger.info(f"Initializing OpenAI LLM with model: {model_name}")
-                logger.info(f"Max tokens: {actual_max_tokens} (model limit: {model_max})")
-                logger.info(f"Using OpenAI API key: {'*' * 10}{self.settings.openai_api_key[-4:] if len(self.settings.openai_api_key) > 4 else '****'}")
+                logger.debug("Initializing OpenAI LLM with model: %s", model_name)
                 
                 llm = ChatOpenAI(
                     model=model_name,
@@ -12628,22 +12942,14 @@ class SurvyAIAgent:
                     temperature=self.settings.agent_temperature,
                     max_tokens=actual_max_tokens
                 )
-
-                # Save to cache
-                try:
-                    self._openai_llm_cache[cache_key] = llm
-                except Exception:
-                    pass
-                
-                logger.info(f"✓ OpenAI LLM ({model_name}) initialized successfully")
-                return llm
+                return self._store_cached_llm(cache_key, llm)
 
             elif llm_type == "ollama":
                 base = (
                     getattr(self.settings, "ollama_base_url", None) or "http://localhost:11434"
                 ).strip().rstrip("/")
                 model_name = (
-                    model_name
+                    str(model_name or "").strip()
                     or getattr(self.settings, "ollama_model", None)
                     or "llama3.2:1b"
                 )
@@ -12662,9 +12968,25 @@ class SurvyAIAgent:
                 # leaves Ollama generating forever in a daemon thread (RAM/CPU thrash).
                 invoke_budget = int(getattr(self.settings, "llm_invoke_timeout_seconds", 180) or 180)
                 http_timeout = max(30, min(invoke_budget, 90))
-                logger.info(
-                    f"Initializing Ollama LLM with model: {model_name} at {base}/v1 "
-                    f"(max_tokens={actual_max_tokens}, num_ctx={num_ctx}, http_timeout={http_timeout}s)"
+                cache_key = self._llm_client_cache_key(
+                    "ollama",
+                    transport="direct",
+                    model_name=f"{model_name}@{base}:{num_ctx}",
+                    max_tokens=actual_max_tokens,
+                )
+                cached = self._get_cached_llm(cache_key)
+                if cached is not None:
+                    logger.debug("Using cached Ollama LLM (%s)", model_name)
+                    self._ollama_num_ctx = int(num_ctx)
+                    return cached
+                logger.debug(
+                    "Initializing Ollama LLM with model: %s at %s/v1 "
+                    "(max_tokens=%s, num_ctx=%s, http_timeout=%ss)",
+                    model_name,
+                    base,
+                    actual_max_tokens,
+                    num_ctx,
+                    http_timeout,
                 )
                 kwargs: Dict[str, Any] = {
                     "model": model_name,
@@ -12685,7 +13007,7 @@ class SurvyAIAgent:
                     },
                 }
                 self._ollama_num_ctx = int(num_ctx)
-                return ChatOpenAI(**kwargs)
+                return self._store_cached_llm(cache_key, ChatOpenAI(**kwargs))
                 
             else:
                 raise ValueError(
@@ -12711,12 +13033,17 @@ class SurvyAIAgent:
             
         Note:
             Returns empty list if the API call fails (network error, etc.)
+            Successful results are cached for the agent process lifetime.
         """
+        cached = getattr(self, "_gemini_models_cache", None)
+        if cached is not None:
+            return list(cached)
         try:
             import requests
             
             api_key = getattr(self.settings, "google_api_key", None)
             if not api_key:
+                self._gemini_models_cache = []
                 return []
             
             # Google's model listing endpoint
@@ -12737,11 +13064,13 @@ class SurvyAIAgent:
                     methods = model.get("supportedGenerationMethods", [])
                     if not methods or "generateContent" in methods:
                         models.append(name)
-                        
-            return models
+
+            self._gemini_models_cache = models
+            return list(models)
             
         except Exception as e:
             logger.debug(f"Could not list Gemini models: {e}")
+            # Do not cache hard failures forever — allow a later retry.
             return []
     
     # ==========================================================================
@@ -16903,46 +17232,86 @@ class SurvyAIAgent:
                 logger.info("Model tier raised by prompt assessment: %s", complexity)
 
             logger.info(f"Final task complexity for model selection: {complexity}")
-            
-            # Determine which LLM and model to use
+
+            from survyai.provider_models import PAID_PROVIDERS, is_elevated_average_task
+
+            elevated_average = bool(
+                complexity == "average"
+                and is_elevated_average_task(prompt_action.effective_query or routing_query)
+            )
+            if elevated_average:
+                logger.info(
+                    "Elevated-average reasoning detected → prefer stronger mid-tier "
+                    "(e.g. gpt-5.5 on OpenAI) for accuracy"
+                )
+
+            # Determine which LLM and model to use (tiered for all paid providers)
             llm_to_use = None
             model_name_used = None
-            
+            active_provider = self._active_llm_provider(use_fallback)
+
             if use_fallback:
-                logger.warning(f"⚠ Using fallback LLM ({self.settings.fallback_llm}) instead of primary ({self.settings.primary_llm})")
+                logger.warning(
+                    f"⚠ Using fallback LLM ({self.settings.fallback_llm}) instead of "
+                    f"primary ({self.settings.primary_llm})"
+                )
                 llm_to_use = self.llm_fallback
-                if self.settings.fallback_llm == "openai":
-                    # For OpenAI fallback, still use complexity-based selection if enabled
-                    if getattr(self.settings, "enable_tiered_models", True):
-                        model_name = self._get_openai_model_for_complexity(complexity)
-                        llm_to_use = self._initialize_llm("openai", model_name=model_name)
-                        model_name_used = model_name
-                        logger.info(f"Using OpenAI fallback model: {model_name} (complexity: {complexity})")
-                    else:
-                        model_name_used = getattr(self.settings, "openai_model", "gpt-4o-mini")
-                elif self.settings.fallback_llm == "gemini":
-                    model_name_used = self._current_gemini_model or getattr(self.settings, "gemini_model", "gemini-2.0-flash")
-                else:
-                    model_name_used = self._resolve_provider_model_name(self.settings.fallback_llm)
-            else:
-                # Using primary LLM with complexity-based selection for OpenAI
-                if self.settings.primary_llm == "openai" and getattr(self.settings, "enable_tiered_models", True):
-                    model_name = self._get_openai_model_for_complexity(complexity)
-                    llm_to_use = self._initialize_llm("openai", model_name=model_name)
-                    self._current_openai_model = model_name
+                if active_provider in PAID_PROVIDERS and getattr(
+                    self.settings, "enable_tiered_models", True
+                ):
+                    model_name = self._get_model_for_complexity(
+                        active_provider,
+                        complexity,
+                        elevated_average=elevated_average,
+                    )
+                    llm_to_use = self._initialize_llm(active_provider, model_name=model_name)
                     model_name_used = model_name
-                    logger.info(f"✓ Using OpenAI model: {model_name} (complexity: {complexity})")
+                    if active_provider == "openai":
+                        self._current_openai_model = model_name
+                    elif active_provider == "gemini":
+                        self._current_gemini_model = model_name
+                    logger.info(
+                        "Using %s fallback model: %s (complexity: %s)",
+                        active_provider,
+                        model_name,
+                        complexity,
+                    )
                 else:
-                    # Use standard primary LLM (either non-OpenAI or tiered models disabled)
+                    model_name_used = self._resolve_provider_model_name(active_provider)
+            else:
+                if active_provider in PAID_PROVIDERS and getattr(
+                    self.settings, "enable_tiered_models", True
+                ):
+                    model_name = self._get_model_for_complexity(
+                        active_provider,
+                        complexity,
+                        elevated_average=elevated_average,
+                    )
+                    llm_to_use = self._initialize_llm(active_provider, model_name=model_name)
+                    model_name_used = model_name
+                    if active_provider == "openai":
+                        self._current_openai_model = model_name
+                    elif active_provider == "gemini":
+                        self._current_gemini_model = model_name
+                    logger.info(
+                        "✓ Using %s model: %s (complexity: %s)",
+                        active_provider,
+                        model_name,
+                        complexity,
+                    )
+                else:
+                    # Untiered paid provider, or local Ollama
                     llm_to_use = self.llm_primary
-                    if self.settings.primary_llm == "openai":
-                        model_name_used = getattr(self.settings, "openai_model", "gpt-4o-mini")
+                    model_name_used = self._resolve_provider_model_name(active_provider)
+                    if active_provider == "openai":
                         self._current_openai_model = model_name_used
-                    elif self.settings.primary_llm == "gemini":
-                        model_name_used = self._current_gemini_model or getattr(self.settings, "gemini_model", "gemini-2.0-flash")
-                    else:
-                        model_name_used = self._resolve_provider_model_name(self.settings.primary_llm)
-                    logger.info(f"✓ Using primary LLM: {self.settings.primary_llm} (model: {model_name_used})")
+                    elif active_provider == "gemini":
+                        self._current_gemini_model = model_name_used
+                    logger.info(
+                        "✓ Using primary LLM: %s (model: %s)",
+                        active_provider,
+                        model_name_used,
+                    )
 
             # Host RAM hard-cap for local Ollama before any heavy prompt/tool work.
             if self._llm_is_ollama(llm_to_use) or str(
@@ -17801,6 +18170,29 @@ class SurvyAIAgent:
                 tools_to_bind = [t for t in self.tools if t.name != "internet_search"]
                 logger.info("✓ Removed internet_search tool (already searched) to prevent loops")
 
+            # Task-scoped packs: simple knowledge/historic Q&A → no tool schemas + short prompt.
+            # GIS/CAD/file/complex stays on the full pack (accuracy first).
+            try:
+                from survyai.tool_scoping import lite_system_prompt, select_tool_scope
+
+                _scope_q = actual_query_for_routing or routing_query or query or ""
+                _tool_scope = select_tool_scope(
+                    _scope_q,
+                    complexity=complexity if "complexity" in locals() else "average",
+                    intent=intent if "intent" in locals() else "other",
+                    prompt_action=prompt_action if "prompt_action" in locals() else None,
+                    file_driven=bool(
+                        looks_like_file_driven_task(_scope_q)
+                        or self._extract_document_paths(_scope_q)
+                    ),
+                )
+            except Exception:
+                _tool_scope = "full"
+            if _tool_scope == "lite":
+                tools_to_bind = []
+                enhanced_system_prompt = lite_system_prompt(base_full_prompt=self._system_prompt)
+                logger.info("✓ Tool/prompt scope: lite (simple knowledge — no tool schemas)")
+
             # Ollama + full tool schemas massively inflate prompt/KV-cache RAM.
             # For non-file prompts, run tool-free to protect the host.
             if self._llm_is_ollama(llm_to_use) and not looks_like_file_driven_task(
@@ -17963,6 +18355,7 @@ class SurvyAIAgent:
                             context_retrieved=context_retrieved,
                             switch_reason=switch_reason,
                             tools_to_bind=tools_to_bind if 'tools_to_bind' in locals() else self.tools,
+                            provider=active_provider if "active_provider" in locals() else self._active_llm_provider(use_fallback),
                         )
                     
                     # If we can't switch or already switched, raise the error
@@ -18134,26 +18527,30 @@ class SurvyAIAgent:
                         is_proxy_or_model_dead,
                     )
 
-                    # Intelligent OpenAI failover: try next catalog model before giving up.
-                    using_openai = (
-                        (not use_fallback and self.settings.primary_llm == "openai")
-                        or (use_fallback and self.settings.fallback_llm == "openai")
-                        or bool(getattr(self, "_cloud_proxy_enabled", False))
-                    )
+                    # Intelligent same-provider failover before giving up.
+                    from survyai.provider_models import PAID_PROVIDERS as _PAID
+
+                    _failover_provider = self._active_llm_provider(use_fallback)
+                    using_paid_tier = _failover_provider in _PAID
                     if (
-                        using_openai
+                        using_paid_tier
                         and current_model
                         and current_model != "unknown"
                         and "initial_messages" in locals()
                     ):
-                        nxt = self._next_openai_failover_model(
+                        nxt = self._next_provider_failover_model(
+                            _failover_provider,
                             current_model,
                             complexity if "complexity" in locals() else "average",
+                            elevated_average=bool(
+                                locals().get("elevated_average", False)
+                            ),
                         )
                         tried_n = len(getattr(self, "_openai_models_tried_this_query", []) or [])
                         if nxt and tried_n < 6:
                             logger.info(
-                                "🔄 OpenAI failover %s → %s after %s",
+                                "🔄 %s failover %s → %s after %s",
+                                _failover_provider,
                                 current_model,
                                 nxt,
                                 "quota" if is_quota_error else "proxy/model error",
@@ -18173,6 +18570,7 @@ class SurvyAIAgent:
                                 switch_reason="quota_or_proxy_failover",
                                 tools_to_bind=tools_to_bind if "tools_to_bind" in locals() else self.tools,
                                 target_model=nxt,
+                                provider=_failover_provider,
                             )
 
                     # No alternate model left — surface a clear message.
@@ -18182,8 +18580,8 @@ class SurvyAIAgent:
                             f"⚠️ **API Quota / Model Unavailable**\n\n"
                             f"The hosted model `{current_model}` could not complete this request "
                             f"(quota exhausted or upstream proxy error).\n\n"
-                            f"SurvyAI already tried alternate OpenAI models in the failover chain "
-                            f"when available.\n\n"
+                            f"SurvyAI already tried alternate {_failover_provider} models in the "
+                            f"failover chain when available.\n\n"
                             f"**Options:**\n"
                             f"1. **Wait for quota reset** — provider quotas often reset daily\n"
                             f"2. **Retry later** — or Sign in again if the cloud session expired\n"

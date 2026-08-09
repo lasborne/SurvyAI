@@ -224,8 +224,9 @@ class Settings(BaseSettings):
         default=True,
         env="ENABLE_TIERED_MODELS",
         description=(
-            "Enable intelligent model selection based on task complexity.\n"
-            "If False, uses OPENAI_MODEL for all tasks (legacy behavior)."
+            "Enable intelligent model selection based on task complexity for paid "
+            "providers (OpenAI, Claude, Gemini, DeepSeek).\n"
+            "If False, each provider uses its single legacy model setting for all tasks."
         )
     )
     

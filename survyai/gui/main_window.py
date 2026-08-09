@@ -2362,10 +2362,31 @@ class MainWindow(QMainWindow):
         llm_form.setVerticalSpacing(10)
         self._active_primary_llm_label = QLabel("—")
         self._active_fallback_llm_label = QLabel("—")
-        self._active_primary_llm_label.setWordWrap(True)
-        self._active_fallback_llm_label.setWordWrap(True)
+        self._active_openai_low_label = QLabel("—")
+        self._active_openai_medium_label = QLabel("—")
+        self._active_openai_advanced_label = QLabel("—")
+        for _lbl in (
+            self._active_primary_llm_label,
+            self._active_fallback_llm_label,
+            self._active_openai_low_label,
+            self._active_openai_medium_label,
+            self._active_openai_advanced_label,
+        ):
+            _lbl.setWordWrap(True)
+            _lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         llm_form.addRow("Primary", self._active_primary_llm_label)
+        llm_form.addRow("Low (simple tasks)", self._active_openai_low_label)
+        llm_form.addRow("Medium (typical GIS/CAD)", self._active_openai_medium_label)
+        llm_form.addRow("Advanced (hard reasoning)", self._active_openai_advanced_label)
         llm_form.addRow("Fallback", self._active_fallback_llm_label)
+        openai_tier_hint = QLabel(
+            "SurvyAI routes by task complexity across paid providers (OpenAI, Claude, Gemini, "
+            "DeepSeek): Low / Medium / Advanced. Rows above show the OpenAI tier examples when "
+            "Primary is OpenAI or Auto. Exact API model IDs are shown — not marketing nicknames."
+        )
+        openai_tier_hint.setWordWrap(True)
+        openai_tier_hint.setObjectName("hintLabel")
+        llm_form.addRow("", openai_tier_hint)
         page_layout.addWidget(llm_status)
 
         desktop_status = QGroupBox("Desktop status")
@@ -2514,6 +2535,34 @@ class MainWindow(QMainWindow):
         cad_layout.addWidget(self._credits_cad_label)
         cad_layout.addWidget(cad_hint)
         page_layout.addWidget(cad_group)
+
+        # --- Active hosted OpenAI tiers (current config, not history) ---
+        models_group = QGroupBox("Models in use (hosted OpenAI tiers)")
+        models_form = QFormLayout(models_group)
+        models_form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        models_form.setHorizontalSpacing(14)
+        models_form.setVerticalSpacing(8)
+        self._credits_model_low_label = QLabel("—")
+        self._credits_model_medium_label = QLabel("—")
+        self._credits_model_advanced_label = QLabel("—")
+        for _lbl in (
+            self._credits_model_low_label,
+            self._credits_model_medium_label,
+            self._credits_model_advanced_label,
+        ):
+            _lbl.setWordWrap(True)
+            _lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        models_form.addRow("Low (simple)", self._credits_model_low_label)
+        models_form.addRow("Medium (typical)", self._credits_model_medium_label)
+        models_form.addRow("Advanced (complex)", self._credits_model_advanced_label)
+        models_hint = QLabel(
+            "These are the models SurvyAI will use for new runs. Recent usage below lists the "
+            "exact model ID that billed each past run (older lines may still show gpt-5.4*)."
+        )
+        models_hint.setWordWrap(True)
+        models_hint.setObjectName("hintLabel")
+        models_form.addRow("", models_hint)
+        page_layout.addWidget(models_group)
 
         # --- Usage history (last N runs from output history) ---
         usage_group = QGroupBox("Recent usage (USD)")
@@ -3313,7 +3362,10 @@ class MainWindow(QMainWindow):
                         overrides["anthropic_api_key"] = str(bs.get("anthropic_api_key")).strip()
                     if str(bs.get("deepseek_api_key") or "").strip():
                         overrides["deepseek_api_key"] = str(bs.get("deepseek_api_key")).strip()
-                # Models (single + tiered)
+                # Models (single + tiered). Stale cloud env often still ships the
+                # prior gpt-5.4* platform defaults — migrate those slots only.
+                from survyai.openai_models import migrate_legacy_platform_model
+
                 for k_src, k_dst in [
                     ("openai_model", "openai_model"),
                     ("openai_model_nano", "openai_model_nano"),
@@ -3326,7 +3378,10 @@ class MainWindow(QMainWindow):
                     ("primary_llm", "primary_llm"),
                 ]:
                     if k_src in bs and bs.get(k_src) is not None:
-                        overrides[k_dst] = bs.get(k_src)
+                        val = bs.get(k_src)
+                        if k_dst.startswith("openai_model"):
+                            val = migrate_legacy_platform_model(k_dst, str(val) if val is not None else "")
+                        overrides[k_dst] = val
                 agent_cfg = bs.get("agent_config")
                 if isinstance(agent_cfg, dict):
                     overrides["agent_cloud_config_json"] = json.dumps(agent_cfg)
@@ -3345,7 +3400,10 @@ class MainWindow(QMainWindow):
                         "agent_max_tokens",
                     ]:
                         if k in agent_cfg and agent_cfg.get(k) is not None:
-                            overrides[k] = agent_cfg.get(k)
+                            val = agent_cfg.get(k)
+                            if str(k).startswith("openai_model"):
+                                val = migrate_legacy_platform_model(str(k), str(val) if val is not None else "")
+                            overrides[k] = val
         # User-selected runtime providers win over cloud defaults. The cloud
         # bootstrap supplies hosted model credentials/config, but Apply Settings
         # must still honor the user's selected primary/fallback provider.
@@ -3367,6 +3425,24 @@ class MainWindow(QMainWindow):
             overrides["ollama_model"] = self._state.ollama_model.strip()
         overrides["fast_mode_non_file_prompts"] = bool(getattr(self._state, "fast_mode_non_file_prompts", False))
         settings = merge_settings(**overrides)
+
+        # Migrate retired SurvyAI platform defaults (cloud bootstrap or local .env).
+        from survyai.openai_models import migrate_legacy_platform_models
+
+        _model_slots = {
+            "openai_model": getattr(settings, "openai_model", None),
+            "openai_model_nano": getattr(settings, "openai_model_nano", None),
+            "openai_model_mini": getattr(settings, "openai_model_mini", None),
+            "openai_model_complex": getattr(settings, "openai_model_complex", None),
+        }
+        _migrated_models = migrate_legacy_platform_models(_model_slots)
+        _model_updates = {
+            k: v
+            for k, v in _migrated_models.items()
+            if v and v != str(getattr(settings, k, "") or "").strip()
+        }
+        if _model_updates:
+            settings = settings.model_copy(update=_model_updates)
 
         # Commercial scaffolding (dormant): Free plan forces Ollama-only and disallows live models.
         # This is OFF by default for development; enable via ENFORCE_PLAN_POLICIES=true.
@@ -4229,6 +4305,12 @@ class MainWindow(QMainWindow):
             self._credits_cad_label.setText(
                 "Not enough data yet. Run a few tasks to establish an average cost."
             )
+
+        if hasattr(self, "_credits_model_low_label"):
+            tiers = self._openai_tier_labels()
+            self._credits_model_low_label.setText(tiers.get("low") or "—")
+            self._credits_model_medium_label.setText(tiers.get("medium") or "—")
+            self._credits_model_advanced_label.setText(tiers.get("advanced") or "—")
 
         lines: list[str] = []
         period_start, period_end, _ = self._credits_usage_period_bounds()
@@ -5546,6 +5628,18 @@ class MainWindow(QMainWindow):
                 self._fallback_cb.blockSignals(False)
             self.statusBar().showMessage("Ollama selected — 'Use fallback LLM' turned off.", 4500)
 
+    def _openai_tier_labels(self) -> dict[str, str]:
+        """Exact Low/Medium/Advanced OpenAI model IDs from effective settings."""
+        from survyai.openai_models import openai_tier_models_for_display
+
+        return openai_tier_models_for_display(
+            nano=str(getattr(self._settings, "openai_model_nano", "") or "").strip(),
+            mini=str(getattr(self._settings, "openai_model_mini", "") or "").strip(),
+            complex_model=str(getattr(self._settings, "openai_model_complex", "") or "").strip(),
+            legacy=str(getattr(self._settings, "openai_model", "") or "").strip(),
+            enable_tiered=bool(getattr(self._settings, "enable_tiered_models", True)),
+        )
+
     def _refresh_active_llm_status(self) -> None:
         """
         Update the Settings page "Active LLMs" card from the current effective settings.
@@ -5564,23 +5658,15 @@ class MainWindow(QMainWindow):
                 extra = " / ".join([x for x in [model, base] if x])
                 return f"ollama ({extra})" if extra else "ollama"
             if prov == "openai":
-                tiered = bool(getattr(self._settings, "enable_tiered_models", True))
-                if tiered:
-                    nano = str(getattr(self._settings, "openai_model_nano", "") or "").strip()
-                    mini = str(getattr(self._settings, "openai_model_mini", "") or "").strip()
-                    complex_m = str(getattr(self._settings, "openai_model_complex", "") or "").strip()
-                    models = [x for x in [nano, mini, complex_m] if x]
-                    # De-duplicate while preserving order (in case the user sets the same model for multiple tiers)
-                    seen: set[str] = set()
-                    uniq: list[str] = []
-                    for m in models:
-                        if m not in seen:
-                            uniq.append(m)
-                            seen.add(m)
-                    if uniq:
-                        return f"openai ({', '.join(uniq)})"
-                m = str(getattr(self._settings, "openai_model", "") or "").strip()
-                return f"openai ({m})" if m else "openai"
+                from survyai.openai_models import format_openai_tier_summary
+
+                return format_openai_tier_summary(
+                    nano=str(getattr(self._settings, "openai_model_nano", "") or "").strip(),
+                    mini=str(getattr(self._settings, "openai_model_mini", "") or "").strip(),
+                    complex_model=str(getattr(self._settings, "openai_model_complex", "") or "").strip(),
+                    legacy=str(getattr(self._settings, "openai_model", "") or "").strip(),
+                    enable_tiered=bool(getattr(self._settings, "enable_tiered_models", True)),
+                )
             if prov == "gemini":
                 m = str(getattr(self._settings, "gemini_model", "") or "").strip()
                 return f"gemini ({m})" if m else "gemini"
@@ -5595,6 +5681,21 @@ class MainWindow(QMainWindow):
             primary_txt = f"auto → {primary_txt}" if primary_txt != "—" else "auto"
         self._active_primary_llm_label.setText(primary_txt)
         self._active_fallback_llm_label.setText(_fmt("fallback_llm"))
+
+        tiers = self._openai_tier_labels()
+        primary_prov = str(getattr(self._settings, "primary_llm", "") or "").strip().lower()
+        show_openai_tiers = primary_prov == "openai" or normalize_primary_llm_selection(
+            self._state.preferred_primary_llm
+        ) == AUTO_PRIMARY_LLM
+        if hasattr(self, "_active_openai_low_label"):
+            if show_openai_tiers:
+                self._active_openai_low_label.setText(tiers.get("low") or "—")
+                self._active_openai_medium_label.setText(tiers.get("medium") or "—")
+                self._active_openai_advanced_label.setText(tiers.get("advanced") or "—")
+            else:
+                self._active_openai_low_label.setText("(not used — Primary is not OpenAI)")
+                self._active_openai_medium_label.setText("(not used — Primary is not OpenAI)")
+                self._active_openai_advanced_label.setText("(not used — Primary is not OpenAI)")
 
     def _cloud_base_and_token(self) -> tuple[str, str]:
         return self._state.cloud_api_base_url.strip(), self._state.cloud_access_token.strip()

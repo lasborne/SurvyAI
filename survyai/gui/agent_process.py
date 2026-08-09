@@ -66,19 +66,40 @@ def _windows_release_run_awake() -> None:
         pass
 
 
+# Auth/session fields that rotate often (token refresh / cloud poll) but must NOT
+# force a full SurvyAIAgent rebuild. Hot-swapped onto the live service instead.
+_EPHEMERAL_SETTINGS_KEYS = frozenset(
+    {
+        "survyai_access_token",
+        "survyai_refresh_token",  # if ever present in settings dumps
+    }
+)
+
+# Bump when agent routing/pipelines change so a running app picks up new logic.
+_WORKER_CODE_REV = "20260809-warm-auth-hotswap-v1"
+
+
+def _structural_settings_payload(settings_payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Settings used for rebuild fingerprint (excludes rotating auth tokens)."""
+    if not isinstance(settings_payload, dict):
+        return {}
+    return {k: v for k, v in settings_payload.items() if k not in _EPHEMERAL_SETTINGS_KEYS}
+
+
 def _payload_signature(settings_payload: Dict[str, Any], ff_payload: Dict[str, Any]) -> str:
     """Stable fingerprint of the inputs the agent is built from.
 
     When this changes (e.g. user switches primary LLM or toggles a feature flag
     in Settings) the warm worker rebuilds the agent; otherwise it reuses it.
+
+    Access tokens are excluded: they rotate on cloud refresh and are hot-swapped
+    onto the live agent so Pro sessions stay warm.
     """
-    # Bump _WORKER_CODE_REV when agent routing/pipelines change so a running app
-    # picks up new fast-path logic after restart (warm process rebuilds on mismatch).
-    _WORKER_CODE_REV = "20260722-ollama-cost-fix-v1"
+    structural = _structural_settings_payload(settings_payload)
     try:
-        return json.dumps([settings_payload, ff_payload, _WORKER_CODE_REV], sort_keys=True, default=str)
+        return json.dumps([structural, ff_payload, _WORKER_CODE_REV], sort_keys=True, default=str)
     except Exception:
-        return repr((settings_payload, ff_payload, _WORKER_CODE_REV))
+        return repr((structural, ff_payload, _WORKER_CODE_REV))
 
 
 def _agent_worker_loop(in_queue: "multiprocessing.Queue", out_queue: "multiprocessing.Queue") -> None:
@@ -106,15 +127,25 @@ def _agent_worker_loop(in_queue: "multiprocessing.Queue", out_queue: "multiproce
     def _ensure_service(settings_payload: Dict[str, Any], ff_payload: Dict[str, Any]):
         nonlocal service, current_sig
         sig = _payload_signature(settings_payload, ff_payload)
+        settings = Settings(**(settings_payload or {}))
+        feature_flags = FeatureFlags(**(ff_payload or {}))
         if service is None or sig != current_sig:
-            settings = Settings(**settings_payload)
-            feature_flags = FeatureFlags(**ff_payload)
             service = SurvyAIAgentService(
                 settings=settings,
                 feature_flags=feature_flags,
                 eager_init=True,  # build the heavy agent now, once
             )
             current_sig = sig
+        else:
+            # Same structural config: hot-swap rotating cloud auth onto the warm agent.
+            try:
+                service.apply_runtime_auth(settings)
+            except Exception:
+                pass
+            try:
+                service.feature_flags = feature_flags
+            except Exception:
+                pass
         return service
 
     while True:
@@ -411,4 +442,7 @@ __all__ = [
     "get_shared_agent_process",
     "prewarm_shared_agent_process",
     "shutdown_shared_agent_process",
+    "_payload_signature",
+    "_structural_settings_payload",
+    "_EPHEMERAL_SETTINGS_KEYS",
 ]

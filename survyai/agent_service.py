@@ -58,6 +58,25 @@ class SurvyAIAgentService:
         """Force agent initialization (loads LLMs, tools, graph)."""
         return self._get_agent()
 
+    def apply_runtime_auth(self, settings: Settings) -> None:
+        """
+        Hot-swap rotating cloud auth onto the live agent without rebuilding.
+
+        Used by the warm worker when only ``survyai_access_token`` (etc.) changed.
+        """
+        self._settings = settings
+        agent = self._agent
+        if agent is None:
+            return
+        apply = getattr(agent, "apply_runtime_auth", None)
+        if callable(apply):
+            apply(settings)
+        else:
+            try:
+                agent.settings = settings
+            except Exception:
+                pass
+
     def start_session(self, session_id: Optional[str] = None) -> str:
         """Set or create a conversation session id."""
         sid = session_id or str(uuid.uuid4())

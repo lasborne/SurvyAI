@@ -333,16 +333,37 @@ def build_bootstrap_payload(user: User, settings: CloudSettings | None = None) -
     if not can_use_platform_llm(user, settings):
         raise HTTPException(status_code=403, detail="Active Pro subscription required for platform keys")
 
+    # Stale production env may still list retired gpt-5.4* platform defaults.
+    # Migrate those slots only so desktop receives the current SurvyAI tiers.
+    try:
+        from survyai.openai_models import migrate_legacy_platform_model
+
+        openai_model = migrate_legacy_platform_model("openai_model", settings.platform_openai_model)
+        openai_model_nano = migrate_legacy_platform_model(
+            "openai_model_nano", settings.platform_openai_model_nano
+        )
+        openai_model_mini = migrate_legacy_platform_model(
+            "openai_model_mini", settings.platform_openai_model_mini
+        )
+        openai_model_complex = migrate_legacy_platform_model(
+            "openai_model_complex", settings.platform_openai_model_complex
+        )
+    except Exception:
+        openai_model = settings.platform_openai_model
+        openai_model_nano = settings.platform_openai_model_nano
+        openai_model_mini = settings.platform_openai_model_mini
+        openai_model_complex = settings.platform_openai_model_complex
+
     primary = resolve_platform_llm_provider(settings)
     agent_cfg = resolve_agent_runtime_config(
         local_config_path=str(settings.platform_agent_config_path or ""),
         cloud_config_json=json.dumps(
             {
                 "primary_llm": primary,
-                "openai_model": settings.platform_openai_model,
-                "openai_model_nano": settings.platform_openai_model_nano,
-                "openai_model_mini": settings.platform_openai_model_mini,
-                "openai_model_complex": settings.platform_openai_model_complex,
+                "openai_model": openai_model,
+                "openai_model_nano": openai_model_nano,
+                "openai_model_mini": openai_model_mini,
+                "openai_model_complex": openai_model_complex,
                 "enable_tiered_models": settings.platform_enable_tiered_models,
                 "gemini_model": settings.platform_gemini_model,
                 "claude_model": settings.platform_claude_model,
@@ -350,20 +371,37 @@ def build_bootstrap_payload(user: User, settings: CloudSettings | None = None) -
             }
         ),
     )
+    agent_payload = dict(agent_cfg.to_payload_dict() or {})
+    try:
+        from survyai.openai_models import migrate_legacy_platform_model
+
+        for _slot in (
+            "openai_model",
+            "openai_model_nano",
+            "openai_model_mini",
+            "openai_model_complex",
+        ):
+            if agent_payload.get(_slot) is not None:
+                agent_payload[_slot] = migrate_legacy_platform_model(
+                    _slot, str(agent_payload.get(_slot) or "")
+                )
+    except Exception:
+        pass
+
     out = BootstrapOut(
         llm_proxy_enabled=True,
         llm_proxy_path=str(settings.platform_llm_proxy_path or "/v1/llm/chat").strip()
         or "/v1/llm/chat",
         primary_llm=primary,
-        openai_model=settings.platform_openai_model,
-        openai_model_nano=settings.platform_openai_model_nano,
-        openai_model_mini=settings.platform_openai_model_mini,
-        openai_model_complex=settings.platform_openai_model_complex,
+        openai_model=openai_model,
+        openai_model_nano=openai_model_nano,
+        openai_model_mini=openai_model_mini,
+        openai_model_complex=openai_model_complex,
         enable_tiered_models=settings.platform_enable_tiered_models,
         gemini_model=settings.platform_gemini_model,
         claude_model=settings.platform_claude_model,
         deepseek_base_url=settings.platform_deepseek_base_url,
-        agent_config=AgentConfigOut(**agent_cfg.to_payload_dict()),
+        agent_config=AgentConfigOut(**agent_payload),
     )
     if primary == "openai" and not settings.platform_openai_api_key.strip():
         raise HTTPException(status_code=503, detail="Server missing platform OpenAI configuration")
