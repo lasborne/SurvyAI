@@ -50,7 +50,7 @@ class RAGRouteDecision(BaseModel):
 
 
 def looks_like_file_driven_task(query: str) -> bool:
-    """True if the query mentions file types or paths (documents, CAD, etc.)."""
+    """True if the query mentions file types or paths (documents, CAD, images, etc.)."""
     q = query or ""
     ql = q.lower()
     if any(
@@ -67,10 +67,20 @@ def looks_like_file_driven_task(query: str) -> bool:
             ".txt",
             ".shp",
             ".aprx",
+            ".png",
+            ".jpg",
+            ".jpeg",
+            ".webp",
+            ".tif",
+            ".tiff",
+            ".bmp",
+            ".gif",
         ]
     ):
         return True
     if "\\Users\\" in q or ":\\" in q:
+        return True
+    if "[survyai attachments]" in ql:
         return True
     return False
 

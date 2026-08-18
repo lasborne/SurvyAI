@@ -73,6 +73,10 @@ class ConversationMessage:
     content: str
     created_at: str
     error: bool = False
+    # Local file paths attached to this turn (filenames shown in UI; not uploaded).
+    attachments: List[str] = field(default_factory=list)
+    # Optional OCR review payload for click-to-verify (older states omit this).
+    ocr_review: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -230,6 +234,14 @@ class DesktopState:
                             content=str(msg.get("content", "")),
                             created_at=str(msg.get("created_at", "")),
                             error=bool(msg.get("error", False)),
+                            attachments=[
+                                str(p)
+                                for p in (msg.get("attachments") or [])
+                                if str(p or "").strip()
+                            ],
+                            ocr_review=msg.get("ocr_review")
+                            if isinstance(msg.get("ocr_review"), dict)
+                            else None,
                         )
                         for msg in (item.get("messages") or [])
                         if isinstance(msg, dict)
@@ -445,6 +457,8 @@ class AppStateStore:
         role: str,
         content: str,
         error: bool = False,
+        attachments: Optional[List[str]] = None,
+        ocr_review: Optional[Dict[str, Any]] = None,
     ) -> Optional[Conversation]:
         for idx, conv in enumerate(state.conversations):
             if conv.conversation_id != conversation_id:
@@ -455,6 +469,8 @@ class AppStateStore:
                     content=content,
                     created_at=_utc_now(),
                     error=error,
+                    attachments=[str(p) for p in (attachments or []) if str(p or "").strip()],
+                    ocr_review=ocr_review if isinstance(ocr_review, dict) else None,
                 )
             )
             conv.updated_at = _utc_now()

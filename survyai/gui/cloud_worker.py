@@ -10,9 +10,7 @@ from PySide6.QtCore import QThread, Signal
 from survyai.cloud_api import CloudApiError, get_update_manifest
 from survyai.gui.cloud_sync import (
     CloudAccountSyncPayload,
-    CloudAccountSyncResult,
     CloudCreditsSyncPayload,
-    CloudCreditsSyncResult,
     sync_cloud_account,
     sync_cloud_credits,
 )

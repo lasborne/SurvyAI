@@ -76,7 +76,7 @@ _EPHEMERAL_SETTINGS_KEYS = frozenset(
 )
 
 # Bump when agent routing/pipelines change so a running app picks up new logic.
-_WORKER_CODE_REV = "20260809-warm-auth-hotswap-v1"
+_WORKER_CODE_REV = "20260817-ocr-word-export-v8"
 
 
 def _structural_settings_payload(settings_payload: Dict[str, Any]) -> Dict[str, Any]:

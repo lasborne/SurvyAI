@@ -229,6 +229,17 @@ class Settings(BaseSettings):
             "If False, each provider uses its single legacy model setting for all tasks."
         )
     )
+
+    enable_llm_prompt_router: bool = Field(
+        default=True,
+        env="ENABLE_LLM_PROMPT_ROUTER",
+        description=(
+            "When True (and tiered models are enabled), the cheapest paid model for the "
+            "active provider (e.g. gpt-5.6-luna, Claude Haiku, Gemini Flash, DeepSeek Chat) "
+            "classifies the prompt and picks the execution model before the task runs.\n"
+            "If the classifier fails or times out, SurvyAI falls back to heuristic complexity routing."
+        ),
+    )
     
     # ==========================================================================
     # Agent Configuration
@@ -710,6 +721,33 @@ class Settings(BaseSettings):
             "use layout/vision extraction plus the cadastral CAD template pipeline "
             "(AutoCAD DWG output — not ArcGIS)."
         ),
+    )
+
+    enable_vision_ocr: bool = Field(
+        default=True,
+        env="ENABLE_VISION_OCR",
+        description=(
+            "When enabled, standalone images (.png/.jpg/…) and scanned-image OCR requests "
+            "use the session's vision-capable LLM before the text-only agent loop."
+        ),
+    )
+
+    vision_ocr_max_files: int = Field(
+        default=4,
+        env="VISION_OCR_MAX_FILES",
+        description="Maximum number of image files processed by vision OCR in one turn.",
+    )
+
+    vision_ocr_max_file_mb: int = Field(
+        default=10,
+        env="VISION_OCR_MAX_FILE_MB",
+        description="Maximum size in megabytes for a single vision-OCR input image.",
+    )
+
+    vision_ocr_timeout_s: int = Field(
+        default=58,
+        env="VISION_OCR_TIMEOUT_S",
+        description="Wall-clock budget in seconds for a vision OCR turn (style-locked read + optional verify).",
     )
     
     # ==========================================================================

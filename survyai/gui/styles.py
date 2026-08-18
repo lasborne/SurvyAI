@@ -533,6 +533,46 @@ QPlainTextEdit#chatInput:focus {
     border-color: #3b82f6;
     background: #fafcff;
 }
+QToolButton#attachButton {
+    border: 1px solid #cbd5e1;
+    border-radius: 10px;
+    background: #f8fafc;
+    color: #334155;
+    font-size: 16pt;
+    font-weight: 600;
+    min-width: 36px;
+    max-width: 36px;
+    min-height: 36px;
+    max-height: 36px;
+    padding: 0;
+}
+QToolButton#attachButton:hover {
+    background: #eef2ff;
+    border-color: #93c5fd;
+    color: #1d4ed8;
+}
+QToolButton#attachButton:pressed {
+    background: #dbeafe;
+}
+QWidget#attachmentChip {
+    background: #eef2ff;
+    border: 1px solid #bfdbfe;
+    border-radius: 12px;
+}
+QLabel#attachmentChipLabel {
+    color: #1e3a8a;
+    font-size: 9pt;
+}
+QToolButton#attachmentChipRemove {
+    color: #64748b;
+    font-size: 11pt;
+    border: none;
+    background: transparent;
+    padding: 0 2px;
+}
+QToolButton#attachmentChipRemove:hover {
+    color: #b91c1c;
+}
 /* --- Scrollbars (light mode) --------------------------------------- */
 QScrollBar:vertical {
     background: #f1f5f9;
@@ -1053,6 +1093,46 @@ QPlainTextEdit#chatInput {
 QPlainTextEdit#chatInput:focus {
     border-color: #60a5fa;
     background: #1c1c1f;
+}
+QToolButton#attachButton {
+    border: 1px solid #3f3f46;
+    border-radius: 10px;
+    background: #27272a;
+    color: #e4e4e7;
+    font-size: 16pt;
+    font-weight: 600;
+    min-width: 36px;
+    max-width: 36px;
+    min-height: 36px;
+    max-height: 36px;
+    padding: 0;
+}
+QToolButton#attachButton:hover {
+    background: #3f3f46;
+    border-color: #60a5fa;
+    color: #93c5fd;
+}
+QToolButton#attachButton:pressed {
+    background: #52525b;
+}
+QWidget#attachmentChip {
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 12px;
+}
+QLabel#attachmentChipLabel {
+    color: #bfdbfe;
+    font-size: 9pt;
+}
+QToolButton#attachmentChipRemove {
+    color: #a1a1aa;
+    font-size: 11pt;
+    border: none;
+    background: transparent;
+    padding: 0 2px;
+}
+QToolButton#attachmentChipRemove:hover {
+    color: #f87171;
 }
 
 QWidget#sidebarConversations {

@@ -22,7 +22,7 @@ from survyai.cloud_api import (
     refresh_tokens,
     register_device,
 )
-from survyai.cloud_user_message import user_facing_cloud_message
+from survyai.cloud_user_message import is_session_expired_cloud_message, user_facing_cloud_message
 from survyai.device_identity import compute_machine_fingerprint
 
 
@@ -143,11 +143,12 @@ def sync_cloud_account(payload: CloudAccountSyncPayload) -> CloudAccountSyncResu
     try:
         access, refresh, expires_at, _tokens = _refresh_access_token(payload)
     except CloudApiError as exc:
-        result.session_expired = True
         result.error_message = user_facing_cloud_message(exc)
+        result.session_expired = is_session_expired_cloud_message(result.error_message)
         return result
     except Exception as exc:
         result.error_message = user_facing_cloud_message(exc)
+        result.session_expired = is_session_expired_cloud_message(result.error_message)
         return result
 
     result.access_token = access
@@ -162,9 +163,11 @@ def sync_cloud_account(payload: CloudAccountSyncPayload) -> CloudAccountSyncResu
             ent = f_ent.result()
     except CloudApiError as exc:
         result.error_message = user_facing_cloud_message(exc)
+        result.session_expired = is_session_expired_cloud_message(result.error_message)
         return result
     except Exception as exc:
         result.error_message = user_facing_cloud_message(exc)
+        result.session_expired = is_session_expired_cloud_message(result.error_message)
         return result
 
     me_d = me if isinstance(me, dict) else {}
@@ -244,11 +247,12 @@ def sync_cloud_credits(payload: CloudCreditsSyncPayload) -> CloudCreditsSyncResu
     try:
         access, refresh, expires_at, _ = _refresh_access_for_credits(payload)
     except CloudApiError as exc:
-        result.session_expired = True
         result.error_message = user_facing_cloud_message(exc)
+        result.session_expired = is_session_expired_cloud_message(result.error_message)
         return result
     except Exception as exc:
         result.error_message = user_facing_cloud_message(exc)
+        result.session_expired = is_session_expired_cloud_message(result.error_message)
         return result
 
     result.access_token = access
@@ -259,9 +263,11 @@ def sync_cloud_credits(payload: CloudCreditsSyncPayload) -> CloudCreditsSyncResu
         ent = get_entitlements(base_url=base, access_token=access)
     except CloudApiError as exc:
         result.error_message = user_facing_cloud_message(exc)
+        result.session_expired = is_session_expired_cloud_message(result.error_message)
         return result
     except Exception as exc:
         result.error_message = user_facing_cloud_message(exc)
+        result.session_expired = is_session_expired_cloud_message(result.error_message)
         return result
 
     result.ent = ent if isinstance(ent, dict) else {}

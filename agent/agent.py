@@ -122,8 +122,6 @@ from utils.token_limiter import (
     chunk_messages,
     wait_for_rate_limit,
     format_token_warning,
-    TokenEstimate,
-    get_tpm_limit,
 )
 from tools import (
     ExcelProcessor,
@@ -1829,6 +1827,7 @@ class SurvyAIAgent:
         # Back-compat alias used by older call sites / tests.
         self._openai_llm_cache = self._llm_client_cache
         self._gemini_models_cache: Optional[List[str]] = None
+        self._prompt_router_cache: Dict[tuple, Any] = {}
         self._app_signature: Optional[tuple] = None
         self._pipeline_llm_cost_usd: float = 0.0
         # Serialize LLM invokes so a timed-out Ollama/HTTP call cannot stack
@@ -1986,7 +1985,7 @@ class SurvyAIAgent:
                 f"Last error: {last_primary_error}"
             )
 
-        if selected_primary != requested_primary:
+        if selected_primary and str(self.settings.primary_llm or "").strip().lower() != selected_primary:
             self.settings = self.settings.model_copy(update={"primary_llm": selected_primary})
 
         selected_fallback = ""
@@ -2151,8 +2150,21 @@ class SurvyAIAgent:
         """
         import re
         from pathlib import Path
+
+        from survyai.attachments import parse_attachments_block
         
         document_paths = []
+        seen = set()
+
+        # Attachment marker block from the chat composer (may include images + docs).
+        marker_paths, _ = parse_attachments_block(query or "")
+        for path_str in marker_paths:
+            path = Path(path_str)
+            if path.exists() and path.is_file() and path.suffix.lower() in [".docx", ".doc", ".pdf"]:
+                key = str(path.resolve())
+                if key not in seen:
+                    seen.add(key)
+                    document_paths.append(key)
         
         # Pattern to match file paths with document extensions.
         #
@@ -2177,10 +2189,23 @@ class SurvyAIAgent:
                 # Verify the file exists and is a document
                 if path.exists() and path.is_file():
                     if path.suffix.lower() in ['.docx', '.doc', '.pdf']:
-                        if str(path.resolve()) not in document_paths:
-                            document_paths.append(str(path.resolve()))
+                        key = str(path.resolve())
+                        if key not in seen:
+                            seen.add(key)
+                            document_paths.append(key)
         
         return document_paths
+
+    def _extract_image_paths(self, query: str) -> List[str]:
+        """
+        Extract image file paths from a query (typed paths + attachment markers).
+
+        Kept separate from ``_extract_document_paths`` so PDF/Word preflight
+        never tries to pdfplumber a PNG.
+        """
+        from agent.vision_ocr import extract_image_paths_from_query
+
+        return extract_image_paths_from_query(query or "")
 
     def _infer_output_path_from_input(
         self, 
@@ -2647,6 +2672,15 @@ class SurvyAIAgent:
         if not q:
             return False
 
+        # Prefer OCR extraction → Word when a prior vision OCR result exists.
+        try:
+            from agent.vision_ocr import is_ocr_word_export_request, load_last_ocr_extraction
+
+            if is_ocr_word_export_request(routing_query) and load_last_ocr_extraction(Path.cwd()):
+                return False
+        except Exception:
+            pass
+
         # Never hijack operational file/GIS/CAD workflows (e.g. PRE/POST CSV + DWG volume).
         if self._classify_query_intent(routing_query) == "task":
             if not self._is_explicit_session_docx_save_request(routing_query):
@@ -3040,6 +3074,264 @@ class SurvyAIAgent:
             full_query=query,
             extract_fn=self._extract_pdf_survey_plan_with_tier_fallback,
         )
+
+    def _vision_ocr_user_text(self, query: str) -> str:
+        """User-facing text without the attachment marker block (for mode selection)."""
+        from survyai.attachments import parse_attachments_block
+
+        _, remaining = parse_attachments_block(query or "")
+        return (remaining or "").strip()
+
+    def _extract_images_survey_plan_with_tier_fallback(
+        self,
+        image_paths: List[str],
+        *,
+        user_notes: str,
+        timeout_s: int = 120,
+    ) -> tuple[Any, Optional[str]]:
+        """Survey-plan extraction from standalone images (average → complex)."""
+        from agent.pdf_survey_plan import SurveyPlanExtraction, validate_extraction_for_replot
+        from agent.vision_ocr import extract_survey_plan_from_images
+
+        tiers: List[tuple[str, int]] = [("average", 1), ("complex", 2)]
+        last: Optional[Any] = None
+        last_model: Optional[str] = None
+        for tier, _pages in tiers:
+            llm, model_name = self._try_openai_tier_llm(tier)  # type: ignore[arg-type]
+            if llm is None:
+                llm = getattr(self, "llm_primary", None)
+            if llm is None:
+                break
+            if not model_name:
+                model_name = getattr(self, "_current_openai_model", None) or getattr(
+                    self.settings, "openai_model", "gpt-5.4-mini"
+                )
+            self._current_openai_model = model_name
+            extraction = extract_survey_plan_from_images(
+                image_paths,
+                llm=llm,
+                run_with_timeout=self._llm_run_with_timeout(model_name),
+                user_notes=user_notes,
+                timeout_s=timeout_s,
+            )
+            last = extraction
+            last_model = model_name
+            if extraction.source in ("error", "llm_parse_failed"):
+                continue
+            if not validate_extraction_for_replot(extraction):
+                return extraction, model_name
+            logger.info(
+                "Image survey extraction incomplete on tier %s — retrying stronger model if available",
+                tier,
+            )
+        if last is None:
+            return (
+                SurveyPlanExtraction(source="error", notes="No LLM available for image extraction"),
+                None,
+            )
+        return last, last_model
+
+    def _run_image_survey_replot_pipeline(self, query: str) -> Dict[str, Any]:
+        """Extract survey plan from image(s) and replot via cadastral CAD pipeline."""
+        from pathlib import Path
+
+        from agent.pdf_survey_plan import (
+            apply_plan_overrides_to_extraction,
+            build_cadastral_subprompt,
+            filter_user_facing_extraction_notes,
+            resolve_output_dwg_path,
+            resolve_plan_overrides_from_query,
+            validate_extraction_for_replot,
+            validate_subprompt_geometry,
+        )
+        from agent.vision_ocr import extract_image_paths_from_query
+
+        scope = self._cadastral_user_message_body(query)
+        image_paths = extract_image_paths_from_query(query)
+        if not image_paths:
+            return {"success": False, "error": "No image path found in the request."}
+
+        # Prefer an explicit .dwg in the query; else derive beside the first image.
+        output_dwg = resolve_output_dwg_path(query, image_paths[0], scope_text=scope)
+        if not output_dwg:
+            stem = Path(image_paths[0]).stem or "survey_plan"
+            output_dwg = str(Path(image_paths[0]).with_name(f"{stem}_replot.dwg"))
+
+        mem = self._resolve_cadastral_template_from_memory(query)
+        self._ensure_autocad_connected()
+        override_llm, override_model = self._try_openai_tier_llm("simple")
+
+        extraction, model_name = self._extract_images_survey_plan_with_tier_fallback(
+            image_paths,
+            user_notes=scope,
+            timeout_s=120,
+        )
+        if override_llm is None:
+            override_llm = getattr(self, "llm_primary", None)
+        if not override_model:
+            override_model = model_name
+        if model_name:
+            self._current_openai_model = model_name
+        if extraction.source in ("error", "llm_parse_failed"):
+            return {
+                "success": False,
+                "error": extraction.notes or "Image survey plan extraction failed.",
+                "extraction": extraction.model_dump(),
+            }
+
+        validation_issues = validate_extraction_for_replot(extraction)
+        if validation_issues:
+            return {
+                "success": False,
+                "error": (
+                    "Image extraction is incomplete and cannot be replotted safely: "
+                    + "; ".join(validation_issues)
+                ),
+                "validation_issues": validation_issues,
+                "extraction": extraction.model_dump(),
+            }
+
+        template_hint = mem.get("template_path") if mem else None
+        plan_overrides = resolve_plan_overrides_from_query(
+            query,
+            scope_text=scope,
+            base_extraction=extraction,
+            llm=override_llm,
+            run_with_timeout=self._llm_run_with_timeout(override_model),
+        )
+        extraction = apply_plan_overrides_to_extraction(extraction, plan_overrides)
+        from agent.pdf_survey_plan import enrich_extraction_coordinates
+
+        extraction = enrich_extraction_coordinates(extraction, "")
+        cert_date = plan_overrides.certification_date or extraction.certification_date or None
+        subprompt = build_cadastral_subprompt(
+            extraction,
+            output_dwg_path=output_dwg,
+            certification_date=cert_date,
+            template_path=template_hint,
+        )
+        subprompt_issues = validate_subprompt_geometry(subprompt)
+        if subprompt_issues:
+            return {
+                "success": False,
+                "error": (
+                    "Generated CAD sub-prompt is missing required geometry: "
+                    + "; ".join(subprompt_issues)
+                ),
+                "validation_issues": subprompt_issues,
+                "extraction": extraction.model_dump(),
+                "subprompt": subprompt,
+            }
+
+        plot_result = self._run_cadastral_cad_prompt_pipeline(
+            subprompt,
+            source_scale_denom=extraction.scale_denom,
+            skip_intent_assessment=True,
+            user_scope_for_extras=scope,
+        )
+        if not plot_result.get("success"):
+            return {
+                "success": False,
+                "error": plot_result.get("error", "Cadastral replot failed."),
+                "extraction": extraction.model_dump(),
+                "subprompt": subprompt,
+            }
+
+        out_lines = [
+            "✅ Survey plan image(s) replotted to CAD.",
+            f"- Source image(s): {', '.join(image_paths)}",
+            f"- Output DWG: {plot_result.get('output_dwg') or output_dwg}",
+            f"- Extraction: {extraction.source} (confidence {extraction.confidence:.0%})",
+        ]
+        filtered_notes = filter_user_facing_extraction_notes(
+            extraction.notes or "",
+            plan_overrides.override_fields,
+        )
+        if filtered_notes:
+            out_lines.append(f"- Notes: {filtered_notes}")
+        return {
+            "success": True,
+            "response": "\n".join(out_lines) + "\n",
+            "output_dwg": plot_result.get("output_dwg") or output_dwg,
+            "output_path": plot_result.get("output_dwg") or output_dwg,
+            "extraction": extraction.model_dump(),
+            "model_name": model_name,
+        }
+
+    def _run_vision_ocr_for_query(
+        self,
+        query: str,
+        *,
+        mode: Optional[str] = None,
+    ) -> Any:
+        """Run LLM vision OCR on image paths found in the query."""
+        from agent.vision_ocr import (
+            OCR_BUDGET_S,
+            VisionOcrResult,
+            extract_image_paths_from_query,
+            looks_like_survey_sheet,
+            run_vision_ocr,
+            select_vision_ocr_mode,
+        )
+
+        image_paths = extract_image_paths_from_query(query)
+        if not image_paths:
+            return VisionOcrResult(success=False, error="No image paths found.")
+
+        user_text = self._vision_ocr_user_text(query)
+        resolved_mode = mode or select_vision_ocr_mode(user_text)
+        if resolved_mode == "plain_text" and looks_like_survey_sheet(user_text, image_paths):
+            resolved_mode = "structured"
+
+        # One average-tier vision call (style lock + extract). Escalate to complex
+        # only when the first pass is empty — keeps typical OCR ≤ ~60s.
+        ocr_timeout = int(getattr(self.settings, "vision_ocr_timeout_s", OCR_BUDGET_S) or OCR_BUDGET_S)
+        last: Optional[VisionOcrResult] = None
+        for tier in ("average", "complex"):
+            llm, model_name = self._try_openai_tier_llm(tier)  # type: ignore[arg-type]
+            if llm is None:
+                llm = getattr(self, "llm_primary", None)
+            if llm is None:
+                break
+            if not model_name:
+                model_name = getattr(self, "_current_openai_model", None) or getattr(
+                    self.settings, "openai_model", "gpt-5.4-mini"
+                )
+            result = run_vision_ocr(
+                image_paths,
+                user_text=user_text,
+                llm=llm,
+                run_with_timeout=self._llm_run_with_timeout(model_name),
+                mode=resolved_mode,  # type: ignore[arg-type]
+                timeout_s=ocr_timeout,
+                max_files=int(getattr(self.settings, "vision_ocr_max_files", 4) or 4),
+                max_file_mb=int(getattr(self.settings, "vision_ocr_max_file_mb", 10) or 10),
+                model_name=model_name,
+                high_accuracy=True,
+                verify_uncertain=False,
+                workspace=Path.cwd(),
+            )
+            last = result
+            if not result.success:
+                err = (result.error or "").lower()
+                if "timed out" in err or tier == "complex":
+                    return result
+                continue
+            if resolved_mode == "plain_text":
+                return result
+            structured = result.structured or {}
+            has_meat = bool(
+                structured.get("coordinates")
+                or structured.get("bearings_distances")
+                or structured.get("pillars")
+                or structured.get("tables")
+                or structured.get("fields")
+                or structured.get("rows")
+                or (result.text and len(result.text) > 40)
+            )
+            if has_meat or tier == "complex":
+                return result
+        return last or VisionOcrResult(success=False, error="No vision LLM available.")
 
     # ==========================================================================
     # FAST-PATH: CAD CADASTRAL PLAN (Template DWG -> Output DWG)
@@ -11449,11 +11741,15 @@ class SurvyAIAgent:
             )
 
         if intent == "task" or looks_like_file_driven_task(clean or routing):
+            from survyai.prompt_router import is_heavy_geospatial_task
+
+            q_task = clean or routing
+            heavy = is_heavy_geospatial_task(q_task)
             return PromptActionAssessment(
                 kind="file_task",
-                effective_query=clean or routing,
+                effective_query=q_task,
                 needs_internet=False,
-                min_complexity="complex" if looks_like_file_driven_task(clean or routing) else "average",
+                min_complexity="complex" if heavy else "average",
                 reason="File-driven or operational task.",
             )
         if intent == "continuation":
@@ -11999,7 +12295,8 @@ class SurvyAIAgent:
         word_count = len(query.split())
         
         # Determine complexity
-        if complex_count >= 2 or tool_count >= 3 or word_count > 30:
+        # Length alone is a weak signal: a 40-word definition is not flagship GIS.
+        if complex_count >= 2 or tool_count >= 3:
             return "complex"
         elif complex_count >= 1 or tool_count >= 2 or word_count > 15:
             return "average"
@@ -12038,7 +12335,9 @@ class SurvyAIAgent:
 
         # If query includes explicit input file paths, prefer tool/document pipelines over RAG.
         # (RAG is still allowed if user asks "based on our previous conversation" etc.)
-        file_driven = looks_like_file_driven_task(q) or bool(self._extract_document_paths(q))
+        file_driven = looks_like_file_driven_task(q) or bool(self._extract_document_paths(q)) or bool(
+            self._extract_image_paths(q)
+        )
 
         wants_memory = any(k in ql for k in [
             "previous", "earlier", "last time", "as we discussed", "from our conversation",
@@ -12214,8 +12513,17 @@ class SurvyAIAgent:
     def _active_llm_provider(self, use_fallback: bool = False) -> str:
         """Concrete provider id for the current primary/fallback selection."""
         if use_fallback:
-            return str(getattr(self.settings, "fallback_llm", "") or "").strip().lower()
-        return str(getattr(self.settings, "primary_llm", "") or "").strip().lower()
+            raw = str(getattr(self.settings, "fallback_llm", "") or "").strip().lower()
+        else:
+            raw = str(getattr(self.settings, "primary_llm", "") or "").strip().lower()
+        if raw in ("", "auto"):
+            try:
+                from survyai.llm_routing import resolve_primary_llm_selection
+
+                return resolve_primary_llm_selection("auto")
+            except Exception:
+                return "openai"
+        return raw
 
     def _escalate_model_tier(self, current_tier: str, provider: Optional[str] = None) -> Optional[str]:
         """
@@ -12415,6 +12723,142 @@ class SurvyAIAgent:
                 "session_id": current_session_id,
                 "llm_cost_usd": 0.0,
             }
+
+    def _route_task_with_cheap_model(
+        self,
+        *,
+        provider: str,
+        query: str,
+        heuristic_complexity: Literal["simple", "average", "complex"],
+        kind: str = "",
+        file_driven: bool = False,
+        needs_internet: bool = False,
+    ) -> Optional[Any]:
+        """
+        Ask the cheapest paid model for ``provider`` to pick the execution model.
+
+        Returns a ``PromptRouteDecision`` on success, or None so the caller can
+        keep heuristic complexity routing (no behavior change on failure).
+        """
+        from dataclasses import replace
+
+        from survyai.prompt_router import (
+            ROUTER_CACHE_MAX,
+            ROUTER_TIMEOUT_SECONDS,
+            apply_route_floors,
+            build_router_messages,
+            execution_candidates_for_provider,
+            message_content_to_text,
+            parse_router_response,
+            router_models_to_try,
+            truncate_router_query,
+        )
+
+        p = str(provider or "").strip().lower()
+        candidates = execution_candidates_for_provider(p, self.settings)
+        if not candidates:
+            return None
+
+        knowledge_only = (not file_driven) and str(kind or "").strip().lower() in {
+            "general_knowledge",
+            "other",
+            "",
+        }
+        cache_key = (
+            p,
+            truncate_router_query(query).lower(),
+            bool(file_driven),
+            str(kind or ""),
+        )
+        cache = getattr(self, "_prompt_router_cache", None)
+        if cache is None:
+            cache = {}
+            self._prompt_router_cache = cache
+        hit = cache.get(cache_key)
+        if hit is not None:
+            logger.info("Prompt router cache hit (%s → %s)", p, getattr(hit, "model", ""))
+            return hit
+
+        system, user = build_router_messages(
+            provider=p,
+            query=query,
+            candidates=candidates,
+            heuristic_complexity=heuristic_complexity,
+            kind=kind,
+            file_driven=file_driven,
+            needs_internet=needs_internet,
+        )
+        last_err: Optional[str] = None
+        for router_model in router_models_to_try(p, self.settings):
+            try:
+                llm = self._initialize_llm(p, model_name=router_model)
+            except Exception as exc:
+                last_err = str(exc)
+                logger.info(
+                    "Prompt router could not init %s/%s (%s) — trying next cheap model.",
+                    p,
+                    router_model,
+                    exc,
+                )
+                continue
+            try:
+                def _invoke_router(llm=llm, sys=system, usr=user):
+                    return llm.invoke(
+                        [SystemMessage(content=sys), HumanMessage(content=usr)]
+                    )
+
+                msg, err, timed_out = self._run_with_timeout(
+                    ROUTER_TIMEOUT_SECONDS,
+                    _invoke_router,
+                    llm_model_name=router_model,
+                    serialize_llm=False,
+                )
+            except Exception as exc:
+                last_err = str(exc)
+                logger.info("Prompt router invoke failed on %s (%s).", router_model, exc)
+                continue
+            if timed_out:
+                last_err = f"timed out after {ROUTER_TIMEOUT_SECONDS}s"
+                logger.info(
+                    "Prompt router %s timed out — trying next cheap model or heuristic.",
+                    router_model,
+                )
+                continue
+            if err or msg is None:
+                last_err = str(err or "empty router response")
+                logger.info("Prompt router %s error: %s", router_model, last_err)
+                continue
+            decision = parse_router_response(
+                message_content_to_text(msg),
+                candidates,
+                heuristic_complexity=heuristic_complexity,
+            )
+            if decision is None:
+                last_err = "unparseable router JSON"
+                logger.info("Prompt router %s returned unusable JSON — trying next.", router_model)
+                continue
+            decision = apply_route_floors(
+                decision,
+                candidates,
+                file_driven=file_driven,
+                knowledge_only=knowledge_only,
+            )
+            resolved = replace(decision, router_model=router_model, source="llm")
+            try:
+                if len(cache) >= ROUTER_CACHE_MAX:
+                    cache.pop(next(iter(cache)))
+                cache[cache_key] = resolved
+            except Exception:
+                pass
+            return resolved
+
+        if last_err:
+            logger.info(
+                "Prompt router unavailable for %s (%s) — using heuristic complexity routing.",
+                p,
+                last_err,
+            )
+        return None
 
     def _get_model_for_complexity(
         self,
@@ -16821,6 +17265,8 @@ class SurvyAIAgent:
         self._model_switched_this_query = False
         self._openai_models_tried_this_query = []
         self._force_internet_search_this_query = False
+        # Bound early so OCR/excel/CAD fast-paths can return before tier selection.
+        model_name_used: Optional[str] = None
 
         # Handle internet permission markers from interactive CLI
         # IMPORTANT: Extract and set permission BEFORE routing/processing
@@ -17188,6 +17634,296 @@ class SurvyAIAgent:
                     "error": fast.get("error") if not fast.get("success") else None,
                 }
 
+            # VISION OCR (images): preprocess only — LangGraph stays text-only.
+            self._vision_ocr_context = None
+            if getattr(self.settings, "enable_vision_ocr", True):
+                from agent.vision_ocr import (
+                    export_ocr_extraction_to_docx,
+                    export_ocr_extraction_to_excel,
+                    extract_image_paths_from_query,
+                    format_last_ocr_for_agent,
+                    is_ocr_export_request,
+                    is_ocr_followup_request,
+                    is_ocr_only_request,
+                    is_ocr_word_export_request,
+                    load_last_ocr_extraction,
+                    resolve_ocr_export_path,
+                    resolve_ocr_word_export_path,
+                    save_last_ocr_extraction,
+                    should_fastpath_image_survey_replot,
+                    user_requested_save,
+                )
+                from survyai.provider_models import (
+                    provider_supports_vision,
+                    vision_unsupported_user_message,
+                )
+
+                _image_paths = extract_image_paths_from_query(tool_routing_query)
+                _ocr_user_text = self._vision_ocr_user_text(tool_routing_query)
+                _ws = Path.cwd()
+
+                # Follow-up with no new images: export prior extraction or inject it for the agent.
+                if not _image_paths and _pre_intent != "knowledge":
+                    _last = load_last_ocr_extraction(_ws)
+                    if _last and is_ocr_export_request(_ocr_user_text):
+                        llm_used = "fallback" if use_fallback else "primary"
+                        try:
+                            out_path = resolve_ocr_export_path(_ocr_user_text, _ws)
+                            structured = _last.get("structured") or {}
+                            # Prefer applying the chat table if structured rows were lost
+                            if isinstance(_last.get("user_table"), str) and _last.get("user_table").strip():
+                                structured = dict(structured)
+                                structured.setdefault("user_table", _last["user_table"])
+                            written = export_ocr_extraction_to_excel(
+                                structured,
+                                out_path,
+                                image_paths=_last.get("image_paths") or [],
+                            )
+                            n_rows = len(
+                                [r for r in (structured.get("rows") or []) if isinstance(r, dict)]
+                            )
+                            return {
+                                "query": query,
+                                "response": (
+                                    f"Saved the latest OCR extraction to `{written}`.\n"
+                                    f"- Open the **Extraction** sheet first (metadata + {n_rows} observation row(s)).\n"
+                                    f"- Sheets: Extraction, Observations, Metadata.\n\n"
+                                    + (str(_last.get("user_table") or "").strip())
+                                ).strip(),
+                                "llm_used": llm_used,
+                                "model_name": model_name_used,
+                                "complexity": "simple",
+                                "success": True,
+                                "session_id": current_session_id,
+                                "context_retrieved": False,
+                                "output_path": str(written),
+                            }
+                        except Exception as export_exc:
+                            logger.exception("OCR Excel export failed")
+                            return {
+                                "query": query,
+                                "response": f"Could not save OCR extraction to Excel: {export_exc}",
+                                "llm_used": llm_used,
+                                "model_name": model_name_used,
+                                "complexity": "simple",
+                                "success": False,
+                                "session_id": current_session_id,
+                                "context_retrieved": False,
+                                "error": str(export_exc),
+                            }
+                    if _last and is_ocr_word_export_request(_ocr_user_text):
+                        llm_used = "fallback" if use_fallback else "primary"
+                        try:
+                            out_path = resolve_ocr_word_export_path(_ocr_user_text, _ws)
+                            structured = _last.get("structured") if isinstance(_last.get("structured"), dict) else {}
+                            written = export_ocr_extraction_to_docx(
+                                structured,
+                                out_path,
+                                image_paths=_last.get("image_paths") or [],
+                                user_table=str(_last.get("user_table") or ""),
+                            )
+                            return {
+                                "query": query,
+                                "response": (
+                                    f"Saved the latest OCR extraction to Word.\n"
+                                    f"- Output: `{written}`\n"
+                                    f"- Content: the full extraction (headings, panels, tables) — "
+                                    f"not an essay rewrite.\n"
+                                ).strip(),
+                                "llm_used": llm_used,
+                                "model_name": model_name_used,
+                                "complexity": "simple",
+                                "success": True,
+                                "session_id": current_session_id,
+                                "context_retrieved": False,
+                                "output_path": str(written),
+                            }
+                        except Exception as export_exc:
+                            logger.exception("OCR Word export failed")
+                            return {
+                                "query": query,
+                                "response": f"Could not save OCR extraction to Word: {export_exc}",
+                                "llm_used": llm_used,
+                                "model_name": model_name_used,
+                                "complexity": "simple",
+                                "success": False,
+                                "session_id": current_session_id,
+                                "context_retrieved": False,
+                                "error": str(export_exc),
+                            }
+                    if _last and is_ocr_followup_request(_ocr_user_text):
+                        self._vision_ocr_context = format_last_ocr_for_agent(_last)
+
+                if _image_paths and _pre_intent != "knowledge":
+                    _prov = self._active_llm_provider(use_fallback)
+                    if not provider_supports_vision(_prov):
+                        llm_used = "fallback" if use_fallback else "primary"
+                        return {
+                            "query": query,
+                            "response": vision_unsupported_user_message(_prov),
+                            "llm_used": llm_used,
+                            "model_name": model_name_used,
+                            "complexity": "average",
+                            "success": False,
+                            "session_id": current_session_id,
+                            "context_retrieved": False,
+                            "error": "vision_unsupported_provider",
+                        }
+
+                    if should_fastpath_image_survey_replot(
+                        tool_routing_query, routing_query
+                    ) and getattr(self.settings, "pdf_survey_replot_enabled", True):
+                        logger.info("Image survey replot fast-path triggered")
+                        fast = self._run_image_survey_replot_pipeline(tool_routing_query)
+                        llm_used = "fallback" if use_fallback else "primary"
+                        return {
+                            "query": query,
+                            "response": fast.get("response") or fast.get("error") or str(fast),
+                            "llm_used": llm_used,
+                            "model_name": fast.get("model_name") or model_name_used,
+                            "complexity": "complex",
+                            "success": bool(fast.get("success")),
+                            "session_id": current_session_id,
+                            "context_retrieved": False,
+                            "output_path": fast.get("output_path"),
+                            "error": fast.get("error") if not fast.get("success") else None,
+                        }
+
+                    logger.info(
+                        "Vision OCR preprocessing for %d image(s)", len(_image_paths)
+                    )
+                    ocr_result = self._run_vision_ocr_for_query(tool_routing_query)
+                    user_text_for_mode = _ocr_user_text
+                    if getattr(ocr_result, "success", False) and getattr(ocr_result, "structured", None):
+                        save_last_ocr_extraction(
+                            ocr_result.structured,
+                            workspace=_ws,
+                            image_paths=getattr(ocr_result, "image_paths", None) or _image_paths,
+                            document_type=getattr(ocr_result, "document_type", "") or "",
+                            source="vision_ocr",
+                        )
+                    if is_ocr_only_request(user_text_for_mode):
+                        llm_used = "fallback" if use_fallback else "primary"
+                        response_text = (
+                            ocr_result.format_for_user()
+                            if getattr(ocr_result, "format_for_user", None)
+                            else str(ocr_result)
+                        )
+                        if (
+                            ocr_result.success
+                            and ocr_result.structured
+                            and (
+                                is_ocr_export_request(user_text_for_mode)
+                                or (
+                                    user_requested_save(user_text_for_mode)
+                                    and any(
+                                        m in user_text_for_mode.lower()
+                                        for m in ("excel", ".xlsx", ".xls", "spreadsheet", "workbook")
+                                    )
+                                )
+                            )
+                        ):
+                            try:
+                                out_path = resolve_ocr_export_path(user_text_for_mode, _ws)
+                                export_ocr_extraction_to_excel(
+                                    ocr_result.structured,
+                                    out_path,
+                                    image_paths=getattr(ocr_result, "image_paths", None) or _image_paths,
+                                )
+                                response_text += (
+                                    f"\n\nSaved extraction to `{out_path}` "
+                                    f"(open the Extraction sheet for metadata + observation rows)."
+                                )
+                            except Exception as save_exc:
+                                logger.debug("OCR Excel save skipped: %s", save_exc)
+                                response_text += f"\n\nCould not save Excel: {save_exc}"
+                        elif (
+                            ocr_result.success
+                            and ocr_result.structured
+                            and is_ocr_word_export_request(user_text_for_mode)
+                        ):
+                            try:
+                                out_path = resolve_ocr_word_export_path(user_text_for_mode, _ws)
+                                export_ocr_extraction_to_docx(
+                                    ocr_result.structured,
+                                    out_path,
+                                    image_paths=getattr(ocr_result, "image_paths", None) or _image_paths,
+                                    user_table=response_text,
+                                )
+                                response_text += (
+                                    f"\n\nSaved extraction to Word: `{out_path}`."
+                                )
+                            except Exception as save_exc:
+                                logger.debug("OCR Word save skipped: %s", save_exc)
+                                response_text += f"\n\nCould not save Word: {save_exc}"
+                        elif (
+                            ocr_result.success
+                            and user_requested_save(user_text_for_mode)
+                            and ocr_result.structured
+                        ):
+                            try:
+                                out_json = _ws / "ocr_result.json"
+                                out_json.write_text(
+                                    json.dumps(ocr_result.structured, indent=2, ensure_ascii=False),
+                                    encoding="utf-8",
+                                )
+                                response_text += f"\n\nSaved structured OCR to `{out_json}`."
+                            except Exception as save_exc:
+                                logger.debug("OCR save skipped: %s", save_exc)
+                        return {
+                            "query": query,
+                            "response": response_text,
+                            "llm_used": llm_used,
+                            "model_name": getattr(ocr_result, "model_name", None) or model_name_used,
+                            "complexity": "average",
+                            "success": bool(getattr(ocr_result, "success", False)),
+                            "session_id": current_session_id,
+                            "context_retrieved": False,
+                            "error": getattr(ocr_result, "error", None)
+                            if not getattr(ocr_result, "success", False)
+                            else None,
+                            "ocr_review": getattr(ocr_result, "ocr_review", None) or None,
+                        }
+
+                    if getattr(ocr_result, "success", False):
+                        self._vision_ocr_context = ocr_result.format_for_agent_context()
+                        # Same-turn: scan + save to Excel without requiring a second message
+                        if is_ocr_export_request(user_text_for_mode) and ocr_result.structured:
+                            try:
+                                out_path = resolve_ocr_export_path(user_text_for_mode, _ws)
+                                export_ocr_extraction_to_excel(
+                                    ocr_result.structured,
+                                    out_path,
+                                    image_paths=getattr(ocr_result, "image_paths", None) or _image_paths,
+                                )
+                                self._vision_ocr_context += (
+                                    f"\n\nAlready saved this extraction to `{out_path}`. "
+                                    "Tell the user the file path; do not ask them for an existing Excel file."
+                                )
+                            except Exception as save_exc:
+                                logger.debug("OCR Excel save (continue path) skipped: %s", save_exc)
+                        elif is_ocr_word_export_request(user_text_for_mode) and ocr_result.structured:
+                            try:
+                                out_path = resolve_ocr_word_export_path(user_text_for_mode, _ws)
+                                export_ocr_extraction_to_docx(
+                                    ocr_result.structured,
+                                    out_path,
+                                    image_paths=getattr(ocr_result, "image_paths", None) or _image_paths,
+                                    user_table=ocr_result.format_for_user(),
+                                )
+                                self._vision_ocr_context += (
+                                    f"\n\nAlready saved this extraction to Word `{out_path}`. "
+                                    "Tell the user the file path; do not rewrite it as an essay."
+                                )
+                            except Exception as save_exc:
+                                logger.debug("OCR Word save (continue path) skipped: %s", save_exc)
+                    elif getattr(ocr_result, "error", None):
+                        # Soft-fail: continue agent loop with a note (path may still be useful).
+                        self._vision_ocr_context = (
+                            f"VISION OCR RESULT: failed — {ocr_result.error}. "
+                            "If the user asked about this image, explain the failure clearly."
+                        )
+
             prompt_action = self._assess_prompt_action(
                 raw_query=query,
                 routing_query=routing_query,
@@ -17207,10 +17943,10 @@ class SurvyAIAgent:
             logger.info(f"🧭 Current-turn intent: {intent} | routing_query='{routing_query[:120]}'")
 
             # Tiered model selection: heuristics + explicit user phrasing + desktop fast-mode (non-file only)
-            complexity = self._detect_task_complexity(
-                prompt_action.effective_query or routing_query
-            )
+            route_query = prompt_action.effective_query or routing_query
+            complexity = self._detect_task_complexity(route_query)
             tier_override = self._parse_user_model_tier_override(routing_query)
+            fast_mode_forced_simple = False
             if tier_override is not None:
                 complexity = tier_override
                 logger.info(f"Model tier from user request: {complexity}")
@@ -17218,38 +17954,97 @@ class SurvyAIAgent:
                 getattr(self.settings, "fast_mode_non_file_prompts", False)
                 and not looks_like_file_driven_task(routing_query)
                 and len(self._extract_document_paths(routing_query)) == 0
+                and len(self._extract_image_paths(routing_query)) == 0
                 and prompt_action.kind not in ("current_fact_lookup", "permission_affirm")
             ):
                 complexity = "simple"
+                fast_mode_forced_simple = True
                 logger.info("Model tier: simple (fast_mode_non_file_prompts, non-file query)")
             else:
                 logger.info(f"Detected task complexity (heuristic): {complexity}")
 
-            # Assessment may require a stronger tier (e.g. factual web synthesis).
-            _tier_rank = {"simple": 0, "average": 1, "complex": 2}
-            if _tier_rank.get(prompt_action.min_complexity, 0) > _tier_rank.get(complexity, 0):
-                complexity = prompt_action.min_complexity
-                logger.info("Model tier raised by prompt assessment: %s", complexity)
+            from survyai.prompt_router import heuristic_route_confidence, should_use_llm_prompt_router
+            from survyai.provider_models import PAID_PROVIDERS, is_elevated_average_task
+
+            llm_to_use = None
+            model_name_used = None
+            llm_routed_model = None
+            elevated_average = False
+            active_provider = self._active_llm_provider(use_fallback)
+            file_driven_route = looks_like_file_driven_task(
+                route_query
+            ) or bool(self._extract_document_paths(routing_query)) or bool(
+                self._extract_image_paths(routing_query)
+            )
+
+            used_llm_router = False
+            route_confidence = heuristic_route_confidence(
+                route_query,
+                complexity=complexity,
+                file_driven=file_driven_route,
+                intent=intent,
+                kind=str(getattr(prompt_action, "kind", "") or ""),
+            )
+            if should_use_llm_prompt_router(
+                provider=active_provider,
+                enable_tiered=bool(getattr(self.settings, "enable_tiered_models", True)),
+                enable_llm_prompt_router=bool(
+                    getattr(self.settings, "enable_llm_prompt_router", True)
+                ),
+                user_tier_override=tier_override,
+                fast_mode_forced_simple=fast_mode_forced_simple,
+                heuristic_confidence=route_confidence,
+            ):
+                route = self._route_task_with_cheap_model(
+                    provider=active_provider,
+                    query=route_query,
+                    heuristic_complexity=complexity,
+                    kind=str(getattr(prompt_action, "kind", "") or ""),
+                    file_driven=file_driven_route,
+                    needs_internet=bool(getattr(prompt_action, "needs_internet", False)),
+                )
+                if route is not None:
+                    used_llm_router = True
+                    complexity = route.complexity
+                    elevated_average = bool(route.elevated_average)
+                    llm_routed_model = route.model
+                    logger.info(
+                        "Cheap-model router (%s) chose %s (complexity=%s, elevated=%s): %s",
+                        route.router_model or "unknown",
+                        route.model,
+                        route.complexity,
+                        route.elevated_average,
+                        route.reason or "n/a",
+                    )
+            elif (
+                route_confidence in ("simple", "complex")
+                and not fast_mode_forced_simple
+                and tier_override is None
+            ):
+                logger.info(
+                    "Skipping LLM prompt router (confident %s heuristic) — saved a round-trip",
+                    route_confidence,
+                )
+
+            if not used_llm_router:
+                # Assessment may require a stronger tier (e.g. factual web synthesis).
+                _tier_rank = {"simple": 0, "average": 1, "complex": 2}
+                if _tier_rank.get(prompt_action.min_complexity, 0) > _tier_rank.get(complexity, 0):
+                    complexity = prompt_action.min_complexity
+                    logger.info("Model tier raised by prompt assessment: %s", complexity)
+                elevated_average = bool(
+                    complexity == "average"
+                    and is_elevated_average_task(route_query)
+                )
+                if elevated_average:
+                    logger.info(
+                        "Elevated-average reasoning detected → prefer stronger mid-tier "
+                        "(e.g. gpt-5.5 on OpenAI) for accuracy"
+                    )
 
             logger.info(f"Final task complexity for model selection: {complexity}")
 
-            from survyai.provider_models import PAID_PROVIDERS, is_elevated_average_task
-
-            elevated_average = bool(
-                complexity == "average"
-                and is_elevated_average_task(prompt_action.effective_query or routing_query)
-            )
-            if elevated_average:
-                logger.info(
-                    "Elevated-average reasoning detected → prefer stronger mid-tier "
-                    "(e.g. gpt-5.5 on OpenAI) for accuracy"
-                )
-
             # Determine which LLM and model to use (tiered for all paid providers)
-            llm_to_use = None
-            model_name_used = None
-            active_provider = self._active_llm_provider(use_fallback)
-
             if use_fallback:
                 logger.warning(
                     f"⚠ Using fallback LLM ({self.settings.fallback_llm}) instead of "
@@ -17259,7 +18054,7 @@ class SurvyAIAgent:
                 if active_provider in PAID_PROVIDERS and getattr(
                     self.settings, "enable_tiered_models", True
                 ):
-                    model_name = self._get_model_for_complexity(
+                    model_name = llm_routed_model or self._get_model_for_complexity(
                         active_provider,
                         complexity,
                         elevated_average=elevated_average,
@@ -17282,7 +18077,7 @@ class SurvyAIAgent:
                 if active_provider in PAID_PROVIDERS and getattr(
                     self.settings, "enable_tiered_models", True
                 ):
-                    model_name = self._get_model_for_complexity(
+                    model_name = llm_routed_model or self._get_model_for_complexity(
                         active_provider,
                         complexity,
                         elevated_average=elevated_average,
@@ -18004,6 +18799,13 @@ class SurvyAIAgent:
                 "- If output location is ambiguous, prefer this workspace.\n"
                 "---\n"
             )
+            vision_ctx = getattr(self, "_vision_ocr_context", None)
+            if vision_ctx:
+                enhanced_system_prompt += (
+                    "\n\n---\n"
+                    f"**{vision_ctx}**\n"
+                    "---\n"
+                )
             # Session GIS artifacts for fit / open-result follow-ups (anti-context-loss).
             try:
                 _gis_arts = self._extract_verified_gis_artifacts_from_history(query)
@@ -18184,6 +18986,7 @@ class SurvyAIAgent:
                     file_driven=bool(
                         looks_like_file_driven_task(_scope_q)
                         or self._extract_document_paths(_scope_q)
+                        or self._extract_image_paths(_scope_q)
                     ),
                 )
             except Exception:
@@ -18217,6 +19020,9 @@ class SurvyAIAgent:
                 # Increase recursion_limit to avoid premature GRAPH_RECURSION_LIMIT on complex tool workflows.
                 max_iterations = getattr(self.settings, 'agent_max_iterations', 20)
                 recursion_limit = getattr(self.settings, "agent_recursion_limit", max(50, (max_iterations * 3)))
+                if _tool_scope == "lite" or not tools_to_bind:
+                    # Knowledge / tool-free turns should finish in 1–2 LLM steps.
+                    recursion_limit = min(int(recursion_limit), 8)
                 config = {
                     "configurable": {"thread_id": thread_id},
                     "recursion_limit": recursion_limit,

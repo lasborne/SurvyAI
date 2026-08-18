@@ -12,6 +12,10 @@ OpenAI also supports an *elevated average* pick (gpt-5.5) when the task is
 medium–high reasoning without full complex-tier signals.
 
 ``enable_tiered_models=False`` keeps legacy single-model settings per provider.
+
+When ``enable_llm_prompt_router`` is True (default), the cheapest paid model
+for the active provider classifies the prompt first; heuristic buckets remain
+the fallback if that classifier fails.
 """
 
 from __future__ import annotations
@@ -298,16 +302,40 @@ def is_elevated_average_task(query: str) -> bool:
     return any(s in ql for s in elevated_signals)
 
 
+# Providers whose hosted APIs accept OpenAI-style image_url multimodal content
+# in the SurvyAI desktop → proxy → provider path.
+VISION_CAPABLE_PROVIDERS = frozenset({"openai", "claude", "gemini"})
+
+
+def provider_supports_vision(provider: str) -> bool:
+    """True when the provider can run LLM vision / OCR for image inputs."""
+    return str(provider or "").strip().lower() in VISION_CAPABLE_PROVIDERS
+
+
+def vision_unsupported_user_message(provider: str) -> str:
+    """Clear, non-silent message when the active provider cannot do vision OCR."""
+    p = str(provider or "").strip().lower() or "the selected provider"
+    return (
+        f"Vision OCR is not available with {p}. "
+        "Switch your primary LLM to OpenAI, Claude, or Gemini to scan images "
+        "(.png, .jpg, …) and extract text or geospatial plan components. "
+        "Typed file paths and document tools for PDF/Word are unchanged."
+    )
+
+
 __all__ = [
     "Complexity",
     "PaidProvider",
     "PAID_PROVIDERS",
     "PROVIDER_TIER_DEFAULTS",
     "OPENAI_ELEVATED_AVERAGE_MODEL",
+    "VISION_CAPABLE_PROVIDERS",
     "legacy_single_model",
     "resolve_provider_model_for_complexity",
     "next_provider_failover_model",
     "escalate_provider_from_model",
     "provider_tier_summary",
     "is_elevated_average_task",
+    "provider_supports_vision",
+    "vision_unsupported_user_message",
 ]

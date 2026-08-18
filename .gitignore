@@ -79,10 +79,8 @@ main/
 .survyai_vectordb/
 
 # Agent runtime-generated workflow scripts & scratch outputs (kept locally,
-# not tracked). Genuine maintenance scripts are re-included below.
+# not tracked).
 scripts/*
-!scripts/restore_survey_plan_template2.py
-!scripts/verify_template_write_protection.py
 
 # Runtime-generated ArcGIS project output
 Adibawa_BorrowPit_Volume/

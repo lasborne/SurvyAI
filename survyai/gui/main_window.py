@@ -75,13 +75,14 @@ from survyai.gui.cad_prompt_defaults import (
     is_system_default_text,
     resolve_active_cad_prompt,
 )
+from survyai.gui.chat_composer import ChatComposer
 from survyai.gui.manage_pcs_dialog import ManagePcsDialog
 from survyai.gui.theme_toggle import ThemeToggle
 from survyai.gui.styles import THEME_DARK, THEME_LIGHT, get_stylesheet
 from survyai.gui.onboarding import OnboardingWizard, environment_validation_report
 from survyai.gui.help_dialog import MarkdownHelpDialog
 from survyai.gui.cursor_affordance import install_clickable_cursor_affordance
-from survyai.cloud_user_message import user_facing_cloud_message
+from survyai.cloud_user_message import is_session_expired_cloud_message, user_facing_cloud_message
 from survyai.cloud_api import (
     CloudApiError,
     access_token_expires_at_iso,
@@ -333,6 +334,15 @@ def _is_save_session_docx_request(raw_query: str) -> bool:
     q = (raw_query or "").lower().strip()
     if not q:
         return False
+
+    # OCR extraction → Word is handled by the OCR export fast-path, not essay save.
+    try:
+        from agent.vision_ocr import is_ocr_word_export_request
+
+        if is_ocr_word_export_request(raw_query):
+            return False
+    except Exception:
+        pass
 
     # Do not treat GIS/CAD/file automation jobs as essay-save requests.
     if looks_like_file_driven_task(raw_query):
@@ -1287,6 +1297,7 @@ class MainWindow(QMainWindow):
         self._session_id = active_conversation.session_id
         self._active_conversation_id = active_conversation.conversation_id
         self._last_query = ""
+        self._last_attachments: list[str] = []
         self._pending_plain_query: Optional[str] = None
         # CAD prompt page staging: None | "user" | "system"
         self._cad_prompt_pending: Optional[str] = None
@@ -1357,16 +1368,25 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, self._refresh_console_prompt_layout)
 
     def _refresh_console_prompt_layout(self) -> None:
-        """Size the prompt strip to the chat input only; transcript fills the rest of the left column."""
-        inp = getattr(self, "_input", None)
+        """Size the prompt strip to the composer (chips + input); transcript fills the rest."""
+        composer = getattr(self, "_composer", None)
         strip = getattr(self, "_input_strip", None)
-        if inp is None or strip is None:
+        inp = getattr(self, "_input", None)
+        if strip is None:
             return
         credit_h = (
             self._credit_notice_wrap.sizeHint().height()
             if self._credit_notice_wrap.isVisible()
             else 0
         )
+        if composer is not None:
+            chips_h = composer.chips_height()
+            inp_h = inp.height() if inp is not None else 132
+            # + button row is roughly max(input, attach button)
+            strip.setFixedHeight(chips_h + inp_h + credit_h + 12)
+            return
+        if inp is None:
+            return
         strip.setFixedHeight(inp.height() + credit_h + 8)
 
     def _apply_prompt_controls_scale(self) -> None:
@@ -1617,6 +1637,8 @@ class MainWindow(QMainWindow):
                     pass
 
         def _on_fail(msg: str) -> None:
+            if self._handle_expired_cloud_session_if_needed(msg):
+                return
             if not silent:
                 QMessageBox.warning(self, "Couldn't refresh account", msg)
 
@@ -1994,6 +2016,13 @@ class MainWindow(QMainWindow):
         self._input.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
+        self._composer = ChatComposer(self._input, parent=self)
+        self._composer.set_workspace_path(self._state.workspace_path)
+        self._composer.sendRequested.connect(self._on_send_clicked)
+        self._composer.layoutChanged.connect(
+            lambda: QTimer.singleShot(0, self._refresh_console_prompt_layout)
+        )
+        # Keep legacy ChatInput Enter signal wired as a safety net.
         self._input.sendRequested.connect(self._on_send_clicked)
         self._input.textChanged.connect(
             lambda: QTimer.singleShot(0, self._refresh_console_prompt_layout)
@@ -2097,7 +2126,7 @@ class MainWindow(QMainWindow):
         input_strip_layout = QVBoxLayout(self._input_strip)
         input_strip_layout.setContentsMargins(0, 6, 0, 2)
         input_strip_layout.setSpacing(2)
-        input_strip_layout.addWidget(self._input, 0)
+        input_strip_layout.addWidget(self._composer, 0)
         input_strip_layout.addWidget(self._credit_notice_wrap, 0)
         self._input_strip.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
@@ -2380,9 +2409,11 @@ class MainWindow(QMainWindow):
         llm_form.addRow("Advanced (hard reasoning)", self._active_openai_advanced_label)
         llm_form.addRow("Fallback", self._active_fallback_llm_label)
         openai_tier_hint = QLabel(
-            "SurvyAI routes by task complexity across paid providers (OpenAI, Claude, Gemini, "
-            "DeepSeek): Low / Medium / Advanced. Rows above show the OpenAI tier examples when "
-            "Primary is OpenAI or Auto. Exact API model IDs are shown — not marketing nicknames."
+            "Before each paid task, the cheapest hosted model for that provider "
+            "(OpenAI gpt-5.6-luna, Claude Haiku, Gemini Flash, DeepSeek Chat) chooses "
+            "Low / Medium / Advanced — including gpt-5.5 when useful. Rows above show "
+            "the OpenAI tier examples when Primary is OpenAI or Auto. Exact API model "
+            "IDs are shown — not marketing nicknames."
         )
         openai_tier_hint.setWordWrap(True)
         openai_tier_hint.setObjectName("hintLabel")
@@ -3372,6 +3403,7 @@ class MainWindow(QMainWindow):
                     ("openai_model_mini", "openai_model_mini"),
                     ("openai_model_complex", "openai_model_complex"),
                     ("enable_tiered_models", "enable_tiered_models"),
+                    ("enable_llm_prompt_router", "enable_llm_prompt_router"),
                     ("gemini_model", "gemini_model"),
                     ("claude_model", "claude_model"),
                     ("deepseek_base_url", "deepseek_base_url"),
@@ -3393,6 +3425,7 @@ class MainWindow(QMainWindow):
                         "openai_model_mini",
                         "openai_model_complex",
                         "enable_tiered_models",
+                        "enable_llm_prompt_router",
                         "gemini_model",
                         "claude_model",
                         "deepseek_base_url",
@@ -3499,11 +3532,14 @@ class MainWindow(QMainWindow):
 
         try:
             tokens = refresh_tokens(base_url=base, refresh_token=rt)
-        except (CloudApiError, Exception):
-            self._clear_cloud_session()
+        except (CloudApiError, Exception) as exc:
+            mapped = user_facing_cloud_message(exc)
+            if self._handle_expired_cloud_session_if_needed(mapped, prompt=not silent):
+                return False
             if not silent:
-                return self._prompt_session_expired()
-            return False
+                QMessageBox.warning(self, "Couldn't refresh account", mapped)
+            # Transient cloud/network error: keep the existing sign-in.
+            return bool(self._state.cloud_access_token.strip())
 
         self._state.cloud_access_token = tokens.access_token
         self._state.cloud_refresh_token = tokens.refresh_token
@@ -3513,6 +3549,29 @@ class MainWindow(QMainWindow):
         self._state_store.save(self._state)
         self._rebuild_service(skip_cloud_refresh=True)
         return True
+
+    def _handle_expired_cloud_session_if_needed(
+        self,
+        msg: str = "",
+        *,
+        prompt: bool = True,
+    ) -> bool:
+        """
+        Sign the user out only for the expired/invalid cloud login session.
+        Other cloud errors (timeout, 403, 5xx) leave the session in place.
+        """
+        if not self._cloud_sync_message_is_session_expired(msg):
+            return False
+        if getattr(self, "_handling_expired_cloud_session", False):
+            return True
+        self._handling_expired_cloud_session = True
+        try:
+            self._clear_cloud_session()
+            if prompt:
+                self._prompt_session_expired()
+            return True
+        finally:
+            self._handling_expired_cloud_session = False
 
     def _prompt_session_expired(self) -> bool:
         """
@@ -3658,6 +3717,9 @@ class MainWindow(QMainWindow):
     def _apply_state_to_ui(self) -> None:
         self._workspace_edit.setText(self._state.workspace_path)
         self._settings_workspace.setText(self._state.workspace_path)
+        composer = getattr(self, "_composer", None)
+        if composer is not None:
+            composer.set_workspace_path(self._state.workspace_path)
         self._settings_data_folder.setText(self._state.data_folder)
         self._fallback_cb.setChecked(self._state.use_fallback_llm)
         self._safe_mode_cb.setChecked(self._state.safe_mode)
@@ -3999,6 +4061,8 @@ class MainWindow(QMainWindow):
         *,
         error: bool = False,
         conversation_id: Optional[str] = None,
+        attachments: Optional[list] = None,
+        ocr_review: Optional[dict] = None,
     ) -> None:
         """Append a message to a conversation.
 
@@ -4014,6 +4078,8 @@ class MainWindow(QMainWindow):
             role=role,
             content=text,
             error=error,
+            attachments=list(attachments or []),
+            ocr_review=ocr_review if isinstance(ocr_review, dict) else None,
         )
         active = self._active_conversation()
         self._session_id = active.session_id
@@ -4600,9 +4666,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Credits refreshed from cloud.", 4000)
 
         def _on_fail(msg: str) -> None:
-            if self._cloud_sync_message_is_session_expired(msg):
-                self._clear_cloud_session()
-                self._prompt_session_expired()
+            if self._handle_expired_cloud_session_if_needed(msg):
                 return
             QMessageBox.warning(self, "Credits sync failed", msg)
 
@@ -4878,8 +4942,10 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_send_clicked(self) -> None:
+        composer = getattr(self, "_composer", None)
+        attachments = list(composer.attachment_paths()) if composer is not None else []
         text = self._input.toPlainText().strip()
-        if not text:
+        if not text and not attachments:
             return
         if self._thread is not None and self._thread.isRunning():
             if self._active_conversation_id == self._running_conversation_id:
@@ -4897,29 +4963,41 @@ class MainWindow(QMainWindow):
             if not self._ensure_cloud_token_valid(silent=False):
                 return
 
+        # Agent-facing query embeds attachment paths; transcript shows filenames only.
+        from survyai.attachments import format_attachments_block, format_user_transcript
+
+        agent_query = format_attachments_block(attachments, text)
+        transcript_text = format_user_transcript(text, attachments)
+
         blocked, credit_msg = self._platform_credit_wall_should_block()
         if blocked and credit_msg:
-            self._pending_plain_query = text
-            self._last_query = text
+            self._pending_plain_query = agent_query
+            self._last_query = text or agent_query
+            self._last_attachments = list(attachments)
             self._input.clear()
-            self._store_conversation_message("user", text)
-            self._append_user_message(text)
+            if composer is not None:
+                composer.clear_attachments()
+            self._store_conversation_message("user", transcript_text, attachments=attachments)
+            self._append_user_message(transcript_text)
             self._store_conversation_message("assistant", credit_msg, error=True)
             self._append_assistant_message(credit_msg, error=True)
             self.statusBar().showMessage("Hosted API credits exhausted for this period.", 8000)
             return
 
-        self._pending_plain_query = text
-        self._last_query = text
+        self._pending_plain_query = agent_query
+        self._last_query = text or agent_query
+        self._last_attachments = list(attachments)
         self._input.clear()
-        self._store_conversation_message("user", text)
-        self._append_user_message(text)
-        resolved = self._try_resolve_internet_permission_reply(text)
+        if composer is not None:
+            composer.clear_attachments()
+        self._store_conversation_message("user", transcript_text, attachments=attachments)
+        self._append_user_message(transcript_text)
+        resolved = self._try_resolve_internet_permission_reply(agent_query)
         if resolved:
             enhanced = resolved
             self._append_activity("Internet permission granted — searching for your original question.")
         else:
-            enhanced = self._build_continuation_query(text)
+            enhanced = self._build_continuation_query(agent_query)
         # Store the history-enriched version so _handle_internet_permission can
         # re-submit it (with full context) instead of the bare plain query.
         self._pending_enhanced_query = enhanced
@@ -5277,12 +5355,18 @@ class MainWindow(QMainWindow):
 
         body = result.response or ""
         result_is_active = (target_conv_id == self._active_conversation_id)
+        ocr_review = None
+        if isinstance(getattr(result, "raw", None), dict):
+            maybe = result.raw.get("ocr_review")
+            if isinstance(maybe, dict) and (maybe.get("image_paths") or maybe.get("rows")):
+                ocr_review = maybe
         if not result.success and result.error:
             self._store_conversation_message(
                 "assistant",
                 f"{body}\n\n(Error: {result.error})",
                 error=True,
                 conversation_id=target_conv_id,
+                ocr_review=ocr_review,
             )
             if result_is_active:
                 self._append_assistant_message(f"{body}\n\n(Error: {result.error})", error=True)
@@ -5292,11 +5376,29 @@ class MainWindow(QMainWindow):
                 body,
                 error=not result.success,
                 conversation_id=target_conv_id,
+                ocr_review=ocr_review,
             )
             if result_is_active:
                 self._append_assistant_message(body, error=not result.success)
+        if result_is_active and ocr_review and result.success:
+            self._maybe_open_ocr_review(ocr_review)
         self._persist_history_from_result(result)
         self._account_for_run_cost(result)
+
+    def _maybe_open_ocr_review(self, review: dict) -> None:
+        """Open click-to-verify dialog for OCR-only results with an image."""
+        try:
+            from pathlib import Path
+
+            from survyai.gui.ocr_review import open_ocr_review_dialog
+
+            workspace = Path(self._state.workspace_path) if self._state.workspace_path else Path.cwd()
+            updated = open_ocr_review_dialog(review, parent=self, workspace=workspace)
+            if updated:
+                self._store_conversation_message("assistant", updated, ocr_review=review)
+                self._append_assistant_message(updated)
+        except Exception:
+            pass
 
     def _handle_internet_permission(self, result: AgentRunResult) -> None:
         # CRITICAL: use the history-enriched query so the agent retains full
@@ -5414,7 +5516,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _retry_last_query(self) -> None:
-        if not self._last_query.strip():
+        if not self._last_query.strip() and not self._last_attachments:
             QMessageBox.information(self, "Retry", "No previous query available yet.")
             return
         if self._thread is not None and self._thread.isRunning():
@@ -5425,6 +5527,9 @@ class MainWindow(QMainWindow):
             )
             return
         self._input.setPlainText(self._last_query)
+        composer = getattr(self, "_composer", None)
+        if composer is not None:
+            composer.set_attachments(self._last_attachments)
         self._on_send_clicked()
 
     @Slot()
@@ -5498,8 +5603,13 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setEnabled(is_running_conv)
         self._fallback_cb.setEnabled(not is_running_conv)
         self._cad_prompt_btn.setEnabled(not is_running_conv)
+        composer = getattr(self, "_composer", None)
+        if composer is not None:
+            composer._attach_btn.setEnabled(not is_running_conv)
         if not is_running_conv:
-            self._retry_btn.setEnabled(bool(self._last_query.strip()))
+            self._retry_btn.setEnabled(
+                bool(self._last_query.strip() or self._last_attachments)
+            )
 
     @Slot()
     def _refresh_capabilities(self) -> None:
@@ -5554,6 +5664,9 @@ class MainWindow(QMainWindow):
         self._workspace_edit.setText(folder)
         self._settings_workspace.setText(folder)
         self._state.workspace_path = folder
+        composer = getattr(self, "_composer", None)
+        if composer is not None:
+            composer.set_workspace_path(folder)
         self._state_store.save(self._state)
         self._append_activity(f"Workspace set to {folder}")
 
@@ -5611,6 +5724,9 @@ class MainWindow(QMainWindow):
         self._state.workspace_path = self._settings_workspace.text().strip() or self._state.workspace_path
         self._state.data_folder = self._settings_data_folder.text().strip() or self._state.data_folder
         self._workspace_edit.setText(self._state.workspace_path)
+        composer = getattr(self, "_composer", None)
+        if composer is not None:
+            composer.set_workspace_path(self._state.workspace_path)
         self._state_store.save(self._state)
         self._rebuild_service()
         self._refresh_active_llm_status()
@@ -6054,9 +6170,7 @@ class MainWindow(QMainWindow):
             )
 
         def _on_fail(msg: str) -> None:
-            if self._cloud_sync_message_is_session_expired(msg):
-                self._clear_cloud_session()
-                self._prompt_session_expired()
+            if self._handle_expired_cloud_session_if_needed(msg):
                 return
             QMessageBox.warning(self, "Couldn't refresh account", msg)
 
@@ -6067,12 +6181,7 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _cloud_sync_message_is_session_expired(msg: str) -> bool:
-        low = (msg or "").lower()
-        return (
-            "session expired" in low
-            or "refresh token" in low
-            or "no refresh token" in low
-        )
+        return is_session_expired_cloud_message(msg)
 
     @Slot()
     def _cloud_sign_in(self) -> None:
@@ -6252,9 +6361,7 @@ class MainWindow(QMainWindow):
                 )
 
         def _on_fail(msg: str) -> None:
-            if self._cloud_sync_message_is_session_expired(msg):
-                self._clear_cloud_session()
-                self._prompt_session_expired()
+            if self._handle_expired_cloud_session_if_needed(msg):
                 return
             QMessageBox.warning(self, "Couldn't sign in", msg)
 
@@ -6283,10 +6390,7 @@ class MainWindow(QMainWindow):
                 cloud_logout(base_url=base, refresh_token=refresh)
             except Exception:
                 pass
-        self._state.profile = AccountProfile()
         self._clear_cloud_session()
-        self._refresh_account_views()
-        self._refresh_diagnostics()
 
     def _on_forgot_password(self, *, base_url: str | None = None) -> None:
         """Request a one-time email code, then set a new password."""

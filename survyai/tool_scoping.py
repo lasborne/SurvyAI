@@ -70,12 +70,6 @@ def select_tool_scope(
         return "full"
     if file_driven:
         return "full"
-    if complexity in ("average", "complex"):
-        # Average GIS orchestration and hard jobs need the full tool surface.
-        if complexity == "complex":
-            return "full"
-        if any(m in ql for m in _CAD_GIS_MARKERS):
-            return "full"
     if any(m in ql for m in _CAD_GIS_MARKERS):
         return "full"
 
@@ -87,9 +81,13 @@ def select_tool_scope(
     if bool(getattr(prompt_action, "needs_tools", False)):
         return "full"
 
-    if complexity == "simple" and intent == "knowledge":
-        # Historic / definitional / short explanatory Q&A only.
+    # Knowledge / historic Q&A never needs the ~46KB CAD/GIS tool pack.
+    if intent == "knowledge":
         return "lite"
+    if complexity == "simple" and intent in ("knowledge", "other"):
+        return "lite"
+    if complexity == "complex":
+        return "full"
     return "full"
 
 

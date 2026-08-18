@@ -23,6 +23,7 @@ class AgentRuntimeConfig:
     openai_model_mini: Optional[str] = None
     openai_model_complex: Optional[str] = None
     enable_tiered_models: Optional[bool] = None
+    enable_llm_prompt_router: Optional[bool] = None
     gemini_model: Optional[str] = None
     claude_model: Optional[str] = None
     deepseek_base_url: Optional[str] = None
@@ -40,6 +41,7 @@ class AgentRuntimeConfig:
             "openai_model_mini",
             "openai_model_complex",
             "enable_tiered_models",
+            "enable_llm_prompt_router",
             "gemini_model",
             "claude_model",
             "deepseek_base_url",
@@ -199,6 +201,7 @@ def resolve_agent_runtime_config(
         openai_model_mini=str(merged.get("openai_model_mini") or "").strip() or None,
         openai_model_complex=str(merged.get("openai_model_complex") or "").strip() or None,
         enable_tiered_models=_parse_bool(merged.get("enable_tiered_models")),
+        enable_llm_prompt_router=_parse_bool(merged.get("enable_llm_prompt_router")),
         gemini_model=str(merged.get("gemini_model") or "").strip() or None,
         claude_model=str(merged.get("claude_model") or "").strip() or None,
         deepseek_base_url=str(merged.get("deepseek_base_url") or "").strip() or None,

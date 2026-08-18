@@ -6,6 +6,26 @@ Keep technical details out of message boxes; users are not operators of the API.
 
 from __future__ import annotations
 
+# Canonical copy shown when the access/refresh token is dead.
+# Keep `is_session_expired_cloud_message` in lock-step with this string.
+SESSION_EXPIRED_USER_MESSAGE = (
+    "Your session has expired or is invalid. Please sign in again from "
+    "Settings (Cloud sign-in)."
+)
+
+
+def is_session_expired_cloud_message(msg: str) -> bool:
+    """
+    True only for the expired/invalid *login session* copy (the desktop screenshot case).
+
+    Timeouts, 403 device errors, 5xx, and other cloud failures must not match.
+    """
+    low = " ".join((msg or "").strip().lower().split())
+    if not low:
+        return False
+    canonical = " ".join(SESSION_EXPIRED_USER_MESSAGE.lower().split())
+    return low == canonical or "your session has expired or is invalid" in low
+
 
 def user_facing_cloud_message(exc: BaseException | str) -> str:
     raw = str(exc).strip() if isinstance(exc, BaseException) else str(exc).strip()
@@ -92,11 +112,6 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
             "connecttimeout",
         )
     ) or ("timed out" in low or "timeout" in low):
-        """return (
-            "The cloud API did not respond in time."
-            "if database_ok is false, the backendserver is waiting on a database that is down or unreachable. "
-            "contact Admin to Fix DATABASE_URL, then try again."
-        )"""
         return (
             "The cloud API did not respond in time. Database_ok is false, the server is waiting on a database that is down or unreachable."
             "Try again. \n\n"
@@ -114,10 +129,7 @@ def user_facing_cloud_message(exc: BaseException | str) -> str:
             "could not validate credentials",
         )
     ) or ("401" in raw and "token refresh" in low):
-        return (
-            "Your session has expired or is invalid. Please sign in again from "
-            "Settings (Cloud sign-in)."
-        )
+        return SESSION_EXPIRED_USER_MESSAGE
 
     if "device limit reached" in low or "active pcs for your plan" in low:
         return (
