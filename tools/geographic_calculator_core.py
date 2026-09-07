@@ -1263,13 +1263,17 @@ class BlueMarbleConverter:
                 except Exception:
                     pass
         
-        # Determine output path
+        # Determine output path (active workspace unless an absolute path was given)
         if output_path is None:
-            output_path = excel_file.parent / f"{excel_file.stem}_converted{excel_file.suffix}"
+            output_path = Path.cwd() / f"{excel_file.stem}_converted{excel_file.suffix}"
         else:
             out_p = Path(output_path)
-            # If user provided only a filename, resolve it into the same folder as the input file
-            output_path = (excel_file.parent / out_p.name) if not out_p.is_absolute() else out_p
+            if out_p.is_absolute():
+                output_path = out_p
+            else:
+                from agent.output_paths import join_workspace_path
+
+                output_path = join_workspace_path(out_p)
         
         # Save results
         try:

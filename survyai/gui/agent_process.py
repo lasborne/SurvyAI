@@ -76,7 +76,7 @@ _EPHEMERAL_SETTINGS_KEYS = frozenset(
 )
 
 # Bump when agent routing/pipelines change so a running app picks up new logic.
-_WORKER_CODE_REV = "20260817-ocr-word-export-v8"
+_WORKER_CODE_REV = "20260830-grid-origin-from-axis-intersection-v25"
 
 
 def _structural_settings_payload(settings_payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,6 +110,14 @@ def _agent_worker_loop(in_queue: "multiprocessing.Queue", out_queue: "multiproce
     cheap. The agent/service is constructed once and reused across requests.
     """
     try:
+        # Decide HF offline mode before any transformers/sentence-transformers
+        # import so cached embedding models never trigger network retry storms.
+        try:
+            from survyai.hf_env import configure_hf_offline_if_appropriate
+
+            configure_hf_offline_if_appropriate()
+        except Exception:
+            pass
         from config import Settings
         from survyai.agent_service import SurvyAIAgentService
         from survyai.feature_flags import FeatureFlags

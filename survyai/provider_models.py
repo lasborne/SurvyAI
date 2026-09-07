@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Literal, Optional, Sequence
 
 from survyai.openai_models import (
     DEFAULT_MODEL_FOR_COMPLEXITY,
+    chat_openai_official_kwargs,
     next_fallback_model as openai_next_fallback_model,
     resolve_model_for_complexity as resolve_openai_model_for_complexity,
 )
@@ -323,6 +324,69 @@ def vision_unsupported_user_message(provider: str) -> str:
     )
 
 
+def claude_extended_thinking_kwargs(model: str, max_tokens: Optional[int] = None) -> Dict[str, Any]:
+    """Enable extended thinking on Claude models that support it with tools.
+
+    Claude 3 / 3.5 do not support this; leaving them unchanged avoids new errors.
+    Temperature is forced to 1 (Anthropic requirement). Effort is never disabled.
+    """
+    m = str(model or "").strip().lower()
+    if not m or any(
+        tag in m
+        for tag in (
+            "claude-3-5",
+            "claude-3-opus-20240229",
+            "claude-3-sonnet-20240229",
+            "claude-3-haiku",
+        )
+    ):
+        return {}
+    if not any(
+        tag in m
+        for tag in ("3-7", "3.7", "sonnet-4", "opus-4", "haiku-4", "claude-4")
+    ):
+        return {}
+    cap = int(max_tokens or 0) or 8192
+    budget = min(16000, max(2048, cap // 2))
+    if budget >= cap:
+        cap = budget + 2048
+    return {
+        "thinking": {"type": "enabled", "budget_tokens": budget},
+        "temperature": 1,
+        "max_tokens": cap,
+    }
+
+
+def gemini_thinking_kwargs(model: str) -> Dict[str, Any]:
+    """Highest supported thinking for Gemini 2.5 / 3.x. Never sets budget to 0."""
+    m = str(model or "").strip().lower()
+    if any(tag in m for tag in ("2.5", "gemini-3", "flash-thinking")):
+        return {"thinking_level": "high"}
+    return {}
+
+
+def paid_llm_constructor_kwargs(
+    provider: str,
+    model: str,
+    *,
+    max_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Extra Chat* kwargs so tools and reasoning work together.
+
+    DeepSeek / Ollama stay empty: they speak OpenAI chat completions and have
+    no /v1/responses. Official OpenAI reasoning models use the Responses API
+    with effort left on.
+    """
+    p = str(provider or "").strip().lower()
+    if p == "openai":
+        return dict(chat_openai_official_kwargs(model))
+    if p == "claude":
+        return claude_extended_thinking_kwargs(model, max_tokens)
+    if p == "gemini":
+        return gemini_thinking_kwargs(model)
+    return {}
+
+
 __all__ = [
     "Complexity",
     "PaidProvider",
@@ -338,4 +402,7 @@ __all__ = [
     "is_elevated_average_task",
     "provider_supports_vision",
     "vision_unsupported_user_message",
+    "claude_extended_thinking_kwargs",
+    "gemini_thinking_kwargs",
+    "paid_llm_constructor_kwargs",
 ]

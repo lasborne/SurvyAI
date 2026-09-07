@@ -261,22 +261,32 @@ def _get_or_create_server_chat_model(
     settings: CloudSettings,
 ) -> Any:
     """Reuse Chat* clients across proxy requests with identical provider/model/temp/max_tokens."""
+    from survyai.provider_models import paid_llm_constructor_kwargs
+
+    extra = paid_llm_constructor_kwargs(
+        provider, resolved_model, max_tokens=body.max_tokens
+    )
     cache_key = _server_chat_cache_key(
         provider,
         resolved_model,
         temperature=body.temperature,
         max_tokens=body.max_tokens,
+    ) + (
+        extra.get("use_responses_api"),
+        (extra.get("reasoning") or {}).get("effort"),
+        (extra.get("thinking") or {}).get("type"),
+        extra.get("thinking_level"),
     )
     cached = _SERVER_CHAT_MODEL_CACHE.get(cache_key)
     if cached is not None:
         return cached
-
     if provider == "openai":
         llm = ChatOpenAI(
             model=resolved_model,
             api_key=settings.platform_openai_api_key,
             temperature=body.temperature,
             max_tokens=body.max_tokens,
+            **extra,
         )
     elif provider == "deepseek":
         llm = ChatOpenAI(
@@ -292,6 +302,7 @@ def _get_or_create_server_chat_model(
             anthropic_api_key=settings.platform_anthropic_api_key,
             temperature=body.temperature,
             max_tokens=body.max_tokens,
+            **extra,
         )
     elif provider == "gemini":
         llm = ChatGoogleGenerativeAI(
@@ -299,6 +310,7 @@ def _get_or_create_server_chat_model(
             google_api_key=settings.platform_google_api_key,
             temperature=body.temperature,
             max_output_tokens=body.max_tokens,
+            **extra,
         )
     else:
         raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")

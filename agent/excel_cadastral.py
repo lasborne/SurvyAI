@@ -14,6 +14,7 @@ Two ownership layouts (semantic — never confuse them):
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -383,19 +384,19 @@ def _normalize_owner_display_name(raw: str) -> str:
     s = re.sub(r"\s*\(([A-Za-z]{1,3})\)\s*$", "", s).strip()
     # Only remove trailing "Land" (keep "Family"): Greenhouse Family Land → Greenhouse Family
     s = re.sub(r"\s+LAND\s*$", "", s, flags=re.IGNORECASE)
-    # Drop synthetic placeholders from earlier bad dup.xlsx runs.
+    # Drop only our own synthetic leftovers from earlier bad dup.xlsx runs.
+    # Source titles (including unusual wording) stay as written.
     if re.fullmatch(r"Parcel\s+\d+", s, flags=re.IGNORECASE):
         return ""
     return s.strip() or (raw or "").strip()
 
 
 def _is_placeholder_owner_name(name: str) -> bool:
+    """True only for empty text or our invented ``Parcel N`` labels — never user titles."""
     s = (name or "").strip()
     if not s:
         return True
-    if re.fullmatch(r"Parcel\s+\d+(?:\s*\([A-Za-z]{1,3}\))?", s, flags=re.IGNORECASE):
-        return True
-    return False
+    return bool(re.fullmatch(r"Parcel\s+\d+(?:\s*\([A-Za-z]{1,3}\))?", s, flags=re.IGNORECASE))
 
 
 def _is_owner_name_row(values: Sequence[Any]) -> bool:
@@ -991,13 +992,22 @@ def resolve_ownership_excel_for_plot(
     ws = Path(workspace).resolve()
     mentioned: List[Path] = []
     q = query or ""
+    try:
+        from survyai.attachments import collect_attached_paths
+
+        for raw in collect_attached_paths(
+            q, suffixes=(".xlsx", ".xls", ".xlsm"), existing_only=True
+        ):
+            mentioned.append(Path(raw))
+    except Exception:
+        pass
     for m in re.finditer(r"['\"]([^'\"]+\.(?:xlsx|xls|xlsm))['\"]", q, flags=re.IGNORECASE):
         p = Path(m.group(1).strip())
         if not p.is_absolute():
             p = (ws / p).resolve()
         if p.exists():
             mentioned.append(p)
-    for m in re.finditer(r"([A-Za-z]:\\[^\s'\"]+\.(?:xlsx|xls|xlsm))", q, flags=re.IGNORECASE):
+    for m in re.finditer(r"([A-Za-z]:\\[^\r\n\"<>|]+?\.(?:xlsx|xls|xlsm))", q, flags=re.IGNORECASE):
         p = Path(m.group(1)).resolve()
         if p.exists():
             mentioned.append(p)
@@ -1132,7 +1142,17 @@ def write_dup_xlsx_with_headers(
     requested = (dest_name or "").strip() or extract_requested_workbook_copy_name(query) or ""
     if not requested:
         requested = "ownership_normalized.xlsx"
-    dest = (src.parent / Path(requested).name).resolve()
+    dest = Path(requested)
+    if not dest.is_absolute():
+        try:
+            from agent.output_paths import resolve_created_output_path
+
+            dest = resolve_created_output_path(
+                requested, query=query, source_path=src
+            )
+        except Exception:
+            dest = (Path.cwd() / Path(requested).name).resolve()
+    dest = dest.resolve()
     try:
         parse_src = src
         # If this path is weak/placeholder, switch to a better nearby ownership sheet.
@@ -1253,38 +1273,65 @@ _YEAR_TOKEN_RE = re.compile(r"^(?:19|20)\d{2}$")
 # Cap runaway Excel batches; same practical ceiling as the inline batch fastpath.
 _MAX_SEPARATE_OWNER_PLANS = 25
 
+# Strong: letter tags / one shared sheet. Weak: "all the owner names" (often filenames).
+_STRONG_MULTI_PARCEL_MARKERS: Tuple[str, ...] = (
+    "within the plan showing each owner",
+    "mark the parcels within",
+    "parcels within the plan",
+    "multi-parcel",
+    "multiparcel",
+    "multi parcel",
+    "combined plan",
+    "on the same drawing",
+    "on one plan",
+    "one cad plan with",
+    "single cad plan",
+    "letters such as",
+    "in bracket after their names",
+    "in brackets after their names",
+    "letter in bracket",
+    "letters in bracket",
+    "amadi family (b)",
+    " (a), ",
+)
+_WEAK_MULTI_PARCEL_MARKERS: Tuple[str, ...] = (
+    "all the owner",
+    "all owner names",
+    "all the buyers",
+    "same plan",
+)
+_SEPARATE_FILENAME_MARKERS: Tuple[str, ...] = (
+    "as the file name",
+    "as the file names",
+    "as the filenames",
+    "as file names",
+    "as filenames",
+    "different cad plan",
+    "all the cad plans",
+    "each of the plans",
+    "plan numbers as increment",
+    "increments from the existing",
+    "_family.dwg",
+)
+
 
 def wants_multi_parcel_layout(query: str) -> bool:
     """
     True when the user explicitly wants all owners on ONE cadastral sheet
     (letter tags A/B/C… marking parcels within that single plan).
+
+    "All the owner names as the file names" is NOT this — that is N DWGs.
     """
     q = (query or "").lower()
     if not q:
         return False
-    markers = (
-        "all the owner",
-        "all owner names",
-        "all the buyers",
-        "within the plan showing each owner",
-        "mark the parcels within",
-        "parcels within the plan",
-        "multi-parcel",
-        "multiparcel",
-        "multi parcel",
-        "combined plan",
-        "same plan",
-        "on the same drawing",
-        "on one plan",
-        "one cad plan with",
-        "single cad plan",
-        "letters such as",
-        "in bracket after their names",
-        "in brackets after their names",
-        "letter in bracket",
-        "letters in bracket",
-    )
-    return any(m in q for m in markers)
+    if any(m in q for m in _STRONG_MULTI_PARCEL_MARKERS):
+        return True
+    if any(m in q for m in _SEPARATE_FILENAME_MARKERS):
+        return False
+    if re.search(r"different\s+cad\s+plans?", q):
+        return False
+    return any(m in q for m in _WEAK_MULTI_PARCEL_MARKERS)
 
 
 def wants_separate_owner_plans(query: str) -> bool:
@@ -1292,13 +1339,13 @@ def wants_separate_owner_plans(query: str) -> bool:
     True when the user wants a distinct CAD .dwg per owner/family block
     (each owner's coordinates plot only that owner's plan).
 
-    Explicit multi-parcel language wins (returns False) so the classic
-    "all owners on one sheet with AMADI (B) labels" route stays intact.
+    Specific separate-plan language (different files, filename = owner,
+    incrementing plan numbers) wins over weak "all the owner names" wording.
+    Strong one-sheet language (letter tags / parcels within the plan) still
+    keeps the classic multi-parcel route.
     """
     q = (query or "").lower()
     if not q:
-        return False
-    if wants_multi_parcel_layout(q):
         return False
 
     patterns: Tuple[str, ...] = (
@@ -1307,6 +1354,7 @@ def wants_separate_owner_plans(query: str) -> bool:
         r"separate\s+(?:cad\s+)?(?:plans?|drawings?|dwgs?)",
         r"individual\s+(?:cad\s+)?(?:plans?|drawings?|dwgs?)",
         r"unique\s+(?:cad\s+)?(?:plans?|drawings?|dwgs?)",
+        r"plot\s+(?:them\s+)?individually",
         r"(?:one|a)\s+plan\s+per\s+(?:owner|buyer|family)",
         r"per[- ]owner\s+(?:cad\s+)?(?:plans?|drawings?)",
         r"each\s+(?:owner|buyer|family|set).{0,100}"
@@ -1316,7 +1364,17 @@ def wants_separate_owner_plans(query: str) -> bool:
         r"(?:each|every)\s+(?:buyer|owner|family)\s+name\s+as\s+the\s+names?\s+"
         r"of\s+that\s+particular",
         r"buyer\s+name\s+as\s+the\s+names?\s+of\s+that\s+particular\s+cad",
+        r"buyer\s+name\s+as\s+the\s+names?\s+of\s+each",
         r"with\s+each\s+(?:buyer|owner)\s+name\s+as\s+the\s+names?",
+        r"owner\s+names?\s+as\s+the\s+file\s+names?",
+        r"as\s+the\s+file\s+names?",
+        r"generate\s+all\s+the\s+cad\s+plans",
+        r"all\s+the\s+cad\s+plans",
+        r"for\s+each\s+of\s+the\s+plans",
+        r"plan\s+numbers?\s+as\s+increments?",
+        r"increments?\s+from\s+the\s+existing\s+plan",
+        r"take\s+the\s+plan\s+numbers?\s+as\s+increments?",
+        r"['\"][a-z][a-z0-9_]*family\.dwg['\"]",
         r"generate\s+\.dwg\s+files",
         r"\.dwg\s+files?\b.{0,80}each\s+(?:buyer|owner)",
         r"if\s+there\s+are\s+\d+\s+different\s+names",
@@ -1326,7 +1384,18 @@ def wants_separate_owner_plans(query: str) -> bool:
         r"plan\s+[ab]\s+should\s+be",
         r"plan\s+number.{0,40}increment",
     )
-    return any(re.search(p, q, flags=re.IGNORECASE) for p in patterns)
+    if any(re.search(p, q, flags=re.IGNORECASE) for p in patterns):
+        # Letter-tag / "parcels within the plan" jobs stay one sheet unless the
+        # user also asked for different files, owner filenames, or increments.
+        if any(m in q for m in _STRONG_MULTI_PARCEL_MARKERS) and not (
+            any(m in q for m in _SEPARATE_FILENAME_MARKERS)
+            or re.search(r"different\s+cad\s+plans?", q)
+        ):
+            return False
+        return True
+    if wants_multi_parcel_layout(q):
+        return False
+    return False
 
 
 def owner_plan_dwg_basename(owner_name: str) -> str:
@@ -1465,6 +1534,124 @@ def build_separate_owner_plan_jobs(
     }
 
 
+def clustered_multi_parcel_text_scales(
+    *,
+    parcel_count: int,
+    chosen_denom: int,
+    layout_span_m: float = 0.0,
+    multi_parcel: bool = True,
+) -> Tuple[float, float]:
+    """
+    Annotation shrink for clustered multi-parcel cadastral sheets.
+
+    Returns ``(body_scale, identity_scale)`` applied to the scale-correct size:
+    - body (max 25%): title, bearings/distances, scalebar, coordinate text,
+      north-arrow text, owner labels, and other plan text (e.g. 12 → 9 at 1:5000)
+    - identity (max 20%): pillar numbers, plan number, certification, surveyor
+
+    Single-parcel and uncrowded few-parcel sheets stay at ``(1.0, 1.0)``.
+    """
+    if not multi_parcel:
+        return 1.0, 1.0
+    n = int(parcel_count or 0)
+    denom = int(chosen_denom or 0)
+    span = float(layout_span_m or 0.0)
+    if n < 2:
+        return 1.0, 1.0
+    clustered = (
+        n >= 6
+        or denom >= 5000
+        or (n >= 3 and denom >= 2000)
+        or (n >= 4 and 0.0 < span <= 900.0)
+    )
+    if clustered:
+        return 0.75, 0.80
+    return 1.0, 1.0
+
+
+def is_shared_or_reverse_traverse_edge(
+    ax1: float,
+    ay1: float,
+    ax2: float,
+    ay2: float,
+    bx1: float,
+    by1: float,
+    bx2: float,
+    by2: float,
+    *,
+    end_tol_m: float = 1.75,
+    len_tol_m: float = 0.40,
+    len_rel: float = 0.04,
+    az_tol_deg: float = 10.0,
+) -> bool:
+    """
+    True when two traverse legs are the same physical boundary (or its reverse).
+
+    Excel ownership rings often restated a shared side with centimetre-to-decimetre
+    vertex drift and the backbearing (e.g. 186°54' / 53.88 m vs 6°54' / 53.88 m).
+    Those must annotate once. Parallel sides of a narrow corridor stay distinct
+    because both endpoints will not pair within ``end_tol_m``.
+    """
+    try:
+        ax1, ay1, ax2, ay2 = float(ax1), float(ay1), float(ax2), float(ay2)
+        bx1, by1, bx2, by2 = float(bx1), float(by1), float(bx2), float(by2)
+    except Exception:
+        return False
+    l1 = math.hypot(ax2 - ax1, ay2 - ay1)
+    l2 = math.hypot(bx2 - bx1, by2 - by1)
+    if l1 <= 1e-6 or l2 <= 1e-6:
+        return False
+    if abs(l1 - l2) > max(float(len_tol_m), float(len_rel) * max(l1, l2)):
+        return False
+    d_same = math.hypot(ax1 - bx1, ay1 - by1) + math.hypot(ax2 - bx2, ay2 - by2)
+    d_flip = math.hypot(ax1 - bx2, ay1 - by2) + math.hypot(ax2 - bx1, ay2 - by1)
+    if min(d_same, d_flip) > (2.0 * float(end_tol_m)):
+        return False
+    az1 = (math.degrees(math.atan2(ax2 - ax1, ay2 - ay1)) + 360.0) % 360.0
+    az2 = (math.degrees(math.atan2(bx2 - bx1, by2 - by1)) + 360.0) % 360.0
+    d_az = abs((az1 - az2 + 180.0) % 360.0 - 180.0)
+    return d_az <= float(az_tol_deg) or abs(d_az - 180.0) <= float(az_tol_deg)
+
+
+def filter_unique_undirected_edges(
+    edges: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Keep the first occurrence of each physical traverse side (incl. reverse)."""
+    kept: List[Dict[str, Any]] = []
+    for ed in edges or []:
+        if not isinstance(ed, dict):
+            continue
+        a = ed.get("a") or {}
+        b = ed.get("b") or {}
+        try:
+            ax1, ay1 = float(a.get("x")), float(a.get("y"))
+            ax2, ay2 = float(b.get("x")), float(b.get("y"))
+        except Exception:
+            continue
+        dup = False
+        for prev in kept:
+            pa = prev.get("a") or {}
+            pb = prev.get("b") or {}
+            try:
+                if is_shared_or_reverse_traverse_edge(
+                    ax1,
+                    ay1,
+                    ax2,
+                    ay2,
+                    float(pa.get("x")),
+                    float(pa.get("y")),
+                    float(pb.get("x")),
+                    float(pb.get("y")),
+                ):
+                    dup = True
+                    break
+            except Exception:
+                continue
+        if not dup:
+            kept.append(ed)
+    return kept
+
+
 def _quantize_xy(x: float, y: float, quantize_m: float = 0.001) -> Tuple[float, float]:
     q = float(quantize_m) if quantize_m and quantize_m > 0 else 0.001
     return (round(float(x) / q) * q, round(float(y) / q) * q)
@@ -1482,7 +1669,8 @@ def build_multi_parcel_layout_draw_ops(
     in a single drawing coordinate space (local/template or absolute).
 
     Returns unique peg insertion points (shared corners once), undirected traverse
-    edges (shared boundaries once; crossings allowed), and one label per parcel.
+    edges (shared boundaries once, including near-coincident reverse sides),
+    crossings allowed, and one label per parcel.
     Does not invent geometry — preserves each parcel's traverse order, including
     the closing edge from last→first when those vertices differ.
     """
@@ -1543,6 +1731,9 @@ def build_multi_parcel_layout_draw_ops(
             cy = sum(p["y"] for p in ring) / float(len(ring))
             labels.append({"label": lab, "x": float(cx), "y": float(cy)})
 
+    if edges:
+        edges = filter_unique_undirected_edges(edges)
+
     return {
         "pegs": pegs,
         "edges": edges,
@@ -1588,10 +1779,9 @@ def build_excel_cadastral_subprompt(
         return {"success": False, "error": f"Main parcel '{main.owner_name}' has fewer than 3 points."}
 
     buyer = ", ".join(p.labeled_name for p in parcels if p.labeled_name)
-    pillars = [pt.pillar for pt in main.points if pt.pillar]
-    # Fill missing pillar tokens so counts stay aligned with vertices.
-    while len(pillars) < len(main.points):
-        pillars.append(f"P{len(pillars) + 1}")
+    pillars = [(pt.pillar or "").strip() for pt in main.points]
+    # Keep empty slots so remaining IDs stay on the vertices they belong to.
+    # Do not invent P1/P2 tokens when Excel left a corner unlabeled.
 
     lines: List[str] = []
     if template_path:

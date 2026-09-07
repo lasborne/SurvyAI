@@ -61,12 +61,25 @@ def looks_like_file_driven_task(query: str) -> bool:
             ".pdf",
             ".xlsx",
             ".xls",
+            ".xlsm",
+            ".csv",
+            ".tsv",
             ".dwg",
             ".dxf",
-            ".csv",
+            ".dwf",
+            ".dgn",
             ".txt",
+            ".md",
             ".shp",
+            ".gpkg",
+            ".geojson",
+            ".kml",
+            ".kmz",
+            ".las",
+            ".laz",
             ".aprx",
+            ".pptx",
+            ".ppt",
             ".png",
             ".jpg",
             ".jpeg",
@@ -78,7 +91,9 @@ def looks_like_file_driven_task(query: str) -> bool:
         ]
     ):
         return True
-    if "\\Users\\" in q or ":\\" in q:
+    if "\\Users\\" in q or ":\\" in q or ":/" in q:
+        return True
+    if "file://" in ql or "file:/" in ql:
         return True
     if "[survyai attachments]" in ql:
         return True

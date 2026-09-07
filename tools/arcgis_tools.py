@@ -2452,10 +2452,12 @@ print("\\nTo zoom to the points, right-click the layer in the Contents pane and 
 
         out_csv = Path(output_csv)
         if not out_csv.is_absolute():
-            out_csv = (excel_file.parent / out_csv.name).resolve()
+            from agent.output_paths import join_workspace_path
 
-        # Create project in the requested folder (default: same folder as Excel file)
-        proj_base = Path(project_folder).resolve() if project_folder else excel_file.parent.resolve()
+            out_csv = join_workspace_path(out_csv)
+
+        # Create project in the requested folder (default: active SurvyAI workspace)
+        proj_base = Path(project_folder).resolve() if project_folder else Path.cwd().resolve()
         create = self.create_project(
             project_name=project_name,
             project_path=str(proj_base),
@@ -2770,7 +2772,7 @@ aprx.save()
         excel_file = Path(excel_path).resolve()
         if not excel_file.exists():
             return {"success": False, "error": f"Excel file not found: {excel_path}"}
-        workspace = excel_file.parent
+        workspace = Path.cwd().resolve()
         out_xlsx = Path(output_excel_path).resolve() if output_excel_path else (workspace / "results_fill.xlsx")
         sr_info = parse_coordinate_system(coordinate_system)
         wkid = sr_info.get("wkid") or 26392

@@ -22,9 +22,12 @@ from PySide6.QtWidgets import (
 
 from survyai.attachments import (
     DEFAULT_ATTACHMENTS_ONLY_PROMPT,
+    attach_unsupported_message,
+    file_dialog_filters,
     format_attachments_block,
     format_user_transcript,
     is_attachable_path,
+    max_file_mb_for_path,
 )
 
 
@@ -67,7 +70,7 @@ class ChatComposer(QWidget):
     attachmentsChanged = Signal()
     layoutChanged = Signal()
 
-    DEFAULT_MAX_FILES = 4
+    DEFAULT_MAX_FILES = 8
     DEFAULT_MAX_FILE_MB = 10
 
     def __init__(
@@ -109,8 +112,9 @@ class ChatComposer(QWidget):
         self._attach_btn.setObjectName("attachButton")
         self._attach_btn.setText("+")
         self._attach_btn.setToolTip(
-            "Attach images or documents (.png, .jpg, .pdf, .docx, …).\n"
-            "You can also type a file path in the prompt."
+            "Attach files for this prompt: images, Excel/CSV, CAD (.dwg/.dxf/.dwf),\n"
+            "GIS (.shp/.gpkg/.kml/.las), PDF/Word, PowerPoint, text, survey data, …\n"
+            "You can also drag-and-drop or type a file path in the prompt."
         )
         self._attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._attach_btn.setAutoRaise(True)
@@ -196,15 +200,10 @@ class ChatComposer(QWidget):
     # ------------------------------------------------------------------
 
     def _on_attach_clicked(self) -> None:
-        filters = (
-            "Images and documents ("
-            "*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif *.pdf *.docx *.doc);;"
-            "Images (*.png *.jpg *.jpeg *.webp *.tif *.tiff *.bmp *.gif);;"
-            "Documents (*.pdf *.docx *.doc);;"
-            "All files (*.*)"
-        )
         start = self._workspace_path or str(Path.home())
-        paths, _ = QFileDialog.getOpenFileNames(self, "Attach files", start, filters)
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "Attach files", start, file_dialog_filters()
+        )
         for p in paths:
             self._try_add_path(p, warn=True)
         if paths:
@@ -225,8 +224,7 @@ class ChatComposer(QWidget):
                 QMessageBox.warning(
                     self,
                     "Attachment",
-                    f"Unsupported type: {p.suffix or '(no extension)'}\n"
-                    "Attach images (.png, .jpg, …) or documents (.pdf, .docx).",
+                    attach_unsupported_message(p.suffix),
                 )
             return False
         try:
@@ -235,13 +233,14 @@ class ChatComposer(QWidget):
             if warn:
                 QMessageBox.warning(self, "Attachment", f"Cannot read file:\n{exc}")
             return False
-        if size_mb > self._max_file_mb:
+        size_cap = max_file_mb_for_path(p, image_max_mb=self._max_file_mb)
+        if size_mb > size_cap:
             if warn:
                 QMessageBox.warning(
                     self,
                     "Attachment too large",
                     f"{p.name} is {size_mb:.1f} MB.\n"
-                    f"Maximum allowed size is {self._max_file_mb} MB.",
+                    f"Maximum allowed size is {size_cap} MB.",
                 )
             return False
         resolved = str(p.resolve())

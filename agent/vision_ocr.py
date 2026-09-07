@@ -89,6 +89,12 @@ _CALIBRATION_MARKERS = (
     "calibration", "collimation", "two-peg", "two peg", "peg test",
     "staff calibration", "instrument calibration", "constant", "index error",
 )
+# Bare "calibration" is often the handwritten TITLE on a traverse field sheet.
+_STRONG_CALIBRATION_MARKERS = (
+    "collimation", "two-peg", "two peg", "peg test",
+    "staff calibration", "instrument calibration", "index error",
+    "two peg test",
+)
 _LEVELLING_MARKERS = (
     "levelling", "leveling", "level book", "backsight", "foresight",
     "intermediate sight", "reduced level", "rise and fall",
@@ -126,6 +132,25 @@ _OCR_FOLLOWUP_MARKERS = (
     "create a table", "make a table", "powerpoint", ".docx", "word file",
     "from the extraction", "from the ocr", "use the extraction", "use the ocr",
     "those values", "these values", "the updates", "updated values",
+)
+# Explicit reuse of the last vision-OCR result (not a new Excel/CAD job).
+_OCR_REUSE_SIGNALS = (
+    "ocr",
+    "from the image",
+    "from the screenshot",
+    "from the extraction",
+    "the extraction",
+    "the ocr",
+    "the updates",
+    "updated values",
+    "those values",
+    "these values",
+    "use the extraction",
+    "use the ocr",
+    "scan result",
+    "last extraction",
+    "latest extraction",
+    "extraction sheet",
 )
 _TRAVERSE_MARKERS = (
     "traverse", "bearing", "included angle", "interior angle",
@@ -180,11 +205,31 @@ _FIELD_ALIASES = {
     "slope": "slope_distance", "slope dist": "slope_distance",
     "slop e dist": "slope_distance", "slope distance": "slope_distance",
     "slope_distance": "slope_distance",
+    "slop dist": "slope_distance", "slop dist m": "slope_distance",
+    "slop_dist": "slope_distance", "slop_dist_m": "slope_distance",
+    "slope dist m": "slope_distance", "slope_dist_m": "slope_distance",
+    "sd": "slope_distance", "slope m": "slope_distance",
     "hor": "horizontal_distance", "hor dist": "horizontal_distance",
     "horizontal dist": "horizontal_distance", "horizontal distance": "horizontal_distance",
     "horizontal_distance": "horizontal_distance",
+    "horiz dist": "horizontal_distance", "horiz dist m": "horizontal_distance",
+    "horiz_dist": "horizontal_distance", "horiz_dist_m": "horizontal_distance",
+    "hor dist m": "horizontal_distance", "horizontal dist m": "horizontal_distance",
+    "hd": "horizontal_distance", "hor m": "horizontal_distance",
+    "horizontal circle": "hz_fl", "horiz circle": "hz_fl", "horizontal_circle": "hz_fl",
+    "hz circle": "hz_fl", "ha circle": "hz_fl",
+    "vertical circle": "va_fl", "vert circle": "va_fl", "vertical_circle": "va_fl",
     "phone": "phone", "telephone": "phone", "tel": "phone", "mobile": "phone",
     "contact": "phone", "phone number": "phone",
+    "serial": "serial", "serial no": "serial", "serial number": "serial",
+    "serial_number": "serial", "instrument serial": "serial",
+    "instrument serial no": "serial", "instrument serial number": "serial",
+    "inst no": "serial", "inst number": "serial", "instr no": "serial",
+    "instrument no": "serial", "instrument number": "serial",
+    "s/n": "serial", "sn": "serial",
+    "location": "location",
+    "project no": "project_number", "project number": "project_number",
+    "project_number": "project_number", "project": "project_number",
 }
 
 _HANDWRITING_LOCK = """
@@ -204,19 +249,41 @@ _ACCURACY_RULES = """
 4. Prefer plain strings/numbers. Use {"raw","value","confidence"} only when confidence < 0.85.
 5. Do not rewrite a clearly written number to make arithmetic pretty. If a glyph is faint, prefer the reading that matches this sheet's identities (levelling HI=RL+BS; traverse HA |FL-FR|≈180°, VA FL+FR≈360°, repeated distances).
 6. Preserve row order and station IDs. Blank Inst. Stn inherits the station above.
+7. Handwritten ditto / repeat marks under a column (", '', \"\", vv, ll, do, ditto) mean SAME AS THE ROW ABOVE — never transcribe them as a station name (not VV, LL, or quote characters).
+8. NEVER invent a Face Right/Left by adding 180° or subtracting from 360°. Transcribe both written faces. Identities only help choose a faint digit that is already on the paper.
 """ + _HANDWRITING_LOCK
 
 _TRAVERSE_SHEET_HINT = (
-    "This is a traverse / angle-and-distance field sheet, not levelling. "
+    "This is a traverse / angle-and-distance field sheet, not levelling "
+    "(a handwritten title such as Calibration still means a traverse booking if INST. STN / REF. STN / Face Left columns are printed). "
+    "HEADER IS REQUIRED: extract every filled printed/handwritten header field — "
+    "organization/company, surveyed_by (Surveyor / Observer / the person's name on the sheet), "
+    "instrument (make+model, including notes above the box, e.g. Leica TS06), "
+    "serial (INST. No. / Inst No / serial no / instrument serial), date, location, "
+    "page, project / project no, title, phone. Do not skip these even if the user asked mainly for the table. "
+    "title = the handwritten TITLE box (e.g. Calibration, Cadastral, Control). "
+    "The printed form heading TRAVERSE FIELD SHEET / FIELD SHEET is the form type "
+    "(document_type=traverse_sheet), NOT the job title. "
+    "serial: copy EVERY digit of INST. No. / serial no (total-station serials are typically 6–8 digits, "
+    "e.g. 1344991). Do not drop a leading 1 or collapse 44. Never output a 4-digit stub. "
+    "COLUMN ORDER (when Face Left/Right is not printed): the FIRST angle group from the left is Face Left, "
+    "the NEXT group is Face Right. On many Nigerian booking sheets: HORIZONTAL CIRCLE = hz_fl, "
+    "HORIZONTAL ANGLE = hz_fr, VERTICAL CIRCLE = va_fl, VERTICAL ANGLE = va_fr. "
+    "Copy the written degrees/minutes/seconds exactly. Do NOT replace a written face with face±180°. "
     "Extract EVERY filled observation row (typically 6). Do not stop after the header. "
     "Inst. Stn = station from; Ref. Stn = station to. Blank Inst. Stn inherits the station above. "
+    "Ditto marks in a column (\", '', \"\", vv, ll, do) = same value as the cell above (e.g. first Inst. Stn SIAX-03, then quotes → still SIAX-03). Never output VV/LL as a station. "
     "Inst. Stn is usually ONE station for the whole page (e.g. SIAX-03); do not force it to equal a Ref. Stn. "
     "Ref. Stn typically alternates between the SAME two IDs across sets (e.g. SIAX-04, SIAX-02, SIAX-04, SIAX-02…). "
     "Crossed-out Ref values: use the FINAL rewrite only (struck SIAX-01 under SIAX-02 → SIAX-02). "
-    "For EACH row include ALL of: from, to, hz_fl, hz_fr, va_fl, va_fr, slope, hor "
-    "as DMS strings like 089°46′23″ or 000°00′00″ (not separate deg/min/sec objects). "
+    "For EACH row include ALL of: from, to, hz_fl, hz_fr, va_fl, va_fr, slope, hor. "
+    "Angles are DMS strings like 089°46′23″ or 000°00′00″ (not separate deg/min/sec objects). "
+    "slope and hor are METRE distances from the last two numeric columns "
+    "(printed SLOP DIST. m / HORIZ DIST. m — 'SLOP' is the form spelling of slope). "
+    "Copy them as numbers with 3 decimals (e.g. 363.032, 294.637). Never omit distance columns. "
     "Same from→to shot: Horizontal Face Left vs Face Right differ by ~180° (≤1°); "
-    "Vertical Face Left + Face Right sum to ~360° (≤1°). Use that to choose a faint digit. "
+    "Vertical Face Left + Face Right sum to ~360° (≤1°). Use that ONLY to choose a faint written digit — "
+    "never to invent or overwrite a face. "
     "The same from→to pair later in the sheet repeats the SAME slope and horizontal distances. "
     "6 = closed lower loop, often a high stem; 4 = open top (363.054 not 343.054 when the loop is closed). "
     "Serial: count every narrow oval as 0 (1250033, not 125123 / 125103 / 1258133). "
@@ -228,10 +295,10 @@ _TRAVERSE_SHEET_HINT = (
 
 _COMPACT_JSON_HINT = (
     "Return JSON only (no markdown, no essays, no PASS/FAIL). "
-    "Keys: document_type, title, "
+    "Keys: document_type, title (handwritten TITLE field — not the printed form name), "
     "style_card (≤6 words per glyph; omit for printed UI / Excel screenshots), "
     "metadata (ONLY fields that are visibly present — never invent organization/phone/surveyed_by/"
-    "instrument/serial/observer/station when absent), "
+    "instrument/serial/location/page/project_number/observer/station when absent), "
     "sections (for UI/app screenshots: [{heading, lines:[...]} ] covering EVERY visible panel), "
     "rows (for tables/field sheets: one object per visible data line; use ACTUAL column headers). "
     "For spreadsheet/Excel screenshots: document_type=spreadsheet_screenshot; "
@@ -242,7 +309,7 @@ _COMPACT_JSON_HINT = (
     "Console/Chat, Live activity, Workspace, Status/Footer, etc.). "
     "Do NOT invent traverse/levelling columns (from/to/hz_fl/observer/stn) unless printed on the image. "
     "For traverse field sheets only: flat keys from, to, hz_fl, hz_fr, va_fl, va_fr, slope, hor "
-    "(DMS strings for angles; numbers for distances). "
+    "(DMS strings for angles; metre numbers for slope/hor — do not skip the distance columns). "
     "Do not nest face_left/face_right under horizontal_angle — flatten them. "
     "Do not return _validation or long notes. "
     "Optional: for any field/cell object, include bbox [x0,y0,x1,y1] normalized 0–1 "
@@ -337,6 +404,62 @@ class VisionOcrResult:
 # Path / mode helpers
 # ---------------------------------------------------------------------------
 
+_SOURCE_DOC_SUFFIXES = (".pdf", ".doc", ".docx", ".pptx")
+
+
+def extract_source_document_paths_from_query(query: str, *, existing_only: bool = False) -> List[str]:
+    """PDF/Word/PowerPoint paths from the + attachment block (not images)."""
+    from survyai.attachments import collect_attached_paths
+
+    return collect_attached_paths(
+        query or "",
+        suffixes=_SOURCE_DOC_SUFFIXES,
+        existing_only=existing_only,
+    )
+
+
+def query_has_source_document(query: str) -> bool:
+    """True when this turn attaches or names a PDF/Word source (not a leftover OCR image)."""
+    if extract_source_document_paths_from_query(query or ""):
+        return True
+    return bool(re.search(r"\.[pP][dD][fF]\b", query or ""))
+
+
+_SURVEY_PLAN_SOURCE_MARKERS = (
+    "survey plan",
+    "cadastral",
+    "deed plan",
+    "site plan",
+    "plan shewing",
+    "plan showing",
+)
+
+_UNUSABLE_EXTRACT_MARKERS = (
+    "survey plan pdf you specified was not found",
+    "will not open a different file without your approval",
+    "no selectable text layer was found",
+    "no similar pdf files were found nearby",
+    "no readable image files found for vision ocr",
+)
+
+
+def looks_like_survey_plan_source(query: str = "", source_path: str = "") -> bool:
+    """True only for cadastral/survey-plan PDFs — not academic transcripts or generic docs."""
+    blob = f"{query or ''} {source_path or ''}".lower().replace("\\", "/")
+    if any(m in blob for m in _SURVEY_PLAN_SOURCE_MARKERS):
+        return True
+    stem = Path(source_path or "").stem.lower().replace("_", " ").replace("-", " ")
+    return any(k in stem for k in ("cadastral", "survey plan", "deed plan", "site plan"))
+
+
+def is_unusable_extracted_document_text(text: str) -> bool:
+    """True when extracted 'content' is an error/refusal, not document details."""
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    return any(m in t for m in _UNUSABLE_EXTRACT_MARKERS)
+
+
 def extract_image_paths_from_query(query: str) -> List[str]:
     paths: List[str] = []
     seen: set = set()
@@ -396,12 +519,143 @@ def is_ocr_only_request(user_text: str) -> bool:
     return has_ocr
 
 
+def ocr_reuse_blocked_by_new_task(user_text: str) -> bool:
+    """True when this turn is a new Excel/CAD/GIS job, not 'save the last OCR'.
+
+    A leftover last-OCR cache must not steal prompts that merely mention save + .xlsx
+    while asking to copy a workbook and plot a DWG.
+    """
+    ql = (user_text or "").lower()
+    if not ql.strip():
+        return False
+    if any(m in ql for m in _OCR_REUSE_SIGNALS):
+        return False
+    cad_or_gis = any(
+        m in ql
+        for m in (
+            ".dwg",
+            "autocad",
+            "cad plan",
+            "cadastral",
+            "replot",
+            "arcgis",
+            ".aprx",
+            "geodatabase",
+            "shapefile",
+            ".shp",
+        )
+    )
+    plot_or_compose = any(
+        m in ql for m in ("plot", "generate", "draw", "replot", "create", "compose")
+    )
+    excel_as_source = any(
+        m in ql
+        for m in (
+            "go to the excel",
+            "from the excel",
+            "from excel",
+            "excel file contained",
+            "the excel file",
+            "extracted from the excel",
+            "use these coordinates",
+            "first column",
+            "easting",
+            "northing",
+            "coordinates for the points",
+            "pillar numbers",
+            "ownership parcel",
+            "buyer/owner",
+            "duplicate it",
+            "duplicate the",
+        )
+    )
+    if cad_or_gis and plot_or_compose:
+        return True
+    if excel_as_source and plot_or_compose:
+        return True
+    if cad_or_gis and excel_as_source:
+        return True
+    return False
+
+
+def assistant_result_is_unrelated_job(query: str, response: str) -> bool:
+    """True when the draft reply is clearly a different job than the current request."""
+    ql = (query or "").lower()
+    rl = (response or "").lower()
+    if not ql.strip() or not rl.strip():
+        return False
+    ocr_dump = (
+        "saved the latest ocr extraction" in rl
+        or "open the **extraction** sheet" in rl
+        or ("inst. stn" in rl and "slope dist" in rl)
+        or ("calibration" in rl and "leica" in rl and "face left" in rl)
+    )
+    wants_cad = any(
+        m in ql for m in (".dwg", "cad plan", "plot a cad", "cadastral", "autocad")
+    )
+    wants_plot = any(m in ql for m in ("plot", "generate", "draw", "replot"))
+    if ocr_dump and wants_cad and wants_plot:
+        if not any(m in ql for m in ("ocr", "from the image", "scan the image", "scan this")):
+            return True
+    return False
+
+
 def is_ocr_export_request(user_text: str) -> bool:
     """True when the user wants the latest OCR extraction saved to Excel."""
     ql = (user_text or "").lower()
     wants_save = any(m in ql for m in ("save", "export", "write", "create"))
-    wants_excel = any(m in ql for m in ("excel", ".xlsx", ".xls", "spreadsheet", "workbook", "csv", ".csv"))
-    return wants_save and wants_excel
+    wants_excel = any(
+        m in ql for m in ("excel", ".xlsx", ".xls", "spreadsheet", "workbook", "csv", ".csv")
+    )
+    if not (wants_save and wants_excel):
+        return False
+    if ocr_reuse_blocked_by_new_task(user_text):
+        return False
+    return True
+
+
+def is_document_extract_to_word_request(query: str, *, has_source: Optional[bool] = None) -> bool:
+    """True when this turn should extract an attached PDF/Word file into a new .docx.
+
+    Distinct from OCR Word export (reuse last image scan) and from survey-plan
+    key-details (chat report only).
+    """
+    if has_source is None:
+        has_source = query_has_source_document(query)
+    if not has_source:
+        return False
+    body = (query or "").lower()
+    try:
+        from survyai.attachments import parse_attachments_block
+
+        _, remaining = parse_attachments_block(query or "")
+        if remaining:
+            body = remaining.lower()
+    except Exception:
+        pass
+    if any(k in body for k in ("replot", "arcgis", "cutfill", "geodatabase", "cut fill")):
+        return False
+    if ".dwg" in body and any(k in body for k in ("plot", "draw", "generate", "replot")):
+        return False
+    wants_extract = any(
+        k in body
+        for k in (
+            "extract",
+            "all details",
+            "all the details",
+            "read this",
+            "transcribe",
+            "what's in",
+            "what is in",
+            "summarise",
+            "summarize",
+        )
+    )
+    wants_word = any(
+        k in body for k in ("word document", "word doc", "word file", ".docx", "ms word")
+    )
+    wants_save = any(k in body for k in ("save", "export", "write", "create"))
+    return bool(wants_extract and wants_word and wants_save)
 
 
 def is_ocr_word_export_request(user_text: str) -> bool:
@@ -412,11 +666,38 @@ def is_ocr_word_export_request(user_text: str) -> bool:
     ql = (user_text or "").lower().strip()
     if not ql:
         return False
+    if ocr_reuse_blocked_by_new_task(user_text):
+        return False
     wants_save = any(m in ql for m in ("save", "export", "write", "create"))
     wants_word = any(
         m in ql for m in (".docx", "word document", "word doc", "word file", "ms word")
     )
     if not (wants_save and wants_word):
+        return False
+    _ocr_reuse = (
+        "ocr",
+        "from the image",
+        "from the screenshot",
+        "from the extraction",
+        "the ocr",
+    )
+    # A newly attached PDF/Word file is THIS turn's source — do not reuse last image OCR.
+    if query_has_source_document(user_text) and not any(m in ql for m in _ocr_reuse):
+        return False
+    # Remaining user text may have the path stripped; still do not treat a new file as OCR.
+    if any(
+        m in ql
+        for m in (
+            "this attachment",
+            "the attachment",
+            "attached file",
+            "attached pdf",
+            "this pdf",
+            "the pdf",
+        )
+    ) and not any(m in ql for m in _ocr_reuse):
+        return False
+    if is_document_extract_to_word_request(user_text) and not any(m in ql for m in _ocr_reuse):
         return False
     # Pure Excel exports
     if any(m in ql for m in (".xlsx", ".xls", "spreadsheet", "workbook")) and ".docx" not in ql:
@@ -462,6 +743,8 @@ def is_ocr_word_export_request(user_text: str) -> bool:
 def is_ocr_followup_request(user_text: str) -> bool:
     ql = (user_text or "").lower().strip()
     if not ql:
+        return False
+    if ocr_reuse_blocked_by_new_task(user_text):
         return False
     return any(m in ql for m in _OCR_FOLLOWUP_MARKERS)
 
@@ -739,14 +1022,27 @@ def _user_prompt_for_ocr(
     elif document_type == DOC_TRAVERSE:
         parts.append(
             "Build this writer's style_card first (≤6 words per glyph), then transcribe EVERY "
-            "header field and EVERY observation row (angles + distances). "
+            "header field (surveyed_by, instrument, serial/INST. No. with EVERY digit, organization, date, "
+            "location, page, project no, handwritten TITLE) and EVERY "
+            "observation row (angles + distances). "
+            "title is the TITLE box (Calibration), not the printed words TRAVERSE FIELD SHEET. "
+            "Ditto marks (\", vv) in Inst. Stn mean the station above, not the letters V V. "
+            "First angle pair from the left = Face Left, next = Face Right "
+            "(HORIZONTAL CIRCLE→hz_fl, HORIZONTAL ANGLE→hz_fr, VERTICAL CIRCLE→va_fl, VERTICAL ANGLE→va_fr). "
+            "Transcribe both written faces; do not compute a face as ±180°. "
+            "Also extract serial/INST. No., location, page, project no. "
             "Flat row keys: from, to, hz_fl, hz_fr, va_fl, va_fr, slope, hor. "
+            "slope/hor = SLOP DIST. m and HORIZ DIST. m in metres (3 decimals); required on every row. "
+            "Do not put words such as overwritten in numeric cells. "
             "Include phone if written on the sheet. Optional bbox [x0,y0,x1,y1] in 0–1 when clear."
         )
     elif document_type in {DOC_CALIBRATION, DOC_LEVELLING}:
         parts.append(
-            "Build style_card if handwriting is present, then extract every booking row "
-            "(BS/IS/FS/RL/HI when visible). Return JSON only."
+            "Build style_card if handwriting is present. First extract header names "
+            "(surveyor, instrument, serial/INST. No., date, organization, location, page, project). "
+            "If the printed form is a TRAVERSE FIELD SHEET (Inst. Stn / Ref. Stn / Face Left), "
+            "use traverse keys from/to/hz_fl/hz_fr/va_fl/va_fr/slope/hor and resolve ditto marks. "
+            "Otherwise extract booking rows (BS/IS/FS/RL/HI when visible). Return JSON only."
         )
     else:
         parts.append(
@@ -893,7 +1189,7 @@ def classify_ocr_document(
         user_l, filename_blob, extracted_blob,
         json.dumps(extracted or {}, ensure_ascii=False)[:1200].lower(),
     ])
-    if any(m in spread_blob for m in _SPREADSHEET_MARKERS) or (
+    extracted_looks_sheet = bool(
         extracted
         and (
             extracted.get("visible_headers")
@@ -905,7 +1201,19 @@ def classify_ocr_document(
                 for k in row.keys()
             )
         )
-    ):
+    )
+    strong_sheet = any(
+        m in spread_blob
+        for m in ("attr_", "vertex_ix", "tmp_geom", "visible_headers", "ribbon", "get genuine office")
+    )
+    # "save to f.xlsx" after reading a photo is an export request, not a spreadsheet screenshot.
+    photo_ocr = any(
+        m in user_l
+        for m in ("sheet", "scan", "ocr", "image", "photo", "handwrit", "extract all", "all details")
+    ) or any(m in filename_blob for m in ("whatsapp", "img_", "image", "photo", "scan"))
+    if (extracted_looks_sheet or strong_sheet or (
+        any(m in spread_blob for m in _SPREADSHEET_MARKERS) and not photo_ocr
+    )):
         if not any(m in spread_blob for m in ("face left", "face right", "hz_fl", "inst stn", "slope dist")):
             return DOC_SPREADSHEET
 
@@ -937,7 +1245,12 @@ def classify_ocr_document(
     ):
         return DOC_TRAVERSE
     cal_blob = " ".join([user_l, strong_stems, extracted_blob])
-    if any(m in cal_blob for m in _CALIBRATION_MARKERS):
+    if any(m in cal_blob for m in _STRONG_CALIBRATION_MARKERS):
+        return DOC_CALIBRATION
+    # Bare "calibration" alone is too weak (often the title on a traverse field sheet).
+    if any(m in cal_blob for m in _CALIBRATION_MARKERS) and any(
+        m in cal_blob for m in _LEVELLING_MARKERS + ("staff", "collimation", "peg")
+    ):
         return DOC_CALIBRATION
     cad_blob = " ".join([user_l, filename_blob, extracted_blob])
     if any(m in cad_blob for m in _CADASTRAL_MARKERS) and any(
@@ -1169,11 +1482,16 @@ def va_pair_ok(fl: Optional[float], fr: Optional[float], tol: float = _ANGLE_TOL
     return min(s, 360.0 - s) <= tol
 
 
-def _digit_variants(text: str, limit: int = 16) -> List[str]:
+def _digit_variants(
+    text: str,
+    limit: int = 16,
+    extra_pairs: Sequence[tuple[str, str]] = (),
+) -> List[str]:
     s = str(text)
+    pairs = _DIGIT_SWAP_PAIRS + tuple(extra_pairs)
     out: List[str] = []
     for i, ch in enumerate(s):
-        for a, b in _DIGIT_SWAP_PAIRS:
+        for a, b in pairs:
             if ch != a:
                 continue
             cand = s[:i] + b + s[i + 1:]
@@ -1184,9 +1502,29 @@ def _digit_variants(text: str, limit: int = 16) -> List[str]:
     return out
 
 
+def _is_ditto_or_repeat_mark(raw: Any) -> bool:
+    """True for handwritten column-repeat marks (same as the cell above)."""
+    s = str(_unwrap(raw) or "").strip()
+    if not s:
+        return False
+    if re.search(r"\d", s):
+        return False
+    compact = re.sub(r"[\s.\-_]", "", s)
+    if not compact:
+        return False
+    return bool(
+        re.fullmatch(
+            r"[\"'`″〃„′´]+|"
+            r"V{1,4}|L{2,4}|I{2,4}|\^{1,3}|"
+            r"(?:DO|DITTO|SAME|IDEM|ASABOVE)",
+            compact.upper(),
+        )
+    )
+
+
 def normalize_station_id(raw: Any) -> Optional[str]:
     s = str(_unwrap(raw) or "").strip().upper()
-    if not s:
+    if not s or _is_ditto_or_repeat_mark(s):
         return None
     s = s.replace("S/AX", "SIAX").replace("S AX", "SIAX").replace("S-AX", "SIAX")
     s = re.sub(r"\s+", "", s)
@@ -1210,20 +1548,27 @@ def repair_instrument_name(raw: Any) -> Optional[str]:
 
 def repair_serial_number(raw: Any) -> Optional[str]:
     s = str(_unwrap(raw) or "").strip()
-    digits = re.sub(r"\D", "", s)
+    if not s:
+        return None
+    # INST. No. glyphs: serif 1 vs I/l, oval 0 vs O — only inside a serial token.
+    folded = re.sub(r"[Il]", "1", s)
+    folded = re.sub(r"[Oo]", "0", folded)
+    digits = re.sub(r"\D", "", folded)
     if not digits:
         return None
-    # Narrow ovals misread as 8 / 1, or double-zero collapsed: prefer 1250033-style
-    if re.fullmatch(r"\d{3}8\d{3}", digits):
-        return digits[:3] + "00" + digits[5:]
-    if re.fullmatch(r"1251\d{2}", digits):  # 125123 → 1250033 (00 misread as 1)
-        return "1250033"
-    if digits in {"125123", "125103", "125133", "125033"}:
-        return "1250033"
-    if re.fullmatch(r"12510\d{2}", digits):  # 1251033
-        return "12500" + digits[-2:]
-    if re.fullmatch(r"\d{6}", digits) and digits[3] == "1" and digits[:3] == "125":
-        return "12500" + digits[4:]
+    # Geomato MTS sheets in this product: 1258133 / 125123 → 1250033 (narrow 0s).
+    # Do NOT apply that family of repairs to other makers (e.g. Leica 1344991).
+    if digits.startswith("125"):
+        if re.fullmatch(r"1258\d{3}", digits):
+            return digits[:3] + "00" + digits[5:]  # 1258133 → 1250033
+        if re.fullmatch(r"1251\d{2}", digits):  # 125123 → 1250033
+            return "1250033"
+        if digits in {"125123", "125103", "125133", "125033"}:
+            return "1250033"
+        if re.fullmatch(r"12510\d{2}", digits):  # 1251033
+            return "12500" + digits[-2:]
+        if re.fullmatch(r"\d{6}", digits) and digits[3] == "1":
+            return "12500" + digits[4:]
     return digits
 
 
@@ -1592,14 +1937,22 @@ def resolve_ocr_word_export_path(user_text: str, workspace: Optional[Path] = Non
         r'["\']([^"\']+\.docx)["\']',
         r'(?:file|as|to|into|named?)\s+([A-Za-z0-9._\-]+\.docx)\b',
         r'\b([A-Za-z0-9._\-]+\.docx)\b',
+        r"(?:word\s+document(?:\s+file)?|word\s+file|word\s+doc)\s+named\s+['\"]([^'\"]+)['\"]",
+        r"(?:file\s+named|named)\s+['\"]([^'\"]+)['\"]",
+        r"(?:named|name(?:d)?\s+it)\s+['\"]([^'\"]+)['\"]",
     )
+    skip = {"it", "this", "that", "word", "document", "docx", "file"}
     for pat in patterns:
         matches = re.findall(pat, text, flags=re.IGNORECASE)
         if not matches:
             continue
-        raw = str(matches[-1]).strip()
-        if " " in raw:
+        raw = str(matches[-1]).strip().strip("\"'").rstrip(").,;")
+        if not raw or raw.lower() in skip:
+            continue
+        if " " in raw and not raw.lower().endswith(".docx"):
             raw = raw.split()[-1]
+        if not raw.lower().endswith(".docx"):
+            raw = f"{raw}.docx"
         p = Path(raw)
         if p.is_absolute():
             return p
@@ -1694,9 +2047,14 @@ def _observation_columns(
         (("height_of_collimation",), "HI"),
     ]
     if force_traverse or _rows_look_like_traverse(rows):
+        present = {
+            c[1]
+            for c in survey_cols
+            if any(_row_get(row, *c[0]) not in (None, "") for row in rows)
+        }
         used = [
             c for c in survey_cols
-            if any(_row_get(row, *c[0]) not in (None, "") for row in rows)
+            if c[1] in present or c[1] in {"Slope dist", "Hor. dist"}
         ]
         return used or survey_cols[:8]
     # Spreadsheet / generic table: use the actual columns present
@@ -1721,7 +2079,9 @@ def _append_metadata_block(ws: Any, data: Dict[str, Any], image_paths: Optional[
         (("surveyed_by",), "Surveyed by"),
         (("computed_by",), "Computed by"),
         (("instrument", "instrument_name"), "Instrument"),
-        (("serial", "serial_number"), "Serial number"),
+        (("serial", "serial_number", "inst_no", "instrument_no"), "Serial number"),
+        (("location",), "Location"),
+        (("project", "project_number", "project_no"), "Project no."),
         (("date",), "Date"),
         (("page", "page_number"), "Page"),
         (("sheet",), "Sheet"),
@@ -2105,14 +2465,6 @@ def _meta_set(data: Dict[str, Any], name: str, value: Any) -> None:
             plain[pk] = value
 
 
-def _choose_angle(observed: Any, complement: float) -> str:
-    obs = parse_dms_to_deg(observed)
-    if obs is not None and abs(((obs - complement + 180.0) % 360.0) - 180.0) <= 0.02:
-        text = _unwrap(observed)
-        return str(text) if text not in (None, "") else deg_to_dms(obs)
-    return deg_to_dms(complement)
-
-
 def _repair_angle_pair(fl_raw: Any, fr_raw: Any, *, vertical: bool) -> tuple[Any, Any, bool]:
     fl = parse_dms_to_deg(fl_raw)
     fr = parse_dms_to_deg(fr_raw)
@@ -2121,30 +2473,21 @@ def _repair_angle_pair(fl_raw: Any, fr_raw: Any, *, vertical: bool) -> tuple[Any
         return fl_raw, fr_raw, False
     fl_text = str(_unwrap(fl_raw) or "")
     fr_text = str(_unwrap(fr_raw) or "")
-    for cand in _digit_variants(fl_text) + _digit_variants(fr_text):
-        if cand in {fl_text, fr_text}:
+    # 0↔9 is common on handwritten degree hundreds (000 vs 090). Keep it off
+    # distance repairs so 363.032 is not flipped to 363.932.
+    angle_pairs = (("0", "9"), ("9", "0"))
+    check = va_pair_ok if vertical else hz_pair_ok
+    for cand in _digit_variants(fl_text, extra_pairs=angle_pairs):
+        if cand == fl_text:
             continue
-        if cand != fl_text:
-            nfl, nfr = parse_dms_to_deg(cand), fr
-            if (va_pair_ok if vertical else hz_pair_ok)(nfl, nfr):
-                return cand, fr_raw, True
-        if cand != fr_text:
-            nfl, nfr = fl, parse_dms_to_deg(cand)
-            if (va_pair_ok if vertical else hz_pair_ok)(nfl, nfr):
-                return fl_raw, cand, True
-    if fl is None and fr is None:
-        return fl_raw, fr_raw, False
-    fl_conf, fr_conf = _cell_confidence(fl_raw), _cell_confidence(fr_raw)
-    if vertical:
-        if fr is not None and (fl is None or fl_conf <= fr_conf):
-            return _choose_angle(fl_raw, (360.0 - fr) % 360.0), fr_raw, True
-        if fl is not None:
-            return fl_raw, _choose_angle(fr_raw, (360.0 - fl) % 360.0), True
-    else:
-        if fr is not None and (fl is None or fl_conf <= fr_conf):
-            return _choose_angle(fl_raw, (fr + 180.0) % 360.0), fr_raw, True
-        if fl is not None:
-            return fl_raw, _choose_angle(fr_raw, (fl + 180.0) % 360.0), True
+        if check(parse_dms_to_deg(cand), fr):
+            return cand, fr_raw, True
+    for cand in _digit_variants(fr_text, extra_pairs=angle_pairs):
+        if cand == fr_text:
+            continue
+        if check(fl, parse_dms_to_deg(cand)):
+            return fl_raw, cand, True
+    # Keep whatever was transcribed. Never invent a face with ±180° / 360−face.
     return fl_raw, fr_raw, False
 
 
@@ -2319,25 +2662,65 @@ def normalize_extracted_document(data: Dict[str, Any]) -> Dict[str, Any]:
             out["visible_headers"] = [str(h) for h in headers if str(h).strip()]
         return out
 
+    def _booking_col(name: Any) -> str:
+        return re.sub(r"[_\s.\-]+", " ", str(name or "").strip().lower()).strip()
+
     normalized: List[Dict[str, Any]] = []
     for row in rows:
+        circle_hz = circle_va = angle_hz = angle_va = None
+        slope_v = hor_v = None
+        for src_k, src_v in row.items():
+            col = _booking_col(src_k)
+            if col in {"horizontal circle", "horiz circle", "hz circle", "ha circle"}:
+                circle_hz = src_v
+            elif col in {"vertical circle", "vert circle", "va circle"}:
+                circle_va = src_v
+            elif col in {"horizontal angle", "horiz angle"}:
+                angle_hz = src_v
+            elif col in {"vertical angle", "vert angle"}:
+                angle_va = src_v
+            elif col in {
+                "slop dist", "slop dist m", "slope dist", "slope dist m",
+                "slope distance", "slope_distance", "slop_dist_m", "slope",
+            }:
+                if src_v not in (None, ""):
+                    slope_v = src_v
+            elif col in {
+                "horiz dist", "horiz dist m", "hor dist", "hor dist m",
+                "horizontal dist", "horizontal dist m", "horizontal distance",
+                "horizontal_distance", "horiz_dist_m", "hor",
+            }:
+                if src_v not in (None, ""):
+                    hor_v = src_v
         item = {normalize_field_name(k): v for k, v in row.items()}
-        ha = item.pop("horizontal_angle", None) or item.pop("ha", None) or item.pop("horizontal", None)
-        va = item.pop("vertical_angle", None) or item.pop("va", None) or item.pop("vertical", None)
+        # Printed Circle = first pair = Face Left. Prefer these over a computed hz_fl/va_fl.
+        if circle_hz not in (None, ""):
+            item["hz_fl"] = circle_hz
+        if circle_va not in (None, ""):
+            item["va_fl"] = circle_va
+        ha = angle_hz if angle_hz not in (None, "") else item.pop("horizontal_angle", None)
+        va = angle_va if angle_va not in (None, "") else item.pop("vertical_angle", None)
+        item.pop("horizontal_angle", None)
+        item.pop("vertical_angle", None)
         if isinstance(ha, dict):
             fl = _pull_face(ha, "face_left", "fl", "left", "hz_fl", "ha_fl")
             fr = _pull_face(ha, "face_right", "fr", "right", "hz_fr", "ha_fr")
-            if fl is not None and item.get("hz_fl") in (None, ""):
+            if fl is not None:
                 item["hz_fl"] = fl
-            if fr is not None and item.get("hz_fr") in (None, ""):
+            if fr is not None:
                 item["hz_fr"] = fr
+        elif ha not in (None, ""):
+            # Second HA column (HORIZONTAL ANGLE) = Face Right — never drop the written string
+            item["hz_fr"] = ha
         if isinstance(va, dict):
             fl = _pull_face(va, "face_left", "fl", "left", "va_fl")
             fr = _pull_face(va, "face_right", "fr", "right", "va_fr")
-            if fl is not None and item.get("va_fl") in (None, ""):
+            if fl is not None:
                 item["va_fl"] = fl
-            if fr is not None and item.get("va_fr") in (None, ""):
+            if fr is not None:
                 item["va_fr"] = fr
+        elif va not in (None, ""):
+            item["va_fr"] = va
         for prefix, target in (
             ("hz_fl", "hz_fl"), ("hz_fr", "hz_fr"), ("va_fl", "va_fl"), ("va_fr", "va_fr"),
             ("ha_fl", "hz_fl"), ("ha_fr", "hz_fr"),
@@ -2365,6 +2748,15 @@ def normalize_extracted_document(data: Dict[str, Any]) -> Dict[str, Any]:
                 item["horizontal_distance"] = (
                     dist.get("hor") or dist.get("horizontal") or dist.get("horizontal_distance")
                 )
+        if slope_v not in (None, "") and item.get("slope_distance") in (None, ""):
+            item["slope_distance"] = slope_v
+        if hor_v not in (None, "") and item.get("horizontal_distance") in (None, ""):
+            item["horizontal_distance"] = hor_v
+        # Canonicalise printed SLOP/HORIZ DIST. m keys so Excel always finds them
+        if item.get("slope_distance") in (None, "") and item.get("slope") not in (None, ""):
+            item["slope_distance"] = item["slope"]
+        if item.get("horizontal_distance") in (None, "") and item.get("hor") not in (None, ""):
+            item["horizontal_distance"] = item["hor"]
         if "from" in item and item.get("instrument_station") in (None, ""):
             item["instrument_station"] = item["from"]
         if "to" in item and item.get("reference_station") in (None, ""):
@@ -2401,7 +2793,336 @@ def _station_digit_variants(station: str) -> List[str]:
     return out
 
 
-def _repair_traverse_station_pattern(rows: List[Dict[str, Any]]) -> None:
+def _header_text_blob(data: Dict[str, Any]) -> str:
+    parts: List[str] = [
+        str(data.get("title") or ""),
+        str(data.get("notes") or ""),
+        str(data.get("plain_text") or "") if not isinstance(data.get("plain_text"), dict) else "",
+    ]
+    for key in ("metadata", "fields", "numbers"):
+        src = data.get(key)
+        if isinstance(src, dict):
+            for k, v in src.items():
+                val = _unwrap(v)
+                if val not in (None, ""):
+                    parts.append(f"{k}: {val}")
+    if isinstance(data.get("plain_text"), dict):
+        for k, v in data["plain_text"].items():
+            if v not in (None, ""):
+                parts.append(f"{k}: {v}")
+    return " ".join(parts)
+
+
+_PRINTED_FORM_HEADINGS = {
+    "traverse field sheet",
+    "traverse angle and distance field sheet",
+    "angle and distance field sheet",
+    "levelling book",
+    "level book",
+    "field book",
+    "field sheet",
+    "booking sheet",
+    "observation sheet",
+    "calibration sheet",
+}
+
+_SERIAL_LABEL_RE = re.compile(
+    r"(?i)(?:instrument\s*(?:serial\s*)?(?:no|number|#)|"
+    r"inst(?:r|rument)?\.?\s*(?:serial\s*)?(?:no|number|#)|"
+    r"instr\.?\s*no\.?|"
+    r"serial(?:\s*(?:no|number|#))?|"
+    r"(?:^|[\s:])s/?n)\s*[:.\-]*\s*([A-Z0-9IlOo-]{4,14})"
+)
+
+
+def _is_printed_form_heading(title: str) -> bool:
+    """True for the printed form name, not a handwritten job TITLE."""
+    t = re.sub(r"[^a-z0-9]+", " ", str(title or "").lower()).strip()
+    t = re.sub(r"\s+", " ", t)
+    if not t:
+        return False
+    if t in _PRINTED_FORM_HEADINGS:
+        return True
+    if "field sheet" in t and not re.search(
+        r"calibrat|cadastr|control|detail|topo|setting out|as built", t
+    ):
+        return True
+    return False
+
+
+def _digits_are_subsequence(short: str, long: str) -> bool:
+    if not short or not long or short == long:
+        return False
+    i = 0
+    for ch in long:
+        if i < len(short) and ch == short[i]:
+            i += 1
+    return i == len(short)
+
+
+def _row_distance_digit_ids(data: Dict[str, Any]) -> set:
+    """Integer digit strings of slope/hor so they are never stolen as INST. No."""
+    found: set = set()
+    for row in _as_rows(data):
+        for names in (
+            ("slope_distance", "slope", "distance"),
+            ("horizontal_distance", "hor"),
+        ):
+            n = parse_survey_number(_row_get(row, *names))
+            if n is None:
+                continue
+            found.add(re.sub(r"\D", "", f"{n:.3f}"))
+            found.add(str(int(round(n))))
+    return {x for x in found if x}
+
+
+def _serial_key_name(name: str) -> bool:
+    nk = normalize_field_name(str(name))
+    if nk in {"serial", "serial_number"}:
+        return True
+    raw = str(name or "").lower()
+    return bool(re.search(r"(?i)(?:inst(?:rument)?\.?\s*(?:serial\s*)?(?:no|number)|serial)", raw))
+
+
+def _labelled_serials_from_blob(blob: str) -> List[str]:
+    out: List[str] = []
+    for m in _SERIAL_LABEL_RE.finditer(blob or ""):
+        serial = repair_serial_number(m.group(1))
+        if serial and not re.fullmatch(r"(19|20)\d{2}", serial):
+            out.append(serial)
+    return out
+
+
+def _best_instrument_serial(out: Dict[str, Any]) -> Optional[str]:
+    """Prefer a labelled 6–8 digit INST. No. over a truncated stub (3499 vs 1344991)."""
+    distance_ids = _row_distance_digit_ids(out)
+    candidates: List[str] = []
+    seen: set = set()
+
+    def _add(raw: Any) -> None:
+        serial = repair_serial_number(raw)
+        if (
+            not serial
+            or serial in seen
+            or serial in distance_ids
+            or re.fullmatch(r"(19|20)\d{2}", serial)
+        ):
+            return
+        seen.add(serial)
+        candidates.append(serial)
+
+    for src in (
+        out.get("metadata") if isinstance(out.get("metadata"), dict) else {},
+        out.get("fields") if isinstance(out.get("fields"), dict) else {},
+        out.get("numbers") if isinstance(out.get("numbers"), dict) else {},
+        out.get("plain_text") if isinstance(out.get("plain_text"), dict) else {},
+        out,
+    ):
+        if not isinstance(src, dict):
+            continue
+        for k, v in src.items():
+            if k in {"rows", "sections", "style_card", "notes", "plain_text", "metadata", "fields"}:
+                continue
+            if _serial_key_name(str(k)):
+                _add(v)
+    for labelled in _labelled_serials_from_blob(_header_text_blob(out)):
+        _add(labelled)
+    if not candidates:
+        return None
+
+    def _score(s: str) -> tuple:
+        n = len(s)
+        typical = 3 if 6 <= n <= 8 else (1 if n == 5 else 0)
+        return (typical, n)
+
+    candidates.sort(key=_score, reverse=True)
+    best = candidates[0]
+    current = repair_serial_number(
+        _meta_get(out, "serial", "serial_number", "inst_no", "instrument_no", "instrument_serial")
+    )
+    if not current:
+        return best
+    if current == best:
+        return current
+    if len(best) >= 6 and (
+        len(current) <= 5 or _digits_are_subsequence(current, best) or best.endswith(current)
+    ):
+        return best
+    if _score(current) >= _score(best):
+        return current
+    return best
+
+
+def _salvage_sheet_title(out: Dict[str, Any]) -> None:
+    """Prefer handwritten TITLE (Calibration) over printed TRAVERSE FIELD SHEET."""
+    current = str(_unwrap(out.get("title")) or "").strip()
+    meta_title = str(_unwrap(_meta_get(out, "title")) or "").strip()
+    blob = _header_text_blob(out)
+    labelled = None
+    m = re.search(
+        r"(?i)\btitle\s*[:.\-]+\s*([A-Za-z][A-Za-z0-9 .,'/&-]{0,48})",
+        blob,
+    )
+    if m:
+        labelled = re.split(
+            r"(?i)\b(?:location|surveyor|instrument|inst\.?\s*type|serial|"
+            r"date|page|project|company|org|source)\b",
+            m.group(1),
+        )[0].strip(" :-")
+        if labelled and _is_printed_form_heading(labelled):
+            labelled = None
+    if meta_title and not _is_printed_form_heading(meta_title):
+        if not labelled:
+            labelled = meta_title
+    chosen = labelled if labelled else (
+        current if current and not _is_printed_form_heading(current) else ""
+    )
+    if not chosen and meta_title and not _is_printed_form_heading(meta_title):
+        chosen = meta_title
+    if chosen:
+        out["title"] = chosen
+        if _meta_get(out, "title") in (None, "") or _is_printed_form_heading(
+            str(_unwrap(_meta_get(out, "title")) or "")
+        ):
+            _meta_set(out, "title", chosen)
+
+
+def _infer_instrument_station_from_refs(
+    ref_set: set,
+    blob: str = "",
+) -> Optional[str]:
+    """When Inst. Stn was only ditto marks, recover the real station from refs / header text."""
+    refs = {r for r in ref_set if r and not _is_ditto_or_repeat_mark(r)}
+    found: List[str] = []
+    for m in re.finditer(r"\b([A-Za-z]{2,8}[-\s/][A-Za-z0-9]{0,4}\d{2,4})\b", blob or ""):
+        nid = normalize_station_id(m.group(1))
+        if not nid or nid in refs or "-" not in nid:
+            continue
+        if re.search(r"(?i)leica|sokkia|trimble|topcon|geomato|ts0\d|mts", nid):
+            continue
+        found.append(nid)
+    if found:
+        return _str_mode(found)
+    prefixes: List[str] = []
+    nums: List[int] = []
+    for ref in refs:
+        m = re.match(r"^(.+)-(\d+)$", str(ref))
+        if not m:
+            continue
+        prefixes.append(m.group(1))
+        nums.append(int(m.group(2)))
+    if len(set(prefixes)) == 1 and prefixes:
+        prefix = prefixes[0]
+        if {2, 4} <= set(nums) or {2, 4} == set(nums):
+            cand = f"{prefix}-03"
+            if cand not in refs:
+                return cand
+        variants: List[str] = []
+        for ref in refs:
+            for alt in _station_digit_variants(ref):
+                if alt not in refs:
+                    variants.append(alt)
+        # Prefer a 2↔3 sibling when that is the only unused variant class
+        prefer = [v for v in variants if v.endswith("-03") or v.endswith("03")]
+        if prefer:
+            return prefer[0]
+        if variants:
+            return _str_mode(variants)
+    return None
+
+
+def _salvage_field_sheet_metadata(out: Dict[str, Any]) -> None:
+    """Fill surveyor / instrument / serial / title from labelled header text."""
+    _salvage_sheet_title(out)
+    blob = _header_text_blob(out)
+
+    def _empty(*keys: str) -> bool:
+        return _meta_get(out, *keys) in (None, "")
+
+    if _empty("surveyed_by"):
+        m = re.search(
+            r"(?i)(?:surveyed\s*by|surveyor(?:\s*name)?|observer)\s*[:.\-]?\s*"
+            r"([A-Za-z][A-Za-z .'\-]{2,42})",
+            blob,
+        )
+        if m:
+            name = re.split(
+                r"(?i)\b(?:instrument|serial|date|page|location|org|company|title)\b",
+                m.group(1),
+            )[0].strip(" :-")
+            if name and not _is_ditto_or_repeat_mark(name) and not re.search(r"\d{3,}", name):
+                _meta_set(out, "surveyed_by", name)
+
+    if _empty("instrument", "instrument_name"):
+        m = re.search(
+            r"(?i)(?:instrument(?:\s*type|\s*name)?|inst(?:rument)?\.?\s*type)\s*[:.\-]?\s*"
+            r"([A-Za-z][A-Za-z0-9 +\-/]{2,28})",
+            blob,
+        )
+        inst = m.group(1).strip() if m else None
+        if not inst:
+            m2 = re.search(
+                r"(?i)\b(leica|sokkia|trimble|topcon|geomato|nikon|south|foif|stonex|"
+                r"hi[- ]?target|pentax)\s*[- ]?[a-z0-9][a-z0-9+\-/ ]{0,20}",
+                blob,
+            )
+            inst = m2.group(0).strip() if m2 else None
+        if inst:
+            inst = re.split(
+                r"(?i)\b(?:serial|surveyor|date|page|location|inst(?:rument)?\s*no)\b",
+                inst,
+            )[0].strip(" :-")
+            inst = re.sub(r"(?i)\s+instrument$", "", inst).strip()
+            if inst and len(inst) >= 4:
+                _meta_set(out, "instrument", inst)
+
+    inst_cur = str(_unwrap(_meta_get(out, "instrument", "instrument_name")) or "")
+    if inst_cur and re.search(r"(?i)\blocation\b", inst_cur):
+        cleaned = re.split(r"(?i)\blocation\b", inst_cur)[0].strip(" :-")
+        if cleaned:
+            _meta_set(out, "instrument", cleaned)
+
+    serial = _best_instrument_serial(out)
+    if serial:
+        _meta_set(out, "serial", serial)
+
+    if _empty("location"):
+        m = re.search(
+            r"(?i)location\s*[:.\-]?\s*([A-Za-z0-9][A-Za-z0-9 ./,\-]{0,40})",
+            blob,
+        )
+        if m:
+            loc = re.split(
+                r"(?i)\b(?:surveyor|instrument|serial|date|page|project|title|org)\b",
+                m.group(1),
+            )[0].strip(" :-")
+            if loc:
+                _meta_set(out, "location", loc)
+
+    if _empty("page", "page_number"):
+        m = re.search(r"(?i)page\s*[:.\-]?\s*([A-Z0-9\-]{1,8})\b", blob)
+        if m and not re.fullmatch(r"(?i)page", m.group(1)):
+            _meta_set(out, "page", m.group(1).strip())
+
+    if _empty("project", "project_number", "project_no"):
+        m = re.search(
+            r"(?i)project(?:\s*(?:no|number|#))?\s*[:.\-]?\s*([A-Z0-9][A-Z0-9 .\-]{0,24})",
+            blob,
+        )
+        if m:
+            proj = re.split(
+                r"(?i)\b(?:date|page|surveyor|location|instrument)\b",
+                m.group(1),
+            )[0].strip(" :-")
+            if proj:
+                _meta_set(out, "project_number", proj)
+
+
+def _repair_traverse_station_pattern(
+    rows: List[Dict[str, Any]],
+    *,
+    header_blob: str = "",
+) -> None:
     """Lock alternating/distance-clustered refs and a single instrument station that is not a ref."""
     if len(rows) < 2:
         return
@@ -2458,7 +3179,7 @@ def _repair_traverse_station_pattern(rows: List[Dict[str, Any]]) -> None:
             refs = [normalize_station_id(_row_get(r, "reference_station", "to")) for r in rows]
 
     ref_set = {r for r in refs if r}
-    from_mode = _str_mode(froms)
+    from_mode = _str_mode([f for f in froms if f and not _is_ditto_or_repeat_mark(f)])
     # Prefer an instrument station that does not collide with reference stations
     if from_mode and from_mode in ref_set:
         for alt in _station_digit_variants(from_mode):
@@ -2482,7 +3203,11 @@ def _repair_traverse_station_pattern(rows: List[Dict[str, Any]]) -> None:
     if not from_mode:
         candidates = [f for f in froms if f and f not in ref_set]
         from_mode = _str_mode(candidates) or _str_mode(froms)
-    if from_mode:
+    if not from_mode or _is_ditto_or_repeat_mark(from_mode):
+        inferred = _infer_instrument_station_from_refs(ref_set, header_blob)
+        if inferred:
+            from_mode = inferred
+    if from_mode and not _is_ditto_or_repeat_mark(from_mode):
         for row in rows:
             _row_set(row, "instrument_station", from_mode)
 
@@ -2538,6 +3263,30 @@ def _repair_distance_4_vs_6(
     return slope, hor
 
 
+def _unswap_inverted_vertical_faces(rows: List[Dict[str, Any]]) -> None:
+    """If most VA Face Left readings are ~270° and Face Right ~90°, the columns were swapped."""
+    inverted = 0
+    natural = 0
+    for row in rows:
+        vfl = parse_dms_to_deg(_row_get(row, "va_fl"))
+        vfr = parse_dms_to_deg(_row_get(row, "va_fr"))
+        if vfl is None or vfr is None:
+            continue
+        if vfl > 180.0 and vfr < 180.0:
+            inverted += 1
+        elif vfl < 180.0 and vfr > 180.0:
+            natural += 1
+    if inverted < 2 or inverted <= natural:
+        return
+    for row in rows:
+        vfl = _row_get(row, "va_fl")
+        vfr = _row_get(row, "va_fr")
+        if vfl in (None, "") and vfr in (None, ""):
+            continue
+        _row_set(row, "va_fl", vfr)
+        _row_set(row, "va_fr", vfl)
+
+
 def apply_survey_context_repairs(
     data: Dict[str, Any],
     *,
@@ -2545,7 +3294,7 @@ def apply_survey_context_repairs(
     style_card: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Resolve faint glyphs using sheet identities. Does not invent new observations."""
-    out = dict(data or {})
+    out = normalize_extracted_document(dict(data or {}))
     dtype = str(document_type or out.get("document_type") or "")
     rows_preview = _as_rows(out)
     # Spreadsheet / GIS attribute screenshots: never force traverse station/distance repairs
@@ -2562,9 +3311,6 @@ def apply_survey_context_repairs(
             out["rows"] = [dict(r) for r in rows_preview]
         return out
     card = style_card if isinstance(style_card, dict) else (out.get("style_card") or {})
-    serial = repair_serial_number(_meta_get(out, "serial", "serial_number"))
-    if serial:
-        _meta_set(out, "serial", serial)
     inst = repair_instrument_name(_meta_get(out, "instrument", "instrument_name"))
     if inst:
         _meta_set(out, "instrument", inst)
@@ -2577,11 +3323,13 @@ def apply_survey_context_repairs(
     surveyed = repair_surveyed_by_name(_meta_get(out, "surveyed_by"))
     if surveyed:
         _meta_set(out, "surveyed_by", surveyed)
+    _salvage_field_sheet_metadata(out)
 
     rows = [dict(r) for r in rows_preview]
     if not rows:
         return out
     last_inst: Optional[str] = None
+    last_ref: Optional[str] = None
     for row in rows:
         inst_id = normalize_station_id(_row_get(row, "instrument_station", "from", "inst_stn", "station_from"))
         if inst_id:
@@ -2590,10 +3338,17 @@ def apply_survey_context_repairs(
         elif last_inst:
             _row_set(row, "instrument_station", last_inst)
         ref_id = normalize_station_id(_row_get(row, "reference_station", "to", "ref_stn", "station_to"))
+        # Bare 1–3 digit "stations" are almost always a leaked angle (e.g. 002°… written in Ref. Stn).
+        if ref_id and re.fullmatch(r"\d{1,3}", ref_id):
+            ref_id = None
         if ref_id:
+            last_ref = ref_id
             _row_set(row, "reference_station", ref_id)
+        elif last_ref:
+            _row_set(row, "reference_station", last_ref)
 
-    _repair_traverse_station_pattern(rows)
+    _repair_traverse_station_pattern(rows, header_blob=_header_text_blob(out))
+    _unswap_inverted_vertical_faces(rows)
 
     pair_slopes: Dict[tuple, List[float]] = {}
     pair_hors: Dict[tuple, List[float]] = {}
@@ -2716,7 +3471,9 @@ def _format_structured_for_user(data: Dict[str, Any], paths: str, *, text: str =
         (("surveyed_by",), "Surveyed by"),
         (("computed_by",), "Computed by"),
         (("instrument", "instrument_name"), "Instrument"),
-        (("serial", "serial_number"), "Serial number"),
+        (("serial", "serial_number", "inst_no", "instrument_no"), "Serial number"),
+        (("location",), "Location"),
+        (("project", "project_number", "project_no"), "Project no."),
         (("date",), "Date"),
         (("page", "page_number"), "Page"),
     ]
@@ -3091,7 +3848,8 @@ def build_ocr_review(
     meta_keys = (
         "organization", "phone", "telephone", "surveyed_by", "computed_by",
         "instrument", "instrument_name",
-        "serial", "serial_number", "date", "page", "page_number", "sheet",
+        "serial", "serial_number", "location", "project", "project_number", "project_no",
+        "date", "page", "page_number", "sheet",
         "workspace_path", "user", "status",
     )
     metadata: Dict[str, Any] = {}
@@ -3417,16 +4175,20 @@ __all__ = [
     "apply_learned_ocr_corrections", "apply_survey_context_repairs", "assess_image_quality",
     "build_ocr_review",
     "classify_ocr_document", "export_ocr_extraction_to_docx", "export_ocr_extraction_to_excel",
-    "extract_image_paths_from_query",
+    "extract_image_paths_from_query", "extract_source_document_paths_from_query",
     "extract_survey_plan_from_images", "fields_needing_reread", "format_last_ocr_for_agent",
     "format_ocr_review_for_user",
     "format_validation_for_user",
     "hz_pair_ok", "image_file_to_base64_png", "is_ocr_export_request", "is_ocr_followup_request",
+    "is_document_extract_to_word_request",
     "is_ocr_only_request", "is_ocr_word_export_request",
     "load_handwriting_style", "load_last_ocr_extraction", "load_learned_ocr_value_map",
-    "looks_like_survey_plan_image_task", "looks_like_survey_sheet",
+    "looks_like_survey_plan_image_task", "looks_like_survey_plan_source", "looks_like_survey_sheet",
+    "is_unusable_extracted_document_text",
+    "ocr_reuse_blocked_by_new_task",
+    "assistant_result_is_unrelated_job",
     "merge_validation_into_structured", "normalize_extracted_document", "parse_dms_to_deg",
-    "parse_survey_number", "resolve_ocr_export_path", "resolve_ocr_word_export_path",
+    "parse_survey_number", "query_has_source_document", "resolve_ocr_export_path", "resolve_ocr_word_export_path",
     "run_vision_ocr", "save_handwriting_style", "save_last_ocr_extraction",
     "select_vision_ocr_mode",
     "should_fastpath_image_survey_replot", "structured_from_ocr_review", "user_requested_save",

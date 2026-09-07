@@ -105,8 +105,8 @@ from langchain_core.messages import (
 )
 from langchain_core.tools import BaseTool, StructuredTool
 from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_anthropic import ChatAnthropic
+# langchain_google_genai / langchain_anthropic are imported lazily inside
+# _initialize_llm so worker startup does not pay for unused provider SDKs.
 
 # Pydantic for input validation
 from pydantic import BaseModel, Field
@@ -201,9 +201,11 @@ from agent.pdf_survey_plan import (
     resolve_cadastral_coordinates_blob,
 )
 from agent.excel_cadastral import (
+    clustered_multi_parcel_text_scales,
     coordinates_deferred_to_external_source,
     default_excel_plot_output_name,
     explicit_cadastral_plot_intent,
+    is_shared_or_reverse_traverse_edge,
     is_tabular_inspect_only_request,
 )
 
@@ -288,6 +290,59 @@ def _ollama_ram_policy(model_name: str = "") -> Tuple[bool, str, int]:
     from survyai.ollama_support import ollama_ram_policy
 
     return ollama_ram_policy(model_name)
+
+
+def _point_in_parcel(pts: Sequence[Dict[str, float]], x: float, y: float) -> bool:
+    """Ray-cast containment test for a closed parcel outline."""
+    inside = False
+    n = len(pts)
+    if n < 3:
+        return False
+    for i in range(n):
+        x1, y1 = float(pts[i]["x"]), float(pts[i]["y"])
+        x2, y2 = float(pts[(i + 1) % n]["x"]), float(pts[(i + 1) % n]["y"])
+        if (y1 > y) != (y2 > y):
+            denom = (y2 - y1) or 1e-12
+            if x < (x2 - x1) * (y - y1) / denom + x1:
+                inside = not inside
+    return inside
+
+
+def _outward_normal_for_edge(
+    pts: Sequence[Dict[str, float]],
+    p1: Dict[str, float],
+    p2: Dict[str, float],
+) -> Tuple[float, float]:
+    """Unit normal of edge p1→p2 pointing out of the parcel.
+
+    A centroid dot-product only settles this for convex outlines. On a re-entrant
+    side of a concave parcel the centroid can lie beyond the edge, which flips the
+    normal inward and lays the road or fence inside the closed traverse — something
+    that cannot exist on a cadastral plan. Probing just off the edge and testing
+    containment settles it for any simple outline.
+    """
+    dx = float(p2["x"]) - float(p1["x"])
+    dy = float(p2["y"]) - float(p1["y"])
+    length = (dx * dx + dy * dy) ** 0.5
+    if length <= 1e-9:
+        return (0.0, 0.0)
+    ux, uy = dx / length, dy / length
+    midx = (float(p1["x"]) + float(p2["x"])) / 2.0
+    midy = (float(p1["y"]) + float(p2["y"])) / 2.0
+    candidates = ((uy, -ux), (-uy, ux))
+    eps = max(length * 0.01, 1e-6)
+    for nx, ny in candidates:
+        if not _point_in_parcel(pts, midx + eps * nx, midy + eps * ny):
+            return (nx, ny)
+    # Degenerate outline: fall back to the centroid heuristic.
+    cx = sum(float(p["x"]) for p in pts) / len(pts)
+    cy = sum(float(p["y"]) for p in pts) / len(pts)
+    vx, vy = cx - midx, cy - midy
+    n1x, n1y = candidates[0]
+    n2x, n2y = candidates[1]
+    if (n1x * vx + n1y * vy) >= (n2x * vx + n2y * vy):
+        return (-n1x, -n1y)
+    return (-n2x, -n2y)
 
 
 def _parse_access_road_specs_from_query(query: str) -> List[str]:
@@ -778,11 +833,13 @@ def _cartographic_denom_for_layout_extent(
         target = 250
     elif span <= 100:
         target = 500
-    elif span <= 220:
+    elif span <= 250:
+        # Clustered cadastral layouts (~1 ha, three family parcels, etc.) stay
+        # at 1:500/1:1000 like a single parcel of the same combined extent.
         target = 1000
-    elif span <= 400:
+    elif span <= 450:
         target = 2000
-    elif span <= 750:
+    elif span <= 900:
         target = 5000
     elif span <= 1400:
         target = 5000
@@ -798,7 +855,9 @@ def _cartographic_denom_for_layout_extent(
         and span <= 400
         and target <= 2000
     ):
-        target = 5000
+        # Many-owner legends need sheet room — one step only (1:2000 → 1:2500/5000),
+        # never a jump to 1:10000 for a mid-size layout.
+        target = 2500 if 2500 in allowed else 5000
     cands = [d for d in allowed if d >= int(target)]
     return int(min(cands) if cands else max(allowed))
 
@@ -829,6 +888,8 @@ def _choose_layout_plan_scale_after_plot(
     user_scale_denom: Optional[int],
     parcel_count: int = 1,
     allowed_denoms: Optional[List[int]] = None,
+    ground_w: float = 0.0,
+    ground_h: float = 0.0,
 ) -> tuple[int, float, str]:
     """
     Intelligent post-plot scale for multi-parcel layouts.
@@ -845,20 +906,26 @@ def _choose_layout_plan_scale_after_plot(
     uh = max(float(usable_h or 0.0), 1e-6)
     iw = max(float(interior_w or 0.0), 1e-6)
     ih = max(float(interior_h or 0.0), 1e-6)
+    # Prefer UTM/ground extent when the drawing bbox is inflated (owner MText,
+    # leftover template text, peg-block definition boxes).
+    gw = float(ground_w or 0.0)
+    gh = float(ground_h or 0.0)
+    carto_w = gw if gw > 1e-6 else pw
+    carto_h = gh if gh > 1e-6 else ph
 
     carto = _cartographic_denom_for_layout_extent(
-        pw,
-        ph,
+        carto_w,
+        carto_h,
         allowed,
         parcel_count=int(parcel_count or 1),
-        dense_title=int(parcel_count or 1) >= 6,
+        dense_title=int(parcel_count or 1) >= 8,
     )
     # Soft enclosure headroom: at most one allowed step coarser than cartographic
     # (e.g. 1:5000 → 1:10000). Two steps would still allow 1:20000 for mid-size land.
     carto_cap = _allowed_denom_steps_above(carto, 1, allowed)
 
-    pad_w = max(pw * 1.12, pw + 10.0)
-    pad_h = max(ph * 1.12, ph + 10.0)
+    pad_w = max(carto_w * 1.12, carto_w + 10.0)
+    pad_h = max(carto_h * 1.12, carto_h + 10.0)
     req_k = max(pad_w / uw, pad_h / uh)
     fit_denom, _fit_k, _fit_reason = _resolve_cadastral_output_scale(
         template_denom=td,
@@ -866,8 +933,8 @@ def _choose_layout_plan_scale_after_plot(
         required_k=float(req_k),
         allowed_denoms=allowed,
         multi_parcel_layout=False,
-        boundary_w=pw,
-        boundary_h=ph,
+        boundary_w=carto_w,
+        boundary_h=carto_h,
         enforce_enclosure=True,
     )
 
@@ -904,6 +971,12 @@ def _choose_layout_plan_scale_after_plot(
         else:
             reason = "layout_cartographic"
 
+    # Combined family layouts of a few hundred metres must not land on 1:10000.
+    if max(carto_w, carto_h) <= 450.0 and int(chosen) > 2000:
+        chosen = min(int(chosen), max(int(carto), 2000))
+        chosen = min(int(chosen), 2000)
+        reason = "layout_midsize_cap"
+
     return int(chosen), float(chosen) / float(td), reason
 
 
@@ -938,6 +1011,188 @@ def _multi_parcel_owner_label_height(
     if median_span > 1e-6:
         h = min(h, max(1.0, median_span * 0.22))
     return float(h)
+
+
+def _ring_shoelace_sq_m(ring: Sequence[Dict[str, Any]]) -> float:
+    """Closed-ring area in square metres (drawing units == metres)."""
+    pts: List[Tuple[float, float]] = []
+    for p in ring or []:
+        if not isinstance(p, dict):
+            continue
+        try:
+            x = float(p.get("x", p.get("e")))
+            y = float(p.get("y", p.get("n")))
+        except Exception:
+            continue
+        pts.append((x, y))
+    n = len(pts)
+    if n < 3:
+        return 0.0
+    acc = 0.0
+    for i in range(n):
+        x1, y1 = pts[i]
+        x2, y2 = pts[(i + 1) % n]
+        acc += x1 * y2 - x2 * y1
+    return abs(acc) * 0.5
+
+
+def _parcel_letter_tag(label: str, index: int) -> str:
+    """Letter used in AREA (A):- from 'OKACHI FAMILY (A)', else A/B/C by index."""
+    m = re.search(r"\(\s*([A-Za-z])\s*\)\s*$", str(label or "").strip())
+    if m:
+        return m.group(1).upper()
+    idx = int(index or 0)
+    if 0 <= idx < 26:
+        return chr(ord("A") + idx)
+    return str(idx + 1)
+
+
+def _multi_parcel_area_title_content(parcels: Sequence[Dict[str, Any]]) -> str:
+    """
+    Multi-line title AREA cell: one line per ownership ring, then total.
+
+    AREA (A):- 10986.322 SQ. MTRS.\\P
+    AREA (B):- 563.740 SQ. MTRS.\\P
+    TOTAL AREA:- 11550.062 SQ. MTRS.
+    """
+    lines: List[str] = []
+    total = 0.0
+    n_ok = 0
+    for i, parcel in enumerate(parcels or []):
+        if not isinstance(parcel, dict):
+            continue
+        area = _ring_shoelace_sq_m(list(parcel.get("points") or []))
+        if area <= 1e-6:
+            continue
+        n_ok += 1
+        total += area
+        letter = _parcel_letter_tag(str(parcel.get("label") or ""), i)
+        lines.append(f"AREA ({letter}):- {area:.3f} SQ. MTRS.")
+    if n_ok < 2:
+        return ""
+    lines.append(f"TOTAL AREA:- {total:.3f} SQ. MTRS.")
+    return "\\P".join(lines)
+
+
+def _scale_table_text_heights(
+    autocad,
+    handle: str,
+    factor: float,
+    tables_now: Optional[Dict[str, Any]] = None,
+    rows_filter: Optional[Sequence[int]] = None,
+) -> int:
+    """Multiply existing table-cell text heights. No-op at factor 1."""
+    if not handle or factor <= 0.05 or abs(float(factor) - 1.0) < 1e-6:
+        return 0
+    meta = (tables_now or {}).get(handle) or {}
+    rows = int(meta.get("rows") or 24)
+    cols = int(meta.get("cols") or 2)
+    n = 0
+    want_rows = set(int(r) for r in rows_filter) if rows_filter is not None else None
+    for r in range(max(1, min(rows, 80))):
+        if want_rows is not None and r not in want_rows:
+            continue
+        for c in range(max(1, min(cols, 12))):
+            try:
+                hr = autocad.get_table_cell_text_height(handle, r, c)
+                th = float((hr or {}).get("text_height") or 0.0)
+                if (hr or {}).get("success") and th > 0.05:
+                    autocad.set_table_cell_text_height(handle, r, c, th * float(factor))
+                    n += 1
+            except Exception:
+                continue
+    return n
+
+
+def _scale_layer_text_heights(autocad, layers: Sequence[str], factor: float) -> int:
+    """Scale Text/MText Height on named layers. Leaves blocks/inserts unchanged."""
+    if factor <= 0.05 or abs(float(factor) - 1.0) < 1e-6:
+        return 0
+    want = {str(L).upper() for L in (layers or []) if str(L).strip()}
+    if not want:
+        return 0
+    n = 0
+    try:
+        ms = autocad.doc.ModelSpace
+        for i in range(int(ms.Count or 0)):
+            e = ms.Item(i)
+            if str(getattr(e, "Layer", "")).upper() not in want:
+                continue
+            on = str(getattr(e, "ObjectName", ""))
+            if "MText" not in on and not on.endswith("Text"):
+                continue
+            if "Table" in on or "Block" in on:
+                continue
+            for attr in ("Height", "TextHeight"):
+                try:
+                    h = float(getattr(e, attr) or 0.0)
+                    if h > 0.05:
+                        setattr(e, attr, h * float(factor))
+                        n += 1
+                        break
+                except Exception:
+                    continue
+    except Exception:
+        return n
+    return n
+
+
+def _apply_cadastral_annotation_text_scales(
+    autocad,
+    *,
+    title_h: str,
+    surv_h: str,
+    cert_h: str,
+    east_h: str,
+    north_h: str,
+    tables_now: Dict[str, Any],
+    title_scale: float,
+    body_scale: float,
+    id_scale: float,
+) -> Dict[str, int]:
+    """
+    After sheet scale: shrink title/body text up to 25%, identity tables up to 20%.
+
+    Mild multi-parcel (title_scale 0.9, identity 1.0) only tightens owner/location
+    title rows. Clustered sheets shrink the whole title plus scalebar/coords/north text.
+    """
+    counts: Dict[str, int] = {}
+    clustered = abs(float(id_scale) - 1.0) > 1e-6
+    if title_h and abs(float(title_scale) - 1.0) > 1e-6:
+        rows = None if clustered else (2, 4, 5, 6)
+        counts["title"] = _scale_table_text_heights(
+            autocad, title_h, float(title_scale), tables_now, rows
+        )
+    if clustered:
+        if surv_h:
+            counts["surveyor"] = _scale_table_text_heights(
+                autocad, surv_h, float(id_scale), tables_now
+            )
+        if cert_h:
+            counts["cert"] = _scale_table_text_heights(
+                autocad, cert_h, float(id_scale), tables_now
+            )
+    if abs(float(body_scale) - 1.0) > 1e-6:
+        if east_h:
+            counts["east"] = _scale_table_text_heights(
+                autocad, east_h, float(body_scale), tables_now
+            )
+        if north_h:
+            counts["north"] = _scale_table_text_heights(
+                autocad, north_h, float(body_scale), tables_now
+            )
+        counts["layers"] = _scale_layer_text_heights(
+            autocad,
+            [
+                "CADA_SCALEBAR",
+                "CADA_COORDINATES",
+                "CADA_NORTHCOORDINATES",
+                "CADA_EASTCOORDINATES",
+                "CADA_NORTHARROW",
+            ],
+            float(body_scale),
+        )
+    return counts
 
 
 def _resolve_cadastral_output_scale(
@@ -1161,6 +1416,15 @@ def _usable_plot_window_from_bboxes(
             maxy = min(maxy, tminy - gap)
     if maxx <= minx + 1.0 or maxy <= miny + 1.0:
         # Fallback: majority of interior.
+        minx = ix0 + margin * iw
+        maxx = ix1 - margin * iw
+        miny = iy0 + margin * ih
+        maxy = iy1 - margin * ih
+    # Expanded multi-owner titles can swallow the plot band; never shrink below the
+    # same floors used for pre-plot scale (≈85% usable width, ≈55% usable height).
+    usable_w_full = (1.0 - 2.0 * margin) * iw
+    usable_h_full = (1.0 - 2.0 * margin) * ih
+    if (maxx - minx) < usable_w_full * 0.85 or (maxy - miny) < usable_h_full * 0.55:
         minx = ix0 + margin * iw
         maxx = ix1 - margin * iw
         miny = iy0 + margin * ih
@@ -1958,13 +2222,30 @@ class SurvyAIAgent:
 
             A fresh installed app has no provider .env.  It should still start
             with Ollama (or cloud proxy after sign-in) instead of crashing.
+            Skip Ollama entirely when the host already failed the RAM cap so
+            startup does not print/retry the same rejection three times.
             """
             out: List[str] = []
             for item in (preferred, requested_fallback, "ollama"):
                 item = str(item or "").strip().lower()
                 if item and item not in out:
                     out.append(item)
-            return out
+            filtered: List[str] = []
+            for item in out:
+                if item == "ollama":
+                    try:
+                        ok, _, _ = _ollama_ram_policy(
+                            self._resolve_provider_model_name("ollama")
+                        )
+                        if not ok:
+                            logger.info(
+                                "Skipping Ollama startup candidate (insufficient RAM; cached)"
+                            )
+                            continue
+                    except Exception:
+                        pass
+                filtered.append(item)
+            return filtered or out
 
         selected_primary = ""
         last_primary_error: Optional[Exception] = None
@@ -2116,6 +2397,7 @@ class SurvyAIAgent:
         # STRICT: Survey plan template paths must never be written (read-only to avoid corruption).
         # Populated from template_profiles/*.json and when learning a template.
         self._protected_template_paths: set = set()
+        self._protected_templates_loaded: bool = False
 
         # Persistent cadastral CAD template memory (multi-template registry).
         # This lets users omit the template path after successful prior runs.
@@ -2151,7 +2433,7 @@ class SurvyAIAgent:
         import re
         from pathlib import Path
 
-        from survyai.attachments import parse_attachments_block
+        from survyai.attachments import normalize_user_path, parse_attachments_block
         
         document_paths = []
         seen = set()
@@ -2159,7 +2441,7 @@ class SurvyAIAgent:
         # Attachment marker block from the chat composer (may include images + docs).
         marker_paths, _ = parse_attachments_block(query or "")
         for path_str in marker_paths:
-            path = Path(path_str)
+            path = Path(normalize_user_path(path_str))
             if path.exists() and path.is_file() and path.suffix.lower() in [".docx", ".doc", ".pdf"]:
                 key = str(path.resolve())
                 if key not in seen:
@@ -2173,8 +2455,10 @@ class SurvyAIAgent:
         #
         # Instead, match Windows/Unix-like paths up to a known extension.
         patterns = [
-            # Windows absolute paths: allow spaces and apostrophes, but stop before illegal filename chars / quotes
+            r'((?:file:(?://+)?)+[^\s"\'<>]+\.(?:docx?|pdf))',
+            # Windows absolute paths (backslash or forward-slash)
             r'([A-Za-z]:\\[^\r\n"<>|]+?\.(?:docx?|pdf))',
+            r'([A-Za-z]:/[^\r\n"<>|]+?\.(?:docx?|pdf))',
             # Unix/relative paths (also allow backslashes for relative Windows-ish paths)
             r'((?:/|\\)[^\r\n"<>|]+?\.(?:docx?|pdf))',
         ]
@@ -2182,9 +2466,9 @@ class SurvyAIAgent:
         for pattern in patterns:
             matches = re.findall(pattern, query, re.IGNORECASE)
             for match in matches:
-                path_str = (match or "").strip()
-                # Trim common trailing punctuation / wrappers
-                path_str = path_str.strip().strip('"').strip("'").rstrip(").,;")
+                path_str = normalize_user_path(match or "")
+                if not path_str:
+                    continue
                 path = Path(path_str)
                 # Verify the file exists and is a document
                 if path.exists() and path.is_file():
@@ -2214,10 +2498,10 @@ class SurvyAIAgent:
         output_type: str = "file"
     ) -> Optional[str]:
         """
-        Infer output path from input file path when user doesn't specify location.
-        
-        CRITICAL RULE: If user doesn't explicitly specify where to create/locate a file or operation,
-        default to the SAME FOLDER as the input file/folder/document.
+        Infer an output path when the user did not name a destination.
+
+        Default is the active SurvyAI workspace (cwd), not the input file's folder.
+        Callers that honor "save beside the source" should use resolve_created_output_path.
         
         Args:
             input_path: Path to input file/folder
@@ -2230,56 +2514,24 @@ class SurvyAIAgent:
         from pathlib import Path
         
         try:
-            input_p = Path(input_path)
-            # If input_path is a file, use its parent; if it's a directory, use it directly
-            if input_p.is_file():
-                parent_dir = input_p.parent
-            elif input_p.is_dir():
-                parent_dir = input_p
-            else:
-                # Path doesn't exist yet, but we can still extract parent from the path string
-                parent_dir = input_p.parent if input_p.suffix else input_p
-            
+            ws = Path.cwd().resolve()
             if output_type == "folder":
-                return str(parent_dir.resolve())
-            elif output_filename:
-                # If output_filename is already absolute, return as-is
+                return str(ws)
+            if output_filename:
                 output_p = Path(output_filename)
                 if output_p.is_absolute():
                     return str(output_p.resolve())
-                # Otherwise, resolve relative to input's parent folder
-                return str((parent_dir / output_filename).resolve())
-            else:
-                return str(parent_dir.resolve())
+                return str((ws / Path(output_filename).name).resolve())
+            return str(ws)
         except Exception as e:
             logger.debug(f"Failed to infer output path from {input_path}: {e}")
             return None
 
     def _extract_explicit_output_folder(self, query: str) -> Optional[Path]:
         """Return a user-named output directory from the prompt, if present."""
-        q = query or ""
-        patterns = (
-            r"(?:in|into|to)\s+(?:the\s+)?(?:folder|directory)\s+['\"]([^'\"]+)['\"]",
-            r"(?:save|saved|export|create|write|store|generate)\s+(?:\w+\s+){0,10}(?:in|into|to)\s+(?:the\s+)?(?:folder|directory)\s+['\"]([^'\"]+)['\"]",
-            r"(?:save|saved|export|create|write)\s+(?:to|in|into)\s+(?:the\s+)?(?:folder|directory)\s+['\"]([^'\"]+)['\"]",
-        )
-        for pat in patterns:
-            m = re.search(pat, q, flags=re.IGNORECASE)
-            if not m:
-                continue
-            raw = (m.group(1) or "").strip().strip("\"'").rstrip(").,;")
-            if not raw:
-                continue
-            folder = Path(raw)
-            if folder.suffix.lower() in {
-                ".dwg", ".docx", ".doc", ".xlsx", ".xls", ".csv", ".pdf", ".aprx", ".gdb", ".shp",
-            }:
-                folder = folder.parent
-            try:
-                return folder.resolve()
-            except Exception:
-                return folder
-        return None
+        from agent.output_paths import extract_explicit_output_folder
+
+        return extract_explicit_output_folder(query)
 
     def _resolve_user_output_path(
         self,
@@ -2287,34 +2539,26 @@ class SurvyAIAgent:
         output_ref: str,
         *,
         fallback_dir: Optional[Path] = None,
+        source_path: Optional[str] = None,
     ) -> Path:
         """
         Resolve an output file path from the user's prompt.
 
         Priority: absolute path in output_ref > explicit folder in query + filename >
-        active workspace (fallback_dir or Path.cwd()).
+        source folder only if the user asked for that > active workspace.
         """
-        ws = (fallback_dir or Path.cwd()).resolve()
-        ref = (output_ref or "").strip().strip("\"'").rstrip(").,;")
-        if not ref:
-            return ws
+        from agent.output_paths import resolve_created_output_path
 
-        p = Path(ref)
+        ws = (fallback_dir or Path.cwd()).resolve()
+        p = resolve_created_output_path(
+            output_ref,
+            query=query or "",
+            source_path=source_path,
+            workspace=ws,
+        )
         if p.is_absolute():
             return self._coerce_write_path_away_from_install_root(p, ws)
-
-        if len(p.parts) > 1 or ("/" in ref) or ("\\" in ref):
-            return (ws / p).resolve()
-
-        explicit_folder = self._extract_explicit_output_folder(query or "")
-        if explicit_folder is not None:
-            try:
-                explicit_folder.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                pass
-            return (explicit_folder / p.name).resolve()
-
-        return (ws / p.name).resolve()
+        return p
 
     @staticmethod
     def _path_looks_like_survyai_install_root(folder: Path) -> bool:
@@ -2360,7 +2604,7 @@ class SurvyAIAgent:
         0) Explicit "Save ... as 'X.docx'" or "save the Summary file as 'X.docx'" (user intent)
         1) A quoted .docx path that does NOT exist (assumed intended output path)
         2) A quoted .docx filename that is NOT a substring of the input filename,
-           resolved into the same folder as the input doc
+           resolved into the active workspace (or beside the input if the user asked)
         3) None (unknown)
         """
         import re
@@ -2385,7 +2629,11 @@ class SurvyAIAgent:
                     if p.is_absolute() and not p.exists():
                         return str(p)
                     if not p.is_absolute():
-                        return str((input_path.parent / p.name).resolve())
+                        return str(
+                            self._resolve_user_output_path(
+                                query, p.name, source_path=str(input_path)
+                            )
+                        )
                     return str(p)
 
         # Find any .docx-like candidates in the query.
@@ -2435,11 +2683,15 @@ class SurvyAIAgent:
             if p.is_absolute() and (p.suffix.lower() == ".docx") and (not p.exists()):
                 return str(p)
 
-        # 2) Relative candidates -> resolve relative to input folder
+        # 2) Relative candidates -> workspace (or beside source if the user asked)
         for c in candidates:
             p = Path(c)
             if not p.is_absolute() and p.suffix.lower() == ".docx":
-                return str((input_path.parent / p.name).resolve())
+                return str(
+                    self._resolve_user_output_path(
+                        query, p.name, source_path=str(input_path)
+                    )
+                )
 
         return None
 
@@ -2681,6 +2933,18 @@ class SurvyAIAgent:
         except Exception:
             pass
 
+        # New PDF/Word attachment this turn is extract-from-file, not save-prior-essay.
+        try:
+            from agent.vision_ocr import query_has_source_document
+
+            body = (routing_query or "").lower()
+            if query_has_source_document(routing_query) and any(
+                k in body for k in ("extract", "all details", "this attachment", "attached")
+            ):
+                return False
+        except Exception:
+            pass
+
         # Never hijack operational file/GIS/CAD workflows (e.g. PRE/POST CSV + DWG volume).
         if self._classify_query_intent(routing_query) == "task":
             if not self._is_explicit_session_docx_save_request(routing_query):
@@ -2858,6 +3122,8 @@ class SurvyAIAgent:
             r"(?:save|saved|export)\s+(?:it\s+)?as\s+(?:a\s+)?(?:word\s+)?(?:document|doc|docx)\s+['\"]([^'\"]+)['\"]",
             r"(?:word\s+document|word\s+doc)\s+['\"]([^'\"]+)['\"]",
             r"(?:save|saved|export)\s+(?:it\s+)?as\s+['\"]([^'\"]+)['\"]",
+            r"(?:file\s+named|named)\s+['\"]([^'\"]+)['\"]",
+            r"(?:word\s+document(?:\s+file)?|word\s+file)\s+named\s+['\"]([^'\"]+)['\"]",
         )
         for pat in patterns:
             m = re.search(pat, q, flags=re.IGNORECASE)
@@ -3062,6 +3328,9 @@ class SurvyAIAgent:
         """Fast-path: extract key survey-plan details from a PDF via layout + vision."""
         from agent.pdf_survey_plan import should_fastpath_pdf_plan_key_details
 
+        # Extract-all-details → Word must win over a chat-only survey-plan report.
+        if self._should_fastpath_document_extract_to_word(query):
+            return False
         return should_fastpath_pdf_plan_key_details(query)
 
     def _run_pdf_plan_key_details_pipeline(self, query: str) -> Dict[str, Any]:
@@ -3074,6 +3343,165 @@ class SurvyAIAgent:
             full_query=query,
             extract_fn=self._extract_pdf_survey_plan_with_tier_fallback,
         )
+
+    def _should_fastpath_document_extract_to_word(self, query: str) -> bool:
+        """Extract a newly attached PDF/Word file into a Word document (not leftover OCR)."""
+        from agent.vision_ocr import is_document_extract_to_word_request, query_has_source_document
+
+        has_source = bool(
+            query_has_source_document(query) or self._extract_document_paths(query)
+        )
+        return is_document_extract_to_word_request(query, has_source=has_source)
+
+    def _ocr_scanned_pdf_pages_to_text(self, pdf_path: str, *, user_notes: str = "") -> str:
+        """Rasterize a scanned PDF and read pages with generic vision OCR (not cadastral)."""
+        import tempfile
+
+        from agent.pdf_survey_plan import render_pdf_pages_to_files
+        from agent.vision_ocr import OCR_BUDGET_S, run_vision_ocr
+
+        max_pages = int(getattr(self.settings, "vision_ocr_max_files", 4) or 4)
+        timeout_s = int(getattr(self.settings, "vision_ocr_timeout_s", OCR_BUDGET_S) or OCR_BUDGET_S)
+        notes = (user_notes or "").strip() or (
+            "Extract every readable detail from this document: headings, names, numbers, "
+            "tables, dates, stamps, and footnotes. Transcribe faithfully. Do not treat it "
+            "as a survey plan unless the page itself is a cadastral plan."
+        )
+        with tempfile.TemporaryDirectory(prefix="survyai_pdfocr_") as tmp:
+            pages = render_pdf_pages_to_files(
+                pdf_path, tmp, max_pages=max(1, max_pages), dpi=160
+            )
+            if not pages:
+                return ""
+            last_err = ""
+            for tier in ("average", "complex"):
+                llm, model_name = self._try_openai_tier_llm(tier)  # type: ignore[arg-type]
+                if llm is None:
+                    llm = getattr(self, "llm_primary", None)
+                if llm is None:
+                    break
+                if not model_name:
+                    model_name = getattr(self, "_current_openai_model", None) or getattr(
+                        self.settings, "openai_model", "gpt-5.4-mini"
+                    )
+                self._current_openai_model = model_name
+                result = run_vision_ocr(
+                    pages,
+                    user_text=notes,
+                    llm=llm,
+                    run_with_timeout=self._llm_run_with_timeout(model_name),
+                    mode="plain_text",
+                    timeout_s=timeout_s,
+                    max_files=len(pages),
+                    max_file_mb=int(getattr(self.settings, "vision_ocr_max_file_mb", 10) or 10) + 12,
+                    model_name=model_name,
+                    high_accuracy=True,
+                    verify_uncertain=False,
+                    workspace=Path.cwd(),
+                )
+                if getattr(result, "success", False):
+                    blob = ""
+                    if getattr(result, "format_for_user", None):
+                        blob = str(result.format_for_user() or "").strip()
+                    if not blob:
+                        blob = str(getattr(result, "text", "") or "").strip()
+                    if blob:
+                        return blob
+                last_err = str(getattr(result, "error", "") or "")
+            logger.debug("Scanned PDF OCR produced no text for %s: %s", pdf_path, last_err)
+            return ""
+
+    def _run_document_extract_to_word_pipeline(self, query: str) -> Dict[str, Any]:
+        """Read the attached PDF/Word source and write the requested .docx in the workspace."""
+        from agent.vision_ocr import (
+            extract_source_document_paths_from_query,
+            is_unusable_extracted_document_text,
+            looks_like_survey_plan_source,
+            resolve_ocr_word_export_path,
+        )
+
+        src_paths = extract_source_document_paths_from_query(query, existing_only=True)
+        if not src_paths:
+            src_paths = self._extract_document_paths(query)
+        if not src_paths:
+            return {
+                "success": False,
+                "error": "no_source_document",
+                "response": "I could not find the attached PDF or Word file to extract.",
+            }
+        src = src_paths[-1]
+        out_path = resolve_ocr_word_export_path(
+            self._vision_ocr_user_text(query) or query,
+            Path.cwd(),
+        )
+        text = ""
+        try:
+            extracted = self.document_processor.get_full_text(src, preserve_structure=True)
+            if isinstance(extracted, dict) and extracted.get("success"):
+                text = str(extracted.get("text") or "")
+            elif (
+                isinstance(extracted, dict)
+                and extracted.get("text")
+                and not extracted.get("warning")
+            ):
+                text = str(extracted.get("text") or "")
+        except Exception as exc:
+            logger.debug("document get_full_text failed for %s: %s", src, exc)
+
+        compact = len(re.sub(r"\s+", "", text))
+        if compact < 80 and str(src).lower().endswith(".pdf"):
+            notes = self._vision_ocr_user_text(query) or query
+            if looks_like_survey_plan_source(notes, src):
+                try:
+                    vision = self._run_pdf_plan_key_details_pipeline(query)
+                    vis_text = str((vision or {}).get("response") or "").strip()
+                    if vis_text and not (vision or {}).get("error"):
+                        text = vis_text
+                    elif vis_text and len(vis_text) > len(text) and not is_unusable_extracted_document_text(vis_text):
+                        text = vis_text
+                except Exception as exc:
+                    logger.debug("PDF vision key-details fallback failed: %s", exc)
+            if is_unusable_extracted_document_text(text) or len(re.sub(r"\s+", "", text)) < 80:
+                try:
+                    ocr_text = self._ocr_scanned_pdf_pages_to_text(src, user_notes=notes)
+                    if ocr_text and not is_unusable_extracted_document_text(ocr_text):
+                        text = ocr_text
+                except Exception as exc:
+                    logger.debug("Scanned PDF page OCR failed for %s: %s", src, exc)
+        if is_unusable_extracted_document_text(text):
+            return {
+                "success": False,
+                "error": "scanned_pdf_unreadable",
+                "response": (
+                    f"I found `{Path(src).name}` but could not read its pages "
+                    "(no selectable text, and page OCR did not return the document details). "
+                    "Try a clearer scan or a text-based PDF."
+                ),
+                "source_path": src,
+            }
+        title = Path(src).stem.replace("_", " ").strip() or "Extraction"
+        create_result = self.document_processor.create_word_document(
+            str(out_path), str(text).strip(), title=title
+        )
+        if not create_result.get("success"):
+            err = create_result.get("error") or "Failed to create Word document"
+            return {
+                "success": False,
+                "error": str(err),
+                "response": f"I extracted `{Path(src).name}` but could not save Word: {err}",
+                "output_path": str(out_path),
+            }
+        written = create_result.get("file_path") or str(out_path)
+        return {
+            "success": True,
+            "response": (
+                f"Extracted details from `{Path(src).name}` and saved them to Word.\n"
+                f"- Source: `{src}`\n"
+                f"- Output: `{written}`\n"
+            ),
+            "output_path": str(written),
+            "source_path": src,
+        }
 
     def _vision_ocr_user_text(self, query: str) -> str:
         """User-facing text without the attachment marker block (for mode selection)."""
@@ -3155,7 +3583,11 @@ class SurvyAIAgent:
         output_dwg = resolve_output_dwg_path(query, image_paths[0], scope_text=scope)
         if not output_dwg:
             stem = Path(image_paths[0]).stem or "survey_plan"
-            output_dwg = str(Path(image_paths[0]).with_name(f"{stem}_replot.dwg"))
+            output_dwg = str(
+                self._resolve_user_output_path(
+                    query, f"{stem}_replot.dwg", source_path=image_paths[0]
+                )
+            )
 
         mem = self._resolve_cadastral_template_from_memory(query)
         self._ensure_autocad_connected()
@@ -3795,12 +4227,7 @@ class SurvyAIAgent:
             return (score, last_used)
 
         best = sorted(valid_entries, key=_score, reverse=True)[0]
-        try:
-            best["last_used_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-            data["templates"] = entries
-            self._save_cad_template_memory(data)
-        except Exception:
-            pass
+        # Read-only resolve: do not write last_used_at here (updated after successful output).
         return {
             "template_path": str(Path(str(best.get("path") or "")).resolve()),
             "profile_path": str(Path(str(best.get("profile_path") or "")).resolve()) if best.get("profile_path") else "",
@@ -3876,6 +4303,61 @@ class SurvyAIAgent:
         scope = self._cadastral_user_message_body(query)
         return resolve_pdf_path_for_replot(scope, query)
 
+    def _confirm_output_overwrite_upfront(self, output_dwg_path: str) -> Optional[Dict[str, Any]]:
+        """Ask about replacing an existing output before any expensive work begins.
+
+        Whether the output exists is a filesystem fact known as soon as the path is
+        resolved, but the prompt used to live inside the plotting step — so the user
+        waited through PDF extraction, vision and AutoCAD startup just to be asked a
+        question that could be answered immediately, and a decline threw all of that
+        away. Asking here makes the prompt instant and makes "no" free.
+
+        Returns a cancellation result when the user declines, otherwise None. On
+        approval a one-shot token is recorded so the plotting step does not re-ask.
+        """
+        # Reset first: an approval only ever applies to the request that made it.
+        self._overwrite_confirmed_outputs = set()
+        try:
+            outp = Path(str(output_dwg_path))
+            if not outp.is_absolute():
+                outp = self._resolve_user_output_path("", str(outp))
+            outp = outp.resolve()
+        except Exception:
+            return None
+        try:
+            # Only the on-disk case is decidable this early; a drawing that is open
+            # but unsaved is still caught by the plotting step's own check.
+            if not outp.exists():
+                return None
+        except Exception:
+            return None
+        if self._is_protected_template_path(str(outp)):
+            return None
+        if not _confirm_overwrite_existing_dwg(str(outp), mode="overwrite"):
+            return {
+                "success": False,
+                "cancelled": True,
+                "stage": "output",
+                "error": (
+                    f"Kept existing drawing unchanged: {str(outp)}\n"
+                    "Overwrite was declined. Change the output name or choose Overwrite to replace it."
+                ),
+            }
+        self._overwrite_confirmed_outputs.add(str(outp).lower())
+        return None
+
+    def _consume_overwrite_confirmation(self, resolved_output: str) -> bool:
+        """True when this output was already approved for overwrite in this request."""
+        key = str(resolved_output or "").lower()
+        try:
+            confirmed = self._overwrite_confirmed_outputs
+        except AttributeError:
+            return False
+        if key in confirmed:
+            confirmed.discard(key)
+            return True
+        return False
+
     def _ensure_autocad_connected(self) -> bool:
         """Connect to AutoCAD early so COM is warm before template plotting."""
         try:
@@ -3903,21 +4385,96 @@ class SurvyAIAgent:
         pdf_path: str,
         *,
         user_notes: str,
-        timeout_s: int = 120,
-    ) -> tuple[Any, Optional[str]]:
-        """Extract from PDF using average-tier vision first; escalate to complex if needed."""
+        timeout_s: int = 90,
+        total_deadline_s: float = 120.0,
+        preloaded_llm: Any = None,
+        preloaded_model: Optional[str] = None,
+        deadline_ts: Optional[float] = None,
+    ) -> tuple[Any, Optional[str], tuple[str, str, List[str]]]:
+        """Extract from PDF using average-tier vision first; escalate to complex if needed.
+
+        Returns ``(extraction, model_name, cached_sources)`` so callers can reuse
+        layout/plain/vision payloads without re-reading the PDF.
+        """
+        import time as _time
+
         from agent.pdf_survey_plan import (
             SurveyPlanExtraction,
+            _load_pdf_extraction_sources,
             extract_survey_plan_from_pdf,
+            get_cached_pdf_extraction,
+            store_cached_pdf_extraction,
             validate_extraction_for_replot,
         )
+        from survyai.perf import incr, set_meta, span
 
-        tiers: List[tuple[str, int]] = [("average", 1), ("complex", 2)]
+        deadline = float(deadline_ts) if deadline_ts is not None else (
+            _time.time() + max(30.0, float(total_deadline_s))
+        )
+        with span("pdf.load_sources"):
+            cached_sources = _load_pdf_extraction_sources(
+                pdf_path, vision_max_pages=1, skip_vision=True
+            )
+
+        cached_result = get_cached_pdf_extraction(pdf_path, user_notes=user_notes)
+        if cached_result and cached_result.get("extraction"):
+            try:
+                extraction = SurveyPlanExtraction(**cached_result["extraction"])
+                if extraction.source not in ("error", "llm_parse_failed"):
+                    issues = validate_extraction_for_replot(extraction)
+                    if not issues:
+                        incr("pdf_extraction_cache_hit")
+                        set_meta("extraction_source", extraction.source)
+                        set_meta("extraction_cache", True)
+                        return extraction, cached_result.get("model_name"), cached_sources
+            except Exception:
+                pass
+
+        page_count = 1
+        try:
+            from agent.pdf_survey_plan import get_cached_pdf_sources
+
+            hit = get_cached_pdf_sources(pdf_path)
+            if hit and hit.get("page_count"):
+                page_count = max(1, int(hit["page_count"]))
+        except Exception:
+            page_count = 1
+        tiers: List[tuple[str, int]] = [("average", 1)]
+        if page_count > 1:
+            tiers.append(("complex", min(2, page_count)))
+        else:
+            tiers.append(("complex", 1))
+
         last: Optional[SurveyPlanExtraction] = None
         last_model: Optional[str] = None
+        last_issues: List[str] = []
 
-        for tier, vision_pages in tiers:
-            llm, model_name = self._try_openai_tier_llm(tier)  # type: ignore[arg-type]
+        def _issues_need_vision(issues: List[str]) -> bool:
+            geo_markers = (
+                "pillar",
+                "traverse",
+                "leg",
+                "misclosure",
+                "area",
+                "coordinate",
+                "anchor",
+                "easting",
+                "northing",
+                "utm",
+                "geometry",
+                "closure",
+            )
+            return any(any(m in (i or "").lower() for m in geo_markers) for i in issues)
+
+        for idx, (tier, vision_pages) in enumerate(tiers):
+            remaining = deadline - _time.time()
+            if remaining <= 5.0:
+                logger.warning("PDF extraction total deadline reached before tier %s", tier)
+                break
+            if tier == "average" and preloaded_llm is not None:
+                llm, model_name = preloaded_llm, preloaded_model
+            else:
+                llm, model_name = self._try_openai_tier_llm(tier)  # type: ignore[arg-type]
             if llm is None:
                 llm = getattr(self, "llm_primary", None)
             if llm is None:
@@ -3927,31 +4484,83 @@ class SurvyAIAgent:
                     self.settings, "openai_model", "gpt-5.4-mini"
                 )
             self._current_openai_model = model_name
-            extraction = extract_survey_plan_from_pdf(
-                pdf_path,
-                llm=llm,
-                run_with_timeout=self._llm_run_with_timeout(model_name),
-                user_notes=user_notes,
-                timeout_s=timeout_s,
-                vision_max_pages=vision_pages,
-            )
+            per_call = int(min(float(timeout_s), max(15.0, remaining - 5.0)))
+            if (vision_pages > 1 or idx > 0) and not (cached_sources[2]):
+                with span("pdf.render_tier", tier=tier):
+                    cached_sources = _load_pdf_extraction_sources(
+                        pdf_path,
+                        vision_max_pages=vision_pages,
+                        preloaded=(cached_sources[0], cached_sources[1], list(cached_sources[2] or [])),
+                        skip_vision=False,
+                    )
+            with span("pdf.extract_tier", tier=tier):
+                extraction = extract_survey_plan_from_pdf(
+                    pdf_path,
+                    llm=llm,
+                    run_with_timeout=self._llm_run_with_timeout(model_name),
+                    user_notes=user_notes,
+                    timeout_s=per_call,
+                    vision_max_pages=vision_pages,
+                    preloaded_sources=cached_sources,
+                    force_vision=bool(last_issues) and _issues_need_vision(last_issues),
+                    retry_focus="; ".join(last_issues) if last_issues else "",
+                )
+            incr("pdf_extract_tiers")
             last = extraction
             last_model = model_name
             if extraction.source in ("error", "llm_parse_failed"):
+                last_issues = [extraction.notes or extraction.source]
                 continue
-            if not validate_extraction_for_replot(extraction):
-                return extraction, model_name
+            issues = validate_extraction_for_replot(extraction)
+            if not issues:
+                set_meta("extraction_source", extraction.source)
+                store_cached_pdf_extraction(
+                    pdf_path,
+                    user_notes=user_notes,
+                    extraction=extraction,
+                    model_name=model_name,
+                )
+                return extraction, model_name, cached_sources
+            if extraction.source in ("layout_text", "pdf_vector", "heuristic") and not _issues_need_vision(
+                issues
+            ):
+                set_meta("extraction_source", extraction.source)
+                set_meta("validation_soft_issues", issues[:5])
+                store_cached_pdf_extraction(
+                    pdf_path,
+                    user_notes=user_notes,
+                    extraction=extraction,
+                    model_name=model_name,
+                )
+                return extraction, model_name, cached_sources
+            last_issues = issues
+            if not _issues_need_vision(issues):
+                break
             logger.info(
-                "PDF extraction incomplete on tier %s — retrying with stronger model if available",
+                "PDF extraction incomplete on tier %s (%s) — retrying with stronger model if available",
                 tier,
+                "; ".join(issues[:3]),
             )
 
         if last is None:
-            return SurveyPlanExtraction(source="error", notes="No LLM available for PDF extraction"), None
-        return last, last_model
+            return (
+                SurveyPlanExtraction(source="error", notes="No LLM available for PDF extraction"),
+                None,
+                cached_sources,
+            )
+        set_meta("extraction_source", getattr(last, "source", ""))
+        if last.source not in ("error", "llm_parse_failed"):
+            store_cached_pdf_extraction(
+                pdf_path,
+                user_notes=user_notes,
+                extraction=last,
+                model_name=last_model,
+            )
+        return last, last_model, cached_sources
 
     def _run_pdf_survey_replot_pipeline(self, query: str) -> Dict[str, Any]:
         """Extract survey plan from PDF (layout + vision) and replot via cadastral CAD pipeline."""
+        import time as _time
         from pathlib import Path
 
         from agent.pdf_survey_plan import (
@@ -3962,171 +4571,268 @@ class SurvyAIAgent:
             resolve_plan_overrides_from_query,
             validate_extraction_for_replot,
             validate_subprompt_geometry,
+            _plan_override_change_requested,
         )
+        from survyai.perf import incr, span, track_pipeline
 
-        scope = self._cadastral_user_message_body(query)
-        pdf_resolution = self._resolve_pdf_path_for_replot(query)
-        if not pdf_resolution.get("success"):
-            return {
-                "success": False,
-                "error": pdf_resolution.get("error") or "No PDF path found in the request.",
-                "requested_pdf": pdf_resolution.get("requested"),
-                "similar_pdfs": pdf_resolution.get("similar") or [],
-                "needs_user_approval": bool(pdf_resolution.get("needs_user_approval")),
-            }
+        with track_pipeline("pdf_replot") as perf:
+            scope = self._cadastral_user_message_body(query)
+            pipeline_deadline = _time.time() + 180.0
 
-        pdf_path = str(pdf_resolution.get("path") or "")
-        if not pdf_path or not Path(pdf_path).exists():
-            return {
-                "success": False,
-                "error": f"PDF not found: {pdf_path or pdf_resolution.get('requested')}",
-            }
+            with span("pdf.path_resolve"):
+                pdf_resolution = self._resolve_pdf_path_for_replot(query)
+            if not pdf_resolution.get("success"):
+                return {
+                    "success": False,
+                    "stage": "path",
+                    "error": pdf_resolution.get("error") or "No PDF path found in the request.",
+                    "requested_pdf": pdf_resolution.get("requested"),
+                    "similar_pdfs": pdf_resolution.get("similar") or [],
+                    "needs_user_approval": bool(pdf_resolution.get("needs_user_approval")),
+                    "perf": perf.as_dict(),
+                }
 
-        output_dwg = resolve_output_dwg_path(query, pdf_path, scope_text=scope)
-        if not output_dwg:
-            return {"success": False, "error": "Could not resolve output DWG path."}
+            pdf_path = str(pdf_resolution.get("path") or "")
+            if not pdf_path or not Path(pdf_path).exists():
+                return {
+                    "success": False,
+                    "stage": "path",
+                    "error": f"PDF not found: {pdf_path or pdf_resolution.get('requested')}",
+                    "perf": perf.as_dict(),
+                }
 
-        logger.info(
-            "PDF survey replot paths (strict): pdf=%s output_dwg=%s scope=%r",
-            pdf_path,
-            output_dwg,
-            scope[:160],
-        )
+            output_dwg = resolve_output_dwg_path(query, pdf_path, scope_text=scope)
+            if not output_dwg:
+                return {
+                    "success": False,
+                    "stage": "path",
+                    "error": "Could not resolve output DWG path.",
+                    "perf": perf.as_dict(),
+                }
 
-        template_hint: Optional[str] = None
-        mem: Optional[Dict[str, str]] = None
-
-        def _resolve_template() -> Optional[Dict[str, str]]:
-            return self._resolve_cadastral_template_from_memory(query)
-
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            fut_template = pool.submit(_resolve_template)
-            fut_simple = pool.submit(self._try_openai_tier_llm, "simple")
-            fut_cad = pool.submit(self._ensure_autocad_connected)
-            mem = fut_template.result()
-            override_llm, override_model = fut_simple.result()
-            fut_cad.result()
-
-        extraction, model_name = self._extract_pdf_survey_plan_with_tier_fallback(
-            pdf_path,
-            user_notes=self._cadastral_user_message_body(query),
-            timeout_s=120,
-        )
-
-        if override_llm is None:
-            override_llm = getattr(self, "llm_primary", None)
-        if not override_model:
-            override_model = model_name
-        if model_name:
-            self._current_openai_model = model_name
-        if extraction.source in ("error", "llm_parse_failed"):
-            return {
-                "success": False,
-                "error": extraction.notes or "PDF survey plan extraction failed.",
-                "extraction": extraction.model_dump(),
-            }
-
-        validation_issues = validate_extraction_for_replot(extraction)
-        if validation_issues:
-            return {
-                "success": False,
-                "error": (
-                    "PDF extraction is incomplete and cannot be replotted safely: "
-                    + "; ".join(validation_issues)
-                ),
-                "validation_issues": validation_issues,
-                "extraction": extraction.model_dump(),
-            }
-
-        if mem and mem.get("template_path"):
-            template_hint = mem["template_path"]
-
-        plan_overrides = resolve_plan_overrides_from_query(
-            query,
-            scope_text=scope,
-            base_extraction=extraction,
-            llm=override_llm,
-            run_with_timeout=self._llm_run_with_timeout(override_model),
-        )
-        extraction = apply_plan_overrides_to_extraction(extraction, plan_overrides)
-        from agent.pdf_survey_plan import enrich_extraction_coordinates
-
-        extraction = enrich_extraction_coordinates(extraction, "")
-        cert_date = plan_overrides.certification_date or extraction.certification_date or None
-
-        subprompt = build_cadastral_subprompt(
-            extraction,
-            output_dwg_path=output_dwg,
-            certification_date=cert_date,
-            template_path=template_hint,
-        )
-        subprompt_issues = validate_subprompt_geometry(subprompt)
-        if subprompt_issues:
-            return {
-                "success": False,
-                "error": (
-                    "Generated CAD sub-prompt is missing required geometry: "
-                    + "; ".join(subprompt_issues)
-                ),
-                "validation_issues": subprompt_issues,
-                "extraction": extraction.model_dump(),
-                "subprompt": subprompt,
-            }
-        logger.info("PDF survey replot sub-prompt:\n%s", subprompt)
-
-        plot_result = self._run_cadastral_cad_prompt_pipeline(
-            subprompt,
-            source_scale_denom=extraction.scale_denom,
-            skip_intent_assessment=True,
-            user_scope_for_extras=scope,
-        )
-        if not plot_result.get("success"):
-            return {
-                "success": False,
-                "error": plot_result.get("error", "Cadastral replot failed."),
-                "extraction": extraction.model_dump(),
-                "subprompt": subprompt,
-            }
-
-        out_lines = [
-            "✅ Survey plan PDF replotted to CAD.",
-            f"- Source PDF: {pdf_path}",
-            f"- Output DWG: {plot_result.get('output_dwg') or output_dwg}",
-            f"- Extraction: {extraction.source} (confidence {extraction.confidence:.0%})",
-        ]
-        if plan_overrides.override_fields:
-            out_lines.append(
-                f"- User overrides applied: {', '.join(plan_overrides.override_fields)}"
+            logger.info(
+                "PDF survey replot paths (strict): pdf=%s output_dwg=%s scope=%r",
+                pdf_path,
+                output_dwg,
+                scope[:160],
             )
-            if extraction.buyer_name and "buyer_name" in plan_overrides.override_fields:
-                out_lines.append(f"- Buyer name: {extraction.buyer_name}")
-            if extraction.plan_number and "plan_number" in plan_overrides.override_fields:
-                out_lines.append(f"- Plan number: {extraction.plan_number}")
-            if cert_date and "certification_date" in plan_overrides.override_fields:
-                out_lines.append(f"- Certification date: {cert_date}")
-        elif cert_date:
-            out_lines.append(f"- Certification date updated to: {cert_date}")
-        if extraction.pillar_numbers:
-            out_lines.append(f"- Pillars: {', '.join(extraction.pillar_numbers)}")
-        if extraction.traverse_legs:
-            out_lines.append(f"- Traverse legs: {len(extraction.traverse_legs)}")
-        if extraction.fences:
-            out_lines.append(f"- Concrete wall fences: {len(extraction.fences)} boundary side(s)")
-        filtered_notes = filter_user_facing_extraction_notes(
-            extraction.notes or "",
-            plan_overrides.override_fields,
-        )
-        if filtered_notes:
-            out_lines.append(f"- Notes: {filtered_notes}")
 
-        return {
-            "success": True,
-            "response": "\n".join(out_lines) + "\n",
-            "output_dwg": plot_result.get("output_dwg") or output_dwg,
-            "output_path": plot_result.get("output_dwg") or output_dwg,
-            "extraction": extraction.model_dump(),
-            "model_name": model_name,
-        }
+            # Ask before spending extraction/vision/AutoCAD time on a run the user
+            # may not want, and so the prompt itself is not delayed behind that work.
+            with span("pdf.overwrite_confirm"):
+                overwrite_block = self._confirm_output_overwrite_upfront(output_dwg)
+            if overwrite_block is not None:
+                overwrite_block["perf"] = perf.as_dict()
+                return overwrite_block
+
+            template_hint: Optional[str] = None
+            profile_hint: Optional[str] = None
+            mem: Optional[Dict[str, str]] = None
+            needs_override_llm = _plan_override_change_requested(scope)
+
+            def _resolve_template() -> Optional[Dict[str, str]]:
+                return self._resolve_cadastral_template_from_memory(query)
+
+            with span("pdf.warm"):
+                with ThreadPoolExecutor(max_workers=3) as pool:
+                    fut_template = pool.submit(_resolve_template)
+                    fut_cad = pool.submit(self._ensure_autocad_connected)
+                    fut_simple = (
+                        pool.submit(self._try_openai_tier_llm, "simple")
+                        if needs_override_llm
+                        else None
+                    )
+                    mem = fut_template.result()
+                    fut_cad.result()
+                    if fut_simple is not None:
+                        override_llm, override_model = fut_simple.result()
+                    else:
+                        override_llm, override_model = None, None
+
+            extraction, model_name, cached_sources = self._extract_pdf_survey_plan_with_tier_fallback(
+                pdf_path,
+                user_notes=self._cadastral_user_message_body(query),
+                timeout_s=75,
+                total_deadline_s=120.0,
+                deadline_ts=pipeline_deadline,
+            )
+
+            if override_llm is None and needs_override_llm:
+                override_llm = getattr(self, "llm_primary", None)
+            if not override_model:
+                override_model = model_name
+            if model_name:
+                self._current_openai_model = model_name
+            if extraction.source in ("error", "llm_parse_failed"):
+                return {
+                    "success": False,
+                    "stage": "extract",
+                    "error": extraction.notes or "PDF survey plan extraction failed.",
+                    "extraction": extraction.model_dump(),
+                    "perf": perf.as_dict(),
+                }
+
+            validation_issues = validate_extraction_for_replot(extraction)
+            if validation_issues:
+                return {
+                    "success": False,
+                    "stage": "validate",
+                    "error": (
+                        "PDF extraction is incomplete and cannot be replotted safely: "
+                        + "; ".join(validation_issues)
+                    ),
+                    "validation_issues": validation_issues,
+                    "extraction": extraction.model_dump(),
+                    "perf": perf.as_dict(),
+                }
+
+            if mem and mem.get("template_path"):
+                template_hint = mem["template_path"]
+            if mem and mem.get("profile_path"):
+                profile_hint = mem["profile_path"]
+
+            with span("pdf.overrides"):
+                if needs_override_llm:
+                    plan_overrides = resolve_plan_overrides_from_query(
+                        query,
+                        scope_text=scope,
+                        base_extraction=extraction,
+                        llm=override_llm,
+                        run_with_timeout=self._llm_run_with_timeout(override_model),
+                    )
+                else:
+                    plan_overrides = resolve_plan_overrides_from_query(
+                        query,
+                        scope_text=scope,
+                        base_extraction=extraction,
+                        llm=None,
+                        run_with_timeout=None,
+                    )
+            extraction = apply_plan_overrides_to_extraction(extraction, plan_overrides)
+            from agent.pdf_survey_plan import (
+                enrich_extraction_coordinates,
+                traverse_misclosure_metrics,
+            )
+
+            pdf_text = f"{cached_sources[0]}\n{cached_sources[1]}"
+            with span("pdf.enrich"):
+                extraction = enrich_extraction_coordinates(extraction, pdf_text)
+            validation_issues = validate_extraction_for_replot(extraction)
+            if validation_issues:
+                detail = "; ".join(validation_issues)
+                try:
+                    metrics = traverse_misclosure_metrics(extraction.traverse_legs or [])
+                    if metrics.get("perimeter_m", 0) > 0:
+                        detail += (
+                            f" | measured misclosure={metrics['misclosure_m']:.3f}m "
+                            f"(1:{metrics['closure_ratio']:.1f})"
+                        )
+                except Exception:
+                    pass
+                if extraction.area_sq_m is not None:
+                    detail += f" | printed area={extraction.area_sq_m:.1f} sq m"
+                return {
+                    "success": False,
+                    "stage": "validate",
+                    "error": (
+                        "PDF extraction is incomplete and cannot be replotted safely: "
+                        + detail
+                    ),
+                    "validation_issues": validation_issues,
+                    "extraction": extraction.model_dump(),
+                    "perf": perf.as_dict(),
+                }
+            cert_date = plan_overrides.certification_date or extraction.certification_date or None
+
+            subprompt = build_cadastral_subprompt(
+                extraction,
+                output_dwg_path=output_dwg,
+                certification_date=cert_date,
+                template_path=template_hint,
+                combined_text=pdf_text,
+            )
+            subprompt_issues = validate_subprompt_geometry(subprompt)
+            if subprompt_issues:
+                return {
+                    "success": False,
+                    "stage": "validate",
+                    "error": (
+                        "Generated CAD sub-prompt is missing required geometry: "
+                        + "; ".join(subprompt_issues)
+                    ),
+                    "validation_issues": subprompt_issues,
+                    "extraction": extraction.model_dump(),
+                    "subprompt": subprompt,
+                    "perf": perf.as_dict(),
+                }
+            logger.info("PDF survey replot sub-prompt:\n%s", subprompt)
+
+            with span("cad.plot"):
+                plot_result = self._run_cadastral_cad_prompt_pipeline(
+                    subprompt,
+                    source_scale_denom=extraction.scale_denom,
+                    skip_intent_assessment=True,
+                    user_scope_for_extras=scope,
+                    skip_session_prep=True,
+                    template_override_path=template_hint,
+                    profile_override_path=profile_hint,
+                )
+            if not plot_result.get("success"):
+                err = plot_result.get("error", "Cadastral replot failed.")
+                stage = "autocad_open" if "open" in str(err).lower() or "Open.Name" in str(err) else "plot"
+                if "save" in str(err).lower():
+                    stage = "save"
+                return {
+                    "success": False,
+                    "stage": stage,
+                    "error": err,
+                    "extraction": extraction.model_dump(),
+                    "subprompt": subprompt,
+                    "perf": perf.as_dict(),
+                }
+
+            out_lines = [
+                "✅ Survey plan PDF replotted to CAD.",
+                f"- Source PDF: {pdf_path}",
+                f"- Output DWG: {plot_result.get('output_dwg') or output_dwg}",
+                f"- Extraction: {extraction.source} (confidence {extraction.confidence:.0%})",
+            ]
+            if plan_overrides.override_fields:
+                out_lines.append(
+                    f"- User overrides applied: {', '.join(plan_overrides.override_fields)}"
+                )
+                if extraction.buyer_name and "buyer_name" in plan_overrides.override_fields:
+                    out_lines.append(f"- Buyer name: {extraction.buyer_name}")
+                if extraction.plan_number and "plan_number" in plan_overrides.override_fields:
+                    out_lines.append(f"- Plan number: {extraction.plan_number}")
+                if cert_date and "certification_date" in plan_overrides.override_fields:
+                    out_lines.append(f"- Certification date: {cert_date}")
+            elif cert_date:
+                out_lines.append(f"- Certification date updated to: {cert_date}")
+            if extraction.pillar_numbers:
+                out_lines.append(f"- Pillars: {', '.join(extraction.pillar_numbers)}")
+            if extraction.traverse_legs:
+                out_lines.append(f"- Traverse legs: {len(extraction.traverse_legs)}")
+            if extraction.fences:
+                out_lines.append(f"- Concrete wall fences: {len(extraction.fences)} boundary side(s)")
+            filtered_notes = filter_user_facing_extraction_notes(
+                extraction.notes or "",
+                plan_overrides.override_fields,
+            )
+            if filtered_notes:
+                out_lines.append(f"- Notes: {filtered_notes}")
+
+            logger.info("PDF replot perf: %s", perf.summary_line())
+            incr("pdf_replot_success")
+            return {
+                "success": True,
+                "response": "\n".join(out_lines) + "\n",
+                "output_dwg": plot_result.get("output_dwg") or output_dwg,
+                "output_path": plot_result.get("output_dwg") or output_dwg,
+                "extraction": extraction.model_dump(),
+                "model_name": model_name,
+                "perf": perf.as_dict(),
+            }
 
     def _should_fastpath_excel_cadastral(self, query: str) -> bool:
         """True when CAD plan coords must be composed from an Excel ownership workbook."""
@@ -4486,6 +5192,7 @@ class SurvyAIAgent:
                 surveyor_address=meta.get("surveyor_address", ""),
                 certification_date=meta.get("certification_date", ""),
                 pillar_numbers=meta.get("pillar_numbers") or [],
+                source_query=scope,
             )
             extra_parcels = []
             extent_points = []
@@ -5321,6 +6028,9 @@ class SurvyAIAgent:
 
         def _simple_override_llm() -> Any:
             nonlocal simple_override_llm, simple_override_model
+            # Called only from regex-miss fallbacks, so it stays lazy: a structured
+            # sub-prompt never pays for it, and a nonstandard prompt keeps the
+            # interpretation fallback it needs to stay correct.
             if simple_override_llm is not None:
                 return simple_override_llm
             llm_inst, model_inst = self._try_openai_tier_llm("simple")
@@ -5477,7 +6187,9 @@ class SurvyAIAgent:
                 flags=re.IGNORECASE | re.DOTALL,
             )
             raw = (m_p.group(1).strip() if m_p else "").strip().rstrip(",").strip()
-            pillar_list = [p.strip().strip("'\"") for p in re.split(r"[,\n]+", raw) if p.strip()]
+            # Keep empty slots so unlabeled corners stay aligned with the traverse ring.
+            parts = [p.strip().strip("'\"") for p in re.split(r"[,\n]+", raw)]
+            pillar_list = parts if any(parts) else []
         pillars = ", ".join(pillar_list)
 
         coords_blob = extract_coordinates_blob_from_cadastral_query(q)
@@ -5563,6 +6275,20 @@ class SurvyAIAgent:
                     user_scale_denom = int(scale_m.group(1))
         if not user_scale_denom and source_scale_denom and int(source_scale_denom) > 0:
             user_scale_denom = int(source_scale_denom)
+
+        printed_area_sq_m = None
+        try:
+            m_area = re.search(
+                r"\barea\s*[:=]\s*([\d,]+(?:\.\d+)?)\s*(?:SQ|$)",
+                q,
+                flags=re.IGNORECASE,
+            )
+            if m_area:
+                printed_area_sq_m = float(m_area.group(1).replace(",", ""))
+                if printed_area_sq_m <= 1.0:
+                    printed_area_sq_m = None
+        except Exception:
+            printed_area_sq_m = None
 
         # Parse optional road title override for first road (e.g. "title as 'UMUAKURU-UMUALILI ROAD'")
         access_road_title = None
@@ -5739,6 +6465,10 @@ class SurvyAIAgent:
             skip_session_prep=bool(skip_session_prep),
             batch_mode=bool(batch_mode),
             close_output_after_save=bool(close_output_after_save),
+            printed_area_sq_m=printed_area_sq_m,
+            user_query="\n\n".join(
+                dict.fromkeys(t for t in (q, extras_scope) if (t or "").strip())
+            ),
         )
         if isinstance(result, dict) and result.get("success"):
             self._register_cad_template_memory(str(template_p), str(profile_path))
@@ -5897,6 +6627,32 @@ class SurvyAIAgent:
         self._protected_template_paths.add(str(tp.resolve()))
         return {"success": True, "profile_path": str(outp), "profile": profile}
 
+    def _release_output_dwg_lock(self, output_dwg_path: Any) -> None:
+        """Save then close an open output DWG so AutoCAD releases the file lock."""
+        path = str(output_dwg_path)
+        try:
+            if hasattr(self.autocad, "save_close_to_release_lock"):
+                self.autocad.save_close_to_release_lock(path)
+                return
+        except Exception:
+            pass
+        try:
+            if hasattr(self.autocad, "quiesce_autocad"):
+                self.autocad.quiesce_autocad(esc_count=4)
+        except Exception:
+            pass
+        try:
+            if hasattr(self.autocad, "save_and_close_drawing"):
+                self.autocad.save_and_close_drawing(path, save=True)
+            else:
+                self.autocad.close_drawing_if_open(path, save_changes=True)
+        except Exception:
+            try:
+                self.autocad.close_drawing_if_open(path, save_changes=True)
+            except Exception:
+                pass
+        time.sleep(0.45)
+
     def _apply_cadastral_template(
         self,
         profile_path: str,
@@ -5924,6 +6680,8 @@ class SurvyAIAgent:
         skip_session_prep: bool = False,
         batch_mode: bool = False,
         close_output_after_save: bool = False,
+        printed_area_sq_m: Optional[float] = None,
+        user_query: Optional[str] = None,
     ) -> Dict[str, Any]:
         # Normalize to list: support legacy single access_road
         roads_to_draw = access_roads if access_roads is not None else ([access_road] if access_road else [])
@@ -6010,8 +6768,8 @@ class SurvyAIAgent:
                 logger.warning("save_and_close_other_drawings failed (continuing): %s", e)
         else:
             try:
-                # Soft prep: only close a prior output with the same basename if open.
-                self.autocad.close_drawing_if_open(str(outp), save_changes=False)
+                # Soft prep: save+close the prior output if still open (pan/zoom lock).
+                self._release_output_dwg_lock(outp)
             except Exception:
                 pass
 
@@ -6033,7 +6791,12 @@ class SurvyAIAgent:
                 output_exists = False
 
         if output_exists:
-            if not _confirm_overwrite_existing_dwg(str(outp), mode="overwrite"):
+            # The pipeline may already have asked before doing the expensive work;
+            # only the prompt is skipped, never the lock release below.
+            already_confirmed = self._consume_overwrite_confirmation(str(outp))
+            if not already_confirmed and not _confirm_overwrite_existing_dwg(
+                str(outp), mode="overwrite"
+            ):
                 return {
                     "success": False,
                     "cancelled": True,
@@ -6042,42 +6805,57 @@ class SurvyAIAgent:
                         "Overwrite was declined. Change the output name or choose Overwrite to replace it."
                     ),
                 }
-            # Release any remaining AutoCAD lock on the target before disk overwrite.
+            # Release AutoCAD's lock: save unsaved pan/zoom/edits, then close.
             try:
-                if hasattr(self.autocad, "quiesce_autocad"):
-                    self.autocad.quiesce_autocad(esc_count=3)
-                self.autocad.close_drawing_if_open(str(outp), save_changes=False)
-                time.sleep(0.35)
+                self._release_output_dwg_lock(outp)
             except Exception:
                 pass
+
+        def _is_output_lock_error(exc: BaseException) -> bool:
+            if isinstance(exc, PermissionError):
+                return True
+            if isinstance(exc, OSError):
+                if int(getattr(exc, "winerror", 0) or 0) in (5, 32, 33):
+                    return True
+                if int(getattr(exc, "errno", 0) or 0) in (13, 11):
+                    return True
+            return False
 
         def _copy_template_to_output() -> Optional[Dict[str, Any]]:
             try:
                 shutil.copy2(str(template), str(outp))
                 return None
-            except PermissionError:
-                # One retry after forcing the target closed (common when still locked).
+            except Exception as e:
+                if not _is_output_lock_error(e):
+                    return {"success": False, "error": f"Failed to copy template to output: {e}"}
+                # Auto-save and close the open drawing, then retry (user left it dirty).
                 try:
-                    if hasattr(self.autocad, "quiesce_autocad"):
-                        self.autocad.quiesce_autocad(esc_count=3)
-                    self.autocad.close_drawing_if_open(str(outp), save_changes=False)
-                    time.sleep(0.5)
+                    self._release_output_dwg_lock(outp)
                     shutil.copy2(str(template), str(outp))
                     return None
-                except PermissionError:
-                    return {
-                        "success": False,
-                        "cancelled": False,
-                        "locked": True,
-                        "error": (
-                            f"Cannot write output DWG (still locked): {str(outp)}\n"
-                            "Close the drawing in AutoCAD (or any other program using it), then retry."
-                        ),
-                    }
                 except Exception as e2:
+                    if _is_output_lock_error(e2):
+                        try:
+                            self._release_output_dwg_lock(outp)
+                            time.sleep(0.6)
+                            shutil.copy2(str(template), str(outp))
+                            return None
+                        except Exception as e3:
+                            if _is_output_lock_error(e3):
+                                return {
+                                    "success": False,
+                                    "cancelled": False,
+                                    "locked": True,
+                                    "error": (
+                                        f"Cannot write output DWG (still locked): {str(outp)}\n"
+                                        "Close the drawing in AutoCAD (or any other program using it), then retry."
+                                    ),
+                                }
+                            return {
+                                "success": False,
+                                "error": f"Failed to copy template to output: {e3}",
+                            }
                     return {"success": False, "error": f"Failed to copy template to output: {e2}"}
-            except Exception as e:
-                return {"success": False, "error": f"Failed to copy template to output: {e}"}
 
         copy_err = _copy_template_to_output()
         if copy_err is not None:
@@ -6108,14 +6886,17 @@ class SurvyAIAgent:
             time.sleep(0.05)
             self.autocad.ensure_workflow_document(light=True)
         else:
-            time.sleep(0.3)
-            # With several DWGs open (template + prior outputs), the active tab can be wrong.
-            # Force the output we just copied to be active before any table/geometry edits.
-            act2 = self.autocad.open_drawing(str(outp), read_only=False)
-            if not act2.get("success"):
-                logger.warning("Could not re-activate output drawing before edits: %s", act2.get("error"))
+            time.sleep(0.15)
+            # Activate by path only — never issue a second Documents.Open.
+            try:
+                from pathlib import Path as _P
+
+                if hasattr(self.autocad, "_activate_document_by_path"):
+                    self.autocad._activate_document_by_path(_P(str(outp)))
+            except Exception as act_exc:
+                logger.warning("Could not re-activate output drawing before edits: %s", act_exc)
             self.autocad.ensure_workflow_document()
-            time.sleep(0.2)
+            time.sleep(0.1)
 
         def _cad_checkpoint() -> None:
             try:
@@ -6318,16 +7099,7 @@ class SurvyAIAgent:
                 _set_cell(title_h, 5, 0, _mtxt_replace(lga_cell, lga_content))
             _set_cell(title_h, 6, 0, _mtxt_replace(_get_cell(title_h, 6), state.strip().upper()))
             _set_cell(title_h, 11, 0, _replace_after_label(_get_cell(title_h, 11), "ORIGIN:-", origin_crs.strip().upper()))
-            # Multi-parcel only: shrink title-block text up to 90% of template to fit many owners.
-            if multi_parcel_layout:
-                for _r in (2, 4, 5, 6):
-                    try:
-                        _hr = self.autocad.get_table_cell_text_height(title_h, _r, 0)
-                        _th = float((_hr or {}).get("text_height") or 0.0)
-                        if (_hr or {}).get("success") and _th > 0.05:
-                            self.autocad.set_table_cell_text_height(title_h, _r, 0, _th * 0.9)
-                    except Exception:
-                        pass
+            # Title-block shrink is applied after sheet scale (clustered 25% / mild 10%).
 
         # CADA_PLANNUMBER is fitted after sheet scaling (see _apply_plan_number_table_cell).
         template_plan_nominal_h: Optional[float] = None
@@ -6572,32 +7344,90 @@ class SurvyAIAgent:
                             max_shift = 0.0
                             method_used = None
                             db_deg = None
+                            delta_distance_m = None
                             bearing_distance_legs = [{"bearing_deg": float(bd), "distance": float(di)} for (bd, di) in legs]
 
                             # Default: bearing-adjustment (keep distances fixed).
-                            # Bowditch is ONLY used when the user explicitly mentions it.
-                            wants_bowditch = bool(re.search(r"\bbowditch\b", coordinates or "", flags=re.IGNORECASE))
+                            # Bowditch / compass rule is used only when the user explicitly
+                            # requests that method — anywhere in the original prompt, not
+                            # only in the trimmed coordinates blob (access-road tails are
+                            # stripped from `coordinates` before we get here).
+                            try:
+                                from agent.cadastral_intent import user_requests_bowditch_adjustment
+
+                                wants_bowditch = user_requests_bowditch_adjustment(
+                                    user_query, coordinates
+                                )
+                            except Exception:
+                                wants_bowditch = bool(
+                                    re.search(
+                                        r"\b(?:bowditch|compass\s+(?:rule|method|adjustment))\b",
+                                        "\n".join(t for t in (user_query, coordinates) if t),
+                                        flags=re.IGNORECASE,
+                                    )
+                                )
+                            intent_text = "\n".join(t for t in (user_query, coordinates) if t)
+                            # PDF-derived cadastral plans: never silently apply large automatic corrections.
+                            forbid_auto_adjust = bool(
+                                re.search(
+                                    r"do not auto-adjust traverse|pdf[- ]derived|no traverse adjustment",
+                                    intent_text,
+                                    flags=re.IGNORECASE,
+                                )
+                            )
+                            # Explicit user request for field-traverse adjustment remains allowed.
+                            wants_explicit_adjust = bool(wants_bowditch) or bool(
+                                re.search(
+                                    r"\b(?:adjust(?:\s+the)?\s+traverse|apply\s+bowditch|bearing\s+adjustment)\b",
+                                    intent_text,
+                                    flags=re.IGNORECASE,
+                                )
+                            )
 
                             if mis > threshold and total_len > 1e-9:
-                                if wants_bowditch:
+                                if forbid_auto_adjust and not wants_explicit_adjust and mis > 0.05:
+                                    method_used = "pdf_auto_adjust_forbidden"
+                                    applied = False
+                                    logger.warning(
+                                        "Skipping automatic traverse adjustment for PDF-derived geometry "
+                                        "(misclosure=%.3fm). Fix extraction instead of distorting the parcel.",
+                                        mis,
+                                    )
+                                elif wants_bowditch:
                                     method_used = "bowditch"
-                                    applied = True
-                                    tmp_adj = [{"e": float(e0), "n": float(n0)}]
-                                    ce2, cn2 = float(e0), float(n0)
-                                    for (de, dn, Li) in deltas:
-                                        # distribute misclosure proportional to line length
-                                        cde = (-mis_e) * (float(Li) / float(total_len))
-                                        cdn = (-mis_n) * (float(Li) / float(total_len))
-                                        ce2 += float(de + cde)
-                                        cn2 += float(dn + cdn)
-                                        tmp_adj.append({"e": float(ce2), "n": float(cn2)})
-                                    tmp = tmp_adj
+                                    try:
+                                        from tools.traverse_bowditch import apply_bowditch_rule
 
-                                    # compute max point shift (excluding start)
-                                    for k in range(1, min(len(tmp_unadj), len(tmp_adj))):
-                                        sh = math.hypot(tmp_adj[k]["e"] - tmp_unadj[k]["e"], tmp_adj[k]["n"] - tmp_unadj[k]["n"])
-                                        if sh > max_shift:
-                                            max_shift = float(sh)
+                                        _bow = apply_bowditch_rule(
+                                            e0,
+                                            n0,
+                                            [float(bd) for (bd, _di) in legs],
+                                            [float(di) for (_bd, di) in legs],
+                                        )
+                                        tmp_adj = list(_bow.get("adjusted_points_with_closure") or [])
+                                        if len(tmp_adj) >= 3:
+                                            tmp = tmp_adj
+                                            applied = True
+                                            max_shift = float(_bow.get("max_point_shift_m") or 0.0)
+                                            # Labels must match the plotted (adjusted) sides:
+                                            # Bowditch changes both bearings and distances.
+                                            adj_legs = _bow.get("adjusted_legs") or []
+                                            if adj_legs:
+                                                bearing_distance_legs = [
+                                                    {
+                                                        "bearing_deg": float(L.get("bearing_deg", 0.0)),
+                                                        "distance": float(L.get("distance", 0.0)),
+                                                    }
+                                                    for L in adj_legs
+                                                ]
+                                            db_deg = list(_bow.get("delta_bearing_deg") or [])
+                                            delta_distance_m = list(_bow.get("delta_distance_m") or [])
+                                        else:
+                                            method_used = "bowditch_failed"
+                                            applied = False
+                                    except Exception:
+                                        method_used = "bowditch_failed"
+                                        applied = False
                                 else:
                                     method_used = "bearing_adjustment"
                                     try:
@@ -6700,6 +7530,14 @@ class SurvyAIAgent:
                                     "perimeter_m": float(total_len),
                                     "max_point_shift_m": float(max_shift),
                                     "db_deg": db_deg,
+                                    "delta_distance_m": delta_distance_m,
+                                    "adjusted_legs_preview": [
+                                        {
+                                            "bearing_deg": float(L.get("bearing_deg", 0.0)),
+                                            "distance": float(L.get("distance", 0.0)),
+                                        }
+                                        for L in (bearing_distance_legs or [])[:6]
+                                    ],
                                     # Keep preview small (most jobs are 4-10 legs)
                                     "adjusted_points_preview": [
                                         {"idx": i, "e": float(p["e"]), "n": float(p["n"])}
@@ -6731,6 +7569,12 @@ class SurvyAIAgent:
         template_native_denom = 500
         output_plan_denom = 500
         output_scale_k = 1.0
+        annot_body_scale = 1.0
+        annot_id_scale = 1.0
+        annot_title_scale = 1.0
+        geometry["annot_body_scale"] = 1.0
+        geometry["annot_id_scale"] = 1.0
+        geometry["annot_title_scale"] = 1.0
 
         if coord_pairs and len(coord_pairs) >= 3:
             # Pillar ↔ vertex order follows the user's pillar list and traverse-leg order.
@@ -6996,9 +7840,10 @@ class SurvyAIAgent:
                     "scale_reason": scale_reason,
                     "user_scale_denom": user_scale_denom,
                 })
-                # Multi-parcel cartography: plot parcels first at template scale, then fit the
-                # sheet from the real drawn extent (avoids pre-plot 1:20000 / title overlap).
-                defer_multi_parcel_sheet_scale = bool(multi_parcel_layout)
+                # Multi-parcel: use the same pre-plot sheet scale as a single parcel of the
+                # combined UTM extent. Plotting at template 1:500 then scaling only title/border
+                # produced mixed scales (sheet 1:10000, parcels still template-sized).
+                defer_multi_parcel_sheet_scale = False
                 if defer_multi_parcel_sheet_scale:
                     geometry["scale_debug"]["deferred_plot_then_fit"] = True
                     geometry["scale_debug"]["prefit_chosen_denom"] = int(chosen_denom)
@@ -7145,6 +7990,37 @@ class SurvyAIAgent:
             except Exception as scale_exc:
                 logger.warning("Cadastral scale/title-block step failed (keeping resolved scale): %s", scale_exc)
 
+            try:
+                _n_ann = (
+                    1 + len(extra_parcels or [])
+                    if (extra_parcels or main_parcel_label)
+                    else 1
+                )
+                _sd_ann = geometry.get("scale_debug") if isinstance(geometry.get("scale_debug"), dict) else {}
+                _span_ann = max(
+                    float((_sd_ann or {}).get("boundary_w") or 0.0),
+                    float((_sd_ann or {}).get("boundary_h") or 0.0),
+                )
+                _bs, _is = clustered_multi_parcel_text_scales(
+                    parcel_count=int(_n_ann),
+                    chosen_denom=int(chosen_denom or output_plan_denom or 500),
+                    layout_span_m=float(_span_ann),
+                    multi_parcel=bool(extra_parcels or main_parcel_label or multi_parcel_layout),
+                )
+                annot_body_scale, annot_id_scale = float(_bs), float(_is)
+                if bool(extra_parcels or main_parcel_label or multi_parcel_layout) and annot_body_scale >= 0.999:
+                    annot_title_scale = 0.90
+                else:
+                    annot_title_scale = float(annot_body_scale)
+                geometry["annot_body_scale"] = float(annot_body_scale)
+                geometry["annot_id_scale"] = float(annot_id_scale)
+                geometry["annot_title_scale"] = float(annot_title_scale)
+                geometry["annot_parcel_count"] = int(_n_ann)
+            except Exception:
+                annot_body_scale = float(geometry.get("annot_body_scale") or 1.0)
+                annot_id_scale = float(geometry.get("annot_id_scale") or 1.0)
+                annot_title_scale = float(geometry.get("annot_title_scale") or 1.0)
+
             # Always keep CADA_SCALEBAR below the "SCALE:- 1:xxx" cell. Owner and/or
             # location growth can push the SCALE label down; the bar must follow.
             if title_h:
@@ -7183,10 +8059,11 @@ class SurvyAIAgent:
 
             local_pts = [{"x": base_x + (p["e"] - e0), "y": base_y + (p["n"] - n0)} for p in pts]
 
-            # Multi-parcel Excel/CSV layouts: skip slow pillar-number TABLE cloning and
-            # bearing/distance annotation (COM-heavy). Owner labels + rings are enough.
-            # Geometry flag is extras/labels only (not multi-comma buyer titles alone).
+            # Multi-parcel Excel/CSV layouts: unique pegs/edges; provided pillar IDs
+            # are labelled later (shared corners once). Geometry flag is extras/labels
+            # only (not multi-comma buyer titles).
             multi_parcel_layout = bool(extra_parcels) or bool(main_parcel_label)
+            layout_parcels: List[Dict[str, Any]] = []
             if multi_parcel_layout:
                 geometry["multi_parcel_layout"] = True
 
@@ -7200,7 +8077,11 @@ class SurvyAIAgent:
                         nn = float(p.get("n", p.get("y")))
                     except Exception:
                         continue
-                    out_l.append({"x": float(base_x + (ee - e0)), "y": float(base_y + (nn - n0))})
+                    rec = {"x": float(base_x + (ee - e0)), "y": float(base_y + (nn - n0))}
+                    pil = str(p.get("pillar") or p.get("pillar_number") or "").strip()
+                    if pil:
+                        rec["pillar"] = pil
+                    out_l.append(rec)
                 return out_l
 
             def _insert_pegs_at(points_xy: List[Dict[str, float]]) -> None:
@@ -7215,6 +8096,7 @@ class SurvyAIAgent:
                         xscale=float(scale_k),
                         yscale=float(scale_k),
                         zscale=float(scale_k),
+                        assume_active=True,
                     )
                     if not r.get("success"):
                         inserted_ok = False
@@ -7289,19 +8171,27 @@ class SurvyAIAgent:
                     _peg_seed_ent.Copy()
             except Exception:
                 _peg_seed_ent = None
-            # Clear old parcel graphics (not tables/border)
-            self.autocad.delete_entities("CADA_BEARING_DIST")
-            self.autocad.delete_entities("CADA_BOUNDARY")
-            self.autocad.delete_entities("CADA_PILLARS")
-            self.autocad.delete_entities("CADA_ROAD")
-            self.autocad.delete_entities("CADA_CWF")
-            self.autocad.delete_entities("CADA_TEXT")
-            if multi_parcel_layout:
-                # Avoid leftover template pillar-number TABLEs cluttering layout plans.
-                try:
-                    self.autocad.delete_entities("CADA_PILLARNUMBERS")
-                except Exception:
-                    pass
+            # Clear old parcel graphics (not tables/border) in one ModelSpace pass.
+            layers_to_clear = [
+                "CADA_BEARING_DIST",
+                "CADA_BOUNDARY",
+                "CADA_PILLARS",
+                "CADA_ROAD",
+                "CADA_CWF",
+                "CADA_TEXT",
+            ]
+            try:
+                if hasattr(self.autocad, "delete_entities_on_layers"):
+                    self.autocad.delete_entities_on_layers(layers_to_clear)
+                else:
+                    for _lyr in layers_to_clear:
+                        self.autocad.delete_entities(_lyr)
+            except Exception:
+                for _lyr in layers_to_clear:
+                    try:
+                        self.autocad.delete_entities(_lyr)
+                    except Exception:
+                        pass
             time.sleep(0.2)
             # IMPORTANT: Do NOT delete generic sheet/title layers; they are part of the template
             # border/title presentation and must remain aligned with the border boxes.
@@ -7315,7 +8205,6 @@ class SurvyAIAgent:
                 try:
                     from agent.excel_cadastral import build_multi_parcel_layout_draw_ops
 
-                    layout_parcels: List[Dict[str, Any]] = []
                     if local_pts and len(local_pts) >= 2:
                         layout_parcels.append(
                             {"label": main_parcel_label or "", "points": list(local_pts)}
@@ -7348,6 +8237,7 @@ class SurvyAIAgent:
                             ],
                             layer="CADA_BOUNDARY",
                             closed=False,
+                            assume_active=True,
                         )
                         if pl_e.get("success"):
                             edges_drawn += 1
@@ -7369,6 +8259,10 @@ class SurvyAIAgent:
                         label_h_mp = float(label_h_mp) * max(1.0, min(float(scale_k), 2.5) ** 0.35)
                     except Exception:
                         pass
+                    try:
+                        label_h_mp = float(label_h_mp) * float(geometry.get("annot_body_scale") or 1.0)
+                    except Exception:
+                        pass
                     labels_drawn = 0
                     for lab in draw_ops.get("labels") or []:
                         try:
@@ -7380,6 +8274,7 @@ class SurvyAIAgent:
                                 height=float(label_h_mp),
                                 width=max(12.0, float(label_h_mp) * 12.0),
                                 attachment_point=5,
+                                assume_active=True,
                             )
                             labels_drawn += 1
                         except Exception:
@@ -7390,145 +8285,128 @@ class SurvyAIAgent:
                     geometry["multi_parcel_labels"] = int(labels_drawn)
                     geometry["multi_parcel_label_height"] = float(label_h_mp)
                     geometry["multi_parcel_drawn_local"] = True
-                    # Title AREA from main ring (shoelace) — no single closed entity in edge mode.
-                    if title_h and local_pts and len(local_pts) >= 3:
+                    # Title AREA: one line per ownership parcel + TOTAL AREA (MTEXT \\P).
+                    if title_h:
                         try:
-                            area_acc = 0.0
-                            nlp = len(local_pts)
-                            for i in range(nlp):
-                                x1 = float(local_pts[i]["x"])
-                                y1 = float(local_pts[i]["y"])
-                                x2 = float(local_pts[(i + 1) % nlp]["x"])
-                                y2 = float(local_pts[(i + 1) % nlp]["y"])
-                                area_acc += x1 * y2 - x2 * y1
-                            sq_m = abs(area_acc) * 0.5
-                            _set_cell(
-                                title_h,
-                                12,
-                                0,
-                                _replace_after_label(
-                                    _get_cell(title_h, 12), "AREA:-", f"{sq_m:.3f} SQ. MTRS."
-                                ),
-                            )
+                            area_txt = _multi_parcel_area_title_content(layout_parcels)
+                            if area_txt:
+                                _set_cell(
+                                    title_h,
+                                    12,
+                                    0,
+                                    _mtxt_replace(_get_cell(title_h, 12), area_txt),
+                                )
+                                geometry["multi_parcel_area_title"] = True
+                            elif local_pts and len(local_pts) >= 3:
+                                sq_m = _ring_shoelace_sq_m(local_pts)
+                                if printed_area_sq_m is not None and float(printed_area_sq_m) > 1.0:
+                                    sq_m = float(printed_area_sq_m)
+                                _set_cell(
+                                    title_h,
+                                    12,
+                                    0,
+                                    _replace_after_label(
+                                        _get_cell(title_h, 12),
+                                        "AREA:-",
+                                        f"{sq_m:.3f} SQ. MTRS.",
+                                    ),
+                                )
                         except Exception:
                             pass
 
-                    # ---- Plot-then-fit: enlarge/position sheet until it ENCLOSES plotted land ----
+                    # ---- Plot-then-fit: only when sheet scale was deferred ----
+                    # If the template was already scaled like a single-parcel plan, do not
+                    # scale sheet layers again (that desynchronizes title/scalebar from land).
                     try:
-                        geom_bb = self.autocad.get_modelspace_bbox(
-                            layers=["CADA_BOUNDARY", "CADA_PILLARS", "CADA_TEXT"]
+                        deferred_fit = bool(
+                            (geometry.get("scale_debug") or {}).get("deferred_plot_then_fit")
                         )
-                        if not geom_bb.get("success"):
-                            geom_bb = self.autocad.get_modelspace_bbox(layers=["CADA_BOUNDARY"])
-                        interior_bb2 = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBORDER"])
-                        if not interior_bb2.get("success"):
-                            interior_bb2 = self.autocad.get_modelspace_bbox(
-                                layers=["CADA_INTERIORBOUNDARY"]
+                        # Always align later recenter to the usable plot window.
+                        geometry["multi_parcel_sheet_fitted"] = True
+                        if not deferred_fit:
+                            geometry["scale_debug"]["plot_then_fit"] = False
+                            geometry["scale_debug"]["plot_then_fit_skipped"] = "pre_plot_scale_applied"
+                        else:
+                            geom_bb = self.autocad.get_modelspace_bbox(
+                                layers=["CADA_BOUNDARY", "CADA_PILLARS"]
                             )
-                        title_bb2 = template_title_bb_for_scale
-                        if not (title_bb2 and title_bb2.get("success")):
-                            title_bb2 = self.autocad.get_modelspace_bbox(layers=["CADA_TITLEBLOCK"])
-                        win0 = _usable_plot_window_from_bboxes(interior_bb2, title_bb2)
-                        if geom_bb.get("success") and win0:
-                            g_minx = float(geom_bb.get("minx", 0.0))
-                            g_miny = float(geom_bb.get("miny", 0.0))
-                            g_maxx = float(geom_bb.get("maxx", 0.0))
-                            g_maxy = float(geom_bb.get("maxy", 0.0))
-                            g_w = max(1e-6, g_maxx - g_minx)
-                            g_h = max(1e-6, g_maxy - g_miny)
-                            g_cx = 0.5 * (g_minx + g_maxx)
-                            g_cy = 0.5 * (g_miny + g_maxy)
-                            # Cartographic margin: enclose all features with breathing room.
-                            g_w_pad = max(g_w * 1.12, g_w + 10.0)
-                            g_h_pad = max(g_h * 1.12, g_h + 10.0)
-                            usable_w2 = max(1e-6, float(win0["width"]))
-                            usable_h2 = max(1e-6, float(win0["height"]))
-                            iw0 = float(interior_bb2.get("maxx", 0.0)) - float(interior_bb2.get("minx", 0.0))
-                            ih0 = float(interior_bb2.get("maxy", 0.0)) - float(interior_bb2.get("miny", 0.0))
-                            td_fit = int(template_native_denom or template_denom or 500)
-                            n_parcels_fit = max(
-                                1,
-                                int(len(layout_parcels) or geometry.get("multi_parcel_labels") or 1),
-                            )
-                            # Primary: cartographic scale from ground span; fit is secondary/capped.
-                            chosen2, k2, reason2 = _choose_layout_plan_scale_after_plot(
-                                plotted_w=float(g_w),
-                                plotted_h=float(g_h),
-                                usable_w=float(usable_w2),
-                                usable_h=float(usable_h2),
-                                interior_w=float(iw0),
-                                interior_h=float(ih0),
-                                template_denom=td_fit,
-                                user_scale_denom=user_scale_denom,
-                                parcel_count=n_parcels_fit,
-                                allowed_denoms=_CADASTRAL_ALLOWED_SCALES,
-                            )
-                            carto_cap2 = _allowed_denom_steps_above(
-                                _cartographic_denom_for_layout_extent(
-                                    g_w,
-                                    g_h,
-                                    _CADASTRAL_ALLOWED_SCALES,
+                            if not geom_bb.get("success"):
+                                geom_bb = self.autocad.get_modelspace_bbox(layers=["CADA_BOUNDARY"])
+                            interior_bb2 = self.autocad.get_modelspace_bbox(layers=["CADA_INTERIORBORDER"])
+                            if not interior_bb2.get("success"):
+                                interior_bb2 = self.autocad.get_modelspace_bbox(
+                                    layers=["CADA_INTERIORBOUNDARY"]
+                                )
+                            title_bb2 = template_title_bb_for_scale
+                            if not (title_bb2 and title_bb2.get("success")):
+                                title_bb2 = self.autocad.get_modelspace_bbox(layers=["CADA_TITLEBLOCK"])
+                            win0 = _usable_plot_window_from_bboxes(interior_bb2, title_bb2)
+                            dbg0 = geometry.get("scale_debug") or {}
+                            ground_w_fit = float(dbg0.get("boundary_w") or 0.0)
+                            ground_h_fit = float(dbg0.get("boundary_h") or 0.0)
+                            if geom_bb.get("success") and win0:
+                                g_minx = float(geom_bb.get("minx", 0.0))
+                                g_miny = float(geom_bb.get("miny", 0.0))
+                                g_maxx = float(geom_bb.get("maxx", 0.0))
+                                g_maxy = float(geom_bb.get("maxy", 0.0))
+                                g_w = max(1e-6, g_maxx - g_minx)
+                                g_h = max(1e-6, g_maxy - g_miny)
+                                g_cx = 0.5 * (g_minx + g_maxx)
+                                g_cy = 0.5 * (g_miny + g_maxy)
+                                g_w_pad = max(g_w * 1.12, g_w + 10.0)
+                                g_h_pad = max(g_h * 1.12, g_h + 10.0)
+                                usable_w2 = max(1e-6, float(win0["width"]))
+                                usable_h2 = max(1e-6, float(win0["height"]))
+                                iw0 = float(interior_bb2.get("maxx", 0.0)) - float(interior_bb2.get("minx", 0.0))
+                                ih0 = float(interior_bb2.get("maxy", 0.0)) - float(interior_bb2.get("miny", 0.0))
+                                td_fit = int(template_native_denom or template_denom or 500)
+                                n_parcels_fit = max(
+                                    1,
+                                    int(len(layout_parcels) or geometry.get("multi_parcel_labels") or 1),
+                                )
+                                chosen2, k2, reason2 = _choose_layout_plan_scale_after_plot(
+                                    plotted_w=float(g_w),
+                                    plotted_h=float(g_h),
+                                    usable_w=float(usable_w2),
+                                    usable_h=float(usable_h2),
+                                    interior_w=float(iw0),
+                                    interior_h=float(ih0),
+                                    template_denom=td_fit,
+                                    user_scale_denom=user_scale_denom,
                                     parcel_count=n_parcels_fit,
-                                    dense_title=n_parcels_fit >= 6,
-                                ),
-                                1,
-                                _CADASTRAL_ALLOWED_SCALES,
-                            )
-                            layers_fit = _cadastral_sheet_translate_layers(profile)
-                            # Scale sheet about the land centroid so the frame grows around the layout.
-                            # Primary crosshair is excluded so it stays locked to the primary peg.
-                            if float(k2) > 1.0 + 1e-9:
-                                sc2 = self.autocad.scale_modelspace_by_layers(
-                                    float(g_cx), float(g_cy), float(k2), layers_fit
+                                    allowed_denoms=_CADASTRAL_ALLOWED_SCALES,
+                                    ground_w=float(ground_w_fit or g_w),
+                                    ground_h=float(ground_h_fit or g_h),
                                 )
-                                geometry["scale_debug"]["scaled_entities"] = int(
-                                    sc2.get("scaled_entities", 0) or 0
-                                ) if sc2.get("success") else 0
-                                try:
-                                    sb_factor2 = float(chosen2) / float(td_fit)
-                                    if abs(sb_factor2 - 1.0) > 1e-9:
-                                        self.autocad.scale_scalebar_text_values(
-                                            sb_factor2, layers=["scalebar", "CADA_SCALEBAR"]
-                                        )
-                                except Exception:
-                                    pass
-                            # Position sheet so the usable plot window centers on the land.
-                            # Iterate: measure → translate → optionally grow one more scale step.
-                            cumulative_k = float(k2)
-                            for _fit_i in range(3):
-                                interior_now = self.autocad.get_modelspace_bbox(
-                                    layers=["CADA_INTERIORBORDER"]
+                                carto_cap2 = _allowed_denom_steps_above(
+                                    _cartographic_denom_for_layout_extent(
+                                        float(ground_w_fit or g_w),
+                                        float(ground_h_fit or g_h),
+                                        _CADASTRAL_ALLOWED_SCALES,
+                                        parcel_count=n_parcels_fit,
+                                        dense_title=n_parcels_fit >= 8,
+                                    ),
+                                    1,
+                                    _CADASTRAL_ALLOWED_SCALES,
                                 )
-                                if not interior_now.get("success"):
-                                    interior_now = self.autocad.get_modelspace_bbox(
-                                        layers=["CADA_INTERIORBOUNDARY"]
+                                layers_fit = _cadastral_sheet_translate_layers(profile)
+                                if float(k2) > 1.0 + 1e-9:
+                                    sc2 = self.autocad.scale_modelspace_by_layers(
+                                        float(g_cx), float(g_cy), float(k2), layers_fit
                                     )
-                                title_now = self.autocad.get_modelspace_bbox(
-                                    layers=["CADA_TITLEBLOCK"]
-                                )
-                                win_now = _usable_plot_window_from_bboxes(interior_now, title_now)
-                                geom_now = self.autocad.get_modelspace_bbox(
-                                    layers=["CADA_BOUNDARY", "CADA_PILLARS", "CADA_TEXT"]
-                                )
-                                if not geom_now.get("success"):
-                                    geom_now = self.autocad.get_modelspace_bbox(
-                                        layers=["CADA_BOUNDARY"]
-                                    )
-                                if not (win_now and geom_now.get("success")):
-                                    break
-                                gx0 = float(geom_now.get("minx", 0.0))
-                                gy0 = float(geom_now.get("miny", 0.0))
-                                gx1 = float(geom_now.get("maxx", 0.0))
-                                gy1 = float(geom_now.get("maxy", 0.0))
-                                gcx = 0.5 * (gx0 + gx1)
-                                gcy = 0.5 * (gy0 + gy1)
-                                dx_fit = float(gcx) - float(win_now["center_x"])
-                                dy_fit = float(gcy) - float(win_now["center_y"])
-                                if abs(dx_fit) > 0.05 or abs(dy_fit) > 0.05:
-                                    self.autocad.move_modelspace_by_layers(
-                                        dx_fit, dy_fit, layers_fit
-                                    )
-                                    # Re-measure window after move
+                                    geometry["scale_debug"]["scaled_entities"] = int(
+                                        sc2.get("scaled_entities", 0) or 0
+                                    ) if sc2.get("success") else 0
+                                    try:
+                                        sb_factor2 = float(chosen2) / float(td_fit)
+                                        if abs(sb_factor2 - 1.0) > 1e-9:
+                                            self.autocad.scale_scalebar_text_values(
+                                                sb_factor2, layers=["scalebar", "CADA_SCALEBAR"]
+                                            )
+                                    except Exception:
+                                        pass
+                                cumulative_k = float(k2)
+                                for _fit_i in range(3):
                                     interior_now = self.autocad.get_modelspace_bbox(
                                         layers=["CADA_INTERIORBORDER"]
                                     )
@@ -7536,137 +8414,160 @@ class SurvyAIAgent:
                                         interior_now = self.autocad.get_modelspace_bbox(
                                             layers=["CADA_INTERIORBOUNDARY"]
                                         )
-                                    title_now = self.autocad.get_modelspace_bbox(
-                                        layers=["CADA_TITLEBLOCK"]
-                                    )
                                     win_now = _usable_plot_window_from_bboxes(
-                                        interior_now, title_now
+                                        interior_now, title_bb2
                                     )
-                                if not win_now:
-                                    break
-                                # Enclosure test with a small tolerance.
-                                pad = 0.5
-                                enclosed = (
-                                    gx0 >= float(win_now["minx"]) - pad
-                                    and gy0 >= float(win_now["miny"]) - pad
-                                    and gx1 <= float(win_now["maxx"]) + pad
-                                    and gy1 <= float(win_now["maxy"]) + pad
-                                )
-                                if enclosed:
-                                    geometry["scale_debug"]["enclosed"] = True
-                                    break
-                                # Grow at most toward cartographic cap (never explode to 1:20000).
-                                next_denoms = [
-                                    d
-                                    for d in _CADASTRAL_ALLOWED_SCALES
-                                    if int(chosen2) < d <= int(carto_cap2)
-                                ]
-                                if not next_denoms:
-                                    geometry["scale_debug"]["enclosed"] = False
-                                    break
-                                next_d = int(next_denoms[0])
-                                step_k = float(next_d) / float(chosen2)
-                                self.autocad.scale_modelspace_by_layers(
-                                    gcx, gcy, step_k, layers_fit
-                                )
+                                    geom_now = self.autocad.get_modelspace_bbox(
+                                        layers=["CADA_BOUNDARY", "CADA_PILLARS"]
+                                    )
+                                    if not geom_now.get("success"):
+                                        geom_now = self.autocad.get_modelspace_bbox(
+                                            layers=["CADA_BOUNDARY"]
+                                        )
+                                    if not (win_now and geom_now.get("success")):
+                                        break
+                                    gx0 = float(geom_now.get("minx", 0.0))
+                                    gy0 = float(geom_now.get("miny", 0.0))
+                                    gx1 = float(geom_now.get("maxx", 0.0))
+                                    gy1 = float(geom_now.get("maxy", 0.0))
+                                    gcx = 0.5 * (gx0 + gx1)
+                                    gcy = 0.5 * (gy0 + gy1)
+                                    dx_fit = float(gcx) - float(win_now["center_x"])
+                                    dy_fit = float(gcy) - float(win_now["center_y"])
+                                    if abs(dx_fit) > 0.05 or abs(dy_fit) > 0.05:
+                                        self.autocad.move_modelspace_by_layers(
+                                            dx_fit, dy_fit, layers_fit
+                                        )
+                                        interior_now = self.autocad.get_modelspace_bbox(
+                                            layers=["CADA_INTERIORBORDER"]
+                                        )
+                                        if not interior_now.get("success"):
+                                            interior_now = self.autocad.get_modelspace_bbox(
+                                                layers=["CADA_INTERIORBOUNDARY"]
+                                            )
+                                        win_now = _usable_plot_window_from_bboxes(
+                                            interior_now, title_bb2
+                                        )
+                                    if not win_now:
+                                        break
+                                    pad = 0.5
+                                    enclosed = (
+                                        gx0 >= float(win_now["minx"]) - pad
+                                        and gy0 >= float(win_now["miny"]) - pad
+                                        and gx1 <= float(win_now["maxx"]) + pad
+                                        and gy1 <= float(win_now["maxy"]) + pad
+                                    )
+                                    if enclosed:
+                                        geometry["scale_debug"]["enclosed"] = True
+                                        break
+                                    next_denoms = [
+                                        d
+                                        for d in _CADASTRAL_ALLOWED_SCALES
+                                        if int(chosen2) < d <= int(carto_cap2)
+                                    ]
+                                    if not next_denoms:
+                                        geometry["scale_debug"]["enclosed"] = False
+                                        break
+                                    next_d = int(next_denoms[0])
+                                    step_k = float(next_d) / float(chosen2)
+                                    self.autocad.scale_modelspace_by_layers(
+                                        gcx, gcy, step_k, layers_fit
+                                    )
+                                    try:
+                                        self.autocad.scale_scalebar_text_values(
+                                            step_k, layers=["scalebar", "CADA_SCALEBAR"]
+                                        )
+                                    except Exception:
+                                        pass
+                                    chosen2 = next_d
+                                    cumulative_k *= step_k
+                                    k2 = float(cumulative_k)
+                                    reason2 = "layout_enclosure_grow"
                                 try:
-                                    self.autocad.scale_scalebar_text_values(
-                                        step_k, layers=["scalebar", "CADA_SCALEBAR"]
-                                    )
+                                    self.autocad.execute_command("REGEN")
                                 except Exception:
                                     pass
-                                chosen2 = next_d
-                                cumulative_k *= step_k
-                                k2 = float(cumulative_k)
-                                reason2 = "layout_enclosure_grow"
-                            try:
-                                self.autocad.execute_command("REGEN")
-                            except Exception:
-                                pass
-                            # Peg symbols follow final plan scale (positions unchanged).
-                            try:
-                                ms_peg = self.autocad.doc.ModelSpace
-                                for ii in range(ms_peg.Count):
-                                    ent = ms_peg.Item(ii)
-                                    if str(getattr(ent, "Layer", "")).upper() != "CADA_PILLARS":
-                                        continue
-                                    if "BlockReference" not in str(getattr(ent, "ObjectName", "")):
-                                        continue
-                                    for attr in ("XScaleFactor", "YScaleFactor", "ZScaleFactor"):
-                                        try:
-                                            setattr(ent, attr, float(k2))
-                                        except Exception:
-                                            pass
-                            except Exception:
-                                pass
-                            chosen_denom = int(chosen2)
-                            scale_k = float(k2)
-                            scale_reason = str(reason2)
-                            output_plan_denom = int(chosen2)
-                            output_scale_k = float(k2)
-                            geometry["output_plan_denom"] = int(output_plan_denom)
-                            geometry["output_scale_k"] = float(output_scale_k)
-                            try:
-                                bearing_road_height = float(bearing_road_height_native) * float(k2)
-                            except Exception:
-                                pass
-                            geometry["scale_debug"].update({
-                                "plot_then_fit": True,
-                                "plotted_w": float(g_w),
-                                "plotted_h": float(g_h),
-                                "plotted_w_padded": float(g_w_pad),
-                                "plotted_h_padded": float(g_h_pad),
-                                "fit_usable_w": float(usable_w2),
-                                "fit_usable_h": float(usable_h2),
-                                "fit_required_k": float(
-                                    max(g_w_pad / usable_w2, g_h_pad / usable_h2)
-                                ),
-                                "carto_cap": int(carto_cap2),
-                                "chosen_denom": int(chosen2),
-                                "k": float(k2),
-                                "scale_reason": str(reason2),
-                            })
-                            if title_h:
                                 try:
-                                    scale_pattern = re.compile(r"1\s*:\s*\d+", re.IGNORECASE)
-                                    replacement = f"1:{chosen2}"
-                                    tbl = tables_now.get(title_h, {}) if isinstance(tables_now, dict) else {}
-                                    rows = int(tbl.get("rows", 25))
-                                    cols = int(tbl.get("cols", 2))
-                                    main_scale_cell = None
-                                    secondary_re = re.compile(r"\bSCALE\b\s*:.*\bto\b", re.IGNORECASE)
-                                    main_hint_re = re.compile(r"\bSCALE\b\s*[:-]", re.IGNORECASE)
-                                    for r in range(min(rows, 60)):
-                                        for c in range(min(cols, 10)):
-                                            cell = _get_cell(title_h, r, c) or ""
-                                            if not cell.strip():
-                                                continue
-                                            if secondary_re.search(cell) and scale_pattern.search(cell):
-                                                try:
-                                                    _set_cell(title_h, r, c, "")
-                                                except Exception:
-                                                    pass
-                                                continue
-                                            if (
-                                                main_scale_cell is None
-                                                and main_hint_re.search(cell)
-                                                and scale_pattern.search(cell)
-                                            ):
-                                                main_scale_cell = (r, c)
-                                    if main_scale_cell is None:
-                                        main_scale_cell = (8, 0)
-                                    mr, mc = main_scale_cell
-                                    title_scale_row = int(mr)
-                                    cell_main = _get_cell(title_h, mr, mc) or ""
-                                    new_cell_main = scale_pattern.sub(replacement, cell_main)
-                                    if new_cell_main != cell_main:
-                                        _set_cell(title_h, mr, mc, new_cell_main)
-                                    elif not (cell_main or "").strip():
-                                        _set_cell(title_h, mr, mc, f"SCALE:- {replacement}")
+                                    ms_peg = self.autocad.doc.ModelSpace
+                                    for ii in range(ms_peg.Count):
+                                        ent = ms_peg.Item(ii)
+                                        if str(getattr(ent, "Layer", "")).upper() != "CADA_PILLARS":
+                                            continue
+                                        if "BlockReference" not in str(getattr(ent, "ObjectName", "")):
+                                            continue
+                                        for attr in ("XScaleFactor", "YScaleFactor", "ZScaleFactor"):
+                                            try:
+                                                setattr(ent, attr, float(k2))
+                                            except Exception:
+                                                pass
                                 except Exception:
                                     pass
-                            # Mark so final recenter uses plot-window alignment, not raw frame center.
-                            geometry["multi_parcel_sheet_fitted"] = True
+                                chosen_denom = int(chosen2)
+                                scale_k = float(k2)
+                                scale_reason = str(reason2)
+                                output_plan_denom = int(chosen2)
+                                output_scale_k = float(k2)
+                                geometry["output_plan_denom"] = int(output_plan_denom)
+                                geometry["output_scale_k"] = float(output_scale_k)
+                                try:
+                                    bearing_road_height = float(bearing_road_height_native) * float(k2)
+                                except Exception:
+                                    pass
+                                geometry["scale_debug"].update({
+                                    "plot_then_fit": True,
+                                    "plotted_w": float(g_w),
+                                    "plotted_h": float(g_h),
+                                    "plotted_w_padded": float(g_w_pad),
+                                    "plotted_h_padded": float(g_h_pad),
+                                    "fit_usable_w": float(usable_w2),
+                                    "fit_usable_h": float(usable_h2),
+                                    "fit_required_k": float(
+                                        max(g_w_pad / usable_w2, g_h_pad / usable_h2)
+                                    ),
+                                    "carto_cap": int(carto_cap2),
+                                    "chosen_denom": int(chosen2),
+                                    "k": float(k2),
+                                    "scale_reason": str(reason2),
+                                })
+                                if title_h:
+                                    try:
+                                        scale_pattern = re.compile(r"1\s*:\s*\d+", re.IGNORECASE)
+                                        replacement = f"1:{chosen2}"
+                                        tbl = tables_now.get(title_h, {}) if isinstance(tables_now, dict) else {}
+                                        rows = int(tbl.get("rows", 25))
+                                        cols = int(tbl.get("cols", 2))
+                                        main_scale_cell = None
+                                        secondary_re = re.compile(r"\bSCALE\b\s*:.*\bto\b", re.IGNORECASE)
+                                        main_hint_re = re.compile(r"\bSCALE\b\s*[:-]", re.IGNORECASE)
+                                        for r in range(min(rows, 60)):
+                                            for c in range(min(cols, 10)):
+                                                cell = _get_cell(title_h, r, c) or ""
+                                                if not cell.strip():
+                                                    continue
+                                                if secondary_re.search(cell) and scale_pattern.search(cell):
+                                                    try:
+                                                        _set_cell(title_h, r, c, "")
+                                                    except Exception:
+                                                        pass
+                                                    continue
+                                                if (
+                                                    main_scale_cell is None
+                                                    and main_hint_re.search(cell)
+                                                    and scale_pattern.search(cell)
+                                                ):
+                                                    main_scale_cell = (r, c)
+                                        if main_scale_cell is None:
+                                            main_scale_cell = (8, 0)
+                                        mr, mc = main_scale_cell
+                                        title_scale_row = int(mr)
+                                        cell_main = _get_cell(title_h, mr, mc) or ""
+                                        new_cell_main = scale_pattern.sub(replacement, cell_main)
+                                        if new_cell_main != cell_main:
+                                            _set_cell(title_h, mr, mc, new_cell_main)
+                                        elif not (cell_main or "").strip():
+                                            _set_cell(title_h, mr, mc, f"SCALE:- {replacement}")
+                                    except Exception:
+                                        pass
                     except Exception as fit_exc:
                         logger.warning("Multi-parcel plot-then-fit scale failed: %s", fit_exc)
                 except Exception as mp_exc:
@@ -7686,6 +8587,8 @@ class SurvyAIAgent:
                     a = self.autocad.calculate_entity_area(str(pl.get("handle")))
                     if a.get("success") and title_h:
                         sq_m = float(a.get("area_conversions", {}).get("sq_meters"))
+                        if printed_area_sq_m is not None and float(printed_area_sq_m) > 1.0:
+                            sq_m = float(printed_area_sq_m)
                         _set_cell(
                             title_h,
                             12,
@@ -7719,9 +8622,14 @@ class SurvyAIAgent:
                     from agent.pdf_survey_plan import split_cadastral_pillar_label
                 except Exception:
                     split_cadastral_pillar_label = None  # type: ignore
-                parts = [p.strip() for p in re.split(r"[,\n]+", raw) if p.strip()]
+                parts = [p.strip() for p in re.split(r"[,\n]+", raw)]
                 out = []
                 for p in parts:
+                    if not p:
+                        # Preserve unlabeled vertex slots so remaining IDs stay on the
+                        # corners they were extracted against (do not compact the ring).
+                        out.append({"prefix": "", "number": ""})
+                        continue
                     split = None
                     if split_cadastral_pillar_label is not None:
                         try:
@@ -7742,10 +8650,12 @@ class SurvyAIAgent:
                         p,
                     )
                     if not m:
+                        out.append({"prefix": "", "number": ""})
                         continue
                     prefix = re.sub(r"\s+", "", m.group(1)).upper()
                     num = m.group(2).upper()
                     if not re.search(r"\d", num):
+                        out.append({"prefix": "", "number": ""})
                         continue
                     out.append({"prefix": prefix, "number": num})
                 return out
@@ -7766,26 +8676,133 @@ class SurvyAIAgent:
                     pn_list = [pn_list[0]] + list(reversed(pn_list[1:]))
             except Exception:
                 pass
-            # If the agent extracted fewer pillar numbers than vertices (often due to punctuation/quoting),
-            # auto-extend sequentially using the last known prefix/number so we never drop pillar labels.
-            # Only when the peg token is pure digits (alphanumeric pegs like AS3459RP are not sequenced).
-            try:
-                need_n = len(local_pts) if isinstance(local_pts, list) else 0
-                if need_n and pn_list and len(pn_list) < need_n:
-                    last = pn_list[-1]
-                    prefix = str(last.get("prefix") or "").strip() or "SP"
-                    num_s = str(last.get("number") or "").strip()
-                    if num_s.isdigit():
-                        start_num = int(num_s)
-                        width = max(len(num_s), 4)
-                        k = start_num
-                        while len(pn_list) < need_n and k < start_num + 2000:
-                            k += 1
-                            pn_list.append({"prefix": prefix, "number": f"{k:0{width}d}"})
-            except Exception:
-                pass
+            # Never invent sequential pillar IDs for unlabeled corners. Extra vertices
+            # keep pegs only; the user may still supply IDs in the prompt.
             pn_meta: List[Dict[str, Any]] = []
-            if pn_list and not multi_parcel_layout:
+            pn_place: List[Dict[str, Any]] = []
+            _seen_pn_xy: set = set()
+
+            def _pn_add(x: float, y: float, prefix: str, number: str) -> None:
+                pre = str(prefix or "").strip()
+                num = str(number or "").strip()
+                if not pre or not num:
+                    return
+                key = (round(float(x), 3), round(float(y), 3))
+                if key in _seen_pn_xy:
+                    return
+                # Shared Excel corners can differ by a few centimetres. A single
+                # pillar label serves that physical corner; retain the first ID.
+                if multi_parcel_layout and any(
+                    math.hypot(float(old["x"]) - float(x), float(old["y"]) - float(y))
+                    <= 0.25
+                    for old in pn_place
+                ):
+                    return
+                _seen_pn_xy.add(key)
+                pn_place.append(
+                    {"x": float(x), "y": float(y), "prefix": pre, "number": num}
+                )
+
+            if multi_parcel_layout:
+                for i_v, v in enumerate(local_pts):
+                    if i_v >= len(pn_list):
+                        break
+                    _pn_add(
+                        float(v["x"]),
+                        float(v["y"]),
+                        str(pn_list[i_v].get("prefix") or ""),
+                        str(pn_list[i_v].get("number") or ""),
+                    )
+                for ep in extra_parcels:
+                    if not isinstance(ep, dict):
+                        continue
+                    raw_pts = list(ep.get("points") or [])
+                    loc_ring = _en_to_local(raw_pts)
+                    for i_v, v in enumerate(loc_ring):
+                        raw_id = ""
+                        if i_v < len(raw_pts) and isinstance(raw_pts[i_v], dict):
+                            raw_id = str(
+                                raw_pts[i_v].get("pillar")
+                                or raw_pts[i_v].get("pillar_number")
+                                or v.get("pillar")
+                                or ""
+                            )
+                        one = _parse_pillar_numbers(raw_id)
+                        sp = one[0] if one else {"prefix": "", "number": ""}
+                        _pn_add(
+                            float(v["x"]),
+                            float(v["y"]),
+                            str(sp.get("prefix") or ""),
+                            str(sp.get("number") or ""),
+                        )
+            else:
+                for i_v, v in enumerate(local_pts[: len(pn_list)]):
+                    pn_place.append(
+                        {
+                            "x": float(v["x"]),
+                            "y": float(v["y"]),
+                            "prefix": str(pn_list[i_v].get("prefix") or ""),
+                            "number": str(pn_list[i_v].get("number") or ""),
+                        }
+                    )
+
+            # AutoCAD TABLE-per-pillar is prohibitively expensive and visually
+            # unsuitable on clustered family layouts: each copied table triggers
+            # repeated ModelSpace scans/GetBoundingBox calls and scales into a large
+            # visible box at 1:5000. Use lightweight stacked MTEXT instead. Every
+            # supplied ID remains present and the 20% maximum shrink rule is kept.
+            _clustered_fast_pillars = bool(
+                pn_place
+                and multi_parcel_layout
+                and float(geometry.get("annot_body_scale") or 1.0) < 0.999
+            )
+            if _clustered_fast_pillars:
+                try:
+                    if hasattr(self.autocad, "delete_entities_on_layers"):
+                        self.autocad.delete_entities_on_layers(["CADA_PILLARNUMBERS"])
+                    else:
+                        self.autocad.delete_entities("CADA_PILLARNUMBERS")
+                except Exception:
+                    pass
+                _pn_h = max(
+                    0.5,
+                    float(bearing_road_height)
+                    * 0.9
+                    * float(geometry.get("annot_id_scale") or 1.0),
+                )
+                _pn_offset = max(2.5, 1.35 * _pn_h)
+                _placed_fast_pn = 0
+                _failed_fast_pn = 0
+                _pn_cx = sum(float(v["x"]) for v in pn_place) / max(1, len(pn_place))
+                _pn_cy = sum(float(v["y"]) for v in pn_place) / max(1, len(pn_place))
+                for v in pn_place:
+                    vx, vy = float(v["x"]), float(v["y"])
+                    dxv, dyv = vx - _pn_cx, vy - _pn_cy
+                    lv = math.hypot(dxv, dyv) or 1.0
+                    ux, uy = dxv / lv, dyv / lv
+                    lbl = f"{v['prefix']}\\P{v['number']}"
+                    res = self.autocad.add_mtext(
+                        f"{{\\fVerdana|b0|i0|c0|p34;{lbl}}}",
+                        vx + ux * _pn_offset,
+                        vy + uy * _pn_offset,
+                        layer="CADA_PILLARNUMBERS",
+                        rotation_rad=0.0,
+                        height=float(_pn_h),
+                        width=max(12.0, 6.5 * _pn_h),
+                        attachment_point=5,
+                        assume_active=True,
+                    )
+                    if (res or {}).get("success"):
+                        _placed_fast_pn += 1
+                    else:
+                        _failed_fast_pn += 1
+                geometry["pillar_labels_mode"] = "clustered_mtext"
+                geometry["pillar_labels_requested"] = int(len(pn_place))
+                geometry["pillar_labels_drawn"] = int(_placed_fast_pn)
+                geometry["pillar_labels_failed"] = int(_failed_fast_pn)
+                pn_place = []
+
+            if pn_place:
                 # Compute a "template-typical" offset distance between a peg and its pillar-number table.
                 # This makes the placement look like the template: close to the peg, but not on it.
                 off = 4.0
@@ -7864,8 +8881,14 @@ class SurvyAIAgent:
                     pass
                 used_handles: set[str] = set()
                 pn_meta: List[Dict[str, Any]] = []
-                cxp = sum(p["x"] for p in local_pts) / len(local_pts)
-                cyp = sum(p["y"] for p in local_pts) / len(local_pts)
+                _cx_src = list(local_pts or [])
+                if multi_parcel_layout:
+                    for lp in layout_parcels or []:
+                        _cx_src.extend(list(lp.get("points") or []))
+                if not _cx_src:
+                    _cx_src = list(pn_place)
+                cxp = sum(float(p["x"]) for p in _cx_src) / max(1, len(_cx_src))
+                cyp = sum(float(p["y"]) for p in _cx_src) / max(1, len(_cx_src))
                 pillar_box_bbs: List[Dict[str, Any]] = []
                 try:
                     pbb = self.autocad.list_entity_bboxes(
@@ -7893,8 +8916,12 @@ class SurvyAIAgent:
                         return (cx - vx) ** 2 + (cy - vy) ** 2
                     return min(pillar_box_bbs, key=_bb_d2)
 
-                for i_v, v in enumerate(local_pts[: len(pn_list)]):
+                for i_v, v in enumerate(pn_place):
                     vx, vy = float(v["x"]), float(v["y"])
+                    if not str(v.get("prefix") or "").strip() or not str(
+                        v.get("number") or ""
+                    ).strip():
+                        continue
                     cand = [t for t in pn_tables if t.get("handle") and str(t.get("handle")) not in used_handles]
                     if not cand:
                         # Template may contain fewer pillar-number tables than parcel vertices.
@@ -7935,8 +8962,8 @@ class SurvyAIAgent:
                         if not cand:
                             # Hard fallback: create an MTEXT-based pillar-number label so we never drop a pillar number.
                             try:
-                                lbl = f"{pn_list[i_v]['prefix']}\\P{pn_list[i_v]['number']}"
-                                peg_tok = str(pn_list[i_v].get("number") or "")
+                                lbl = f"{v['prefix']}\\P{v['number']}"
+                                peg_tok = str(v.get("number") or "")
                                 # Wider box for longer Nigerian peg tokens (up to ~9+ chars).
                                 mtext_w = 12.0 if len(peg_tok) <= 5 else min(28.0, 8.0 + 1.6 * len(peg_tok))
                                 self.autocad.add_mtext(
@@ -7945,7 +8972,12 @@ class SurvyAIAgent:
                                     vy + 2.0,
                                     layer="CADA_PILLARNUMBERS",
                                     rotation_rad=0.0,
-                                    height=max(0.5, float(bearing_road_height) * 0.9),
+                                    height=max(
+                                        0.5,
+                                        float(bearing_road_height)
+                                        * 0.9
+                                        * float(geometry.get("annot_id_scale") or 1.0),
+                                    ),
                                     width=mtext_w,
                                     attachment_point=1,  # top-left
                                 )
@@ -7956,8 +8988,8 @@ class SurvyAIAgent:
                     h = str(best.get("handle"))
                     used_handles.add(h)
                     try:
-                        _set_cell(h, 0, 0, _mtxt_replace(_get_cell(h, 0), pn_list[i_v]["prefix"]))
-                        _set_cell(h, 1, 0, _mtxt_replace(_get_cell(h, 1), pn_list[i_v]["number"]))
+                        _set_cell(h, 0, 0, _mtxt_replace(_get_cell(h, 0), v["prefix"]))
+                        _set_cell(h, 1, 0, _mtxt_replace(_get_cell(h, 1), v["number"]))
                     except Exception:
                         pass
                     # Place the TABLE close to the pillar but not on it.
@@ -8169,16 +9201,52 @@ class SurvyAIAgent:
                     h = str(t.get("handle") or "")
                     if h and h not in used_handles:
                         self.autocad.delete_entity_by_handle(h)
+                try:
+                    _id_sc_pn = float(geometry.get("annot_id_scale") or 1.0)
+                    if abs(_id_sc_pn - 1.0) > 1e-6:
+                        for t in pn_tables:
+                            hh = str(t.get("handle") or "")
+                            if hh and hh in used_handles:
+                                _scale_table_text_heights(
+                                    self.autocad, hh, _id_sc_pn, tables_now
+                                )
+                except Exception:
+                    pass
+
+            try:
+                if not geometry.get("annot_scales_applied"):
+                    _ann_counts = _apply_cadastral_annotation_text_scales(
+                        self.autocad,
+                        title_h=title_h,
+                        surv_h=surv_h,
+                        cert_h=cert_h,
+                        east_h=east_h,
+                        north_h=north_h,
+                        tables_now=tables_now,
+                        title_scale=float(geometry.get("annot_title_scale") or 1.0),
+                        body_scale=float(geometry.get("annot_body_scale") or 1.0),
+                        id_scale=float(geometry.get("annot_id_scale") or 1.0),
+                    )
+                    if _ann_counts:
+                        geometry["annot_scale_counts"] = _ann_counts
+                    geometry["annot_scales_applied"] = True
+            except Exception:
+                pass
 
             # Bearings/distances (DD° MM' only) aligned to each edge, template-like MTEXT wrapper and height 1.2
             # Re-ensure active document before drawing text (avoids one bearing/distance drawn wrong if COM glitched)
             try:
                 self.autocad._ensure_active_document()
-                time.sleep(0.1)
+                if not multi_parcel_layout:
+                    time.sleep(0.1)
             except Exception:
                 pass
             # Use scaled bearing/road height (no max cap so e.g. 1:500→1:10000 gives height 24)
-            _bd_height = max(0.5, float(bearing_road_height))
+            # Clustered multi-parcel: shrink BD up to 25% of the scale-correct size (12 → 9 at 1:5000).
+            _bd_height = max(
+                0.5,
+                float(bearing_road_height) * float(geometry.get("annot_body_scale") or 1.0),
+            )
             def _bearing_ddmm(az_deg: float, hard_spaces: int = 1) -> str:
                 az_deg = az_deg % 360.0
                 d = int(az_deg)
@@ -8229,7 +9297,12 @@ class SurvyAIAgent:
                         "CADA_EASTCOORDINATES",
                         "CADA_ROAD",
                         "CADA_TITLEBLOCK",
-                    ],
+                    ] + (
+                        ["CADA_TEXT"]
+                        if multi_parcel_layout
+                        and float(geometry.get("annot_body_scale") or 1.0) >= 0.999
+                        else []
+                    ),
                     object_names=["AcDbTable", "AcDbText", "AcDbMText"],
                 )
                 if (bb or {}).get("success"):
@@ -8350,13 +9423,71 @@ class SurvyAIAgent:
                             return True
                 return False
 
-            # Multi-parcel layouts already flagged above — skip bearing/distance COM work.
-            if multi_parcel_layout:
-                geometry["bearing_mtext"] = 0
+            # Multi-parcel: annotate unique traverse edges on every ownership ring
+            # (shared boundaries once). Single-parcel: every leg of local_pts.
+            _bd_rings: List[List[Dict[str, float]]] = []
+            try:
+                if multi_parcel_layout:
+                    for lp in layout_parcels or []:
+                        ring = [p for p in (lp.get("points") or []) if isinstance(p, dict)]
+                        if len(ring) >= 2:
+                            _bd_rings.append(ring)
+                if not _bd_rings and local_pts:
+                    _bd_rings = [list(local_pts)]
+            except Exception:
+                _bd_rings = [list(local_pts)] if local_pts else []
+            _seen_bd_edges: set = set()
+            _bd_legs: List[Tuple[Dict[str, float], Dict[str, float], List[Dict[str, float]], int]] = []
+            for _ring in _bd_rings:
+                n_ring = len(_ring)
+                edge_count = n_ring if n_ring >= 3 else max(0, n_ring - 1)
+                for i_leg in range(edge_count):
+                    p1 = _ring[i_leg]
+                    p2 = _ring[(i_leg + 1) % n_ring]
+                    try:
+                        k1 = (round(float(p1["x"]), 3), round(float(p1["y"]), 3))
+                        k2 = (round(float(p2["x"]), 3), round(float(p2["y"]), 3))
+                    except Exception:
+                        continue
+                    if k1 == k2:
+                        continue
+                    ek = (k1, k2) if k1 <= k2 else (k2, k1)
+                    if multi_parcel_layout and ek in _seen_bd_edges:
+                        continue
+                    _seen_bd_edges.add(ek)
+                    _bd_legs.append((p1, p2, _ring, i_leg))
 
-            for i in range(0 if multi_parcel_layout else len(local_pts)):
-                p1 = local_pts[i]
-                p2 = local_pts[(i + 1) % len(local_pts)]
+            # Cartography: one BD per physical common boundary. Excel rings often
+            # restate the shared side with small vertex drift and the reverse azimuth
+            # (186°54' / 53.88 m vs 6°54' / 53.88 m) — keep the first only.
+            if multi_parcel_layout and _bd_legs:
+                _kept_bd: List[Tuple[Dict[str, float], Dict[str, float], List[Dict[str, float]], int]] = []
+                for _leg in _bd_legs:
+                    p1, p2 = _leg[0], _leg[1]
+                    _dup = False
+                    for _prev in _kept_bd:
+                        try:
+                            if is_shared_or_reverse_traverse_edge(
+                                float(p1["x"]),
+                                float(p1["y"]),
+                                float(p2["x"]),
+                                float(p2["y"]),
+                                float(_prev[0]["x"]),
+                                float(_prev[0]["y"]),
+                                float(_prev[1]["x"]),
+                                float(_prev[1]["y"]),
+                            ):
+                                _dup = True
+                                break
+                        except Exception:
+                            continue
+                    if not _dup:
+                        _kept_bd.append(_leg)
+                geometry["bd_legs_before_shared_filter"] = int(len(_bd_legs))
+                geometry["bd_legs_shared_dropped"] = int(len(_bd_legs) - len(_kept_bd))
+                _bd_legs = _kept_bd
+
+            for p1, p2, _ring, i in _bd_legs:
                 dx = p2["x"] - p1["x"]
                 dy = p2["y"] - p1["y"]
                 L_geom = math.hypot(dx, dy)
@@ -8364,7 +9495,11 @@ class SurvyAIAgent:
                     continue
                 # For start-coordinate + bearing/distance traverses, preserve the adjusted leg
                 # bearings/distances for annotation even after the duplicate closure vertex is removed.
-                if bearing_distance_legs and len(bearing_distance_legs) == len(local_pts):
+                if (
+                    (not multi_parcel_layout)
+                    and bearing_distance_legs
+                    and len(bearing_distance_legs) == len(_ring)
+                ):
                     leg_meta = bearing_distance_legs[i]
                     az = float(leg_meta.get("bearing_deg", (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0)) % 360.0
                     L_disp = float(leg_meta.get("distance", L_geom))
@@ -8377,8 +9512,8 @@ class SurvyAIAgent:
                 midx = (p1["x"] + p2["x"]) / 2.0
                 midy = (p1["y"] + p2["y"]) / 2.0
 
-                poly_cx = sum(p["x"] for p in local_pts) / len(local_pts)
-                poly_cy = sum(p["y"] for p in local_pts) / len(local_pts)
+                poly_cx = sum(p["x"] for p in _ring) / len(_ring)
+                poly_cy = sum(p["y"] for p in _ring) / len(_ring)
                 vx = poly_cx - midx
                 vy = poly_cy - midy
                 n1x, n1y = dy / L_geom, -dx / L_geom
@@ -8389,7 +9524,12 @@ class SurvyAIAgent:
                     inx, iny = n2x, n2y
                 outx, outy = -inx, -iny
 
-                use_projecting_arrow = L_geom < _min_text_span
+                if multi_parcel_layout:
+                    # Clustered sheets: keep labels on the leg. Leaders crowd the
+                    # drawing and explode AutoCAD COM time. Only leader very short sides.
+                    use_projecting_arrow = L_geom < max(4.0, 2.4 * _bd_height)
+                else:
+                    use_projecting_arrow = L_geom < _min_text_span
 
                 if not use_projecting_arrow:
                     # --- Normal on-leg placement (unchanged logic) ---
@@ -8440,6 +9580,7 @@ class SurvyAIAgent:
                         height=_bd_height,
                         width=tw,
                         attachment_point=5,
+                        assume_active=True,
                     )
                     try:
                         _placed_label_bboxes.append(_aabb_for_centered_rect(tcx, tcy, tw, h_est, rot))
@@ -8572,6 +9713,7 @@ class SurvyAIAgent:
                             ],
                             layer="CADA_BEARING_DIST",
                             closed=False,
+                            assume_active=True,
                         )
                     except Exception:
                         pass
@@ -8589,7 +9731,12 @@ class SurvyAIAgent:
                             {"x": midx + su * arrow_size + sp * arrow_size * 0.35, "y": midy + sv * arrow_size + sq * arrow_size * 0.35},
                             {"x": midx + su * arrow_size - sp * arrow_size * 0.35, "y": midy + sv * arrow_size - sq * arrow_size * 0.35},
                         ]
-                        self.autocad.create_lwpolyline(arrow_pts, layer="CADA_BEARING_DIST", closed=True)
+                        self.autocad.create_lwpolyline(
+                            arrow_pts,
+                            layer="CADA_BEARING_DIST",
+                            closed=True,
+                            assume_active=True,
+                        )
                     except Exception:
                         pass
 
@@ -8604,6 +9751,7 @@ class SurvyAIAgent:
                             height=_bd_height,
                             width=float(text_w),
                             attachment_point=5,
+                            assume_active=True,
                         )
                     except Exception:
                         # Last-resort: try horizontal at elbow
@@ -8617,6 +9765,7 @@ class SurvyAIAgent:
                                 height=_bd_height,
                                 width=max(2.0, branch_base),
                                 attachment_point=5,
+                                assume_active=True,
                             )
                         except Exception:
                             pass
@@ -8626,7 +9775,8 @@ class SurvyAIAgent:
                         pass
 
                 geometry["bearing_mtext"] += 1
-                time.sleep(0.05)
+                if not multi_parcel_layout:
+                    time.sleep(0.05)
 
             # Second pass (cartographic cleanup): nudge pillar-number labels away from overlaps.
             # This addresses very short legs where pegs and annotations cluster tightly.
@@ -8665,7 +9815,14 @@ class SurvyAIAgent:
                     margin = 2.0 * _bd_height
 
                     # Iterate a few passes so clustered labels can settle without leaving residual overlaps.
-                    for _pass in range(3):
+                    # Clustered multi-parcel: one pass — extra COM bbox work was a major hang source.
+                    _nudge_passes = (
+                        1
+                        if multi_parcel_layout
+                        and float(geometry.get("annot_body_scale") or 1.0) < 0.999
+                        else 3
+                    )
+                    for _pass in range(_nudge_passes):
                         moved = 0
                         for meta in pn_meta:
                             h_raw = str(meta.get("handle") or "")
@@ -8984,26 +10141,19 @@ class SurvyAIAgent:
 
                         ux, uy = dx / L_bound, dy / L_bound
 
-                        # Outward normal using centroid
-                        midx = (p1["x"] + p2["x"]) / 2.0
-                        midy = (p1["y"] + p2["y"]) / 2.0
-                        poly_cx = sum(p["x"] for p in local_pts) / len(local_pts)
-                        poly_cy = sum(p["y"] for p in local_pts) / len(local_pts)
-                        vx = poly_cx - midx
-                        vy = poly_cy - midy
-                        n1x, n1y = uy, -ux
-                        n2x, n2y = -uy, ux
-                        if (n1x * vx + n1y * vy) >= (n2x * vx + n2y * vy):
-                            outx, outy = -n1x, -n1y
-                        else:
-                            outx, outy = -n2x, -n2y
+                        outx, outy = _outward_normal_for_edge(local_pts, p1, p2)
 
                         f_s = {"x": p1["x"] + fence_offset * outx, "y": p1["y"] + fence_offset * outy}
                         f_e = {"x": p2["x"] + fence_offset * outx, "y": p2["y"] + fence_offset * outy}
                         self.autocad.create_lwpolyline([f_s, f_e], layer="CADA_CWF", closed=False, linetype_scale=3.0)
 
                         label = "C.W.F" if kind == "CWF" else "D.C.W.F"
-                        fence_text_h = max(0.25, 0.5 * float(bearing_road_height))
+                        fence_text_h = max(
+                            0.25,
+                            0.5
+                            * float(bearing_road_height)
+                            * float(geometry.get("annot_body_scale") or 1.0),
+                        )
                         tx = (f_s["x"] + f_e["x"]) / 2.0 + (fence_text_h * 1.2) * outx
                         ty = (f_s["y"] + f_e["y"]) / 2.0 + (fence_text_h * 1.2) * outy
                         rot_rad = math.atan2(uy, ux)
@@ -9120,27 +10270,10 @@ class SurvyAIAgent:
                             # Unit vector along edge
                             ux, uy = dx / L_bound, dy / L_bound
                             
-                            # Normal vector (outward)
-                            # Reuse centroid logic
-                            midx = (p1["x"] + p2["x"]) / 2.0
-                            midy = (p1["y"] + p2["y"]) / 2.0
-                            poly_cx = sum(p["x"] for p in local_pts) / len(local_pts)
-                            poly_cy = sum(p["y"] for p in local_pts) / len(local_pts)
-                            vx = poly_cx - midx
-                            vy = poly_cy - midy
-                            
-                            n1x, n1y = uy, -ux
-                            n2x, n2y = -uy, ux
-                            
-                            # Dot product with centroid vector: interior normal points TOWARD centroid
-                            # We want OUTWARD normal
-                            if (n1x * vx + n1y * vy) >= (n2x * vx + n2y * vy):
-                                # n1 is interior
-                                outx, outy = -n1x, -n1y
-                            else:
-                                # n2 is interior
-                                outx, outy = -n2x, -n2y
-                                
+                            # A road lies outside the parcel it serves, never within it.
+                            outx, outy = _outward_normal_for_edge(local_pts, p1, p2)
+
+
                             # Define road line points
                             # Line 1: offset
                             # Start: p1 - ext_side*u + offset*out
@@ -9194,7 +10327,9 @@ class SurvyAIAgent:
                                 rot_rad += math.pi
 
                             # Same text height as bearing/distances (template-matched)
-                            road_title_height = bearing_road_height
+                            road_title_height = float(bearing_road_height) * float(
+                                geometry.get("annot_body_scale") or 1.0
+                            )
                             road_title_fmt = f"{{\\fVerdana|b0|i0|c0|p34;{road_title}}}"
                             # Width = length of drawn road: single line when title fits, wrap only when it exceeds road length
                             L_road = math.hypot(l1_e["x"] - l1_s["x"], l1_e["y"] - l1_s["y"])
@@ -9652,6 +10787,12 @@ class SurvyAIAgent:
                         or _CADASTRAL_TEMPLATE_PLANNUMBER_REF_H
                     ),
                 )
+                try:
+                    ideal_plan_h = float(ideal_plan_h) * float(
+                        geometry.get("annot_id_scale") or 1.0
+                    )
+                except Exception:
+                    pass
                 fit_debug = _apply_plan_number_table_cell(
                     self.autocad,
                     plan_h=plan_h,
@@ -9731,6 +10872,10 @@ class SurvyAIAgent:
         }
         if geometry.get("access_road_title"):
             out_result["access_road_title"] = geometry["access_road_title"]
+        try:
+            self._touch_cadastral_template_last_used(str(template) if template else "")
+        except Exception:
+            pass
         _release_output_tab(already_saved=True)
         return out_result
 
@@ -9742,7 +10887,16 @@ class SurvyAIAgent:
         """Extract a .dwg file path from the query (quoted or path-like). Returns resolved path or None."""
         import re
         from pathlib import Path
+
+        from survyai.attachments import collect_attached_paths
+
         q = query or ""
+        for raw in collect_attached_paths(q, suffixes=(".dwg",), existing_only=False):
+            p = Path(raw)
+            if not p.is_absolute():
+                p = (Path.cwd() / p).resolve()
+            if p.suffix.lower() == ".dwg":
+                return str(p)
         # Quoted paths: 'path.dwg' or "path.dwg"
         for pat in [r"['\"]([^'\"]+?\.dwg)['\"]", r"(?:in|to|file|open|modify)\s+['\"]?([^\s'\"]+\.dwg)['\"]?", r"([A-Za-z]:\\[^\s]+\.dwg)", r"([^\s<>|]+\.dwg)"]:
             m = re.search(pat, q, re.IGNORECASE)
@@ -9757,8 +10911,38 @@ class SurvyAIAgent:
                     return str(p)
         return None
 
+    def _touch_cadastral_template_last_used(self, template_path: str) -> None:
+        """Update last_used_at once after a successful plot (not during read-only resolve)."""
+        if not template_path:
+            return
+        try:
+            from pathlib import Path
+            import time
+
+            data = self._load_cad_template_memory()
+            entries = list(data.get("templates") or [])
+            want = str(Path(template_path).resolve()).lower()
+            dirty = False
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            for ent in entries:
+                try:
+                    tp = str(Path(str(ent.get("path") or "")).resolve()).lower()
+                except Exception:
+                    tp = str(ent.get("path") or "").lower()
+                if tp == want:
+                    ent["last_used_at"] = now
+                    dirty = True
+                    break
+            if dirty:
+                data["templates"] = entries
+                self._save_cad_template_memory(data)
+        except Exception:
+            pass
+
     def _ensure_protected_templates_loaded(self) -> None:
         """Load all known survey plan template paths from template_profiles so they are never written."""
+        if getattr(self, "_protected_templates_loaded", False) and self._protected_template_paths:
+            return
         from pathlib import Path
         import json as _json
         # Scan the writable profiles dir plus read-only seed dirs (bundled + dev)
@@ -9781,6 +10965,7 @@ class SurvyAIAgent:
                         self._protected_template_paths.add(str(Path(tp).resolve()))
                 except Exception:
                     continue
+        self._protected_templates_loaded = True
 
     def _is_protected_template_path(self, dwg_path: str) -> bool:
         """True if dwg_path is a protected survey plan template (must never be written)."""
@@ -9824,11 +11009,23 @@ class SurvyAIAgent:
             logger.warning("Refusing to save protected template path: %s", p)
             return
         try:
-            r = self.autocad.open_drawing(p, read_only=False)
-            if not r.get("success"):
-                logger.warning("ensure_output_saved: could not activate %s: %s", p, r.get("error"))
+            already_open = bool(
+                getattr(self.autocad, "is_drawing_open", None)
+                and self.autocad.is_drawing_open(p)
+            )
+            if already_open and hasattr(self.autocad, "_activate_document_by_path"):
+                from pathlib import Path as _P
+
+                if not self.autocad._activate_document_by_path(_P(p)):
+                    logger.warning("ensure_output_saved: activate-by-path failed for %s", p)
+                else:
+                    self.autocad.set_workflow_document(p)
+            else:
+                r = self.autocad.open_drawing(p, read_only=False)
+                if not r.get("success"):
+                    logger.warning("ensure_output_saved: could not activate %s: %s", p, r.get("error"))
         except Exception as e:
-            logger.warning("ensure_output_saved: open_drawing failed: %s", e)
+            logger.warning("ensure_output_saved: open/activate failed: %s", e)
         ap = self.autocad.get_active_document_path() if getattr(self.autocad, "get_active_document_path", None) else None
         if ap and self._is_protected_template_path(ap):
             logger.warning("Active document is a protected template; save skipped: %s", ap)
@@ -10051,17 +11248,7 @@ class SurvyAIAgent:
                     extension_total = 0.4 * L_bound
                     ext_side = extension_total / 2.0
                     ux, uy = dx / L_bound, dy / L_bound
-                    midx = (p1["x"] + p2["x"]) / 2.0
-                    midy = (p1["y"] + p2["y"]) / 2.0
-                    poly_cx = sum(p["x"] for p in local_pts) / len(local_pts)
-                    poly_cy = sum(p["y"] for p in local_pts) / len(local_pts)
-                    vx, vy = poly_cx - midx, poly_cy - midy
-                    n1x, n1y = uy, -ux
-                    n2x, n2y = -uy, ux
-                    if (n1x * vx + n1y * vy) >= (n2x * vx + n2y * vy):
-                        outx, outy = -n1x, -n1y
-                    else:
-                        outx, outy = -n2x, -n2y
+                    outx, outy = _outward_normal_for_edge(local_pts, p1, p2)
                     rsx = p1["x"] - ext_side * ux
                     rsy = p1["y"] - ext_side * uy
                     rex = p2["x"] + ext_side * ux
@@ -10584,37 +11771,42 @@ class SurvyAIAgent:
         
         if not getattr(self.settings, 'auto_store_conversations', True):
             return
-        
+
+        timestamp = datetime.now().isoformat()
+
+        def _persist() -> None:
+            try:
+                self.vector_store.add_conversation(
+                    role="user",
+                    content=query,
+                    session_id=session_id,
+                    metadata={"timestamp": timestamp, "type": "query"},
+                )
+                self.vector_store.add_conversation(
+                    role="assistant",
+                    content=response,
+                    session_id=session_id,
+                    metadata={
+                        "timestamp": timestamp,
+                        "type": "response",
+                        "llm_used": llm_used,
+                    },
+                )
+                logger.debug(
+                    "Stored conversation in vector store (session: %s...)",
+                    session_id[:8],
+                )
+            except Exception as e:
+                logger.warning(f"Failed to store conversation: {e}")
+
         try:
-            timestamp = datetime.now().isoformat()
-            
-            # Store the user query
-            self.vector_store.add_conversation(
-                role="user",
-                content=query,
-                session_id=session_id,
-                metadata={
-                    "timestamp": timestamp,
-                    "type": "query"
-                }
-            )
-            
-            # Store the assistant response
-            self.vector_store.add_conversation(
-                role="assistant",
-                content=response,
-                session_id=session_id,
-                metadata={
-                    "timestamp": timestamp,
-                    "type": "response",
-                    "llm_used": llm_used
-                }
-            )
-            
-            logger.debug(f"✓ Stored conversation in vector store (session: {session_id[:8]}...)")
-            
-        except Exception as e:
-            logger.warning(f"⚠ Failed to store conversation: {e}")
+            threading.Thread(
+                target=_persist,
+                name="survyai-store-conversation",
+                daemon=True,
+            ).start()
+        except Exception:
+            _persist()
     
     def set_session_id(self, session_id: str) -> None:
         """
@@ -13070,6 +14262,7 @@ class SurvyAIAgent:
             str(model_name or "").strip(),
             float(getattr(self.settings, "agent_temperature", 0.3) or 0.0),
             int(max_tokens or 0),
+            "tr1",
             self._llm_auth_fingerprint(
                 llm_type, proxy=(str(transport).lower() == "proxy")
             ),
@@ -13231,11 +14424,17 @@ class SurvyAIAgent:
 
                 logger.debug("Initializing Gemini LLM with model: %s", resolved)
 
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                from survyai.provider_models import paid_llm_constructor_kwargs
+
                 llm = ChatGoogleGenerativeAI(
                     model=resolved,
                     google_api_key=self.settings.google_api_key,
                     temperature=self.settings.agent_temperature,
                     max_output_tokens=max_tokens,
+                    **paid_llm_constructor_kwargs(
+                        "gemini", resolved, max_tokens=max_tokens
+                    ),
                 )
                 self._current_gemini_model = resolved
                 return self._store_cached_llm(cache_key, llm)
@@ -13296,12 +14495,18 @@ class SurvyAIAgent:
                     )
                 
                 logger.debug("Initializing Claude LLM with model: %s", resolved)
-                
+
+                from langchain_anthropic import ChatAnthropic
+                from survyai.provider_models import paid_llm_constructor_kwargs
+
                 llm = ChatAnthropic(
                     model=resolved,
                     anthropic_api_key=self.settings.anthropic_api_key,
                     temperature=self.settings.agent_temperature,
-                    max_tokens=actual_max_tokens
+                    max_tokens=actual_max_tokens,
+                    **paid_llm_constructor_kwargs(
+                        "claude", resolved, max_tokens=actual_max_tokens
+                    ),
                 )
                 return self._store_cached_llm(cache_key, llm)
                 
@@ -13380,11 +14585,16 @@ class SurvyAIAgent:
                 
                 logger.debug("Initializing OpenAI LLM with model: %s", model_name)
                 
+                from survyai.provider_models import paid_llm_constructor_kwargs
+
                 llm = ChatOpenAI(
                     model=model_name,
                     api_key=self.settings.openai_api_key,
                     temperature=self.settings.agent_temperature,
-                    max_tokens=actual_max_tokens
+                    max_tokens=actual_max_tokens,
+                    **paid_llm_constructor_kwargs(
+                        "openai", model_name, max_tokens=actual_max_tokens
+                    ),
                 )
                 return self._store_cached_llm(cache_key, llm)
 
@@ -13399,6 +14609,9 @@ class SurvyAIAgent:
                 )
                 ok, ram_err, num_ctx = _ollama_ram_policy(model_name)
                 if not ok:
+                    from survyai.ollama_support import remember_ollama_reject
+
+                    remember_ollama_reject(model_name, ram_err)
                     raise RuntimeError(ram_err)
                 num_predict = int(getattr(self.settings, "ollama_num_predict", 512) or 512)
                 # On low-RAM hosts, shrink generation budget further.
@@ -14083,7 +15296,7 @@ class SurvyAIAgent:
             csv_path: str = Field(description="Path to the CSV file to convert")
             output_excel_path: Optional[str] = Field(
                 None,
-                description="Path for the output .xlsx file. If omitted, same folder as CSV, same name with .xlsx extension."
+                description="Path for the output .xlsx file. If omitted, saved in the active SurvyAI workspace with the CSV's base name.",
             )
 
         def csv_to_excel(csv_path: str, output_excel_path: Optional[str] = None) -> str:
@@ -14092,7 +15305,7 @@ class SurvyAIAgent:
 
             CRITICAL for workflows that start with CSV: ArcGIS ExcelToTable and many coordinate/import
             tools accept only .xlsx/.xls. If the user provides a .csv (e.g. Coords.csv), call this
-            FIRST to create Coords.xlsx in the same folder, then use the Excel path for
+            FIRST to create Coords.xlsx in the active workspace, then use the Excel path for
             excel_coordinate_convert, arcgis_import_xy_points_from_excel, etc.
             """
             return str(self.excel_processor.csv_to_excel(csv_path, output_excel_path))
@@ -14803,9 +16016,9 @@ class SurvyAIAgent:
             output_path: Optional[str] = Field(
                 default=None,
                 description=(
-                    "Output file path. "
-                    "CRITICAL: If not specified, automatically saves in same folder as excel_path "
-                    "with '_converted' suffix. This ensures outputs are created alongside input files."
+                    "Output file path. If omitted, saves in the active SurvyAI workspace "
+                    "with a '_converted' suffix. Use an absolute path or say "
+                    "'same folder as the input file' to write beside the source."
                 )
             )
             sheet_name: Optional[str] = Field(
@@ -14865,7 +16078,11 @@ class SurvyAIAgent:
                     if requested_out:
                         src = Path(str(kwargs.get("excel_path") or ""))
                         kwargs["output_path"] = str(
-                            (src.parent / requested_out) if src.parent.exists() else requested_out
+                            self._resolve_user_output_path(
+                                user_request,
+                                requested_out,
+                                source_path=str(src) if src.name else None,
+                            )
                         )
 
                 # Keep only kwargs accepted by convert_excel_file
@@ -14966,7 +16183,7 @@ class SurvyAIAgent:
             y_column: str = Field(default="Lat.", description="Latitude/Northing column name (tabs/whitespace tolerated)")
             output_filename: str = Field(
                 default="converted1.xlsx",
-                description="Output filename to save in the same folder as the input Excel file",
+                description="Output filename. Saved in the active SurvyAI workspace unless an absolute path or another folder is specified.",
             )
             area_on: Literal["best", "source", "target"] = Field(
                 default="best",
@@ -14987,7 +16204,7 @@ class SurvyAIAgent:
             - Reads Excel
             - Parses DMS/DM/decimal values in Lat/Long columns
             - Converts source->target CRS
-            - Saves output to same folder as input
+            - Saves output to the active SurvyAI workspace (unless a folder is specified)
             - Computes area using best available method
             """
             try:
@@ -14996,7 +16213,9 @@ class SurvyAIAgent:
                 from utils.coordinate_parsing import parse_angle
 
                 inp = Path(excel_path)
-                out_path = (inp.parent / Path(output_filename).name).resolve()
+                out_path = self._resolve_user_output_path(
+                    "", Path(output_filename).name, source_path=str(inp)
+                )
 
                 # Run conversion using the improved converter (handles DMS + messy headers)
                 conv = self.blue_marble.convert_excel_file(
@@ -15263,7 +16482,7 @@ class SurvyAIAgent:
                 description=(
                     "Convert a CSV file to an Excel file (.xlsx). Use this FIRST when the user provides a .csv "
                     "but downstream steps need Excel (e.g. coordinate conversion, ArcGIS import). "
-                    "Output defaults to same folder as CSV with .xlsx extension. "
+                    "Output defaults to the active SurvyAI workspace with a .xlsx extension. "
                     "Parameters: csv_path (required), output_excel_path (optional)."
                 ),
                 func=csv_to_excel,
@@ -15293,11 +16512,19 @@ class SurvyAIAgent:
                     "Do NOT use for read/extract/inspect/summarize Excel turns, or bare 'yes/go ahead' "
                     "after those turns (that means deeper extract/search, not CAD). "
                     "SEMANTICS (critical): "
-                    "(1) SEPARATE plans — phrases like 'different CAD plans', 'each owner … only that "
+                    "(1) SEPARATE plans — phrases like 'different CAD plans', 'all the CAD plans', "
+                    "'owner names as the file names' / 'Awuri_Family.dwg', 'each owner … only that "
                     "plan', 'buyer name as the name of that particular CAD drawing', plan-number "
                     "increment → one .dwg per owner named after the buyer. "
-                    "(2) MULTI-PARCEL — 'all owner names', letter tags like 'AMADI (B)', parcels "
-                    "marked within one plan → a single multi-parcel DWG. "
+                    "(2) MULTI-PARCEL — letter tags like 'AMADI (B)', parcels marked within one "
+                    "plan, a single shared Generate filename → a single multi-parcel DWG. "
+                    "Auto-scale from the combined ground extent (typically 1:500/1:1000 for "
+                    "~1 ha clusters) — same fit as a single-parcel plan; do not inherit a "
+                    "reference plan's 1:10000 unless the user asked for that scale. "
+                    "Annotate unique traverse edges with bearings/distances; title AREA lists "
+                    "AREA (A):-, AREA (B):- … and TOTAL AREA:- each on its own line. "
+                    "Label provided pillar/beacon numbers on unique pegs (do not invent IDs). "
+                    "Do NOT treat 'all the owner names as the file names' as multi-parcel. "
                     "(3) PLAN NUMBER — 'start from plan number …' / 'plan number: …' is the first "
                     "plan and increments per owner; it overrides the reference DWG plan no. "
                     "Taking location/surveyor from a reference plan does not imply taking its "
@@ -15886,8 +17113,8 @@ class SurvyAIAgent:
             working_dir: Optional[str] = Field(
                 default=None,
                 description=(
-                    "Working directory for the script (default: same folder as the first input file, "
-                    "or the SurvyAI workspace). Scripts are saved here for audit."
+                    "Working directory for the script (default: the active SurvyAI workspace). "
+                    "Scripts are saved here for audit."
                 )
             )
             expected_output_files: Optional[List[str]] = Field(
@@ -16204,8 +17431,8 @@ class SurvyAIAgent:
                     None,
                     description=(
                         "Folder to create the project in. "
-                        "CRITICAL: If not specified, automatically uses the same folder as excel_path. "
-                        "This ensures projects are created alongside input files when user doesn't specify location."
+                        "If omitted, uses the active SurvyAI workspace. "
+                        "Pass an absolute path, or the user can ask to save beside the Excel file."
                     )
                 )
                 coordinate_system: str = Field(
@@ -16213,9 +17440,8 @@ class SurvyAIAgent:
                 )
                 output_csv: str = Field(
                     description=(
-                        "Output CSV path. Can be absolute path or just filename. "
-                        "CRITICAL: If just a filename (not absolute), automatically saved in same folder as excel_path. "
-                        "This ensures outputs are created alongside input files when user doesn't specify location."
+                        "Output CSV path. Can be absolute path or just a filename. "
+                        "Bare filenames are saved in the active SurvyAI workspace."
                     )
                 )
                 sheet_name: Optional[str] = Field(None, description="Optional Excel sheet name (default: first)")
@@ -16237,14 +17463,14 @@ class SurvyAIAgent:
                 # Auto-infer missing path parameters from input file location
                 excel_path = kwargs.get("excel_path")
                 if excel_path:
-                    # If project_folder not specified, use same folder as Excel file
+                    # If project_folder not specified, use the active workspace
                     if not kwargs.get("project_folder"):
                         inferred_folder = self._infer_output_path_from_input(excel_path, output_type="folder")
                         if inferred_folder:
                             kwargs["project_folder"] = inferred_folder
-                            logger.info(f"Auto-inferred project_folder from excel_path: {inferred_folder}")
+                            logger.info(f"Auto-inferred project_folder from workspace: {inferred_folder}")
                     
-                    # If output_csv is just a filename (not absolute path), resolve to same folder as Excel
+                    # If output_csv is just a filename (not absolute path), resolve to workspace
                     output_csv = kwargs.get("output_csv")
                     if output_csv:
                         from pathlib import Path
@@ -16273,7 +17499,7 @@ class SurvyAIAgent:
                 )
                 output_excel_path: Optional[str] = Field(
                     None,
-                    description="Output Excel path (default: same folder as input, results_fill.xlsx)",
+                    description="Output Excel path (default: active SurvyAI workspace, results_fill.xlsx)",
                 )
 
             def arcgis_fill_volume_idw_cutfill(
@@ -17615,6 +18841,27 @@ class SurvyAIAgent:
                     "error": fast.get("error") if not fast.get("success") else None,
                 }
 
+            # FAST PATH: extract a newly attached PDF/Word file into the requested Word document.
+            # Must run before survey-plan key-details and before leftover OCR Word export.
+            if _pre_intent != "knowledge" and self._should_fastpath_document_extract_to_word(
+                tool_routing_query
+            ):
+                logger.info("Document extract-to-Word fast-path triggered")
+                fast = self._run_document_extract_to_word_pipeline(tool_routing_query)
+                llm_used = "fallback" if use_fallback else "primary"
+                return {
+                    "query": query,
+                    "response": fast.get("response") or fast.get("error") or str(fast),
+                    "llm_used": llm_used,
+                    "model_name": model_name_used,
+                    "complexity": "average",
+                    "success": bool(fast.get("success")),
+                    "session_id": current_session_id,
+                    "context_retrieved": False,
+                    "output_path": fast.get("output_path"),
+                    "error": fast.get("error") if not fast.get("success") else None,
+                }
+
             # FAST PATH (early): extract key details from a survey-plan PDF (vision for scans).
             if _pre_intent != "knowledge" and self._should_fastpath_pdf_plan_key_details(
                 tool_routing_query
@@ -17647,6 +18894,8 @@ class SurvyAIAgent:
                     is_ocr_only_request,
                     is_ocr_word_export_request,
                     load_last_ocr_extraction,
+                    ocr_reuse_blocked_by_new_task,
+                    query_has_source_document,
                     resolve_ocr_export_path,
                     resolve_ocr_word_export_path,
                     save_last_ocr_extraction,
@@ -17661,96 +18910,130 @@ class SurvyAIAgent:
                 _image_paths = extract_image_paths_from_query(tool_routing_query)
                 _ocr_user_text = self._vision_ocr_user_text(tool_routing_query)
                 _ws = Path.cwd()
+                _has_source_doc = bool(
+                    query_has_source_document(tool_routing_query)
+                    or self._extract_document_paths(tool_routing_query)
+                )
 
-                # Follow-up with no new images: export prior extraction or inject it for the agent.
-                if not _image_paths and _pre_intent != "knowledge":
-                    _last = load_last_ocr_extraction(_ws)
+                # Follow-up with no new images or documents: export prior extraction or inject it.
+                # Never reuse a leftover OCR cache for a new Excel/CAD/GIS job that merely
+                # mentions save + .xlsx (that hijack dumped calibration sheets as dup.xlsx).
+                if not _image_paths and not _has_source_doc and _pre_intent != "knowledge":
+                    _block_stale_ocr = ocr_reuse_blocked_by_new_task(_ocr_user_text)
+                    if _block_stale_ocr:
+                        logger.info(
+                            "Skipping stale OCR reuse — current turn is a new Excel/CAD/GIS job"
+                        )
+                    _last = None if _block_stale_ocr else load_last_ocr_extraction(_ws)
                     if _last and is_ocr_export_request(_ocr_user_text):
                         llm_used = "fallback" if use_fallback else "primary"
-                        try:
-                            out_path = resolve_ocr_export_path(_ocr_user_text, _ws)
-                            structured = _last.get("structured") or {}
-                            # Prefer applying the chat table if structured rows were lost
-                            if isinstance(_last.get("user_table"), str) and _last.get("user_table").strip():
-                                structured = dict(structured)
-                                structured.setdefault("user_table", _last["user_table"])
-                            written = export_ocr_extraction_to_excel(
-                                structured,
-                                out_path,
-                                image_paths=_last.get("image_paths") or [],
+                        _ocr_preview = (
+                            "Saved the latest OCR extraction to Excel "
+                            "(Extraction / Observations / Metadata sheets)."
+                        )
+                        if self._should_withhold_draft_result(
+                            tool_routing_query,
+                            _ocr_preview,
+                            use_fallback=use_fallback,
+                        ):
+                            logger.warning(
+                                "Withheld stale OCR Excel export — draft does not match current request"
                             )
-                            n_rows = len(
-                                [r for r in (structured.get("rows") or []) if isinstance(r, dict)]
-                            )
-                            return {
-                                "query": query,
-                                "response": (
-                                    f"Saved the latest OCR extraction to `{written}`.\n"
-                                    f"- Open the **Extraction** sheet first (metadata + {n_rows} observation row(s)).\n"
-                                    f"- Sheets: Extraction, Observations, Metadata.\n\n"
-                                    + (str(_last.get("user_table") or "").strip())
-                                ).strip(),
-                                "llm_used": llm_used,
-                                "model_name": model_name_used,
-                                "complexity": "simple",
-                                "success": True,
-                                "session_id": current_session_id,
-                                "context_retrieved": False,
-                                "output_path": str(written),
-                            }
-                        except Exception as export_exc:
-                            logger.exception("OCR Excel export failed")
-                            return {
-                                "query": query,
-                                "response": f"Could not save OCR extraction to Excel: {export_exc}",
-                                "llm_used": llm_used,
-                                "model_name": model_name_used,
-                                "complexity": "simple",
-                                "success": False,
-                                "session_id": current_session_id,
-                                "context_retrieved": False,
-                                "error": str(export_exc),
-                            }
+                        else:
+                            try:
+                                out_path = resolve_ocr_export_path(_ocr_user_text, _ws)
+                                structured = _last.get("structured") or {}
+                                # Prefer applying the chat table if structured rows were lost
+                                if isinstance(_last.get("user_table"), str) and _last.get("user_table").strip():
+                                    structured = dict(structured)
+                                    structured.setdefault("user_table", _last["user_table"])
+                                written = export_ocr_extraction_to_excel(
+                                    structured,
+                                    out_path,
+                                    image_paths=_last.get("image_paths") or [],
+                                )
+                                n_rows = len(
+                                    [r for r in (structured.get("rows") or []) if isinstance(r, dict)]
+                                )
+                                return {
+                                    "query": query,
+                                    "response": (
+                                        f"Saved the latest OCR extraction to `{written}`.\n"
+                                        f"- Open the **Extraction** sheet first (metadata + {n_rows} observation row(s)).\n"
+                                        f"- Sheets: Extraction, Observations, Metadata.\n\n"
+                                        + (str(_last.get("user_table") or "").strip())
+                                    ).strip(),
+                                    "llm_used": llm_used,
+                                    "model_name": model_name_used,
+                                    "complexity": "simple",
+                                    "success": True,
+                                    "session_id": current_session_id,
+                                    "context_retrieved": False,
+                                    "output_path": str(written),
+                                }
+                            except Exception as export_exc:
+                                logger.exception("OCR Excel export failed")
+                                return {
+                                    "query": query,
+                                    "response": f"Could not save OCR extraction to Excel: {export_exc}",
+                                    "llm_used": llm_used,
+                                    "model_name": model_name_used,
+                                    "complexity": "simple",
+                                    "success": False,
+                                    "session_id": current_session_id,
+                                    "context_retrieved": False,
+                                    "error": str(export_exc),
+                                }
                     if _last and is_ocr_word_export_request(_ocr_user_text):
                         llm_used = "fallback" if use_fallback else "primary"
-                        try:
-                            out_path = resolve_ocr_word_export_path(_ocr_user_text, _ws)
-                            structured = _last.get("structured") if isinstance(_last.get("structured"), dict) else {}
-                            written = export_ocr_extraction_to_docx(
-                                structured,
-                                out_path,
-                                image_paths=_last.get("image_paths") or [],
-                                user_table=str(_last.get("user_table") or ""),
+                        _ocr_word_preview = "Saved the latest OCR extraction to Word."
+                        if self._should_withhold_draft_result(
+                            tool_routing_query,
+                            _ocr_word_preview,
+                            use_fallback=use_fallback,
+                        ):
+                            logger.warning(
+                                "Withheld stale OCR Word export — draft does not match current request"
                             )
-                            return {
-                                "query": query,
-                                "response": (
-                                    f"Saved the latest OCR extraction to Word.\n"
-                                    f"- Output: `{written}`\n"
-                                    f"- Content: the full extraction (headings, panels, tables) — "
-                                    f"not an essay rewrite.\n"
-                                ).strip(),
-                                "llm_used": llm_used,
-                                "model_name": model_name_used,
-                                "complexity": "simple",
-                                "success": True,
-                                "session_id": current_session_id,
-                                "context_retrieved": False,
-                                "output_path": str(written),
-                            }
-                        except Exception as export_exc:
-                            logger.exception("OCR Word export failed")
-                            return {
-                                "query": query,
-                                "response": f"Could not save OCR extraction to Word: {export_exc}",
-                                "llm_used": llm_used,
-                                "model_name": model_name_used,
-                                "complexity": "simple",
-                                "success": False,
-                                "session_id": current_session_id,
-                                "context_retrieved": False,
-                                "error": str(export_exc),
-                            }
+                        else:
+                            try:
+                                out_path = resolve_ocr_word_export_path(_ocr_user_text, _ws)
+                                structured = _last.get("structured") if isinstance(_last.get("structured"), dict) else {}
+                                written = export_ocr_extraction_to_docx(
+                                    structured,
+                                    out_path,
+                                    image_paths=_last.get("image_paths") or [],
+                                    user_table=str(_last.get("user_table") or ""),
+                                )
+                                return {
+                                    "query": query,
+                                    "response": (
+                                        f"Saved the latest OCR extraction to Word.\n"
+                                        f"- Output: `{written}`\n"
+                                        f"- Content: the full extraction (headings, panels, tables) — "
+                                        f"not an essay rewrite.\n"
+                                    ).strip(),
+                                    "llm_used": llm_used,
+                                    "model_name": model_name_used,
+                                    "complexity": "simple",
+                                    "success": True,
+                                    "session_id": current_session_id,
+                                    "context_retrieved": False,
+                                    "output_path": str(written),
+                                }
+                            except Exception as export_exc:
+                                logger.exception("OCR Word export failed")
+                                return {
+                                    "query": query,
+                                    "response": f"Could not save OCR extraction to Word: {export_exc}",
+                                    "llm_used": llm_used,
+                                    "model_name": model_name_used,
+                                    "complexity": "simple",
+                                    "success": False,
+                                    "session_id": current_session_id,
+                                    "context_retrieved": False,
+                                    "error": str(export_exc),
+                                }
                     if _last and is_ocr_followup_request(_ocr_user_text):
                         self._vision_ocr_context = format_last_ocr_for_agent(_last)
 
@@ -18523,23 +19806,10 @@ class SurvyAIAgent:
                     if fast.get("access_road_title"):
                         resp_lines.append(f"- Access road title (as plotted): {fast.get('access_road_title')!r}")
                     try:
+                        from agent.cadastral_intent import format_traverse_adjustment_chat_lines
+
                         bow = (fast.get("geometry") or {}).get("bowditch") if isinstance(fast, dict) else None
-                        if isinstance(bow, dict) and bow.get("mode") == "bearing_distance":
-                            if bow.get("applied"):
-                                resp_lines.append(
-                                    "- Bowditch adjustment applied (misclosure > 1cm): "
-                                    f"misclosure={bow.get('misclosure_m'):.3f}m "
-                                    f"(E={bow.get('misclosure_e_m'):.3f}m, N={bow.get('misclosure_n_m'):.3f}m), "
-                                    f"max point shift={bow.get('max_point_shift_m'):.3f}m."
-                                )
-                                prev = bow.get("adjusted_points_preview") or []
-                                if prev:
-                                    resp_lines.append(f"- Adjusted points preview (first {len(prev)}): {prev}")
-                            else:
-                                resp_lines.append(
-                                    "- Bowditch adjustment not applied: "
-                                    f"misclosure={bow.get('misclosure_m'):.3f}m (<= 0.010m threshold)."
-                                )
+                        resp_lines.extend(format_traverse_adjustment_chat_lines(bow))
                     except Exception:
                         pass
                     resp_lines.append("\nYou can request modifications in this session (e.g. add another road, change the title) without closing or re-prompting.")
@@ -18694,7 +19964,11 @@ class SurvyAIAgent:
                     if self._should_fastpath_large_doc_summary(tool_routing_query, primary_doc):
                         input_doc = primary_doc["path"]
                         output_doc = self._extract_requested_output_docx(query, input_doc) or str(
-                            (Path(input_doc).parent / f"Summary_{Path(input_doc).stem}.docx").resolve()
+                            self._resolve_user_output_path(
+                                tool_routing_query,
+                                f"Summary_{Path(input_doc).stem}.docx",
+                                source_path=input_doc,
+                            )
                         )
                         logger.info("Using fast-path large document summary pipeline")
                         fast_result = self._run_large_doc_summary_pipeline(
@@ -19203,6 +20477,21 @@ class SurvyAIAgent:
                         "Please retry this request — I should run the appropriate ArcGIS, CAD, Excel, "
                         "or document tools and confirm outputs exist on disk before reporting success."
                     )
+                elif self._should_withhold_draft_result(
+                    routing_query,
+                    response_text,
+                    use_fallback=use_fallback,
+                    run_cheap_llm=not tools_used,
+                ):
+                    logger.warning(
+                        "Withheld LangGraph reply — cheap alignment checker rejected an off-task result"
+                    )
+                    graph_success = False
+                    response_text = (
+                        "I stopped before sending a result that does not match your current request "
+                        "(it looked like a leftover job, not the Excel/CAD/GIS work you asked for). "
+                        "Please resend the same prompt and I will run the requested file workflow."
+                    )
                 llm_cost_usd = self._estimate_llm_cost_usd_from_graph_result(
                     result,
                     model_name_used,
@@ -19500,6 +20789,123 @@ class SurvyAIAgent:
             if isinstance(message, ToolMessage):
                 return True
         return False
+
+    def _cheap_result_is_aligned(
+        self,
+        query: str,
+        response: str,
+        *,
+        output_path: str = "",
+        use_fallback: bool = False,
+    ) -> bool:
+        """
+        Ask the cheapest paid model of the active brand whether the draft reply
+        matches the current user request.
+
+        Fail-open (True) on Ollama, missing APIs, timeout, or unparseable JSON so
+        this never blocks a correct result when the checker cannot run.
+        """
+        from survyai.prompt_router import (
+            ALIGNMENT_TIMEOUT_SECONDS,
+            build_alignment_messages,
+            message_content_to_text,
+            parse_alignment_response,
+            router_models_to_try,
+        )
+        from survyai.provider_models import PAID_PROVIDERS
+
+        provider = self._active_llm_provider(use_fallback)
+        if provider not in PAID_PROVIDERS:
+            return True
+        system, user = build_alignment_messages(
+            query=query, response=response, output_path=output_path
+        )
+        for router_model in router_models_to_try(provider, self.settings):
+            try:
+                llm = self._initialize_llm(provider, model_name=router_model)
+            except Exception as exc:
+                logger.info(
+                    "Alignment checker could not init %s/%s (%s)",
+                    provider,
+                    router_model,
+                    exc,
+                )
+                continue
+
+            def _invoke_align(llm=llm, sys=system, usr=user):
+                return llm.invoke(
+                    [SystemMessage(content=sys), HumanMessage(content=usr)]
+                )
+
+            try:
+                msg, err, timed_out = self._run_with_timeout(
+                    ALIGNMENT_TIMEOUT_SECONDS,
+                    _invoke_align,
+                    llm_model_name=router_model,
+                    serialize_llm=False,
+                )
+            except Exception as exc:
+                logger.info("Alignment checker invoke failed on %s (%s)", router_model, exc)
+                continue
+            if timed_out or err or msg is None:
+                logger.info(
+                    "Alignment checker %s skipped (%s)",
+                    router_model,
+                    "timeout" if timed_out else (err or "empty"),
+                )
+                continue
+            parsed = parse_alignment_response(message_content_to_text(msg))
+            if parsed is None:
+                logger.info("Alignment checker %s returned unusable JSON — fail-open", router_model)
+                continue
+            if not parsed:
+                logger.warning(
+                    "Cheap alignment checker (%s/%s) flagged off-task draft",
+                    provider,
+                    router_model,
+                )
+            return bool(parsed)
+        return True
+
+    def _should_withhold_draft_result(
+        self,
+        query: str,
+        response: str,
+        *,
+        output_path: str = "",
+        use_fallback: bool = False,
+        run_cheap_llm: bool = True,
+    ) -> bool:
+        """True when the draft must not be shown because it is the wrong job."""
+        from agent.vision_ocr import assistant_result_is_unrelated_job
+
+        if assistant_result_is_unrelated_job(query, response):
+            return True
+        if not run_cheap_llm:
+            return False
+        ql = (query or "").lower()
+        # Deterministic CAD/Excel pipelines are not checked here (caller skips).
+        # Cheap model only for ambiguous / leftover-session replies.
+        looks_operational = any(
+            m in ql
+            for m in (
+                ".dwg",
+                ".xlsx",
+                "excel",
+                "cad",
+                "arcgis",
+                "plot",
+                "generate",
+            )
+        )
+        if not looks_operational:
+            return False
+        return not self._cheap_result_is_aligned(
+            query,
+            response,
+            output_path=output_path,
+            use_fallback=use_fallback,
+        )
 
     def _response_looks_like_unverified_task_completion(
         self,

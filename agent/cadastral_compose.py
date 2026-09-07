@@ -95,6 +95,18 @@ def discover_coordinate_source_files(
         seen.add(key)
         found.append(rp)
 
+    try:
+        from survyai.attachments import collect_attached_paths
+
+        for raw in collect_attached_paths(
+            q,
+            suffixes=(".xlsx", ".xls", ".xlsm", ".csv", ".txt", ".docx", ".doc"),
+            existing_only=True,
+        ):
+            _add(Path(raw))
+    except Exception:
+        pass
+
     for m in re.finditer(
         r"['\"]([^'\"]+\.(?:xlsx|xls|xlsm|csv|txt|docx|doc))['\"]",
         q,
@@ -106,7 +118,7 @@ def discover_coordinate_source_files(
         _add(p)
 
     for m in re.finditer(
-        r"([A-Za-z]:\\[^\s'\"]+\.(?:xlsx|xls|xlsm|csv|txt|docx|doc))",
+        r"([A-Za-z]:\\[^\r\n\"<>|]+?\.(?:xlsx|xls|xlsm|csv|txt|docx|doc))",
         q,
         flags=re.IGNORECASE,
     ):
@@ -498,8 +510,9 @@ def llm_compose_cadastral_plan(
         "- Prefer coordinates_blob when the source is a single traverse with bearings/distances.\n"
         "- Owner labels with letters like 'AMADI (B)' ONLY when the user asked for multi-parcel "
         "letter tags on ONE plan. If they asked for separate/different CAD plans per owner "
-        "(each owner's coords → only that owner's DWG; buyer name as each drawing name; "
-        "incrementing plan numbers), still return parcels[] (one per owner) WITHOUT inventing "
+        "(each owner's coords → only that owner's DWG; owner names as the file names e.g. "
+        "Awuri_Family.dwg; buyer name as each drawing name; incrementing plan numbers), "
+        "still return parcels[] (one per owner) WITHOUT inventing "
         "a combined multi-parcel layout — the caller plots each parcel as its own DWG.\n"
         "- Preserve numeric coordinates exactly as in the files.\n"
         "- Do not invent coordinates that are not present in the files/prompt.\n"
@@ -641,6 +654,7 @@ def build_subprompt_from_coordinates_blob(
     pillar_numbers: Optional[Sequence[str]] = None,
     template_path: Optional[str] = None,
     scale_denom: Optional[int] = None,
+    source_query: Optional[str] = None,
 ) -> str:
     """Build a conventional cadastral prompt from a coordinates/traverse blob."""
     lines: List[str] = []
@@ -679,6 +693,14 @@ def build_subprompt_from_coordinates_blob(
         lines.append(blob)
     else:
         lines.append("coordinates for the points = " + blob)
+    try:
+        from agent.cadastral_intent import bowditch_instruction_for_subprompt
+
+        adj_line = bowditch_instruction_for_subprompt(source_query)
+        if adj_line:
+            lines.append(adj_line)
+    except Exception:
+        pass
     return "\n".join(lines)
 
 
@@ -934,6 +956,7 @@ def compose_cadastral_from_files(
             surveyor_address=llm_meta.get("surveyor_address", ""),
             certification_date=cert_date,
             pillar_numbers=llm_meta.get("pillar_numbers") or [],
+            source_query=query,
         )
 
     ref_dwg = find_reference_dwg_from_query(query, ws)

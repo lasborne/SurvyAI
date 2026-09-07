@@ -28,6 +28,90 @@ logger = get_logger(__name__)
 
 _T = TypeVar("_T")
 
+# Process-level PDF source cache: (resolved_path, size, mtime_ns) -> payload
+_PDF_SOURCE_CACHE: Dict[tuple, Dict[str, Any]] = {}
+_PDF_SOURCE_CACHE_MAX = 8
+
+# Process-level extraction result cache: (pdf_key, notes_hash) -> extraction dump + model
+_PDF_EXTRACTION_RESULT_CACHE: Dict[tuple, Dict[str, Any]] = {}
+_PDF_EXTRACTION_RESULT_CACHE_MAX = 6
+
+
+def _pdf_cache_key(pdf_path: str) -> Optional[tuple]:
+    try:
+        p = Path(pdf_path).resolve()
+        st = p.stat()
+        return (str(p).lower(), int(st.st_size), int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9))))
+    except Exception:
+        return None
+
+
+def get_cached_pdf_sources(pdf_path: str) -> Optional[Dict[str, Any]]:
+    key = _pdf_cache_key(pdf_path)
+    if key is None:
+        return None
+    return _PDF_SOURCE_CACHE.get(key)
+
+
+def store_cached_pdf_sources(pdf_path: str, payload: Dict[str, Any]) -> None:
+    key = _pdf_cache_key(pdf_path)
+    if key is None:
+        return
+    _PDF_SOURCE_CACHE[key] = payload
+    while len(_PDF_SOURCE_CACHE) > _PDF_SOURCE_CACHE_MAX:
+        # Drop oldest insertion
+        try:
+            oldest = next(iter(_PDF_SOURCE_CACHE))
+            _PDF_SOURCE_CACHE.pop(oldest, None)
+        except Exception:
+            break
+
+
+def clear_pdf_source_cache() -> None:
+    _PDF_SOURCE_CACHE.clear()
+    _PDF_EXTRACTION_RESULT_CACHE.clear()
+
+
+def get_cached_pdf_extraction(
+    pdf_path: str, *, user_notes: str = ""
+) -> Optional[Dict[str, Any]]:
+    import hashlib
+
+    key = _pdf_cache_key(pdf_path)
+    if key is None:
+        return None
+    notes_hash = hashlib.sha1((user_notes or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return _PDF_EXTRACTION_RESULT_CACHE.get((key, notes_hash))
+
+
+def store_cached_pdf_extraction(
+    pdf_path: str,
+    *,
+    user_notes: str,
+    extraction: Any,
+    model_name: Optional[str],
+) -> None:
+    import hashlib
+
+    key = _pdf_cache_key(pdf_path)
+    if key is None:
+        return
+    notes_hash = hashlib.sha1((user_notes or "").encode("utf-8", errors="ignore")).hexdigest()[:16]
+    try:
+        dump = extraction.model_dump() if hasattr(extraction, "model_dump") else dict(extraction)
+    except Exception:
+        return
+    _PDF_EXTRACTION_RESULT_CACHE[(key, notes_hash)] = {
+        "extraction": dump,
+        "model_name": model_name,
+    }
+    while len(_PDF_EXTRACTION_RESULT_CACHE) > _PDF_EXTRACTION_RESULT_CACHE_MAX:
+        try:
+            oldest = next(iter(_PDF_EXTRACTION_RESULT_CACHE))
+            _PDF_EXTRACTION_RESULT_CACHE.pop(oldest, None)
+        except Exception:
+            break
+
 
 def _parallel_invoke(*callables: Callable[[], _T]) -> List[_T]:
     """Run independent callables concurrently; single-call fast path avoids thread overhead."""
@@ -45,13 +129,107 @@ def _load_pdf_extraction_sources(
     pdf_path: str,
     *,
     vision_max_pages: int = 1,
+    preloaded: Optional[tuple[str, str, List[str]]] = None,
+    skip_vision: bool = False,
 ) -> tuple[str, str, List[str]]:
     """Load layout text, plain text, and vision images from a PDF in parallel."""
+    try:
+        from survyai.perf import incr, span
+    except Exception:
+        incr = None  # type: ignore
+        span = None  # type: ignore
+
+    cached = get_cached_pdf_sources(pdf_path)
+    if preloaded is not None:
+        layout_text, plain_text, images = preloaded
+        if skip_vision:
+            if cached is not None:
+                cached["layout_text"] = layout_text or cached.get("layout_text") or ""
+                cached["plain_text"] = plain_text or cached.get("plain_text") or ""
+                store_cached_pdf_sources(pdf_path, cached)
+            return layout_text, plain_text, list(images or [])[:0]
+        if images:
+            if cached is not None:
+                cached["images"] = list(images)
+                store_cached_pdf_sources(pdf_path, cached)
+            return layout_text, plain_text, images
+        if cached and cached.get("images"):
+            return layout_text, plain_text, list(cached["images"])
+
+    if cached and cached.get("layout_text") is not None and cached.get("plain_text") is not None:
+        layout_text = str(cached.get("layout_text") or "")
+        plain_text = str(cached.get("plain_text") or "")
+        images = list(cached.get("images") or [])
+        if skip_vision:
+            if incr:
+                incr("pdf_cache_hit")
+            return layout_text, plain_text, []
+        if images:
+            if incr:
+                incr("pdf_cache_hit")
+            return layout_text, plain_text, images
+        # Need vision render only
+        max_pages = max(1, int(vision_max_pages or 1))
+        page_count = int(cached.get("page_count") or 1)
+        max_pages = min(max_pages, max(1, page_count))
+        ctx = span("pdf.render") if span else None
+        try:
+            if ctx:
+                ctx.__enter__()
+            images = render_pdf_pages_base64(pdf_path, max_pages=max_pages)
+            if incr:
+                incr("pdf_renders")
+        finally:
+            if ctx:
+                ctx.__exit__(None, None, None)
+        cached["images"] = images
+        store_cached_pdf_sources(pdf_path, cached)
+        return layout_text, plain_text, images
+
     max_pages = max(1, int(vision_max_pages or 1))
-    layout_text, plain_text, images = _parallel_invoke(
-        lambda: extract_layout_text_from_pdf(pdf_path),
-        lambda: extract_plain_text_from_pdf(pdf_path),
-        lambda: render_pdf_pages_base64(pdf_path, max_pages=max_pages),
+    # Cap to actual page count when cheap to probe.
+    try:
+        import fitz
+
+        doc = fitz.open(str(pdf_path))
+        page_count = int(doc.page_count or 1)
+        doc.close()
+        max_pages = min(max_pages, max(1, page_count))
+    except Exception:
+        page_count = 1
+
+    ctx = span("pdf.load_sources") if span else None
+    try:
+        if ctx:
+            ctx.__enter__()
+        if skip_vision:
+            layout_text, plain_text = _parallel_invoke(
+                lambda: extract_layout_text_from_pdf(pdf_path),
+                lambda: extract_plain_text_from_pdf(pdf_path),
+            )
+            images: List[str] = []
+        else:
+            layout_text, plain_text, images = _parallel_invoke(
+                lambda: extract_layout_text_from_pdf(pdf_path),
+                lambda: extract_plain_text_from_pdf(pdf_path),
+                lambda: render_pdf_pages_base64(pdf_path, max_pages=max_pages),
+            )
+            if incr:
+                incr("pdf_renders")
+        if incr:
+            incr("pdf_text_loads")
+    finally:
+        if ctx:
+            ctx.__exit__(None, None, None)
+
+    store_cached_pdf_sources(
+        pdf_path,
+        {
+            "layout_text": layout_text,
+            "plain_text": plain_text,
+            "images": images,
+            "page_count": page_count,
+        },
     )
     return layout_text, plain_text, images
 
@@ -147,23 +325,70 @@ def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
 
 def extract_pdf_paths_from_text(text: str) -> List[str]:
     """Find PDF paths in a query string (does not require the file to exist)."""
+    from survyai.attachments import normalize_user_path
+
     found: List[str] = []
+    seen: set = set()
+
+    def _add(raw: str) -> None:
+        p = normalize_user_path(raw)
+        if not p or not p.lower().endswith(".pdf"):
+            return
+        # Never keep URI leftovers like "/C:/Users/..." or "\C:\Users\..."
+        p = re.sub(r"^[/\\]+([A-Za-z]:)", r"\1", p)
+        p = re.sub(r"^([A-Za-z]:)(?![/\\])", r"\1\\", p)
+        try:
+            cand = Path(p)
+            # Only resolve when the path is a real drive-absolute file; avoid cwd-join of /C:...
+            if re.match(r"^[A-Za-z]:[/\\]", p) and cand.is_file():
+                resolved = str(cand.resolve())
+            elif cand.is_file():
+                resolved = str(cand.resolve())
+            else:
+                resolved = str(cand) if re.match(r"^[A-Za-z]:[/\\]", p) else p
+        except Exception:
+            resolved = p
+        # Drop still-mangled drive-relative results (C:Users\... or e:\C:\...)
+        low = resolved.replace("/", "\\").lower()
+        if re.match(r"^[a-z]:[^\\]", low) or re.search(r"\\[a-z]:\\", "\\" + low):
+            # Retry one more normalize pass on the original raw token
+            retry = normalize_user_path(raw)
+            retry = re.sub(r"^[/\\]+([A-Za-z]:)", r"\1", retry)
+            if retry and Path(retry).is_file():
+                resolved = str(Path(retry).resolve())
+            elif "C:Users" in resolved.replace("/", "\\") or re.match(r"^[A-Za-z]:[/\\].*C:", resolved):
+                return
+        key = resolved.lower()
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(resolved)
+
+    try:
+        from survyai.attachments import collect_attached_paths
+
+        for p in collect_attached_paths(text or "", suffixes=[".pdf"], existing_only=False):
+            _add(p)
+    except Exception:
+        pass
+
+    scope = text or ""
     patterns = [
+        # file:///C:/... or file:/C:/... (percent-encoded OK via normalize_user_path)
+        r"((?:file:(?:///?)+)[^\s\"'<>]+\.pdf)",
+        # Windows drive with backslashes
         r"([A-Za-z]:\\[^\r\n\"<>|]+?\.pdf)",
-        r"((?:/|\\)[^\r\n\"<>|]+?\.pdf)",
-        r"(?<![A-Za-z0-9_/\\])([A-Za-z0-9][A-Za-z0-9_\- ]*?\.pdf)(?![A-Za-z0-9])",
+        # Windows drive with forward slashes (common in pasted URIs / chat)
+        r"([A-Za-z]:/[^\r\n\"<>|]+?\.pdf)",
+        # Absolute Unix-style / UNC-ish (never match /C: Windows drive fragments from file URIs)
+        r"(?<![A-Za-z0-9:])(/(?![A-Za-z]:)[^\r\n\"<>|]+?\.pdf)",
+        r"((?:\\\\|//)[^\r\n\"<>|]+?\.pdf)",
+        # Bare filename
+        r"(?<![A-Za-z0-9_/\\:])([A-Za-z0-9][A-Za-z0-9_\- ]*?\.pdf)(?![A-Za-z0-9])",
     ]
     for pat in patterns:
-        for m in re.finditer(pat, text or "", flags=re.IGNORECASE):
-            raw = (m.group(1) or "").strip().strip("\"'").rstrip(").,;")
-            if not raw:
-                continue
-            try:
-                resolved = str(Path(raw).resolve())
-            except Exception:
-                resolved = raw
-            if resolved not in found:
-                found.append(resolved)
+        for m in re.finditer(pat, scope, flags=re.IGNORECASE):
+            _add((m.group(1) or "").strip())
     return found
 
 
@@ -242,6 +467,7 @@ def enrich_extraction_coordinates(
 
     pillars = _filter_plausible_pillars(extraction.pillar_numbers)
     legs = _filter_plausible_legs(extraction.traverse_legs)
+    _drop_stale_anchor_pillars(extraction)
     if not extraction.absolute_parcel_coords and len(pillars) >= 3 and len(legs) >= 3:
         grid_e = extraction.anchor_easting if _is_plausible_utm_easting(extraction.anchor_easting or 0) else best_e
         grid_n = extraction.anchor_northing if _is_plausible_utm_northing(extraction.anchor_northing or 0) else best_n
@@ -369,7 +595,57 @@ def split_cadastral_pillar_label(raw: str) -> Optional[Dict[str, str]]:
     if m and re.search(r"\d", m.group(2)):
         prefix = re.sub(r"\s+", "", m.group(1)).upper()
         return {"prefix": prefix, "number": m.group(2).upper()}
-    return None
+    return _split_incomplete_printed_pillar_label(text)
+
+
+_INCOMPLETE_PILLAR_GLYPH_RE = re.compile(
+    "(?:SC|SP|RV|RP)\\s*/\\s*(?:[A-Za-z]{1,6}\\s+)?"
+    "[.\\u2026_*?]{2,}"
+    "(?:\\s+[.\\u2026_*?]{2,})?",
+    re.IGNORECASE,
+)
+_NOTES_INCOMPLETE_PILLAR_RE = re.compile(
+    r"(?:incomplete|illegible|obscured|erased|partial|redacted|unreadable).{0,100}pillar"
+    r"|pillar.{0,80}(?:incomplete|illegible|obscured|erased|partial|redacted|unreadable)",
+    re.IGNORECASE | re.DOTALL,
+)
+_DEFAULT_INCOMPLETE_PILLAR_GLYPH = "SC/.. ......"
+
+
+def is_incomplete_printed_pillar_label(raw: str) -> bool:
+    """True when a label is a printed-but-redacted cadastral ID (e.g. SC/.. ......)."""
+    text = re.sub(r"\s+", " ", (raw or "").strip())
+    if not text:
+        return False
+    if not re.match(r"^(?:SC|SP|RV|RP)\s*/", text, re.IGNORECASE):
+        return False
+    if not re.search("[.\\u2026_*?]{2,}", text):
+        return False
+    if re.match(
+        rf"^(?:SC|SP|RV|RP)\s*/\s*{_PILLAR_DISTRICT}\s+{_PILLAR_PEG_TOKEN}$",
+        text,
+        re.IGNORECASE,
+    ) and re.search(r"\d", text):
+        return False
+    return True
+
+
+def _split_incomplete_printed_pillar_label(text: str) -> Optional[Dict[str, str]]:
+    """Split a redacted printed label into CADA_PILLARNUMBERS cells as seen."""
+    if not is_incomplete_printed_pillar_label(text):
+        return None
+    m = re.match(
+        "^(SC|SP|RV|RP)\\s*/\\s*([A-Za-z.\\u2026_*?]{1,8})"
+        "(?:\\s+([A-Za-z0-9.\\u2026_*?]{2,14}))?$",
+        (text or "").strip(),
+        re.IGNORECASE,
+    )
+    if not m:
+        return None
+    series = m.group(1).upper()
+    district = (m.group(2) or "..").strip()
+    number = (m.group(3) or "").strip() or "......"
+    return {"prefix": f"{series}/{district}", "number": number}
 
 
 def _parse_pillar_token(tok: str, next_tok: str = "") -> Optional[str]:
@@ -442,9 +718,263 @@ def extract_pillars_from_pdf_page(page: Any) -> List[str]:
             found[pid] = (cx, cy)
         i += 1
 
-    if len(found) < 3:
+    ids = list(found.keys())
+    if len(ids) < 3:
+        # One or two printed labels are still real — do not discard them so later
+        # filtering can keep those IDs and leave other corners unlabeled.
+        return ids
+    return _order_pillars_clockwise(found, ids)
+
+
+def _pillar_id_match_key(pid: str) -> str:
+    return re.sub(r"\s+", "", _normalize_pillar_id(pid) or "").upper()
+
+
+def _pillar_ids_from_text(text: str) -> List[str]:
+    """Collect plausible cadastral IDs in first-seen order from free text."""
+    out: List[str] = []
+    seen: set[str] = set()
+    norm = re.sub(r"\s+", " ", (text or "").replace("\n", " "))
+    for m in _PILLAR_ID_TEXT_RE.finditer(norm):
+        pid = _normalize_pillar_id(m.group(0))
+        key = _pillar_id_match_key(pid)
+        if not pid or not key or not _is_plausible_pillar_id(pid) or key in seen:
+            continue
+        seen.add(key)
+        out.append(pid)
+    return out
+
+
+def collect_attested_pillar_ids(
+    pdf_path: Optional[str] = None,
+    combined_text: str = "",
+) -> List[str]:
+    """
+    Pillar IDs that actually appear on the plan (PDF word boxes, else page text).
+
+    Word geometry is preferred: it is the printed label, not an LLM guess.
+    """
+    page_ids: List[str] = []
+    if pdf_path and Path(pdf_path).exists():
+        try:
+            import fitz
+
+            doc = fitz.open(str(pdf_path))
+            try:
+                page_ids = extract_pillars_from_pdf_page(doc[0])
+            finally:
+                doc.close()
+        except Exception as exc:
+            logger.debug("Attested PDF pillar scan failed: %s", exc)
+    if page_ids:
+        return page_ids
+    return _pillar_ids_from_text(combined_text)
+
+
+def extract_user_requested_pillar_ids(user_notes: str) -> List[str]:
+    """IDs the user explicitly named in the prompt (allowed even if absent from the PDF)."""
+    text = user_notes or ""
+    if not text.strip():
         return []
-    return _order_pillars_clockwise(found, list(found.keys()))
+    out: List[str] = []
+    seen: set[str] = set()
+
+    def _add(pid: str) -> None:
+        n = _normalize_pillar_id(pid)
+        key = _pillar_id_match_key(n)
+        if n and key and _is_plausible_pillar_id(n) and key not in seen:
+            seen.add(key)
+            out.append(n)
+
+    m_p = re.search(
+        rf"pillar\s+numbers\s*[:=]\s*(.*?)(?={_COORDINATES_FOR_STOP}|$)",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if m_p:
+        raw = (m_p.group(1) or "").strip().rstrip(",").strip()
+        for part in re.split(r"[,\n]+", raw):
+            token = part.strip().strip("'\"")
+            if token:
+                _add(token)
+    for pid in _pillar_ids_from_text(text):
+        _add(pid)
+    return out
+
+
+def retain_attested_pillar_ids(
+    candidates: Sequence[str],
+    attested: Sequence[str],
+    user_requested: Sequence[str] = (),
+) -> List[str]:
+    """
+    Keep only pillar IDs printed on the plan or named by the user.
+
+    Unattested slots stay empty so vertex order is preserved (unlabeled corners).
+    When the plan has no extractable IDs (scanned sheet, empty text layer), the
+    candidate list is left unchanged — it cannot be verified.
+    """
+    cand = [str(p).strip() if p is not None else "" for p in (candidates or [])]
+    requested = [
+        _normalize_pillar_id(p) for p in (user_requested or []) if str(p).strip()
+    ]
+    attested_norm = [
+        _normalize_pillar_id(p) for p in (attested or []) if str(p).strip()
+    ]
+
+    if not attested_norm:
+        kept = [_normalize_pillar_id(p) for p in cand if p]
+        have = {_pillar_id_match_key(p) for p in kept}
+        for pid in requested:
+            key = _pillar_id_match_key(pid)
+            if pid and key and key not in have:
+                kept.append(pid)
+                have.add(key)
+        return kept
+
+    allowed = {_pillar_id_match_key(p) for p in attested_norm}
+    allowed |= {_pillar_id_match_key(p) for p in requested if p}
+
+    out: List[str] = []
+    for p in cand:
+        n = _normalize_pillar_id(p) if p else ""
+        if n and _pillar_id_match_key(n) in allowed:
+            out.append(n)
+        elif p and is_incomplete_printed_pillar_label(p):
+            # Printed-but-redacted labels stay on the drawing as seen.
+            out.append(n or re.sub(r"\s+", " ", p).strip())
+        else:
+            out.append("")
+
+    if cand and not any(out):
+        # Format mismatch (nothing overlapped) — do not wipe a complete reading.
+        return [_normalize_pillar_id(p) for p in cand if p]
+
+    have = {_pillar_id_match_key(p) for p in out if p}
+    for pid in requested:
+        key = _pillar_id_match_key(pid)
+        if not pid or not key or key in have:
+            continue
+        filled = False
+        for i, slot in enumerate(out):
+            if not slot:
+                out[i] = pid
+                filled = True
+                have.add(key)
+                break
+        if not filled:
+            out.append(pid)
+            have.add(key)
+    return out
+
+
+def apply_attested_pillar_filter(
+    extraction: SurveyPlanExtraction,
+    *,
+    pdf_path: Optional[str] = None,
+    combined_text: str = "",
+    user_notes: str = "",
+) -> SurveyPlanExtraction:
+    """Drop invented pillar IDs after geometry has been resolved from the traverse."""
+    kept = retain_attested_pillar_ids(
+        extraction.pillar_numbers,
+        collect_attested_pillar_ids(pdf_path, combined_text),
+        extract_user_requested_pillar_ids(user_notes),
+    )
+    if list(extraction.pillar_numbers or []) == kept:
+        return extraction
+    extraction.pillar_numbers = kept
+    extraction.notes = (
+        f"{extraction.notes or ''} | dropped unattested pillar numbers"
+    ).strip(" |")
+    _drop_stale_anchor_pillars(extraction)
+    return extraction
+
+
+def incomplete_pillar_glyphs_from_text(text: str) -> List[str]:
+    """Collect redacted pillar glyphs (SC/.. ......) from notes or page text."""
+    out: List[str] = []
+    seen: set[str] = set()
+    for m in _INCOMPLETE_PILLAR_GLYPH_RE.finditer(text or ""):
+        raw = (m.group(0) or "").strip()
+        n = _normalize_pillar_id(raw)
+        glyph = n if is_incomplete_printed_pillar_label(n or raw) else ""
+        if not glyph:
+            continue
+        key = _pillar_id_match_key(glyph)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(glyph)
+    return out
+
+
+def restore_incomplete_printed_pillar_labels(
+    extraction: SurveyPlanExtraction,
+    *,
+    combined_text: str = "",
+) -> SurveyPlanExtraction:
+    """
+    Keep incomplete printed labels on the ring (do not omit them).
+
+    Geometry already used complete IDs; this only transcribes what the sheet shows
+    (e.g. SC/.. ......) into empty / missing corner slots.
+    """
+    legs_n = len(_filter_plausible_legs(extraction.traverse_legs))
+    pillars = list(extraction.pillar_numbers or [])
+    already = [p for p in pillars if is_incomplete_printed_pillar_label(p)]
+    glyphs = list(already)
+    for src in (extraction.notes or "", combined_text or ""):
+        for g in incomplete_pillar_glyphs_from_text(src):
+            if _pillar_id_match_key(g) not in {_pillar_id_match_key(x) for x in glyphs}:
+                glyphs.append(g)
+    notes_say_incomplete = bool(_NOTES_INCOMPLETE_PILLAR_RE.search(extraction.notes or ""))
+    if not glyphs and notes_say_incomplete:
+        glyphs = [_DEFAULT_INCOMPLETE_PILLAR_GLYPH]
+    if not glyphs:
+        return extraction
+
+    labeled_n = sum(1 for p in pillars if str(p).strip())
+    need = max(0, legs_n - labeled_n) if legs_n >= 3 else 0
+    gi = 0
+
+    def _next_glyph() -> str:
+        nonlocal gi
+        g = glyphs[gi] if gi < len(glyphs) else glyphs[-1]
+        gi += 1
+        return g
+
+    changed = False
+    if need:
+        for i, p in enumerate(pillars):
+            if need <= 0:
+                break
+            if str(p).strip():
+                continue
+            pillars[i] = _next_glyph()
+            need -= 1
+            changed = True
+        while need > 0:
+            pillars.append(_next_glyph())
+            need -= 1
+            changed = True
+        extraction.pillar_numbers = pillars
+
+    transcribed = [p for p in extraction.pillar_numbers or [] if is_incomplete_printed_pillar_label(p)]
+    if transcribed:
+        shown = ", ".join(dict.fromkeys(transcribed))
+        extraction.notes = re.sub(
+            r"\s*(?:and are )?therefore omitted\.?",
+            "",
+            extraction.notes or "",
+            flags=re.IGNORECASE,
+        ).strip(" |")
+        note = f"incomplete pillar labels transcribed as printed: {shown}"
+        if note.lower() not in (extraction.notes or "").lower():
+            extraction.notes = f"{extraction.notes or ''} | {note}".strip(" |")
+        if changed:
+            _drop_stale_anchor_pillars(extraction)
+    return extraction
 
 
 def _extraction_geometry_is_usable(extraction: SurveyPlanExtraction) -> bool:
@@ -457,6 +987,70 @@ def _extraction_geometry_is_usable(extraction: SurveyPlanExtraction) -> bool:
     return True
 
 
+def _legs_misclosure(legs: Sequence[SurveyTraverseLeg]) -> Optional[Tuple[float, float, float]]:
+    """Return (misclosure_m, perimeter_m, closure_ratio) for at least three legs."""
+    kept = _filter_plausible_legs(legs)
+    if len(kept) < 3:
+        return None
+    try:
+        m = traverse_misclosure_metrics(kept)
+        peri = float(m["perimeter_m"])
+        if peri <= 1e-6:
+            return None
+        return float(m["misclosure_m"]), peri, float(m["closure_ratio"])
+    except Exception:
+        return None
+
+
+def _closure_is_acceptable(legs: Sequence[SurveyTraverseLeg]) -> bool:
+    """True when a traverse closes within the tolerance the replot requires."""
+    metrics = _legs_misclosure(legs)
+    if metrics is None:
+        return False
+    mis, _peri, ratio = metrics
+    if mis > _MAX_PDF_MISCLOSURE_ABS_M:
+        return False
+    if mis > 1e-6 and ratio < _MIN_PDF_CLOSURE_RATIO:
+        return False
+    return True
+
+
+def _extraction_geometry_is_consistent(extraction: SurveyPlanExtraction) -> bool:
+    """Counts line up *and* the traverse actually closes.
+
+    Matching pillar and leg counts only proves the labels were counted, not that
+    they were paired to the correct sides. A traverse that does not close is not
+    self-consistent no matter how tidy its counts look.
+    """
+    return _extraction_geometry_is_usable(extraction) and _closure_is_acceptable(
+        extraction.traverse_legs
+    )
+
+
+def _replacement_traverse_is_better(
+    current: Sequence[SurveyTraverseLeg],
+    candidate: Sequence[SurveyTraverseLeg],
+) -> bool:
+    """True when ``candidate`` is a safer traverse than ``current``.
+
+    Closure is a necessary condition for a valid traverse, so it is the criterion
+    used to compare two candidate readings of the same parcel. An unusable current
+    traverse is always replaced; otherwise the candidate must close meaningfully
+    tighter before it is allowed to win.
+    """
+    cand = _legs_misclosure(candidate)
+    if cand is None:
+        return False
+    cur = _legs_misclosure(current)
+    if cur is None or len(_filter_plausible_legs(current)) < 3:
+        return True
+    if _closure_is_acceptable(current):
+        # Already good enough for a safe replot; do not gamble on a rewrite.
+        return False
+    # Require a real gain, not floating-point noise.
+    return cand[0] < cur[0] - 1e-3
+
+
 def repair_survey_extraction_from_pdf(
     extraction: SurveyPlanExtraction,
     pdf_path: Optional[str],
@@ -466,9 +1060,10 @@ def repair_survey_extraction_from_pdf(
     Proactively repair weak LLM/heuristic extraction using PDF geometry and text.
 
     Only replaces missing or inconsistent pillars/traverse — never overwrites a
-    complete, self-consistent extraction.
+    complete, self-consistent extraction. "Self-consistent" includes closure, so a
+    mis-paired traverse with tidy counts is still repaired from PDF vector geometry.
     """
-    if _extraction_geometry_is_usable(extraction):
+    if _extraction_geometry_is_consistent(extraction):
         return extraction
 
     pillars = _filter_plausible_pillars(extraction.pillar_numbers)
@@ -488,6 +1083,7 @@ def repair_survey_extraction_from_pdf(
                     extraction.notes = (
                         f"{extraction.notes or ''} | pillars from PDF geometry".strip(" |")
                     )
+                    _drop_stale_anchor_pillars(extraction)
             doc.close()
         except Exception as exc:
             logger.debug("PDF pillar repair failed: %s", exc)
@@ -502,15 +1098,20 @@ def repair_survey_extraction_from_pdf(
             extraction.pillar_numbers = pillars[: min(len(pillars), 12)]
 
     if len(pillars) >= 3 and (
-        len(legs) < 3 or len(legs) != len(pillars) or not _extraction_geometry_is_usable(extraction)
+        len(legs) < 3
+        or len(legs) != len(pillars)
+        or not _extraction_geometry_is_consistent(extraction)
     ):
         pdf_legs = extract_boundary_legs_from_pdf(pdf_path, pillars) if pdf_path else []
         if len(pdf_legs) >= 3 and len(pdf_legs) == len(pillars):
-            extraction.traverse_legs = pdf_legs
-            legs = pdf_legs
-            extraction.notes = (
-                f"{extraction.notes or ''} | traverse from PDF geometry".strip(" |")
-            )
+            # Accept PDF vector geometry only when it is a measurable improvement, so
+            # repairing a mis-paired traverse can never spoil a better one.
+            if _replacement_traverse_is_better(legs, pdf_legs):
+                extraction.traverse_legs = pdf_legs
+                legs = pdf_legs
+                extraction.notes = (
+                    f"{extraction.notes or ''} | traverse from PDF geometry".strip(" |")
+                )
 
     if _extraction_geometry_is_usable(extraction):
         n = len(extraction.pillar_numbers)
@@ -519,6 +1120,7 @@ def repair_survey_extraction_from_pdf(
                 leg.from_pillar = extraction.pillar_numbers[i]
             if not leg.to_pillar and i < n:
                 leg.to_pillar = extraction.pillar_numbers[(i + 1) % n]
+        _drop_stale_anchor_pillars(extraction)
 
     return extraction
 
@@ -527,14 +1129,19 @@ def validate_extraction_for_replot(extraction: SurveyPlanExtraction) -> List[str
     """Return human-readable issues that block a safe PDF→CAD replot."""
     issues: List[str] = []
     pillars = _filter_plausible_pillars(extraction.pillar_numbers)
-    legs = _filter_plausible_legs(extraction.traverse_legs)
+    # Fall back to raw pillar labels for topology when heuristic IDs are used in tests/plans.
     if len(pillars) < 3:
-        issues.append("fewer than three pillar numbers extracted")
+        raw_pillars = [
+            _normalize_pillar_id(p) for p in (extraction.pillar_numbers or []) if str(p).strip()
+        ]
+        if len(raw_pillars) >= 3:
+            pillars = raw_pillars
+    legs = _filter_plausible_legs(extraction.traverse_legs)
     if len(legs) < 3:
         issues.append("fewer than three traverse legs extracted")
-    elif len(pillars) >= 3 and len(legs) != len(pillars):
+    elif len(pillars) > len(legs):
         issues.append(
-            f"pillar count ({len(pillars)}) does not match traverse legs ({len(legs)})"
+            f"pillar count ({len(pillars)}) exceeds traverse legs ({len(legs)})"
         )
     if extraction.anchor_easting is None and extraction.anchor_northing is None:
         if not extraction.absolute_parcel_coords:
@@ -559,6 +1166,31 @@ def validate_extraction_for_replot(extraction: SurveyPlanExtraction) -> List[str
         )
     ):
         issues.append("traverse data present but coordinates could not be resolved")
+
+    # Require a complete E/N pair before trusting absolute parcel coordinates.
+    if extraction.absolute_parcel_coords and (
+        extraction.anchor_easting is None or extraction.anchor_northing is None
+    ):
+        # Absolute list may still be valid if it carries full UTM pairs.
+        if not _absolute_coords_are_plausible_utm(extraction.absolute_parcel_coords):
+            issues.append("absolute coordinates emitted without complete E/N anchoring")
+
+    # Always validate misclosure/area when a full ring of legs is present.
+    if len(legs) >= 3:
+        topo_ext = extraction.model_copy(deep=True)
+        if len(pillars) >= 3 and len(pillars) == len(legs):
+            topo_ext.pillar_numbers = list(pillars)
+        elif len(topo_ext.pillar_numbers) != len(legs):
+            # Internal placeholders only — never plotted as cadastral IDs.
+            topo_ext.pillar_numbers = [f"P{i+1}" for i in range(len(legs))]
+        # Align leg endpoints to pillar ring for continuity checks.
+        n = len(topo_ext.pillar_numbers)
+        if n == len(legs):
+            for i, leg in enumerate(topo_ext.traverse_legs):
+                if i < len(legs):
+                    leg.from_pillar = topo_ext.pillar_numbers[i]
+                    leg.to_pillar = topo_ext.pillar_numbers[(i + 1) % n]
+        issues.extend(validate_extraction_topology(topo_ext))
     return issues
 
 
@@ -567,10 +1199,15 @@ def validate_subprompt_geometry(subprompt: str) -> List[str]:
     issues: List[str] = []
     if not re.search(r"pillar\s+numbers\s*[:=]", subprompt, re.I):
         issues.append("subprompt missing pillar numbers")
-    if not re.search(r"coordinates\s+for\s+the\s+points\s*=", subprompt, re.I):
+    if not re.search(r"coordinates\s+for\s+the\s+point(?:s)?\s*=", subprompt, re.I):
         issues.append("subprompt missing coordinates")
-    elif not re.search(r"\(\s*\d{5,7}(?:\.\d+)?\s*m?\s*[eE]", subprompt):
-        if not re.search(r"\d{5,7}(?:\.\d+)?\s*m?\s*[eE]\s*,", subprompt, re.I):
+    else:
+        has_en = bool(
+            re.search(r"\(\s*\d{5,7}(?:\.\d+)?\s*m?\s*[eE]", subprompt)
+            or re.search(r"\d{5,7}(?:\.\d+)?\s*m?\s*[eE]\s*,", subprompt, re.I)
+        )
+        has_bearings = bool(re.search(r"\bbearing\b.{0,80}\bdistance\b", subprompt, re.I))
+        if not has_en and not has_bearings:
             issues.append("subprompt coordinates look incomplete")
     return issues
 
@@ -1067,18 +1704,130 @@ def extract_user_requested_plan_number(text: str) -> Optional[str]:
     return None
 
 
+_JUNK_PLAN_NUMBER_RE = re.compile(
+    r"^(?:SURV|SURVEYOR|MNIS|FNIS|ANIS|PLAN|NO|COPY|CERTIFIED|ORIGINAL|AREA|SCALE|"
+    r"ORIGIN|SHEWING|LANDED|PROPERTY|ACCESS|ROAD|CLOSE)$",
+    re.IGNORECASE,
+)
+_PLAN_NUMBER_SLASH_RE = re.compile(
+    r"\b((?:RV|RP|TR|TP|RS)\s*/\s*\d{2,5}\s*/\s*\d{4}\s*/\s*\d{2,4})\b",
+    re.IGNORECASE,
+)
+_PLAN_NUMBER_COMPACT_RE = re.compile(
+    r"\b((?:RV|RP|TR|TP)\d{4}\d{4}\d{2,4})\b",
+    re.IGNORECASE,
+)
+
+
+def _is_plausible_plan_number(raw: str) -> bool:
+    """True when a token is a cadastral plan number, not a neighbouring title-block word."""
+    s = (raw or "").strip().upper()
+    if not s or not re.search(r"\d{2,}", s):
+        return False
+    token = re.sub(r"[^A-Z0-9]", "", s)
+    if not token or _JUNK_PLAN_NUMBER_RE.fullmatch(token):
+        return False
+    head = s.split("/")[0].strip()
+    if head and _JUNK_PLAN_NUMBER_RE.fullmatch(head) and not re.search(r"\d", head):
+        return False
+    return True
+
+
 def normalize_plan_number(raw: str) -> str:
     """Normalize Nigerian plan numbers (e.g. RV11242026012 -> RV/1124/2026/012)."""
     s = (raw or "").strip().upper()
     if not s:
         return ""
     if "/" in s and len(s) <= 32:
-        return s
+        return s if _is_plausible_plan_number(s) else ""
     compact = re.sub(r"[^A-Z0-9]", "", s)
     m = re.match(r"^(RV|RP|TR|TP)(\d{4})(\d{4})(\d{2,4})$", compact)
     if m:
         return f"{m.group(1)}/{m.group(2)}/{m.group(3)}/{m.group(4)}"
+    if not _is_plausible_plan_number(s):
+        return ""
     return s[:32]
+
+
+def extract_plan_number_from_plan_text(text: str) -> str:
+    """Read the printed plan number; never take SURV. / MNIS sitting beside PLAN NO."""
+    raw = text or ""
+    m = _PLAN_NUMBER_SLASH_RE.search(raw)
+    if m:
+        return normalize_plan_number(re.sub(r"\s+", "", m.group(1)))
+    m = _PLAN_NUMBER_COMPACT_RE.search(raw)
+    if m:
+        return normalize_plan_number(m.group(1))
+    m = re.search(
+        r"(?:PLAN\s*(?:NO\.?|NUMBER)\s*[:=]?\s*)([A-Z0-9/\-]{4,32})",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if m:
+        return normalize_plan_number(m.group(1).strip())
+    return ""
+
+
+def extract_certification_date_from_plan_text(text: str) -> str:
+    """Nigerian CTC line: MADE BY ME ON DD-MM-YYYY, or a labelled certification date."""
+    raw = text or ""
+    for pat in (
+        r"MADE BY ME ON\s+(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+        r"(?:DATE\s+OF\s+CERTIF(?:ICATION)?|CERTIF(?:ICATION)?\s+DATE)\s*[:-]?\s*"
+        r"(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})",
+    ):
+        m = re.search(pat, raw, flags=re.IGNORECASE)
+        if m:
+            return sanitize_metadata_field(m.group(1).strip(), max_len=40)
+    return ""
+
+
+def extract_surveyor_address_from_plan_text(text: str) -> str:
+    """Address line(s) under the surveyor name (NO. … ROAD … STATE)."""
+    raw = text or ""
+    m = re.search(
+        r"SURV\.?\s+[^\n]+\n+\s*(NO\.?\s+[^\n]+(?:\n[^\n]{0,80}STATE)?)",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if not m:
+        m = re.search(
+            r"(NO\.?\s+\d[^\n]*(?:ROAD|STREET|AVENUE|ESTATE|CLOSE)[^\n]*(?:\n[^\n]{0,80}STATE)?)",
+            raw,
+            flags=re.IGNORECASE,
+        )
+    if not m:
+        return ""
+    addr = re.sub(r"\s+", " ", m.group(1)).strip(" ,;:-")
+    addr = scrub_surveyor_metadata_value(addr, max_len=120)
+    return sanitize_metadata_field(addr, max_len=120)
+
+
+def _pillar_id_in_ring(pillar: str, pillars: Sequence[str]) -> bool:
+    if not pillar:
+        return False
+    want = _normalize_pillar_id(pillar)
+    for p in pillars:
+        if p == pillar or _normalize_pillar_id(p) == want:
+            return True
+    return False
+
+
+def _drop_stale_anchor_pillars(extraction: SurveyPlanExtraction) -> None:
+    """Forget E/N pillar hints that no longer exist after geometry repair."""
+    ring = list(extraction.pillar_numbers or [])
+    if not ring:
+        return
+    if extraction.anchor_pillar and not _pillar_id_in_ring(extraction.anchor_pillar, ring):
+        extraction.anchor_pillar = ""
+    if extraction.grid_easting_pillar and not _pillar_id_in_ring(
+        extraction.grid_easting_pillar, ring
+    ):
+        extraction.grid_easting_pillar = ""
+    if extraction.grid_northing_pillar and not _pillar_id_in_ring(
+        extraction.grid_northing_pillar, ring
+    ):
+        extraction.grid_northing_pillar = ""
 
 
 def _prefer_labelled_easting(raw: str, eastings: List[float]) -> Optional[float]:
@@ -1248,6 +1997,240 @@ def _compute_relative_traverse_vertices(
     return pts
 
 
+def traverse_misclosure_metrics(
+    legs: Sequence[SurveyTraverseLeg],
+) -> Dict[str, float]:
+    """Return misclosure and perimeter for a closed traverse (last → first implied)."""
+    ce = cn = peri = 0.0
+    for leg in legs:
+        try:
+            dist = float(leg.distance_m)
+            bdeg = float(leg.bearing_deg) + float(leg.bearing_min) / 60.0
+        except Exception:
+            continue
+        peri += dist
+        br = math.radians(bdeg)
+        ce += dist * math.sin(br)
+        cn += dist * math.cos(br)
+    mis = float(math.hypot(ce, cn))
+    ratio = (peri / mis) if mis > 1e-9 else float("inf")
+    return {
+        "misclosure_e_m": float(ce),
+        "misclosure_n_m": float(cn),
+        "misclosure_m": mis,
+        "perimeter_m": float(peri),
+        "closure_ratio": float(ratio),
+    }
+
+
+def _shoelace_area_sq_m(pts: Sequence[Dict[str, float]]) -> Optional[float]:
+    if len(pts) < 3:
+        return None
+    area = 0.0
+    n = len(pts)
+    for i in range(n):
+        j = (i + 1) % n
+        area += float(pts[i]["e"]) * float(pts[j]["n"])
+        area -= float(pts[j]["e"]) * float(pts[i]["n"])
+    return abs(area) * 0.5
+
+
+def _segments_properly_cross(
+    p1: Dict[str, float],
+    p2: Dict[str, float],
+    p3: Dict[str, float],
+    p4: Dict[str, float],
+) -> bool:
+    """True when segment p1p2 crosses p3p4 (strict; shared endpoints do not count)."""
+
+    def orient(a: Dict[str, float], b: Dict[str, float], c: Dict[str, float]) -> float:
+        return (float(b["e"]) - float(a["e"])) * (float(c["n"]) - float(a["n"])) - (
+            float(b["n"]) - float(a["n"])
+        ) * (float(c["e"]) - float(a["e"]))
+
+    d1 = orient(p3, p4, p1)
+    d2 = orient(p3, p4, p2)
+    d3 = orient(p1, p2, p3)
+    d4 = orient(p1, p2, p4)
+    return ((d1 > 0.0) != (d2 > 0.0)) and ((d3 > 0.0) != (d4 > 0.0))
+
+
+def _polygon_is_simple(pts: Sequence[Dict[str, float]]) -> bool:
+    """True when a closed ring has no self-intersections.
+
+    A cadastral parcel boundary is by definition a simple polygon. Misclosure cannot
+    detect a violation: the closing error is a vector sum, so it is identical for
+    every ordering of the same legs and stays near zero even when the sides are
+    paired to the wrong corners and the outline crosses itself.
+    """
+    n = len(pts)
+    if n < 4:
+        return True
+    for i in range(n):
+        a1, a2 = pts[i], pts[(i + 1) % n]
+        for j in range(i + 1, n):
+            if j == i or j == i + 1 or (i == 0 and j == n - 1):
+                continue
+            if _segments_properly_cross(a1, a2, pts[j], pts[(j + 1) % n]):
+                return False
+    return True
+
+
+def _angular_diff_deg(a: float, b: float) -> float:
+    d = abs((float(a) - float(b)) % 360.0)
+    return d if d <= 180.0 else 360.0 - d
+
+
+def _pdf_edge_bearing_deg(ax: float, ay: float, bx: float, by: float) -> float:
+    """Bearing from North clockwise for a PDF page edge (Y flips downward)."""
+    dx = float(bx) - float(ax)
+    dy = float(ay) - float(by)  # invert PDF Y → north-up
+    return float(math.degrees(math.atan2(dx, dy)) % 360.0)
+
+
+def _assign_unique_edge_labels(
+    edges: Sequence[Dict[str, Any]],
+    labels: Sequence[Any],
+    *,
+    max_dist: float,
+    score_fn: Callable[[Dict[str, Any], Any, float], float],
+) -> Dict[int, Any]:
+    """
+    One-to-one edge→label assignment.
+
+    Prefer lower scores; each edge and each label may be used at most once.
+    """
+    candidates: List[Tuple[float, int, int, Any]] = []
+    for ei, edge in enumerate(edges):
+        mx, my = float(edge["mx"]), float(edge["my"])
+        for li, lab in enumerate(labels):
+            cx, cy = float(lab[0]), float(lab[1])
+            d = math.hypot(cx - mx, cy - my)
+            if d > max_dist:
+                continue
+            score = float(score_fn(edge, lab, d))
+            candidates.append((score, ei, li, lab))
+    candidates.sort(key=lambda t: t[0])
+    used_edges: set[int] = set()
+    used_labels: set[int] = set()
+    assigned: Dict[int, Any] = {}
+    for score, ei, li, lab in candidates:
+        if ei in used_edges or li in used_labels:
+            continue
+        used_edges.add(ei)
+        used_labels.add(li)
+        assigned[ei] = lab
+    return assigned
+
+
+# PDF-derived cadastral plans: reject gross open traverses before CAD generation.
+_MAX_PDF_MISCLOSURE_ABS_M = 0.25
+_MIN_PDF_CLOSURE_RATIO = 200.0  # perimeter / misclosure
+_MAX_PRINTED_AREA_REL_ERR = 0.18
+# A printed label must describe the side the plan actually draws. Pillar label boxes
+# sit slightly off the true peg, so allow real slack — but a reading tens of degrees
+# from the drawn side, or one implying a different drawing scale, is a mis-assignment.
+_MAX_LABEL_EDGE_BEARING_DEV_DEG = 30.0
+_MAX_EDGE_SCALE_DEV = 0.35
+
+
+def _extraction_side_assignment_issues(
+    pillars: Sequence[str],
+    legs: Sequence[SurveyTraverseLeg],
+) -> List[str]:
+    issues: List[str] = []
+    if len(legs) < 3:
+        return issues
+    if len(legs) != len(pillars):
+        # Fewer labels than sides: unlabeled corners. Extra labels vs sides is wrong.
+        if len(pillars) > len(legs):
+            issues.append(
+                f"pillar count ({len(pillars)}) exceeds traverse legs ({len(legs)})"
+            )
+        return issues
+    pairs: List[Tuple[str, str]] = []
+    for i, leg in enumerate(legs):
+        a = _normalize_pillar_id(leg.from_pillar) or pillars[i]
+        b = _normalize_pillar_id(leg.to_pillar) or pillars[(i + 1) % len(pillars)]
+        pairs.append((a, b))
+        expect_a = pillars[i]
+        expect_b = pillars[(i + 1) % len(pillars)]
+        if a and a != expect_a:
+            issues.append(f"leg {i + 1} from_pillar {a} breaks pillar order (expected {expect_a})")
+        if b and b != expect_b:
+            issues.append(f"leg {i + 1} to_pillar {b} breaks pillar order (expected {expect_b})")
+    if len(set(pairs)) != len(pairs):
+        issues.append("duplicate traverse side assignments")
+    # Continuity around the ring
+    for i in range(len(pairs)):
+        if pairs[i][1] != pairs[(i + 1) % len(pairs)][0]:
+            issues.append("traverse legs are not continuous around the parcel")
+            break
+    return issues
+
+
+def validate_extraction_topology(
+    extraction: SurveyPlanExtraction,
+) -> List[str]:
+    """Strict topology/closure/area checks for safe PDF→CAD replot."""
+    issues: List[str] = []
+    pillars = _filter_plausible_pillars(extraction.pillar_numbers)
+    legs = _filter_plausible_legs(extraction.traverse_legs)
+    issues.extend(_extraction_side_assignment_issues(pillars, legs))
+    if len(legs) < 3:
+        return issues
+
+    metrics = traverse_misclosure_metrics(legs)
+    mis = float(metrics["misclosure_m"])
+    peri = float(metrics["perimeter_m"])
+    ratio = float(metrics["closure_ratio"])
+    if peri > 1e-6 and (
+        mis > _MAX_PDF_MISCLOSURE_ABS_M
+        or (mis > 1e-6 and ratio < _MIN_PDF_CLOSURE_RATIO)
+    ):
+        issues.append(
+            f"traverse misclosure {mis:.3f} m over {peri:.1f} m perimeter "
+            f"(1:{ratio:.1f}; need ≤{_MAX_PDF_MISCLOSURE_ABS_M:.2f} m and ≥1:{_MIN_PDF_CLOSURE_RATIO:.0f})"
+        )
+
+    verts = _compute_relative_traverse_vertices(pillars, legs)
+    if verts is None:
+        # Force-close so shape can still be inspected when misclosure blocked the drop.
+        ce = cn = 0.0
+        verts = [{"e": 0.0, "n": 0.0}]
+        for leg in legs:
+            bdeg = float(leg.bearing_deg) + float(leg.bearing_min) / 60.0
+            br = math.radians(bdeg)
+            ce += float(leg.distance_m) * math.sin(br)
+            cn += float(leg.distance_m) * math.cos(br)
+            verts.append({"e": float(ce), "n": float(cn)})
+        if len(verts) == len(legs) + 1:
+            verts = verts[:-1]
+
+    # Shape check. This is independent of closure, which is a vector sum and so is
+    # blind to the order the sides are joined in: a traverse whose labels were paired
+    # to the wrong corners can close to millimetres and still describe a crossed
+    # outline that is not a parcel at all.
+    if verts and len(verts) >= 4 and not _polygon_is_simple(verts):
+        issues.append(
+            "traverse boundary crosses itself — the parcel outline is not a simple "
+            "polygon, so sides are paired to the wrong corners"
+        )
+
+    if extraction.area_sq_m is not None and extraction.area_sq_m > 1.0:
+        if verts and len(verts) >= 3:
+            computed = _shoelace_area_sq_m(verts)
+            printed = float(extraction.area_sq_m)
+            if computed is not None and printed > 1.0:
+                rel = abs(computed - printed) / printed
+                if rel > _MAX_PRINTED_AREA_REL_ERR:
+                    issues.append(
+                        f"computed area {computed:.1f} sq m disagrees with printed "
+                        f"{printed:.1f} sq m ({rel:.0%} relative error)"
+                    )
+    return issues
+
+
 def _is_plausible_pillar_id(pillar: str) -> bool:
     """
     Lightweight gate for PDF/layout pillar candidates.
@@ -1255,6 +2238,8 @@ def _is_plausible_pillar_id(pillar: str) -> bool:
     Accepts classic SC/SP (and RV/RP) labels with digit pegs up to 9 digits, and
     alphanumeric peg tokens such as AS3459RP / OA94567KL.
     """
+    if is_incomplete_printed_pillar_label(pillar or ""):
+        return False
     split = split_cadastral_pillar_label(pillar or "")
     if not split:
         # Fall back for already-normalized ids
@@ -1316,6 +2301,37 @@ def _filter_plausible_legs(legs: Sequence[SurveyTraverseLeg]) -> List[SurveyTrav
     return [lg for lg in legs if _is_plausible_boundary_leg(lg)]
 
 
+def _grid_origin_from_en_labels(
+    e_labels: Sequence[tuple[float, float, float]],
+    n_labels: Sequence[tuple[float, float, float]],
+    positions: Dict[str, tuple[float, float]],
+    pillars: Sequence[str],
+) -> tuple[Optional[float], Optional[float], str]:
+    """
+    Station the printed easting/northing at the peg the grid arrows point to.
+
+    On a north-up cadastral sheet the easting text sits on a north–south grid line
+    (constant page X) and the northing text on an east–west line (constant page Y).
+    Those two lines meet at the origin station — not at the lowest pillar number,
+    and not at whichever peg happens to be first in reading order.
+    """
+    if not e_labels or not n_labels or not positions:
+        return None, None, ""
+    best: Optional[tuple[float, float, float, str]] = None
+    for ev, ex, _ey in e_labels:
+        for nv, _nx, ny in n_labels:
+            ix, iy = float(ex), float(ny)
+            pillar = _nearest_pillar_to_point(positions, (ix, iy), max_dist=280.0)
+            if not pillar:
+                continue
+            d = math.hypot(positions[pillar][0] - ix, positions[pillar][1] - iy)
+            if best is None or d < best[0]:
+                best = (d, float(ev), float(nv), pillar)
+    if best is None:
+        return None, None, ""
+    return best[1], best[2], best[3]
+
+
 def _match_grid_coordinate_block(
     e_labels: Sequence[tuple[float, float, float]],
     n_labels: Sequence[tuple[float, float, float]],
@@ -1325,19 +2341,16 @@ def _match_grid_coordinate_block(
     anchor_hint: str = "",
 ) -> tuple[Optional[float], Optional[float], str]:
     """
-    When E and N labels sit together in the coordinate block, assign both to the same pillar.
-    Prefer the LLM/anchor pillar hint when supplied.
+    Bind printed E/N to the origin station drawn on the sheet.
+
+    A leftover first-in-list / lowest-number hint must not override page geometry:
+    that is how a plan whose arrows meet at SC/CJ 2439 was hung on SC/CJ 2436.
     """
-    if anchor_hint and _pillar_list_index(pillars, anchor_hint) is not None:
-        best_e = best_n = None
-        for ev, _ex, _ey in e_labels:
-            best_e = ev
-            break
-        for nv, _nx, _ny in n_labels:
-            best_n = nv
-            break
-        if best_e is not None and best_n is not None:
-            return best_e, best_n, anchor_hint
+    axis_e, axis_n, axis_pillar = _grid_origin_from_en_labels(
+        e_labels, n_labels, positions, pillars
+    )
+    if axis_e is not None and axis_n is not None and axis_pillar:
+        return axis_e, axis_n, axis_pillar
 
     best_pair: Optional[tuple[float, float, float, float, float]] = None
     for ev, ex, ey in e_labels:
@@ -1355,8 +2368,15 @@ def _match_grid_coordinate_block(
                 best_pair = (score, ev, nv, cx, cy)
     if best_pair:
         _, ev, nv, cx, cy = best_pair
-        pillar = _nearest_pillar_to_point(positions, (cx, cy), max_dist=220.0) or anchor_hint
-        return ev, nv, pillar or anchor_hint
+        pillar = _nearest_pillar_to_point(positions, (cx, cy), max_dist=220.0) or ""
+        if pillar:
+            return ev, nv, pillar
+
+    if anchor_hint and _pillar_list_index(pillars, anchor_hint) is not None:
+        best_e = e_labels[0][0] if e_labels else None
+        best_n = n_labels[0][0] if n_labels else None
+        if best_e is not None and best_n is not None:
+            return best_e, best_n, anchor_hint
     return None, None, ""
 
 
@@ -1377,8 +2397,27 @@ def _compute_absolute_parcel_coordinates(
 
     pts = [dict(p) for p in rel]
 
-    # Full E+N at one pillar (common on Nigerian plans) — highest priority.
+    i_e = _pillar_list_index(pillars, grid_e_pillar) if grid_e_pillar else None
+    i_n = _pillar_list_index(pillars, grid_n_pillar) if grid_n_pillar else None
+
+    # Page-derived grid station wins over a leftover first-in-list / lowest-number
+    # anchor: that hint is not evidence of where the arrows point.
+    if (i_e is not None and grid_e is not None) or (i_n is not None and grid_n is not None):
+        de = 0.0
+        dn = 0.0
+        if i_e is not None and grid_e is not None:
+            de = float(grid_e) - float(pts[i_e]["e"])
+        if i_n is not None and grid_n is not None:
+            dn = float(grid_n) - float(pts[i_n]["n"])
+        for p in pts:
+            p["e"] = float(p["e"]) + de
+            p["n"] = float(p["n"]) + dn
+        return pts
+
+    # Fallback only when the sheet did not name a grid station.
     anchor_p = (extraction.anchor_pillar or "").strip()
+    if anchor_p and not _pillar_id_in_ring(anchor_p, pillars):
+        anchor_p = ""
     anchor_e = extraction.anchor_easting
     anchor_n = extraction.anchor_northing
     if anchor_p and anchor_e is not None and anchor_n is not None:
@@ -1390,22 +2429,6 @@ def _compute_absolute_parcel_coordinates(
                 p["e"] = float(p["e"]) + de
                 p["n"] = float(p["n"]) + dn
             return pts
-
-    i_e = _pillar_list_index(pillars, grid_e_pillar) if grid_e_pillar else None
-    i_n = _pillar_list_index(pillars, grid_n_pillar) if grid_n_pillar else None
-
-    if i_e is not None and grid_e is not None:
-        de = float(grid_e) - float(pts[i_e]["e"])
-        dn = 0.0
-        if i_n is not None and grid_n is not None and i_n == i_e:
-            dn = float(grid_n) - float(pts[i_n]["n"])
-        for p in pts:
-            p["e"] = float(p["e"]) + de
-            p["n"] = float(p["n"]) + dn
-    elif i_n is not None and grid_n is not None:
-        dn = float(grid_n) - float(pts[i_n]["n"])
-        for p in pts:
-            p["n"] = float(p["n"]) + dn
 
     return pts
 
@@ -1435,6 +2458,7 @@ def apply_pdf_grid_coordinates(
     pillars = extraction.pillar_numbers
     if len(pillars) < 3 or len(extraction.traverse_legs) < 3:
         return extraction
+    _drop_stale_anchor_pillars(extraction)
 
     grid_e: Optional[float] = None
     grid_n: Optional[float] = None
@@ -1566,11 +2590,17 @@ def apply_pdf_grid_coordinates(
     extraction.grid_northing_pillar = grid_n_pillar or extraction.grid_northing_pillar
     extraction.absolute_parcel_coords = abs_coords
 
-    primary_idx = _pick_primary_pillar_index(abs_coords)
-    primary = abs_coords[primary_idx]
+    origin_idx: Optional[int] = None
+    if grid_e_pillar and grid_n_pillar and grid_e_pillar == grid_n_pillar:
+        origin_idx = _pillar_list_index(pillars, grid_e_pillar)
+    if origin_idx is None:
+        origin_idx = _pick_primary_pillar_index(abs_coords)
+    primary = abs_coords[origin_idx]
     extraction.anchor_easting = float(primary["e"])
     extraction.anchor_northing = float(primary["n"])
-    extraction.anchor_pillar = pillars[primary_idx] if primary_idx < len(pillars) else extraction.anchor_pillar
+    extraction.anchor_pillar = (
+        pillars[origin_idx] if origin_idx < len(pillars) else extraction.anchor_pillar
+    )
 
     return extraction
 
@@ -1978,6 +3008,7 @@ def finalize_survey_extraction(
     llm: Any = None,
     run_with_timeout: Optional[Callable[..., Any]] = None,
     pre_rendered_images: Optional[List[str]] = None,
+    user_notes: str = "",
 ) -> SurveyPlanExtraction:
     """Fill or correct anchor coordinates from all available PDF text sources."""
     combined = f"{layout_text}\n{plain_text}"
@@ -2029,6 +3060,16 @@ def finalize_survey_extraction(
         extraction.confidence = max(float(extraction.confidence or 0), 0.65)
 
     extraction = enrich_extraction_coordinates(extraction, combined)
+    # Strip invented IDs after coordinates are computed from the traverse ring.
+    extraction = apply_attested_pillar_filter(
+        extraction,
+        pdf_path=pdf_path,
+        combined_text=combined,
+        user_notes=user_notes,
+    )
+    extraction = restore_incomplete_printed_pillar_labels(
+        extraction, combined_text=combined
+    )
 
     return prepare_extraction_for_cadastral(
         extraction,
@@ -2273,6 +3314,97 @@ def _pillar_label_positions(page: Any, pillars: Sequence[str]) -> Dict[str, tupl
     return positions
 
 
+def _pdf_text_line_directions(page: Any) -> List[tuple[tuple[float, float, float, float], tuple[float, float]]]:
+    """Writing direction of every text line, so a label's baseline is known."""
+    out: List[tuple[tuple[float, float, float, float], tuple[float, float]]] = []
+    try:
+        data = page.get_text("dict") or {}
+    except Exception:
+        return out
+    for block in data.get("blocks", []) or []:
+        for line in block.get("lines", []) or []:
+            bbox = line.get("bbox") or None
+            direction = line.get("dir") or (1.0, 0.0)
+            if not bbox or len(bbox) < 4:
+                continue
+            try:
+                out.append(
+                    (
+                        (float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])),
+                        (float(direction[0]), float(direction[1])),
+                    )
+                )
+            except Exception:
+                continue
+    return out
+
+
+def _direction_at_point(
+    line_dirs: Sequence[tuple[tuple[float, float, float, float], tuple[float, float]]],
+    pt: tuple[float, float],
+) -> tuple[float, float]:
+    """Writing direction of the text line covering (or nearest to) a point."""
+    best: tuple[float, float] = (1.0, 0.0)
+    best_d = 1e18
+    for (x0, y0, x1, y1), direction in line_dirs:
+        if x0 - 1.0 <= pt[0] <= x1 + 1.0 and y0 - 1.0 <= pt[1] <= y1 + 1.0:
+            return direction
+        cx, cy = (x0 + x1) / 2.0, (y0 + y1) / 2.0
+        d = math.hypot(cx - pt[0], cy - pt[1])
+        if d < best_d:
+            best_d = d
+            best = direction
+    return best if best_d <= 40.0 else (1.0, 0.0)
+
+
+# A road name printed along its corridor may be broken across lines ("ACCESS" /
+# "ROAD"), and a phrase search reports one rectangle per line. Fragments of one
+# title sit on that title's own baseline, so they share a writing direction and the
+# gap between them runs along it. Two genuinely different roads meeting at a corner
+# each read along their own corridor, so their directions disagree and they survive.
+_MAX_LABEL_FRAGMENT_GAP_PT = 220.0
+_MAX_LABEL_FRAGMENT_OFFSET_PT = 14.0
+_MAX_LABEL_FRAGMENT_ANGLE_DEG = 12.0
+
+
+def _merge_collinear_label_fragments(
+    items: Sequence[tuple[str, tuple[float, float], tuple[float, float]]],
+) -> List[tuple[str, tuple[float, float]]]:
+    """Join label fragments that lie along one shared baseline into single labels."""
+    merged: List[tuple[str, List[tuple[float, float]], tuple[float, float]]] = []
+    for title, pt, direction in items:
+        dlen = math.hypot(direction[0], direction[1]) or 1.0
+        ux, uy = direction[0] / dlen, direction[1] / dlen
+        placed = False
+        for group in merged:
+            g_title, g_pts, (gux, guy) = group
+            if g_title != title:
+                continue
+            if _angular_diff_deg(
+                math.degrees(math.atan2(uy, ux)), math.degrees(math.atan2(guy, gux))
+            ) > _MAX_LABEL_FRAGMENT_ANGLE_DEG:
+                continue
+            for gp in g_pts:
+                dx, dy = pt[0] - gp[0], pt[1] - gp[1]
+                along = abs(dx * gux + dy * guy)
+                across = abs(-dx * guy + dy * gux)
+                if along <= _MAX_LABEL_FRAGMENT_GAP_PT and across <= _MAX_LABEL_FRAGMENT_OFFSET_PT:
+                    g_pts.append(pt)
+                    placed = True
+                    break
+            if placed:
+                break
+        if not placed:
+            merged.append((title, [pt], (ux, uy)))
+
+    out: List[tuple[str, tuple[float, float]]] = []
+    for title, pts, _direction in merged:
+        cx = sum(p[0] for p in pts) / len(pts)
+        cy = sum(p[1] for p in pts) / len(pts)
+        out.append((title, (cx, cy)))
+    return out
+
+
 def _extract_all_access_road_labels_from_pdf(page: Any) -> List[tuple[str, tuple[float, float]]]:
     """
     Find every printed access-road / ACCESS CLOSE label and its centre on the plan page.
@@ -2297,6 +3429,8 @@ def _extract_all_access_road_labels_from_pdf(page: Any) -> List[tuple[str, tuple
         ("ACCESS CLOSE", "ACCESS CLOSE"),
         ("ACCESS/CLOSE", "ACCESS CLOSE"),
     )
+    line_dirs = _pdf_text_line_directions(page)
+    fragments: List[tuple[str, tuple[float, float], tuple[float, float]]] = []
     for phrase, title in phrase_map:
         try:
             rects = page.search_for(phrase) or []
@@ -2307,8 +3441,11 @@ def _extract_all_access_road_labels_from_pdf(page: Any) -> List[tuple[str, tuple
                 (float(r.x0) + float(r.x1)) / 2.0,
                 (float(r.y0) + float(r.y1)) / 2.0,
             )
-            if _is_new_cluster(pt):
-                found.append((title, pt))
+            fragments.append((title, pt, _direction_at_point(line_dirs, pt)))
+
+    for title, pt in _merge_collinear_label_fragments(fragments):
+        if _is_new_cluster(pt):
+            found.append((title, pt))
 
     # Vertical / split-word labels: ACCESS above ROAD (or CLOSE) on the same column
     try:
@@ -3006,34 +4143,47 @@ def analyze_pdf_access_roads(
                     )
 
         if not specs and llm is not None and run_with_timeout is not None:
-            llm_roads = resolve_access_roads_with_llm(
-                pdf_path,
-                extraction,
-                llm=llm,
-                run_with_timeout=run_with_timeout,
-                pre_rendered_images=pre_rendered_images,
-            )
-            for pair, title, llm_width in llm_roads:
-                key = _road_pair_key(pair)
-                if key in used_pairs:
-                    continue
-                used_pairs.add(key)
-                width_m = (
-                    float(llm_width)
-                    if llm_width and llm_width > 0
-                    else estimate_road_width_from_pdf(
-                        pdf_path,
-                        scale_denom=extraction.scale_denom,
-                        reference_leg_m=_leg_length_for_pair(extraction, pair),
-                    )
+            if labels:
+                # Labels present but width/side incomplete — do not spend LLM budget guessing.
+                note = "Access road label found; width not printed on plan"
+                if note not in (extraction.notes or ""):
+                    extraction.notes = f"{extraction.notes or ''} | {note}".strip(" |")
+                logger.info("Skipping access-road LLM fallback (%s)", note)
+            else:
+                llm_roads = resolve_access_roads_with_llm(
+                    pdf_path,
+                    extraction,
+                    llm=llm,
+                    run_with_timeout=run_with_timeout,
+                    pre_rendered_images=pre_rendered_images,
                 )
-                norm_title = normalize_access_road_title(title)
-                if not primary_title:
-                    primary_title = norm_title
-                specs.append(_format_access_road_spec(width_m, pair, title=norm_title))
+                for pair, title, llm_width in llm_roads:
+                    key = _road_pair_key(pair)
+                    if key in used_pairs:
+                        continue
+                    used_pairs.add(key)
+                    width_m = (
+                        float(llm_width)
+                        if llm_width and llm_width > 0
+                        else estimate_road_width_from_pdf(
+                            pdf_path,
+                            scale_denom=extraction.scale_denom,
+                            reference_leg_m=_leg_length_for_pair(extraction, pair),
+                        )
+                    )
+                    norm_title = normalize_access_road_title(title)
+                    if not primary_title:
+                        primary_title = norm_title
+                    specs.append(_format_access_road_spec(width_m, pair, title=norm_title))
 
         doc.close()
         if not specs:
+            if labels:
+                if not primary_title:
+                    primary_title = normalize_access_road_title(labels[0][0])
+                return [], normalize_access_road_title(
+                    primary_title or extract_access_road_title_from_text(text) or "ACCESS    ROAD"
+                )
             return None
         if not primary_title:
             primary_title = extract_access_road_title_from_text(text) or "ACCESS    ROAD"
@@ -3327,7 +4477,13 @@ def infer_access_roads_from_text(
         )
         llm_title = ""
         llm_width: Optional[float] = None
-        if not pair and pdf_path and llm is not None and run_with_timeout is not None:
+        if (
+            not pair
+            and pdf_path
+            and llm is not None
+            and run_with_timeout is not None
+            and not all_labels
+        ):
             llm_result = resolve_access_road_with_llm(
                 pdf_path,
                 extraction,
@@ -3336,6 +4492,10 @@ def infer_access_roads_from_text(
             )
             if llm_result:
                 pair, llm_title, llm_width = llm_result
+        elif not pair and all_labels:
+            note = "Access road label found; width not printed on plan"
+            if note not in (extraction.notes or ""):
+                extraction.notes = f"{extraction.notes or ''} | {note}".strip(" |")
         if pair:
             ref_leg_m = _leg_length_for_pair(extraction, pair)
             width_m = (
@@ -3390,6 +4550,9 @@ def prepare_extraction_for_cadastral(
     )
     extraction.surveyor_address = sanitize_metadata_field(extraction.surveyor_address, max_len=120)
     extraction.plan_number = normalize_plan_number(extraction.plan_number)
+    if not _is_plausible_plan_number(extraction.plan_number):
+        extraction.plan_number = ""
+    extraction = _fill_extraction_from_printed_text(extraction, combined_text)
     if not extraction.scale_denom:
         extraction.scale_denom = extract_scale_denom_from_text(combined_text)
 
@@ -3531,6 +4694,101 @@ def extract_plain_text_from_pdf(pdf_path: str, *, max_pages: int = 3) -> str:
     return "\n".join(parts)
 
 
+def _fill_extraction_from_printed_text(
+    extraction: SurveyPlanExtraction,
+    text: str,
+) -> SurveyPlanExtraction:
+    """Fill title-block gaps from printed PDF/DWG text. Never invent; never clobber a good value."""
+    raw = text or ""
+    if not raw.strip():
+        return extraction
+    fields = parse_dwg_title_block_fields(raw)
+
+    buyer = (fields.get("buyer_name") or "").strip()
+    buyer = re.sub(r"^(?:OF\s+)+", "", buyer, flags=re.IGNORECASE).strip(" :-")
+    cur_buyer = (extraction.buyer_name or "").strip()
+    if buyer and (not cur_buyer or (len(buyer) > len(cur_buyer) + 3 and " AND " in buyer.upper())):
+        extraction.buyer_name = sanitize_metadata_field(buyer, max_len=140)
+
+    if not (extraction.location or "").strip() and fields.get("location"):
+        extraction.location = sanitize_metadata_field(fields["location"], max_len=200)
+    if fields.get("lga"):
+        cand_lga = sanitize_metadata_field(
+            normalize_lga_name(fields["lga"]) or fields["lga"], max_len=80
+        )
+        if cand_lga and not re.search(
+            r"\b(?:PLAN|SHEWING|LANDED|PROPERTY|PAGE|SCALE|ORIGIN)\b",
+            cand_lga,
+            flags=re.IGNORECASE,
+        ):
+            if not (extraction.lga or "").strip() or re.search(
+                r"\b(?:PLAN|SHEWING|LANDED|PROPERTY|PAGE)\b",
+                extraction.lga or "",
+                flags=re.IGNORECASE,
+            ):
+                extraction.lga = cand_lga
+    if not (extraction.state or "").strip() and fields.get("state"):
+        extraction.state = sanitize_metadata_field(fields["state"], max_len=40)
+    if not (extraction.origin_crs or "").strip() and fields.get("origin_crs"):
+        extraction.origin_crs = sanitize_metadata_field(fields["origin_crs"], max_len=60)
+    if extraction.scale_denom is None and fields.get("scale_denom"):
+        try:
+            extraction.scale_denom = int(str(fields["scale_denom"]).split(":")[-1].strip())
+        except Exception:
+            pass
+    if extraction.area_sq_m is None:
+        area = fields.get("area_sq_m")
+        if area:
+            try:
+                extraction.area_sq_m = float(str(area).replace(",", ""))
+            except Exception:
+                extraction.area_sq_m = _extract_area_sq_m_from_dwg_text(raw)
+        else:
+            extraction.area_sq_m = _extract_area_sq_m_from_dwg_text(raw)
+
+    plan_no = extract_plan_number_from_plan_text(raw)
+    if plan_no and (
+        not _is_plausible_plan_number(extraction.plan_number)
+        or not (extraction.plan_number or "").strip()
+    ):
+        extraction.plan_number = plan_no
+
+    cert = (fields.get("certification_date") or "").strip() or extract_certification_date_from_plan_text(raw)
+    if cert and not (extraction.certification_date or "").strip():
+        extraction.certification_date = sanitize_metadata_field(cert, max_len=40)
+
+    if not (extraction.surveyor_address or "").strip():
+        addr = extract_surveyor_address_from_plan_text(raw)
+        if addr:
+            extraction.surveyor_address = addr
+
+    if not (extraction.state or "").strip():
+        m_state = re.search(
+            r"(?:^|\n)\s*([A-Z][A-Z]*(?:\s+[A-Z]+){0,3})\s+STATE\b",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if m_state:
+            extraction.state = sanitize_metadata_field(m_state.group(1).strip(), max_len=40)
+
+    return extraction
+
+
+def _origin_crs_from_layout_text(upper: str, field_getter) -> str:
+    """Use an explicit UTM zone from the sheet; never invent Zone 32 from a bare 'UTM' mention."""
+    labeled = ""
+    try:
+        labeled = str(field_getter("UTM") or "").strip()
+    except Exception:
+        labeled = ""
+    if labeled and re.search(r"ZONE\s*\d{1,2}|WGS|MINNA|EPSG", labeled, re.I):
+        return labeled
+    m = re.search(r"UTM[^\n]{0,12}ZONE[ \t]*(\d{1,2})[ \t]*([NS])?", upper or "")
+    if m:
+        return f"UTM ZONE {int(m.group(1))}{m.group(2) or 'N'}"
+    return ""
+
+
 def extract_heuristics_from_layout_text(layout_text: str) -> SurveyPlanExtraction:
     """
     Regex/layout fallback when LLM extraction is weak — common Nigerian plan PDFs.
@@ -3649,11 +4907,6 @@ def extract_heuristics_from_layout_text(layout_text: str) -> SurveyPlanExtractio
 
     location = extract_location_from_text(text) or _field("LOCATION")
     scale_denom = extract_scale_denom_from_text(text)
-    plan_m = re.search(
-        r"(?:PLAN\s*(?:NO\.?|NUMBER)\s*[:=]?\s*)([A-Z0-9/\-]+)",
-        upper,
-        flags=re.IGNORECASE,
-    )
 
     surveyor = _field("SURV") or _field("SURVEYOR")
     if not surveyor:
@@ -3673,24 +4926,25 @@ def extract_heuristics_from_layout_text(layout_text: str) -> SurveyPlanExtractio
     if pillar_list:
         conf += 0.1
 
-    return SurveyPlanExtraction(
+    extraction = SurveyPlanExtraction(
         buyer_name=buyer,
         location=location,
         lga=_field("LOCAL GOVERNMENT AREA") or _field("LGA"),
         state=_field("STATE"),
-        origin_crs=_field("UTM") or ("UTM ZONE 32N" if "UTM" in upper or "ZONE 32" in upper else ""),
-        plan_number=normalize_plan_number(plan_m.group(1).strip() if plan_m else _field("PLAN NO")),
+        origin_crs=_origin_crs_from_layout_text(upper, _field),
+        plan_number=extract_plan_number_from_plan_text(text),
         surveyor_name=ensure_surveyor_professional_title(surveyor) if surveyor else "",
         scale_denom=scale_denom,
         pillar_numbers=pillar_list,
         anchor_easting=anchor_e,
         anchor_northing=anchor_n,
-        anchor_pillar=pillar_list[0] if pillar_list else "",
+        anchor_pillar="",
         traverse_legs=legs,
         confidence=min(conf, 0.85),
         source="layout_heuristic",
         notes="Heuristic extraction from layout-ordered PDF text",
     )
+    return _fill_extraction_from_printed_text(extraction, text)
 
 
 def merge_survey_extractions(
@@ -3805,6 +5059,46 @@ def render_pdf_pages_base64(
     return images
 
 
+def render_pdf_pages_to_files(
+    pdf_path: str,
+    dest_dir,
+    *,
+    max_pages: int = 8,
+    dpi: int = 160,
+) -> List[str]:
+    """Rasterize PDF pages to PNG files for generic (non-cadastral) vision OCR."""
+    path = Path(pdf_path).resolve()
+    dest = Path(dest_dir)
+    if not path.exists():
+        return []
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return []
+    out: List[str] = []
+    try:
+        import fitz  # PyMuPDF
+
+        doc = fitz.open(str(path))
+        try:
+            zoom = float(dpi) / 72.0
+            mat = fitz.Matrix(zoom, zoom)
+            n = min(len(doc), max(1, int(max_pages or 1)))
+            stem = re.sub(r"[^\w\-]+", "_", path.stem)[:40] or "page"
+            for i in range(n):
+                pix = doc.load_page(i).get_pixmap(matrix=mat, alpha=False)
+                dest_file = dest / f"{stem}_p{i + 1}.png"
+                pix.save(str(dest_file))
+                out.append(str(dest_file.resolve()))
+        finally:
+            doc.close()
+    except ImportError:
+        logger.info("PyMuPDF not installed; cannot rasterize PDF pages for OCR")
+    except Exception as exc:
+        logger.warning("PDF page file render failed for %s: %s", pdf_path, exc)
+    return out
+
+
 def _coerce_legs(raw: Any) -> List[SurveyTraverseLeg]:
     legs: List[SurveyTraverseLeg] = []
     if not isinstance(raw, list):
@@ -3909,12 +5203,76 @@ def _pdf_bearing_labels(page: Any) -> List[tuple[float, float, int, int]]:
     return hits
 
 
+def _legs_agreeing_with_drawn_edges(
+    candidates: Sequence[Tuple[Dict[str, Any], SurveyTraverseLeg]],
+) -> List[SurveyTraverseLeg]:
+    """Keep only legs whose label agrees with the side the PDF actually draws.
+
+    The plan is two independent records of the same parcel: the drawn outline fixes
+    each side's direction and relative length, while the printed text supplies the
+    precise values. Matching a label to a side by proximity alone can pair a reading
+    with the wrong side, and the result is undetectable downstream — the closing
+    error is a vector sum, so a wrong pairing still sums to nearly zero.
+
+    Two cross-checks against the drawing catch it: a label must point along the side
+    it was matched to, and every side must imply one common drawing scale.
+    """
+    if not candidates:
+        return []
+    ratios: List[float] = []
+    for edge, leg in candidates:
+        len_pt = float(edge.get("len_pt") or 0.0)
+        if len_pt > 1e-6:
+            ratios.append(float(leg.distance_m) / len_pt)
+    median_scale = 0.0
+    if ratios:
+        ordered = sorted(ratios)
+        mid = len(ordered) // 2
+        median_scale = (
+            ordered[mid]
+            if len(ordered) % 2
+            else (ordered[mid - 1] + ordered[mid]) / 2.0
+        )
+
+    kept: List[SurveyTraverseLeg] = []
+    for edge, leg in candidates:
+        label_brg = float(leg.bearing_deg) + float(leg.bearing_min) / 60.0
+        drawn_brg = float(edge.get("bearing_hint") or 0.0)
+        dev = _angular_diff_deg(label_brg, drawn_brg)
+        if dev > _MAX_LABEL_EDGE_BEARING_DEV_DEG:
+            logger.info(
+                "PDF leg %s->%s rejected: label bearing %.1f differs %.1f deg from drawn side",
+                leg.from_pillar,
+                leg.to_pillar,
+                label_brg,
+                dev,
+            )
+            continue
+        len_pt = float(edge.get("len_pt") or 0.0)
+        if median_scale > 1e-9 and len_pt > 1e-6:
+            scale_dev = abs((float(leg.distance_m) / len_pt) - median_scale) / median_scale
+            if scale_dev > _MAX_EDGE_SCALE_DEV:
+                logger.info(
+                    "PDF leg %s->%s rejected: %.2fm implies %.0f%% off the plan scale",
+                    leg.from_pillar,
+                    leg.to_pillar,
+                    float(leg.distance_m),
+                    scale_dev * 100.0,
+                )
+                continue
+        kept.append(leg)
+    return kept
+
+
 def extract_boundary_legs_from_pdf(
     pdf_path: str,
     pillars: Sequence[str],
 ) -> List[SurveyTraverseLeg]:
     """
     Match bearing/distance labels on the PDF page to traverse edges using geometry.
+
+    Uses one-to-one assignment so the same printed label cannot be reused on
+    multiple sides (greedy nearest matching previously caused large misclosures).
     """
     if len(pillars) < 3 or not pdf_path or not Path(pdf_path).exists():
         return []
@@ -3931,7 +5289,7 @@ def extract_boundary_legs_from_pdf(
         dist_labels = _pdf_distance_labels(page)
         bearing_hits = _pdf_bearing_labels(page)
 
-        legs: List[SurveyTraverseLeg] = []
+        edges: List[Dict[str, Any]] = []
         n = len(pillars)
         for i in range(n):
             a = pillars[i]
@@ -3941,38 +5299,93 @@ def extract_boundary_legs_from_pdf(
             ax, ay = positions[a]
             bx, by = positions[b]
             mx, my = (ax + bx) / 2.0, (ay + by) / 2.0
+            edges.append(
+                {
+                    "i": i,
+                    "a": a,
+                    "b": b,
+                    "ax": ax,
+                    "ay": ay,
+                    "bx": bx,
+                    "by": by,
+                    "mx": mx,
+                    "my": my,
+                    "bearing_hint": _pdf_edge_bearing_deg(ax, ay, bx, by),
+                    "len_pt": math.hypot(bx - ax, by - ay),
+                }
+            )
 
-            best_dist = 1e18
-            best_dm: Optional[float] = None
-            for cx, cy, dm in dist_labels:
-                if dm < 0.5 or dm > 250.0:
-                    continue
-                d = math.hypot(cx - mx, cy - my)
-                if d < best_dist:
-                    best_dist = d
-                    best_dm = dm
+        if len(edges) < 3:
+            doc.close()
+            return []
 
-            best_bearing = 1e18
-            best_bd, best_bm = 0, 0
-            for cx, cy, bd, bm in bearing_hits:
-                d = math.hypot(cx - mx, cy - my)
-                if d < best_bearing:
-                    best_bearing = d
-                    best_bd, best_bm = bd, bm
+        def _dist_score(edge: Dict[str, Any], lab: Any, d: float) -> float:
+            dm = float(lab[2])
+            # Prefer labels near edge midpoints; lightly prefer distances that scale with edge length.
+            scale_pen = 0.0
+            len_pt = float(edge.get("len_pt") or 0.0)
+            if len_pt >= 8.0 and dm > 0.5:
+                # Soft consistency: longer edges should not match tiny labels preferentially via distance alone.
+                scale_pen = abs(math.log((dm + 1.0) / (len_pt * 0.15 + 1.0))) * 2.0
+            return d + scale_pen
 
-            if best_dm is None or best_bearing > 120.0:
+        def _bearing_score(edge: Dict[str, Any], lab: Any, d: float) -> float:
+            bd, bm = int(lab[2]), int(lab[3])
+            label_brg = float(bd) + float(bm) / 60.0
+            ang = _angular_diff_deg(label_brg, float(edge["bearing_hint"]))
+            # Which side a reading describes is settled by orientation, not by which
+            # side it was printed closest to: crowded corners put several labels
+            # within a few points of the wrong edge. Weight it so a nearby label
+            # facing the wrong way can never outscore a further one that agrees.
+            return d + ang * 4.0
+
+        dist_map = _assign_unique_edge_labels(
+            edges, dist_labels, max_dist=110.0, score_fn=_dist_score
+        )
+        bearing_map = _assign_unique_edge_labels(
+            edges, bearing_hits, max_dist=120.0, score_fn=_bearing_score
+        )
+
+        candidates: List[Tuple[Dict[str, Any], SurveyTraverseLeg]] = []
+        for ei, edge in enumerate(edges):
+            dlab = dist_map.get(ei)
+            blab = bearing_map.get(ei)
+            if dlab is None or blab is None:
                 continue
-            legs.append(
-                SurveyTraverseLeg(
-                    from_pillar=a,
-                    to_pillar=b,
-                    bearing_deg=best_bd,
-                    bearing_min=best_bm,
-                    distance_m=float(best_dm),
+            best_dm = float(dlab[2])
+            if best_dm < 0.5 or best_dm > 250.0:
+                continue
+            best_bd, best_bm = int(blab[2]), int(blab[3])
+            candidates.append(
+                (
+                    edge,
+                    SurveyTraverseLeg(
+                        from_pillar=edge["a"],
+                        to_pillar=edge["b"],
+                        bearing_deg=best_bd,
+                        bearing_min=best_bm,
+                        distance_m=float(best_dm),
+                    ),
                 )
             )
+        legs = _legs_agreeing_with_drawn_edges(candidates)
         doc.close()
-        return _filter_plausible_legs(legs) if len(legs) >= 3 else []
+        legs = _filter_plausible_legs(legs) if len(legs) >= 3 else []
+        if len(legs) != len(pillars):
+            return []
+        # Reject grossly open assignments even at extraction time.
+        metrics = traverse_misclosure_metrics(legs)
+        if (
+            metrics["misclosure_m"] > max(1.5, metrics["perimeter_m"] / 50.0)
+            and metrics["closure_ratio"] < 50.0
+        ):
+            logger.info(
+                "PDF boundary legs rejected: misclosure=%.3fm ratio=1:%.1f",
+                metrics["misclosure_m"],
+                metrics["closure_ratio"],
+            )
+            return []
+        return legs
     except Exception as exc:
         logger.debug("PDF boundary leg extraction failed: %s", exc)
         return []
@@ -4053,7 +5466,7 @@ Extract ALL visible plan details into strict JSON. Do not guess geometry that is
 Rules:
 - Read bearings as DD° MM' from North, clockwise; distances in metres.
 - List traverse_legs in clockwise order around the parcel, one entry per boundary line.
-- pillar_numbers: ordered list matching the traverse (clockwise from first pillar).
+- pillar_numbers: ordered list of labels printed on the plan, clockwise from the first labelled corner. Copy incomplete/obscured labels exactly as printed (e.g. SC/.. ......) — do not omit them and do not invent the missing district or digits. Never invent sequential IDs (SC/XX N+1, SC/XX N+2, …) to fill the ring. A corner with no printed box at all stays omitted.
 - If one coordinate pair is shown (easting + northing), set anchor_easting, anchor_northing, and anchor_pillar (the pillar that coordinate belongs to). If E and N appear on different grid lines at different pillars, use the pillar where both values apply or the primary/westernmost pillar with a full pair.
 - Normalize pillar IDs like SC/CR 5338, SC/Q 573, SC/CK 2285, SC/BV 6015 (not SCCR5338 or SCQ573).
 - Do NOT infer concrete wall fence from line work alone. Only note a fence when the plan prints an explicit label such as C.W.F., D.C.W.F., CWF, DCWF, WF, Fence, Wall Fence, or Concrete Wall Fence beside that boundary side.
@@ -4062,7 +5475,7 @@ Rules:
 - access_road_title: copy EXACTLY as printed beside the primary/first road — typically "ACCESS ROAD" or "ACCESS CLOSE" / "ACCESS/CLOSE". When multiple roads use different titles, embed each title in its access_roads spec using: titled 'ACCESS CLOSE' of width ...
 - buyer_name, location, lga, state: short title-block strings only — never bearings, coordinates, or traverse data.
 - confidence: 0-1 how complete/certain the extraction is.
-- If a field is missing on the plan, use "" or null — never invent.
+- If a field is missing on the plan, use "" or null — never invent. Never invent pillar numbers that are not printed on the plan.
 - notes: extraction caveats only (illegible labels, missing width, etc.). Never say the replot or date change cannot be executed — that is handled downstream.
 
 Return ONLY JSON with keys:
@@ -4081,6 +5494,25 @@ def _preflight_heuristic_pdf_geometry(
     return repair_survey_extraction_from_pdf(heuristic, pdf_path, combined_text)
 
 
+def _heuristic_title_block_is_complete(extraction: SurveyPlanExtraction) -> bool:
+    """Geometry alone is not a cadastral plan: the title block must also have been read."""
+    if not (extraction.buyer_name or "").strip():
+        return False
+    if not (extraction.location or "").strip():
+        return False
+    if not (extraction.lga or "").strip():
+        return False
+    if extraction.area_sq_m is None or float(extraction.area_sq_m) <= 1.0:
+        return False
+    if not _is_plausible_plan_number(extraction.plan_number or ""):
+        return False
+    if not (extraction.surveyor_name or "").strip():
+        return False
+    if not (extraction.certification_date or "").strip():
+        return False
+    return True
+
+
 def _heuristic_pdf_extraction_is_replot_ready(
     extraction: SurveyPlanExtraction,
     combined_text: str,
@@ -4088,6 +5520,7 @@ def _heuristic_pdf_extraction_is_replot_ready(
     pdf_path: Optional[str] = None,
 ) -> bool:
     """True when repaired heuristics already satisfy safe replot validation (no vision LLM)."""
+    _fill_extraction_from_printed_text(extraction, combined_text)
     ext = enrich_extraction_coordinates(extraction, combined_text)
     if pdf_path and Path(pdf_path).exists():
         apply_pdf_grid_coordinates(ext, pdf_path, combined_text)
@@ -4111,7 +5544,14 @@ def _heuristic_pdf_extraction_is_replot_ready(
                     ext.anchor_easting = best_e
                 if ext.anchor_northing is None:
                     ext.anchor_northing = best_n
-    return not validate_extraction_for_replot(ext)
+    # Vision may only be skipped when the deterministic extraction passes the SAME
+    # strict gate the replot itself enforces (topology, misclosure, printed area)
+    # *and* the title block was actually read. Counting pillars/legs is not enough:
+    # a closed traverse with empty LGA / plan number / date still plots the CAD
+    # template defaults (wrong LGA, 01-01-2026, blank PLAN NO.).
+    if validate_extraction_for_replot(ext):
+        return False
+    return _heuristic_title_block_is_complete(ext)
 
 
 def extract_survey_plan_from_pdf(
@@ -4122,17 +5562,31 @@ def extract_survey_plan_from_pdf(
     user_notes: str = "",
     timeout_s: int = 120,
     vision_max_pages: int = 1,
+    preloaded_sources: Optional[tuple[str, str, List[str]]] = None,
+    force_vision: bool = False,
+    retry_focus: str = "",
 ) -> SurveyPlanExtraction:
     """Extract structured survey plan data using layout text + optional vision."""
     max_pages = max(1, int(vision_max_pages or 1))
+    # Cheap text-only load first; render vision only if heuristics are not replot-ready
+    # (unless force_vision / retry_focus requires it).
     layout_text, plain_text, images = _load_pdf_extraction_sources(
-        pdf_path, vision_max_pages=max_pages
+        pdf_path,
+        vision_max_pages=max_pages,
+        preloaded=preloaded_sources,
+        skip_vision=True if preloaded_sources is None and not force_vision else bool(
+            preloaded_sources is not None and not (preloaded_sources[2] or force_vision)
+        ),
     )
     combined_text = f"{layout_text}\n{plain_text}"
 
     preflight = _preflight_heuristic_pdf_geometry(pdf_path, combined_text)
-    if _heuristic_pdf_extraction_is_replot_ready(
-        preflight, combined_text, pdf_path=pdf_path
+    if (
+        not force_vision
+        and not retry_focus
+        and _heuristic_pdf_extraction_is_replot_ready(
+            preflight, combined_text, pdf_path=pdf_path
+        )
     ):
         preflight.source = "layout_text"
         preflight.notes = f"{preflight.notes or ''} | heuristic-fast-path".strip(" |")
@@ -4145,7 +5599,20 @@ def extract_survey_plan_from_pdf(
             llm=llm,
             run_with_timeout=run_with_timeout,
             pre_rendered_images=images,
+            user_notes=user_notes,
         )
+
+    # Need vision images now if not already loaded.
+    if not images and not (preloaded_sources and preloaded_sources[2]):
+        layout_text, plain_text, images = _load_pdf_extraction_sources(
+            pdf_path,
+            vision_max_pages=max_pages,
+            preloaded=(layout_text, plain_text, []),
+            skip_vision=False,
+        )
+        combined_text = f"{layout_text}\n{plain_text}"
+    elif preloaded_sources and preloaded_sources[2] and not images:
+        images = list(preloaded_sources[2])
 
     user_prompt = (
         f"PDF path: {pdf_path}\n\n"
@@ -4154,9 +5621,17 @@ def extract_survey_plan_from_pdf(
     )
     if user_notes.strip():
         user_prompt += f"USER INSTRUCTIONS:\n{user_notes.strip()}\n\n"
+    if retry_focus.strip():
+        user_prompt += (
+            "PREVIOUS EXTRACTION FAILED VALIDATION. Fix ONLY these issues with exact values "
+            f"from the plan:\n{retry_focus.strip()}\n\n"
+        )
     user_prompt += (
         "Extract the full traverse (all bearings and distances), metadata, and coordinates. "
-        "The plan image(s) are attached when available — read labels on the drawing carefully."
+        "The plan image(s) are attached when available — read labels on the drawing carefully. "
+        "Always cross-check bearings/distances against the printed labels; do not reuse the same "
+        "label for multiple sides. Do not invent pillar numbers that are not printed on the plan. "
+        "Copy incomplete pillar boxes exactly as printed (e.g. SC/.. ......); do not omit them."
     )
 
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -4188,6 +5663,7 @@ def extract_survey_plan_from_pdf(
                 llm=llm,
                 run_with_timeout=run_with_timeout,
                 pre_rendered_images=images,
+                user_notes=user_notes,
             )
         return SurveyPlanExtraction(source="error", notes="LLM extraction timed out")
     if err:
@@ -4201,6 +5677,7 @@ def extract_survey_plan_from_pdf(
                 llm=llm,
                 run_with_timeout=run_with_timeout,
                 pre_rendered_images=images,
+                user_notes=user_notes,
             )
         return SurveyPlanExtraction(source="error", notes=f"LLM extraction failed: {err}")
 
@@ -4221,6 +5698,7 @@ def extract_survey_plan_from_pdf(
                 llm=llm,
                 run_with_timeout=run_with_timeout,
                 pre_rendered_images=images,
+                user_notes=user_notes,
             )
         return SurveyPlanExtraction(
             source="llm_parse_failed",
@@ -4251,6 +5729,32 @@ def extract_survey_plan_from_pdf(
             if not merged.pillar_numbers and pillars_for_legs:
                 merged.pillar_numbers = list(pillars_for_legs)
             merged.notes = f"{merged.notes or ''} | traverse from PDF geometry".strip(" |")
+    elif pdf_path and Path(pdf_path).exists() and len(pillars_for_legs) >= 3:
+        # Always cross-check apparently complete LLM geometry against PDF vector labels.
+        llm_legs = _filter_plausible_legs(merged.traverse_legs)
+        pdf_legs = extract_boundary_legs_from_pdf(pdf_path, pillars_for_legs)
+        if len(pdf_legs) == len(pillars_for_legs):
+            llm_m = traverse_misclosure_metrics(llm_legs) if len(llm_legs) >= 3 else None
+            pdf_m = traverse_misclosure_metrics(pdf_legs)
+            prefer_pdf = False
+            if llm_m is None:
+                prefer_pdf = True
+            elif pdf_m["misclosure_m"] + 0.05 < llm_m["misclosure_m"]:
+                prefer_pdf = True
+            elif (
+                llm_m["misclosure_m"] > _MAX_PDF_MISCLOSURE_ABS_M
+                and pdf_m["closure_ratio"] > llm_m["closure_ratio"]
+            ):
+                prefer_pdf = True
+            if prefer_pdf:
+                merged.traverse_legs = pdf_legs
+                if not merged.pillar_numbers:
+                    merged.pillar_numbers = list(pillars_for_legs)
+                merged.notes = (
+                    f"{merged.notes or ''} | LLM traverse replaced by PDF geometry cross-check"
+                ).strip(" |")
+                # Absolute coords computed from bad LLM legs must be recomputed.
+                merged.absolute_parcel_coords = []
     return finalize_survey_extraction(
         merged,
         layout_text,
@@ -4259,6 +5763,7 @@ def extract_survey_plan_from_pdf(
         llm=llm,
         run_with_timeout=run_with_timeout,
         pre_rendered_images=images,
+        user_notes=user_notes,
     )
 
 
@@ -4300,6 +5805,8 @@ def build_cadastral_subprompt(
         lines.append(f"crs_origin: {extraction.origin_crs}")
     if extraction.plan_number:
         lines.append(f"plan number: {extraction.plan_number}")
+    if extraction.area_sq_m is not None and float(extraction.area_sq_m) > 1.0:
+        lines.append(f"area: {float(extraction.area_sq_m):.3f} SQ. MTRS.")
     if extraction.surveyor_name:
         lines.append(f"Surveyor name: {extraction.surveyor_name}")
     if extraction.surveyor_address:
@@ -4359,6 +5866,9 @@ def build_cadastral_subprompt(
     if cert:
         lines.append(f"date on the certification: {cert}")
 
+    # PDF-derived geometry must not be massively auto-adjusted downstream.
+    lines.append("do not auto-adjust traverse")
+
     return "\n".join(lines)
 
 
@@ -4378,20 +5888,40 @@ def _is_affirmation_reply(text: str) -> bool:
 
 def extract_dwg_paths_from_text(text: str) -> List[str]:
     """Find DWG paths/names in a query string (does not require the file to exist)."""
+    from survyai.attachments import normalize_user_path
+
     scope = _normalize_dwg_list_separators(text or "")
     found: List[str] = []
+    try:
+        from survyai.attachments import collect_attached_paths
+
+        for raw in collect_attached_paths(scope, suffixes=(".dwg",), existing_only=False):
+            key = raw.lower()
+            if not any(existing.lower() == key for existing in found):
+                found.append(raw)
+    except Exception:
+        pass
     patterns = [
+        r"((?:file:(?://+)?)+[^\s\"'<>]+\.dwg)",
         r"([A-Za-z]:\\[^\r\n\"<>|]+?\.dwg)",
+        r"([A-Za-z]:/[^\r\n\"<>|]+?\.dwg)",
         r"((?:/|\\)[^\r\n\"<>|]+?\.dwg)",
         r"(?<![A-Za-z0-9_/\\:])([A-Za-z0-9][A-Za-z0-9_.\-]*\.dwg)\b",
     ]
     for pat in patterns:
         for m in re.finditer(pat, scope, flags=re.IGNORECASE):
-            raw = (m.group(1) or "").strip().strip("\"'").rstrip(").,;")
+            raw = normalize_user_path(m.group(1) or "")
             if not raw or not _is_valid_dwg_basename(Path(raw).name):
                 continue
+            # Reject "Abigail_Ufere.pdf save as det3.dwg" style merges where the
+            # regex accidentally absorbs the preceding PDF token into the DWG path.
+            if ".pdf" in raw.lower() and raw.lower().endswith(".dwg"):
+                continue
             try:
-                resolved = str(Path(raw).resolve()) if re.match(r"[A-Za-z]:\\", raw) or raw.startswith(("/", "\\")) else raw
+                if Path(raw).is_absolute() or re.match(r"^[A-Za-z]:[/\\]", raw):
+                    resolved = str(Path(raw).resolve()) if Path(raw).is_file() else str(Path(raw))
+                else:
+                    resolved = raw
             except Exception:
                 resolved = raw
             key = resolved.lower()
@@ -4634,7 +6164,7 @@ def run_pdf_plan_key_details_extract(
     Resolve a survey-plan PDF and extract key details via layout + vision.
 
     ``extract_fn`` should match agent ``_extract_pdf_survey_plan_with_tier_fallback``
-    signature: ``(pdf_path, *, user_notes, timeout_s) -> (SurveyPlanExtraction, model_name)``.
+    signature: ``(pdf_path, *, user_notes, timeout_s) -> (SurveyPlanExtraction, model_name[, cached_sources])``.
     """
     scope = (query or "").strip()
     full = (full_query or scope).strip()
@@ -4651,14 +6181,22 @@ def run_pdf_plan_key_details_extract(
 
     pdf_path = str(resolution["path"])
     try:
-        extraction, model_name = extract_fn(
+        result = extract_fn(
             pdf_path,
             user_notes=scope,
             timeout_s=120,
         )
+        if isinstance(result, tuple) and len(result) >= 2:
+            extraction, model_name = result[0], result[1]
+        else:
+            extraction, model_name = result, None
     except TypeError:
         # Allow simpler callables used in unit tests.
-        extraction, model_name = extract_fn(pdf_path)
+        result = extract_fn(pdf_path)
+        if isinstance(result, tuple) and len(result) >= 2:
+            extraction, model_name = result[0], result[1]
+        else:
+            extraction, model_name = result, None
     except Exception as exc:
         logger.exception("PDF key-details extraction failed for %s", pdf_path)
         return {
@@ -4721,8 +6259,15 @@ def _is_valid_dwg_basename(name: str) -> bool:
         return False
     if name.lower().count(".dwg") > 1:
         return False
+    # Reject "foo.pdf save as bar.dwg" / "foo.pdfbar.dwg" style merges.
+    low = name.lower()
+    if ".pdf" in low:
+        return False
     stem = Path(name).stem
     if not stem or len(stem) > 200:
+        return False
+    # Bare stems that look like instruction fragments, not filenames.
+    if re.search(r"\b(save|strictly|as|generate|create|produce|replot)\b", stem, re.I):
         return False
     return True
 
@@ -5070,14 +6615,26 @@ def parse_dwg_title_block_fields(text: str) -> Dict[str, str]:
             fields["location"] = sanitize_metadata_field(loc_fb, max_len=200)
 
     lga_m = re.search(
-        r"(.+?)\s+(?:LOCAL\s+GOVERNMENT\s+AREA|LOCAL\s+GOVT\.?\s*AREA|L\.?\s*G\.?\s*A\.?|LGA)\b",
+        r"(?:^|\n)\s*([A-Z][A-Z0-9/.\-]*(?:\s+[A-Z][A-Z0-9/.\-]*){0,3})\s+"
+        r"(?:LOCAL\s+GOVERNMENT\s+AREA|LOCAL\s+GOVT\.?\s*AREA|L\.?\s*G\.?\s*A\.?|\bLGA\b)\b",
         raw,
-        flags=re.IGNORECASE | re.DOTALL,
+        flags=re.IGNORECASE,
     )
+    if not lga_m:
+        lga_m = re.search(
+            r"\b([A-Z]{3,14}(?:\s*/\s*[A-Z]{3,14})?)\s+"
+            r"(?:LOCAL\s+GOVERNMENT\s+AREA|LOCAL\s+GOVT\.?\s*AREA)\b",
+            raw,
+            flags=re.IGNORECASE,
+        )
     if lga_m:
         lga = re.sub(r"\s+", " ", lga_m.group(1)).strip(" ,;:-")
         lga = re.split(r"\n", lga)[-1].strip()
-        if lga and not re.search(r"\.{3,}", lga):
+        if lga and not re.search(r"\.{3,}", lga) and not re.search(
+            r"\b(?:PLAN|SHEWING|LANDED|PROPERTY|PAGE|SCALE|ORIGIN|MR|MRS)\b",
+            lga,
+            flags=re.IGNORECASE,
+        ):
             # Store bare LGA name only; CAD template attaches "LOCAL GOVERNMENT AREA".
             bare = normalize_lga_name(lga)
             if bare:
@@ -5113,6 +6670,19 @@ def parse_dwg_title_block_fields(text: str) -> Dict[str, str]:
     )
     if cert_m:
         fields["certification_date"] = sanitize_metadata_field(cert_m.group(1).strip(), max_len=40)
+    else:
+        cert_on = extract_certification_date_from_plan_text(raw)
+        if cert_on:
+            fields["certification_date"] = cert_on
+
+    if "state" not in fields:
+        state_line = re.search(
+            r"(?:^|\n)\s*([A-Z][A-Z]*(?:\s+[A-Z]+){0,3})\s+STATE\b",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if state_line:
+            fields["state"] = sanitize_metadata_field(state_line.group(1).strip(), max_len=40)
 
     return fields
 
@@ -5669,6 +7239,8 @@ def run_dwg_plan_extract_to_docx(
 
 def _pick_user_requested_dwg(scope_text: str) -> Optional[str]:
     """Return the DWG path/name the user asked to save/generate in *scope_text*."""
+    from survyai.attachments import normalize_user_path
+
     q = scope_text or ""
     patterns = [
         r"(?:save\s+(?:strictly\s+)?as|generate|create|produce|replot\s+(?:as|to)?)\s*['\"]([^'\"]+\.dwg)['\"]",
@@ -5679,16 +7251,21 @@ def _pick_user_requested_dwg(scope_text: str) -> Optional[str]:
     for pat in patterns:
         m = re.search(pat, q, flags=re.IGNORECASE)
         if m:
-            return (m.group(1) or "").strip().strip("\"'").rstrip(").,;")
+            cand = normalize_user_path(m.group(1) or "")
+            if cand and _is_valid_dwg_basename(Path(cand).name):
+                return cand
     dwgs = extract_dwg_paths_from_text(q)
     return dwgs[0] if dwgs else None
 
 
 def _normalize_resolved_path(raw: str) -> str:
+    from survyai.attachments import normalize_user_path
+
     try:
-        return str(Path(raw).resolve())
+        p = normalize_user_path(raw)
+        return str(Path(p).resolve()) if p else ""
     except Exception:
-        return raw
+        return str(raw or "")
 
 
 def find_similar_pdf_paths(requested_path: str, *, limit: int = 5) -> List[str]:
@@ -5748,12 +7325,30 @@ def resolve_pdf_path_for_replot(
     source_text = full if use_full else scope
 
     pdfs = extract_pdf_paths_from_text(source_text)
+    if not pdfs and full != source_text:
+        pdfs = extract_pdf_paths_from_text(full)
     if not pdfs:
         return {"success": False, "error": "No PDF path found in the request."}
 
+    existing: List[str] = []
+    seen_exist: set = set()
+    for raw in pdfs:
+        try:
+            cand = Path(str(raw))
+            if not cand.is_file():
+                continue
+            key = str(cand.resolve())
+            if key.lower() in seen_exist:
+                continue
+            seen_exist.add(key.lower())
+            existing.append(key)
+        except Exception:
+            continue
+    if existing:
+        chosen = existing[-1]
+        return {"success": True, "path": chosen, "requested": chosen}
+
     requested = _normalize_resolved_path(pdfs[-1])
-    if Path(requested).exists():
-        return {"success": True, "path": requested, "requested": requested}
 
     similar = find_similar_pdf_paths(requested)
     lines = [
@@ -5786,7 +7381,14 @@ def resolve_output_dwg_path(
     *,
     scope_text: Optional[str] = None,
 ) -> Optional[str]:
-    """Resolve target DWG from the user's current request; default to PDF stem in same folder."""
+    """
+    Resolve target DWG from the user's current request.
+
+    Bare filenames go to the active SurvyAI workspace, not the PDF/image folder,
+    unless the user asked to save beside the source or named another folder.
+    """
+    from agent.output_paths import resolve_created_output_path
+
     scope = (scope_text if scope_text is not None else query) or ""
     full = query or ""
     use_full = _is_affirmation_reply(scope) or not (
@@ -5795,13 +7397,14 @@ def resolve_output_dwg_path(
     source_text = full if use_full else scope
 
     dwg_ref = _pick_user_requested_dwg(source_text)
-    if dwg_ref:
-        dwg_p = Path(dwg_ref)
-        if dwg_p.is_absolute():
-            return str(dwg_p.resolve())
-        return str((Path(pdf_path).parent / dwg_p.name).resolve())
-
-    return str((Path(pdf_path).with_suffix(".dwg")).resolve())
+    default_name = Path(pdf_path).with_suffix(".dwg").name if pdf_path else "replot.dwg"
+    resolved = resolve_created_output_path(
+        dwg_ref or "",
+        query=source_text,
+        source_path=pdf_path,
+        default_name=default_name,
+    )
+    return str(resolved)
 
 
 def today_certification_date_str() -> str:

@@ -405,11 +405,11 @@ class ExcelProcessor:
 
         Use this when a downstream tool (e.g. ArcGIS ExcelToTable, excel_coordinate_convert,
         or arcgis_import_xy_points_from_excel) requires .xlsx/.xls and the user provides a .csv.
-        Output defaults to the same folder as the CSV with the same base name and .xlsx extension.
+        Output defaults to the active SurvyAI workspace with the same base name and .xlsx extension.
 
         Args:
             csv_path: Path to the CSV file.
-            output_excel_path: Path for the output Excel file. If None, uses same folder as CSV, same stem, .xlsx.
+            output_excel_path: Path for the output Excel file. If None, uses the workspace, same stem, .xlsx.
             encoding: CSV encoding (default utf-8). Tries utf-8 first, then latin-1 if needed.
 
         Returns:
@@ -421,7 +421,16 @@ class ExcelProcessor:
         if csv_p.suffix.lower() != ".csv":
             return {"success": False, "error": f"File is not a CSV: {csv_p.suffix}"}
 
-        out_p = Path(output_excel_path).resolve() if output_excel_path else csv_p.with_suffix(".xlsx")
+        out_p = (
+            Path(output_excel_path)
+            if output_excel_path
+            else (Path.cwd() / f"{csv_p.stem}.xlsx")
+        )
+        if not out_p.is_absolute():
+            from agent.output_paths import join_workspace_path
+
+            out_p = join_workspace_path(out_p)
+        out_p = out_p.resolve()
         out_p.parent.mkdir(parents=True, exist_ok=True)
 
         try:

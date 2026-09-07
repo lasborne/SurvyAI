@@ -15,7 +15,7 @@ Selection priority (product policy): accuracy → speed → cost.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Literal, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence, Tuple
 
 Complexity = Literal["simple", "average", "complex"]
 TierName = Literal["nano", "mini", "complex"]
@@ -451,6 +451,36 @@ def format_openai_tier_summary(
     )
 
 
+def openai_model_needs_responses_api(model: str) -> bool:
+    """True when function tools + reasoning must use /v1/responses.
+
+    OpenAI rejects tools on /v1/chat/completions for GPT-5 / o-series while
+    reasoning is on. Chat-only aliases (gpt-5-chat, …) stay on completions.
+    """
+    m = str(model or "").strip().lower()
+    if not m or "chat" in m:
+        return False
+    return m.startswith(("gpt-5", "o1", "o3", "o4"))
+
+
+def openai_reasoning_effort_for_model(model: str) -> str:
+    """Responses-API reasoning effort. Never returns 'none'."""
+    m = str(model or "").strip().lower()
+    if any(tag in m for tag in ("luna", "nano")):
+        return "medium"
+    return "high"
+
+
+def chat_openai_official_kwargs(model: str) -> Dict[str, Any]:
+    """ChatOpenAI kwargs for official OpenAI (not Ollama / DeepSeek)."""
+    if not openai_model_needs_responses_api(model):
+        return {}
+    return {
+        "use_responses_api": True,
+        "reasoning": {"effort": openai_reasoning_effort_for_model(model)},
+    }
+
+
 __all__ = [
     "Complexity",
     "TierName",
@@ -471,4 +501,7 @@ __all__ = [
     "migrate_legacy_platform_models",
     "openai_tier_models_for_display",
     "format_openai_tier_summary",
+    "openai_model_needs_responses_api",
+    "openai_reasoning_effort_for_model",
+    "chat_openai_official_kwargs",
 ]

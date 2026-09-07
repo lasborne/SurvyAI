@@ -400,7 +400,7 @@ def merge_access_roads(
     """
     Union regex and assessed roads. Regex results are always kept.
     Assessed roads are added when they are new and either confidence is high
-    enough or the assessment found more roads than regex alone.
+    enough, or regex found none (LLM is the only source).
     """
     merged: List[str] = list(regex_specs or [])
     seen = {_normalize_key(s) for s in merged}
@@ -410,11 +410,7 @@ def merge_access_roads(
         key = _normalize_key(spec)
         if not key or key in seen:
             continue
-        add = (
-            confidence >= min_confidence
-            or not regex_specs
-            or len(assessed) > len(regex_specs)
-        )
+        add = confidence >= min_confidence or not regex_specs
         if add:
             merged.append(spec)
             seen.add(key)
@@ -489,3 +485,104 @@ def store_cadastral_plan_extras(
         )
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Traverse adjustment intent (Bowditch / compass rule)
+# ---------------------------------------------------------------------------
+# Surveyors name the same method in many ways. Detect the *method*, not one
+# prompt template. Generic "adjust/close the traverse" is NOT Bowditch — the
+# CAD default remains bearing-only adjustment unless this method is requested.
+
+_BOWDITCH_TERM = (
+    r"(?:bowditch|bowdich|bodwitch)(?:['’]s)?"
+    r"|compass\s+(?:rule|method|adjustment)"
+)
+# Negation must attach to the method itself. Do not let
+# "do not auto-adjust traverse" swallow a later "use Bowditch".
+_BOWDITCH_NEGATION = re.compile(
+    r"(?:"
+    r"(?:do\s+not|don['’]?t|never)\s+(?:please\s+)?(?:use|apply|perform|run)\s+(?:the\s+)?"
+    r"|without\s+(?:please\s+)?(?:using\s+|applying\s+)?(?:the\s+)?"
+    r"|\b(?:no|not)\s+(?:the\s+)?"
+    r")(?:" + _BOWDITCH_TERM + r")",
+    flags=re.IGNORECASE,
+)
+_BOWDITCH_REQUEST = re.compile(
+    r"\b(?:" + _BOWDITCH_TERM + r")\b",
+    flags=re.IGNORECASE,
+)
+
+
+def user_requests_bowditch_adjustment(*texts: Optional[str]) -> bool:
+    """
+    True when the user asked for Bowditch / compass-rule closure.
+
+    Searches the whole message (title block, access-road tail, compose scope,
+    etc.). The coordinates blob is often trimmed before 'Add an access…', so
+    callers must pass the original prompt — not only the geometry excerpt.
+    """
+    blob = "\n".join(str(t) for t in texts if t and str(t).strip())
+    if not blob:
+        return False
+    if _BOWDITCH_NEGATION.search(blob):
+        return False
+    return bool(_BOWDITCH_REQUEST.search(blob))
+
+
+def bowditch_instruction_for_subprompt(*texts: Optional[str]) -> str:
+    """Canonical sentence so composed CAD sub-prompts keep an explicit request."""
+    if user_requests_bowditch_adjustment(*texts):
+        return "Use Bowditch adjustment method to close the traverse."
+    return ""
+
+
+def format_traverse_adjustment_chat_lines(bow: Optional[Dict[str, Any]]) -> List[str]:
+    """User-visible summary that names the method actually applied."""
+    if not isinstance(bow, dict) or bow.get("mode") != "bearing_distance":
+        return []
+    method = str(bow.get("method") or "")
+    mis = bow.get("misclosure_m")
+    try:
+        mis_s = f"{float(mis):.3f}m"
+    except (TypeError, ValueError):
+        mis_s = "unknown"
+    try:
+        me = f"{float(bow.get('misclosure_e_m')):.3f}m"
+        mn = f"{float(bow.get('misclosure_n_m')):.3f}m"
+        shift = f"{float(bow.get('max_point_shift_m')):.3f}m"
+    except (TypeError, ValueError):
+        me = mn = shift = "unknown"
+
+    if method == "pdf_auto_adjust_forbidden":
+        return [
+            f"- Traverse left unadjusted (PDF-derived geometry): misclosure={mis_s}."
+        ]
+    if method == "bearing_adjustment_failed":
+        return [
+            f"- Bearing adjustment failed; traverse plotted unadjusted (misclosure={mis_s})."
+        ]
+    if not bow.get("applied"):
+        return [
+            f"- Traverse already closed within 1 cm (misclosure={mis_s}); no adjustment applied."
+        ]
+    if method == "bowditch":
+        lines = [
+            "- Bowditch (compass-rule) adjustment applied "
+            f"(misclosure={mis_s}, E={me}, N={mn}, max point shift={shift}). "
+            "Both bearings and distances were recomputed from the adjusted coordinates."
+        ]
+    elif method == "bearing_adjustment":
+        lines = [
+            "- Bearing adjustment applied (distances held; misclosure="
+            f"{mis_s}, E={me}, N={mn}, max point shift={shift})."
+        ]
+    else:
+        lines = [
+            f"- Traverse adjustment ({method or 'unknown'}) applied "
+            f"(misclosure={mis_s}, max point shift={shift})."
+        ]
+    prev = bow.get("adjusted_points_preview") or []
+    if prev:
+        lines.append(f"- Adjusted points preview (first {len(prev)}): {prev}")
+    return lines

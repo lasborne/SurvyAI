@@ -645,6 +645,23 @@ class DocumentProcessor:
                     for page in pdf_reader.pages:
                         text += page.extract_text() + "\n\n"
 
+            # PyMuPDF often recovers text layers that pdfplumber/PyPDF2 miss
+            if not text.strip():
+                try:
+                    import fitz  # PyMuPDF
+
+                    doc = fitz.open(str(path))
+                    try:
+                        page_count = doc.page_count
+                        for page in doc:
+                            page_text = page.get_text("text") or ""
+                            if page_text.strip():
+                                text += page_text + ("\n\n" if preserve_structure else " ")
+                    finally:
+                        doc.close()
+                except Exception:
+                    pass
+
             # Hard safety cap (same rationale as Word)
             max_chars = 200_000
             truncated = False
@@ -860,19 +877,21 @@ class DocumentProcessor:
         
         # Pattern: "depth: X m" or "X m deep" or "at X m"
         patterns = [
-            r'depth[:\s]+(\d+\.?\d*)\s*(?:m|meters?|ft|feet)',
-            r'(\d+\.?\d*)\s*(?:m|meters?|ft|feet)\s+deep',
-            r'at\s+(\d+\.?\d*)\s*(?:m|meters?|ft|feet)',
-            r'shallowest[:\s]+(\d+\.?\d*)\s*(?:m|meters?|ft|feet)',
+            r"depth[:\s]+(\d+\.?\d*)\s*(m|meters?|ft|feet)",
+            r"(\d+\.?\d*)\s*(m|meters?|ft|feet)\s+deep",
+            r"at\s+(\d+\.?\d*)\s*(m|meters?|ft|feet)",
+            r"shallowest[:\s]+(\d+\.?\d*)\s*(m|meters?|ft|feet)",
         ]
         
         for pattern in patterns:
             for match in re.finditer(pattern, text, re.IGNORECASE):
                 try:
                     value = float(match.group(1))
+                    unit_raw = (match.group(2) if match.lastindex and match.lastindex >= 2 else "m") or "m"
+                    unit = "ft" if unit_raw.lower().startswith("f") else "m"
                     depths.append({
                         "value": value,
-                        "unit": match.group(2) if len(match.groups()) > 1 else "m",
+                        "unit": unit,
                         "text": match.group(0),
                         "position": match.start()
                     })

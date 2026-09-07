@@ -469,6 +469,50 @@ def truncate_router_query(query: str) -> str:
     return text[: MAX_ROUTER_QUERY_CHARS - 3] + "..."
 
 
+ALIGNMENT_TIMEOUT_SECONDS = 8
+ALIGNMENT_MAX_OUTPUT_TOKENS = 120
+
+
+def build_alignment_messages(*, query: str, response: str, output_path: str = "") -> tuple[str, str]:
+    """Cheap same-brand fail-safe: did the draft reply address THIS user request?"""
+    system = (
+        "You are a fail-safe checker for SurvyAI (land survey / GIS / CAD). "
+        "The execution model already ran. You do not execute tools. "
+        "Decide whether ASSISTANT RESULT is the same job as USER REQUEST. "
+        "Return ONLY JSON: {\"aligned\": true|false, \"reason\": \"short\"}. "
+        "aligned=false ONLY when the result is a clearly different task "
+        "(example: dumping a prior OCR/calibration sheet when the user asked to copy an Excel "
+        "workbook and plot a DWG). "
+        "aligned=true if the result is on-task, including honest errors about the same files. "
+        "Do not require perfection."
+    )
+    user = (
+        f"USER REQUEST:\n{truncate_router_query(query)}\n\n"
+        f"ASSISTANT RESULT:\n{truncate_router_query(response)}\n\n"
+        f"OUTPUT PATH: {(output_path or '').strip() or '(none)'}\n"
+    )
+    return system, user
+
+
+def parse_alignment_response(raw_text: str) -> Optional[bool]:
+    """True/False from JSON; None if unusable (caller must fail-open)."""
+    data = _extract_json_object(raw_text)
+    if not data:
+        return None
+    flag = data.get("aligned")
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(flag, (int, float)):
+        return bool(flag)
+    if isinstance(flag, str):
+        t = flag.strip().lower()
+        if t in {"1", "true", "yes", "y", "aligned"}:
+            return True
+        if t in {"0", "false", "no", "n", "unaligned", "mismatch"}:
+            return False
+    return None
+
+
 def build_router_messages(
     *,
     provider: str,
@@ -565,6 +609,9 @@ __all__ = [
     "apply_route_floors",
     "truncate_router_query",
     "build_router_messages",
+    "build_alignment_messages",
+    "parse_alignment_response",
+    "ALIGNMENT_TIMEOUT_SECONDS",
     "message_content_to_text",
     "should_use_llm_prompt_router",
 ]

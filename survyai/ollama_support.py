@@ -14,6 +14,24 @@ from typing import Optional, Tuple
 
 OLLAMA_DOWNLOAD_PAGE = "https://ollama.com/download"
 
+# Process-lifetime cache of failed Ollama init reasons (avoids repeated RAM checks
+# and identical RuntimeError noise during startup / provider fallback loops).
+_OLLAMA_REJECT_CACHE: dict[str, str] = {}
+
+
+def clear_ollama_reject_cache() -> None:
+    _OLLAMA_REJECT_CACHE.clear()
+
+
+def cached_ollama_reject_reason(model_name: str = "") -> Optional[str]:
+    key = (model_name or "").strip().lower() or "*"
+    return _OLLAMA_REJECT_CACHE.get(key) or _OLLAMA_REJECT_CACHE.get("*")
+
+
+def remember_ollama_reject(model_name: str, reason: str) -> None:
+    key = (model_name or "").strip().lower() or "*"
+    _OLLAMA_REJECT_CACHE[key] = str(reason or "").strip() or "Ollama unavailable"
+
 
 def host_ram_mb() -> Tuple[int, int]:
     """Return ``(total_mb, available_mb)``. ``(0, 0)`` if unavailable."""
@@ -83,6 +101,10 @@ def ollama_ram_policy(model_name: str = "") -> Tuple[bool, str, int]:
     Refuses when free RAM cannot cover OS reserve + estimated model working set.
     Caps context window by installed RAM / remaining headroom.
     """
+    cached = cached_ollama_reject_reason(model_name)
+    if cached:
+        return False, cached, 0
+
     total_mb, avail_mb = host_ram_mb()
     if total_mb <= 0:
         return True, "", 1024
@@ -93,17 +115,15 @@ def ollama_ram_policy(model_name: str = "") -> Tuple[bool, str, int]:
     # Free RAM must cover reserve *and* loading/running the model.
     need_mb = reserve_mb + working_mb
     if avail_mb < need_mb:
-        return (
-            False,
-            (
-                f"Not enough free memory for a local Ollama run on this PC "
-                f"({avail_mb} MB free; need ~{need_mb} MB: {reserve_mb} MB system reserve "
-                f"+ ~{working_mb} MB for '{(model_name or 'model').strip() or 'model'}' "
-                f"on {total_mb} MB total). Close other heavy apps, then try again. "
-                f"This hard-cap stops local models from overloading RAM and locking the system."
-            ),
-            1024,
+        msg = (
+            f"Not enough free memory for a local Ollama run on this PC "
+            f"({avail_mb} MB free; need ~{need_mb} MB: {reserve_mb} MB system reserve "
+            f"+ ~{working_mb} MB for '{(model_name or 'model').strip() or 'model'}' "
+            f"on {total_mb} MB total). Close other heavy apps, then try again. "
+            f"This hard-cap stops local models from overloading RAM and locking the system."
         )
+        remember_ollama_reject(model_name, msg)
+        return (False, msg, 1024)
 
     if total_mb < 8192:
         num_ctx = 1024

@@ -127,13 +127,16 @@ except ImportError:
     NUMPY_AVAILABLE = False
     np = None  # type: ignore
 
-# Sentence Transformers – local embeddings
+# Sentence Transformers – local embeddings.
+# Do NOT import sentence_transformers (pulls torch, ~10-25s on Windows) at module
+# load. PDF→DWG replot never embeds until after the result is returned.
 try:
-    from sentence_transformers import SentenceTransformer
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
+    import importlib.util as _ilu
+
+    SENTENCE_TRANSFORMERS_AVAILABLE = _ilu.find_spec("sentence_transformers") is not None
+except Exception:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
-    SentenceTransformer = None  # type: ignore
+SentenceTransformer = None  # type: ignore  # bound lazily on first use
 
 # OpenAI – cloud embeddings
 try:
@@ -174,19 +177,135 @@ class LocalEmbeddingProvider:
     Sentence Transformers embedding provider.
     Runs fully offline after the initial model download.  Dimension is
     model-dependent (all-MiniLM-L6-v2 → 384, all-mpnet-base-v2 → 768).
+
+    Loading is deferred until the first ``embed`` / ``embed_query`` call so
+    agent startup is not blocked by Hugging Face network retries.
     """
 
-    def __init__(self, model_name: str = DEFAULT_LOCAL_MODEL) -> None:
+    # Known dims without loading the model (avoids cold-start downloads).
+    _KNOWN_DIMS: Dict[str, int] = {
+        "all-MiniLM-L6-v2": 384,
+        "sentence-transformers/all-MiniLM-L6-v2": 384,
+        "all-mpnet-base-v2": 768,
+        "sentence-transformers/all-mpnet-base-v2": 768,
+    }
+
+    def __init__(self, model_name: str = DEFAULT_LOCAL_MODEL, *, lazy: bool = True) -> None:
         if not SENTENCE_TRANSFORMERS_AVAILABLE:
             raise ImportError(
                 "sentence-transformers is required for local embeddings. "
                 "pip install sentence-transformers"
             )
         self.model_name = model_name
-        logger.info(f"Loading local embedding model: {model_name}")
-        self.model = SentenceTransformer(model_name)
-        self._dimension: int = self.model.get_sentence_embedding_dimension()
-        logger.info(f"✓ Local embedding model loaded (dim={self._dimension})")
+        self._model = None
+        self._load_error: Optional[str] = None
+        self._dimension: int = int(self._KNOWN_DIMS.get(model_name, 384))
+        self._lazy = bool(lazy)
+        if not self._lazy:
+            self._ensure_model()
+        else:
+            logger.info(
+                "Local embedding model deferred until first semantic use: %s (dim=%s)",
+                model_name,
+                self._dimension,
+            )
+
+    def _local_snapshot_exists(self) -> bool:
+        """True when the model is already present in the HF cache (offline-safe)."""
+        try:
+            from huggingface_hub import try_to_load_from_cache
+
+            name = self.model_name
+            if "/" not in name:
+                name = f"sentence-transformers/{name}"
+            # Any core config file means a prior successful download.
+            for fname in ("config.json", "modules.json", "tokenizer_config.json"):
+                path = try_to_load_from_cache(repo_id=name, filename=fname)
+                if path is not None and path != "___not_found___":
+                    return True
+        except Exception:
+            pass
+            # Fallback: common cache directory layout
+            try:
+                home = Path.home()
+                roots = [home / ".cache" / "huggingface" / "hub"]
+                hf_home = os.environ.get("HF_HOME")
+                if hf_home:
+                    roots.append(Path(hf_home) / "hub")
+                short = self.model_name.replace("/", "--")
+                candidates = [
+                    f"models--sentence-transformers--{self.model_name}",
+                    f"models--{short}",
+                ]
+                for root in roots:
+                    if not root.exists():
+                        continue
+                    for name in candidates:
+                        if (root / name).exists():
+                            return True
+            except Exception:
+                pass
+            return False
+
+    def _ensure_model(self):
+        if self._model is not None:
+            return self._model
+        if self._load_error:
+            raise RuntimeError(self._load_error)
+        try:
+            try:
+                from survyai.hf_env import configure_hf_offline_if_appropriate
+
+                configure_hf_offline_if_appropriate(self.model_name)
+            except Exception:
+                pass
+            global SentenceTransformer
+            if SentenceTransformer is None:
+                from sentence_transformers import SentenceTransformer as _ST
+
+                SentenceTransformer = _ST  # type: ignore
+            offline = str(os.environ.get("HF_HUB_OFFLINE", "") or "").strip() in {"1", "true", "yes"}
+            local_only = offline or self._local_snapshot_exists()
+            if not local_only and not self._local_snapshot_exists():
+                # Fail fast instead of Hugging Face's 1/2/4/8/8s retry storm when offline/DNS fails.
+                os.environ.setdefault("HF_HUB_DISABLE_EXPERIMENTAL_WARNING", "1")
+                # Prefer local files; if missing, one short attempt only.
+                local_only = True
+            logger.info(
+                "Loading local embedding model: %s (local_files_only=%s)",
+                self.model_name,
+                local_only,
+            )
+            try:
+                self._model = SentenceTransformer(self.model_name, local_files_only=local_only)
+            except TypeError:
+                # Older sentence-transformers without local_files_only.
+                if local_only:
+                    prev = os.environ.get("HF_HUB_OFFLINE")
+                    os.environ["HF_HUB_OFFLINE"] = "1"
+                    try:
+                        self._model = SentenceTransformer(self.model_name)
+                    finally:
+                        if prev is None:
+                            os.environ.pop("HF_HUB_OFFLINE", None)
+                        else:
+                            os.environ["HF_HUB_OFFLINE"] = prev
+                else:
+                    self._model = SentenceTransformer(self.model_name)
+            self._dimension = int(self._model.get_sentence_embedding_dimension())
+            logger.info(f"✓ Local embedding model loaded (dim={self._dimension})")
+            return self._model
+        except Exception as exc:
+            self._load_error = (
+                f"Local embedding model '{self.model_name}' unavailable offline "
+                f"({exc}). Semantic search disabled until the model is cached."
+            )
+            logger.warning(self._load_error)
+            raise RuntimeError(self._load_error) from exc
+
+    @property
+    def model(self):
+        return self._ensure_model()
 
     def embed(self, texts: List[str]) -> List[List[float]]:
         return self.model.encode(texts, convert_to_numpy=True).tolist()
