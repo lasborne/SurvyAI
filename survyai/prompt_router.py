@@ -15,7 +15,6 @@ Design constraints (no breaking changes):
 
 from __future__ import annotations
 
-import json
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence
@@ -291,19 +290,9 @@ def match_candidate_model(
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    raw = str(text or "").strip()
-    if not raw:
-        return None
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.S | re.I)
-    blob = fence.group(1) if fence else None
-    if blob is None:
-        brace = re.search(r"\{.*\}", raw, flags=re.S)
-        blob = brace.group(0) if brace else raw
-    try:
-        data = json.loads(blob)
-    except Exception:
-        return None
-    return data if isinstance(data, dict) else None
+    from survyai.provider_models import extract_llm_json_object
+
+    return extract_llm_json_object(text)
 
 
 def parse_router_response(

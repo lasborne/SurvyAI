@@ -198,6 +198,7 @@ from agent.pdf_survey_plan import (
     CADASTRAL_FIELD_BOUNDARY as _CADASTRAL_NEXT_FIELD,
     CADASTRAL_COORDINATES_FOR_STOP as _COORDINATES_FOR_STOP,
     extract_coordinates_blob_from_cadastral_query,
+    parse_traverse_bearing_distance_legs,
     resolve_cadastral_coordinates_blob,
 )
 from agent.excel_cadastral import (
@@ -226,6 +227,104 @@ _EXTRA_ROAD_SPEC_RE = re.compile(
     r"\s*Add\s|\.\s*Add|\.\s*$|$)",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def _fold_cadastral_pillar_text(text: str) -> str:
+    s = re.sub(r"\s+", " ", (text or "").strip().lower())
+    return re.sub(r"\s*/\s*", "/", s)
+
+
+def _cadastral_pillar_mention_span(
+    text: str, prefix: str, number: str
+) -> Optional[Tuple[int, int]]:
+    """Start/end of the most specific mention of one pillar in *text*."""
+    hay = _fold_cadastral_pillar_text(text)
+    num = re.sub(r"\s+", "", (number or "").strip().lower())
+    if not num or not re.search(r"\d", num):
+        return None
+    pre = _fold_cadastral_pillar_text(prefix or "")
+    labels: List[str] = []
+    if pre:
+        labels.append(f"{pre} {num}")
+        labels.append(f"{pre}{num}")
+    labels.append(num)
+    best: Optional[Tuple[int, int, int]] = None
+    for lab in labels:
+        if not lab:
+            continue
+        pat = r"(?<![A-Za-z0-9])" + re.escape(lab) + r"(?![A-Za-z0-9])"
+        m = re.search(pat, hay)
+        if not m:
+            continue
+        score = len(lab)
+        if best is None or score > best[0]:
+            best = (score, m.start(), m.end())
+    if best is None:
+        return None
+    return (best[1], best[2])
+
+
+def _cadastral_match_pillars_in_text(
+    pn_list: Sequence[Dict[str, str]], text: str
+) -> List[Tuple[int, int]]:
+    """Appearance-ordered (pos, index) for pillars named in *text*.
+
+    Longer labels win overlapping spans so ``SC/DH 559`` cannot steal ``SC/DH 5591``.
+    """
+    cands: List[Tuple[int, int, int, int]] = []
+    for idx, p_info in enumerate(pn_list or ()):
+        if not isinstance(p_info, dict):
+            continue
+        span = _cadastral_pillar_mention_span(
+            text,
+            str(p_info.get("prefix") or ""),
+            str(p_info.get("number") or ""),
+        )
+        if span is None:
+            continue
+        start, end = span
+        cands.append((start, end, end - start, idx))
+    cands.sort(key=lambda x: (-x[2], x[0], x[3]))
+    kept: List[Tuple[int, int]] = []
+    occupied: List[Tuple[int, int]] = []
+    used_idx: set[int] = set()
+
+    def _overlaps(a0: int, a1: int, b0: int, b1: int) -> bool:
+        return a0 < b1 and b0 < a1
+
+    for start, end, _ln, idx in cands:
+        if idx in used_idx:
+            continue
+        if any(_overlaps(start, end, a, b) for a, b in occupied):
+            continue
+        kept.append((start, idx))
+        used_idx.add(idx)
+        occupied.append((start, end))
+    kept.sort(key=lambda x: x[0])
+    return kept
+
+
+def _cadastral_adjacent_edge_index(
+    matched: Sequence[Tuple[int, int]], n_pts: int
+) -> int:
+    """Traverse-edge index for the first adjacent pillar pair in appearance order."""
+    if n_pts < 2 or len(matched) < 2:
+        return -1
+    ordered = [idx for _, idx in matched]
+    for k in range(len(ordered) - 1):
+        a, b = ordered[k], ordered[k + 1]
+        if a == b:
+            continue
+        for i in range(n_pts):
+            j = (i + 1) % n_pts
+            if (i == a and j == b) or (i == b and j == a):
+                return i
+    idxs = set(ordered)
+    for i in range(n_pts):
+        j = (i + 1) % n_pts
+        if i in idxs and j in idxs:
+            return i
+    return -1
 
 
 # Optional GUI/IPC handler: (path, mode) -> bool. Set by the desktop agent worker.
@@ -7298,25 +7397,7 @@ class SurvyAIAgent:
                         e0 = float(m0.group(1))
                         n0 = float(m0.group(2))
 
-                        # 2) Traverse legs: bearing + distance (flexible phrasing)
-                        leg_re = re.compile(
-                            # Accept "bearing-", "bearing:", "bearing=", and "bearing is"
-                            r"\bbearing\b\s*(?:(?:=|:|-)|\bis\b)?\s*"
-                            r"(\d{1,3})\s*(?:deg|degree|degrees|°|d)\s*"
-                            r"([0-5]?\d)\s*(?:min|mins|minute|minutes|['’])"
-                            r"(?:[^0-9]{0,80}?)"
-                            r"(?:distance|dist\.?|measured\s+distance)\s*(?:=|is|:)?\s*"
-                            r"([0-9]+(?:\.[0-9]+)?)\s*(?:m)?\b",
-                            flags=re.IGNORECASE | re.DOTALL,
-                        )
-                        legs = []
-                        for mm in leg_re.finditer(coordinates):
-                            d = int(mm.group(1))
-                            m = int(mm.group(2))
-                            dist = float(mm.group(3))
-                            # Normalize bearing to decimal degrees (from North, clockwise)
-                            bdeg = (float(d) % 360.0) + (float(m) / 60.0)
-                            legs.append((bdeg, dist))
+                        legs = parse_traverse_bearing_distance_legs(coordinates)
 
                         if legs:
                             # Build unadjusted deltas + vertices
@@ -8644,17 +8725,17 @@ class SurvyAIAgent:
                             }
                         )
                         continue
-                    # Legacy fallback: Letter/Letter + digits only
+                    # Legacy fallback: slash series or slash-optional beacons (RFE 2176)
                     m = re.search(
-                        r"([A-Za-z]+\s*/\s*[A-Za-z]+)\s*([A-Za-z0-9]{3,12})\b",
+                        r"(?:([A-Za-z]+\s*/\s*[A-Za-z]+)|([A-Za-z]{2,6}))\s*([A-Za-z0-9]{3,12})\b",
                         p,
                     )
                     if not m:
                         out.append({"prefix": "", "number": ""})
                         continue
-                    prefix = re.sub(r"\s+", "", m.group(1)).upper()
-                    num = m.group(2).upper()
-                    if not re.search(r"\d", num):
+                    prefix = re.sub(r"\s+", "", (m.group(1) or m.group(2) or "")).upper()
+                    num = m.group(3).upper()
+                    if not prefix or not re.search(r"\d", num):
                         out.append({"prefix": "", "number": ""})
                         continue
                     out.append({"prefix": prefix, "number": num})
@@ -10016,6 +10097,7 @@ class SurvyAIAgent:
             # - Sits outside the traverse (outward normal)
             # - Offset scales with plan scale: 0.3 @ 1:500, 0.15 @ 1:250, 0.6 @ 1:1000, etc.
             used_fence_edges: set[int] = set()
+            used_road_edges: set[int] = set()
             try:
                 fence_offset = 0.3 * (float(chosen_denom) / 500.0)
             except Exception:
@@ -10040,29 +10122,25 @@ class SurvyAIAgent:
 
                         def _pillar_idx_in_text(chunk: str) -> Optional[int]:
                             """Resolve a single pillar mention (substring) to one pn_list index."""
-                            ch = re.sub(r"[.,;]+$", "", (chunk or "").strip()).lower()
-                            if not ch:
+                            hits = _cadastral_match_pillars_in_text(pn_list, chunk)
+                            if not hits:
                                 return None
+                            if len(hits) == 1:
+                                return hits[0][1]
                             best_i: Optional[int] = None
-                            best_key = -1
-                            for idx, p_info in enumerate(pn_list):
-                                num = str(p_info.get("number", "")).strip()
-                                prefix = str(p_info.get("prefix", "")).strip()
-                                if not num:
-                                    continue
-                                fl = f"{prefix} {num}".lower().replace("  ", " ")
-                                if fl in ch:
-                                    if len(fl) > best_key:
-                                        best_key = len(fl)
-                                        best_i = idx
-                                else:
-                                    nlu = num.lower()
-                                    if re.search(r"\b" + re.escape(nlu) + r"\b", ch):
-                                        sc = 50 + len(nlu)
-                                        if sc > best_key:
-                                            best_key = sc
-                                            best_i = idx
-                            return best_i
+                            best_len = -1
+                            for _pos, idx in hits:
+                                p_info = pn_list[idx]
+                                span = _cadastral_pillar_mention_span(
+                                    chunk,
+                                    str(p_info.get("prefix") or ""),
+                                    str(p_info.get("number") or ""),
+                                )
+                                ln = (span[1] - span[0]) if span else 0
+                                if ln > best_len:
+                                    best_len = ln
+                                    best_i = idx
+                            return best_i if best_i is not None else hits[0][1]
 
                         n_pts = len(local_pts)
                         explicit_pairs_done = False
@@ -10091,24 +10169,10 @@ class SurvyAIAgent:
                                         break
 
                         if not explicit_pairs_done:
-                            matched_ordered: List[Tuple[int, int]] = []
-                            for idx, p_info in enumerate(pn_list):
-                                num = str(p_info.get("number", "")).strip()
-                                prefix = str(p_info.get("prefix", "")).strip()
-                                if not num:
-                                    continue
-                                full_label = (prefix + " " + num).lower()
-                                num_lower = num.lower()
-                                ref_lower = ref_str_norm.lower()
-                                pos = ref_lower.find(full_label)
-                                if pos >= 0:
-                                    matched_ordered.append((pos, idx))
-                                    continue
-                                m_num = re.search(r"\b" + re.escape(num_lower) + r"\b", ref_lower)
-                                if m_num:
-                                    matched_ordered.append((m_num.start(), idx))
+                            matched_ordered = _cadastral_match_pillars_in_text(
+                                pn_list, ref_str_norm
+                            )
                             if len(matched_ordered) >= 2:
-                                matched_ordered.sort(key=lambda x: x[0])
                                 ordered_indices: List[int] = []
                                 seen_idx: set[int] = set()
                                 for _, idx in matched_ordered:
@@ -10213,35 +10277,22 @@ class SurvyAIAgent:
                     target_idx = -1
                     if ref_match and pn_list:
                         ref_str = ref_match.group(1).strip()
-                        # Normalize separators: "SC/CK 4324 - 4325" or "4324 and 4325"
                         ref_str_norm = re.sub(r"\s+", " ", ref_str)
-                        matched_indices = []
-                        for idx, p_info in enumerate(pn_list):
-                            num = str(p_info.get("number", "")).strip()
-                            prefix = str(p_info.get("prefix", "")).strip()
-                            if not num:
-                                continue
-                            # Match full label (e.g. "sc/ck 4324") or number as whole word to avoid "432" matching "4324"
-                            full_label = (prefix + " " + num).lower()
-                            num_lower = num.lower()
-                            if full_label in ref_str_norm.lower():
-                                matched_indices.append(idx)
-                            elif re.search(r"\b" + re.escape(num_lower) + r"\b", ref_str_norm.lower()):
-                                matched_indices.append(idx)
-                        
-                        if len(matched_indices) >= 2:
-                            n_pts = len(local_pts)
-                            for i in range(n_pts):
-                                j = (i + 1) % n_pts
-                                if i in matched_indices and j in matched_indices:
-                                    target_idx = i
-                                    break
+                        matched = _cadastral_match_pillars_in_text(pn_list, ref_str_norm)
+                        target_idx = _cadastral_adjacent_edge_index(
+                            matched, len(local_pts)
+                        )
                     if target_idx == -1:
-                        # Fallback: first edge (index 0) if we have at least two points
+                        # Named pillars/sides that did not resolve to a traverse
+                        # edge must not silently plot on edge 0 (wrong side).
+                        if ref_match:
+                            continue
                         if len(local_pts) >= 2:
                             target_idx = 0
-
+                    if target_idx != -1 and target_idx in used_road_edges:
+                        continue
                     if target_idx != -1:
+                        used_road_edges.add(target_idx)
                         p1 = local_pts[target_idx]
                         p2 = local_pts[(target_idx + 1) % len(local_pts)]
                         dx = p2["x"] - p1["x"]
@@ -14564,7 +14615,12 @@ class SurvyAIAgent:
                 # because clamping is the expected, harmless behaviour.
                 model_max = openai_max_tokens_limits.get(model_name, 16384)
                 requested_tokens = self.settings.agent_max_tokens
-                actual_max_tokens = min(requested_tokens, model_max)
+                from survyai.openai_models import openai_responses_max_output_tokens
+
+                actual_max_tokens = min(
+                    openai_responses_max_output_tokens(model_name, requested_tokens),
+                    model_max,
+                )
 
                 cache_key = self._llm_client_cache_key(
                     "openai",
@@ -20960,21 +21016,9 @@ class SurvyAIAgent:
         import ast
 
         def _stringify_content(content: Any) -> str:
-            if isinstance(content, str):
-                return content.strip()
-            if isinstance(content, list):
-                text_parts: List[str] = []
-                for item in content:
-                    if isinstance(item, dict) and item.get("type") == "text":
-                        text = str(item.get("text", "")).strip()
-                        if text:
-                            text_parts.append(text)
-                    elif isinstance(item, str):
-                        text = item.strip()
-                        if text:
-                            text_parts.append(text)
-                return "\n".join(text_parts).strip()
-            return str(content).strip() if content is not None else ""
+            from survyai.provider_models import llm_visible_text_from_content
+
+            return llm_visible_text_from_content(content)
 
         def _maybe_parse_tool_payload(raw_text: str) -> Optional[Dict[str, Any]]:
             if not raw_text:

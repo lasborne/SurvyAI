@@ -47,9 +47,31 @@ _UTM_PAIR_RE = re.compile(
     r"([0-9]{5,7}(?:\.[0-9]+)?)\s*(?:m)?\s*[nN]"
 )
 _PILLAR_NEAR_RE = re.compile(
-    r"([A-Za-z]{1,6}\s*/\s*[A-Za-z]{1,6}\s*[0-9]{2,6}|SC/[A-Za-z0-9]+\s*[0-9]{2,6}|P\s*[0-9]{1,5})",
+    r"([A-Za-z]{1,6}\s*/\s*[A-Za-z]{1,6}\s*[A-Za-z0-9]{2,12}|SC/[A-Za-z0-9]+\s*[A-Za-z0-9]{2,12}|"
+    r"[A-Za-z]{2,6}\s+[0-9]{3,9}|[A-Za-z]{3,6}\d{3,9}|P\s*[0-9]{1,5})",
     re.I,
 )
+
+
+def _nearby_pillar_id(window: str) -> str:
+    """Best plausible pillar token near a coordinate pair; skip SCALE/ZONE/AREA noise."""
+    try:
+        from agent.pdf_survey_plan import split_cadastral_pillar_label
+    except Exception:
+        split_cadastral_pillar_label = None  # type: ignore
+    for m in _PILLAR_NEAR_RE.finditer(window or ""):
+        cand = (m.group(1) or "").strip()
+        if not cand:
+            continue
+        if split_cadastral_pillar_label is not None:
+            split = split_cadastral_pillar_label(cand)
+            if split:
+                return f"{split['prefix']} {split['number']}".strip()
+            if re.match(r"^P\s*\d{1,5}$", cand, re.I):
+                return cand
+            continue
+        return cand
+    return ""
 
 
 def should_intelligent_cadastral_compose(query: str) -> bool:
@@ -239,8 +261,7 @@ def extract_geometry_from_plain_text(text: str) -> Dict[str, Any]:
         e = float(m.group(1))
         n = float(m.group(2))
         window = source[max(0, m.start() - 80) : m.end() + 40]
-        pillar_m = _PILLAR_NEAR_RE.search(window)
-        pillar = pillar_m.group(1).strip() if pillar_m else ""
+        pillar = _nearby_pillar_id(window)
         points.append(ParcelPoint(e=e, n=n, pillar=pillar))
 
     has_bearings = bool(
@@ -363,23 +384,9 @@ def extract_from_coordinate_file(
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", raw, re.S)
-    if not m:
-        return None
-    try:
-        parsed = json.loads(m.group(0))
-        return parsed if isinstance(parsed, dict) else None
-    except Exception:
-        return None
+    from survyai.provider_models import extract_llm_json_object
+
+    return extract_llm_json_object(text)
 
 
 def _retrieve_compose_rag_context(
@@ -553,12 +560,9 @@ def llm_compose_cadastral_plan(
                 "error": err or ("LLM timed out" if timed_out else "LLM returned empty"),
                 "source": "error",
             }
-        text = msg.content if hasattr(msg, "content") else str(msg)
-        if isinstance(text, list):
-            text = "\n".join(
-                str(part.get("text", "")) if isinstance(part, dict) else str(part)
-                for part in text
-            )
+        from survyai.provider_models import llm_visible_text_from_content
+
+        text = llm_visible_text_from_content(getattr(msg, "content", msg))
         payload = _extract_json_object(str(text or ""))
         if not payload:
             return {"success": False, "error": "LLM compose returned non-JSON.", "source": "llm_parse_failed"}

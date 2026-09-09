@@ -52,26 +52,31 @@ def _normalize_key(text: str) -> str:
     return re.sub(r"\s+", " ", (text or "").lower()).strip()
 
 
-def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    for candidate in (raw,):
-        try:
-            parsed = json.loads(candidate)
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            pass
-    m = re.search(r"\{.*\}", raw, re.S)
+def _road_merge_key(spec: str) -> str:
+    """Identity for an access road: width + sorted pillar names (order-independent)."""
+    s = _normalize_key(spec)
+    wm = re.search(r"(\d+(?:\.\d+)?)\s*m", s)
+    width = wm.group(1) if wm else ""
+    m = re.search(
+        r"(?:side of|joining pillars|(?:boundary line )?connecting)\s+(.+)$",
+        s,
+    )
     if m:
-        try:
-            parsed = json.loads(m.group(0))
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            return None
-    return None
+        tail = re.sub(r"\s+offset\b.*$", "", m.group(1)).strip()
+        parts = [
+            p.strip(" .,;")
+            for p in re.split(r"\s+and\s+", tail)
+            if p.strip(" .,;")
+        ]
+        if len(parts) >= 2:
+            return width + "|" + "|".join(sorted(parts[:2]))
+    return s
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    from survyai.provider_models import extract_llm_json_object
+
+    return extract_llm_json_object(text)
 
 
 def _coerce_access_roads(raw: Any) -> List[CadastralAccessRoadSpec]:
@@ -262,7 +267,9 @@ def assess_cadastral_plan_extras(
             30,
             lambda: llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]),
         )[0]
-        text = msg.content if hasattr(msg, "content") else str(msg)
+        from survyai.provider_models import llm_visible_text_from_content
+
+        text = llm_visible_text_from_content(getattr(msg, "content", msg))
         payload = _extract_json_object(str(text or ""))
         if not payload:
             return CadastralPlanExtrasAssessment(
@@ -352,12 +359,9 @@ def parse_cadastral_geometry_blob_with_llm(
         )
         if timed_out or err or msg is None:
             return ""
-        text = msg.content if hasattr(msg, "content") else str(msg)
-        if isinstance(text, list):
-            text = "\n".join(
-                str(part.get("text", "")) if isinstance(part, dict) else str(part)
-                for part in text
-            )
+        from survyai.provider_models import llm_visible_text_from_content
+
+        text = llm_visible_text_from_content(getattr(msg, "content", msg))
         payload = _extract_json_object(str(text or ""))
         if not payload:
             return ""
@@ -403,11 +407,11 @@ def merge_access_roads(
     enough, or regex found none (LLM is the only source).
     """
     merged: List[str] = list(regex_specs or [])
-    seen = {_normalize_key(s) for s in merged}
+    seen = {_road_merge_key(s) for s in merged}
 
     for road in assessed:
         spec = access_road_to_spec(road)
-        key = _normalize_key(spec)
+        key = _road_merge_key(spec)
         if not key or key in seen:
             continue
         add = confidence >= min_confidence or not regex_specs

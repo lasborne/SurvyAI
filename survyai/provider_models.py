@@ -20,6 +20,8 @@ the fallback if that classifier fails.
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any, Dict, List, Literal, Optional, Sequence
 
 from survyai.openai_models import (
@@ -387,6 +389,207 @@ def paid_llm_constructor_kwargs(
     return {}
 
 
+_SKIP_CONTENT_BLOCK_TYPES = frozenset(
+    {
+        "reasoning",
+        "thinking",
+        "redacted_thinking",
+        "function_call",
+        "tool_use",
+        "tool_call",
+        "web_search_call",
+        "file_search_call",
+        "computer_call",
+        "code_interpreter_call",
+        "mcp_call",
+        "mcp_list_tools",
+        "mcp_approval_request",
+        "image_generation_call",
+    }
+)
+
+
+def _is_reasoning_payload(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    kind = str(obj.get("type") or "").strip().lower()
+    if kind in {"reasoning", "thinking", "redacted_thinking"}:
+        return True
+    if obj.get("encrypted_content") and str(obj.get("id") or "").startswith("rs_"):
+        return True
+    return False
+
+
+def _text_from_content_block(block: Any) -> str:
+    if isinstance(block, str):
+        return block.strip()
+    if not isinstance(block, dict) or _is_reasoning_payload(block):
+        if isinstance(block, dict):
+            summary = block.get("summary")
+            if isinstance(summary, list):
+                parts = [
+                    str(item.get("text") or "").strip()
+                    if isinstance(item, dict)
+                    else str(item).strip()
+                    for item in summary
+                ]
+                return "\n".join(p for p in parts if p)
+        return ""
+    kind = str(block.get("type") or "").strip().lower()
+    if kind in _SKIP_CONTENT_BLOCK_TYPES:
+        return ""
+    for key in ("text", "output_text", "refusal"):
+        val = block.get(key)
+        if isinstance(val, str) and val.strip():
+            return val.strip()
+    inner = block.get("content")
+    if isinstance(inner, str) and inner.strip():
+        return inner.strip()
+    if isinstance(inner, list):
+        return llm_visible_text_from_content(inner)
+    return ""
+
+
+def llm_visible_text_from_content(content: Any) -> str:
+    """User-visible model text; skips Responses-API reasoning / encrypted blobs."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        raw = content.strip()
+        if not raw:
+            return ""
+        if ("encrypted_content" in raw[:1200] and "reasoning" in raw[:400]) and not any(
+            key in raw for key in ("traverse_legs", "pillar_numbers", "buyer_name", "plan_number")
+        ):
+            return ""
+        return raw
+    if isinstance(content, dict):
+        text = _text_from_content_block(content)
+        if text:
+            return text
+        if _is_reasoning_payload(content):
+            return ""
+        kind = str(content.get("type") or "").strip().lower()
+        if kind in _SKIP_CONTENT_BLOCK_TYPES or kind in {"text", "output_text", "refusal"}:
+            return ""
+        try:
+            return json.dumps(content)
+        except Exception:
+            return ""
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(llm_visible_text_from_content(item))
+            else:
+                parts.append(_text_from_content_block(item))
+        return "\n".join(p for p in parts if p).strip()
+    if hasattr(content, "model_dump"):
+        try:
+            return llm_visible_text_from_content(content.model_dump())
+        except Exception:
+            pass
+    return str(content).strip()
+
+
+def _balance_truncated_json(s: str) -> str:
+    """Close an unfinished JSON string and any open [ / { so json.loads can run."""
+    in_str = False
+    escape = False
+    stack: List[str] = []
+    for ch in s:
+        if in_str:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch == "{":
+            stack.append("}")
+        elif ch == "[":
+            stack.append("]")
+        elif stack and ch == stack[-1]:
+            stack.pop()
+    out = s
+    if in_str:
+        if out.endswith("\\") and not out.endswith("\\\\"):
+            out = out[:-1]
+        out += '"'
+    out = out.rstrip().rstrip(",")
+    for closer in reversed(stack):
+        out += closer
+    return out
+
+
+def _usable_llm_json_object(parsed: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(parsed, dict) or _is_reasoning_payload(parsed):
+        return None
+    kind = str(parsed.get("type") or "").strip().lower()
+    if kind in _SKIP_CONTENT_BLOCK_TYPES:
+        return None
+    return parsed
+
+
+def extract_llm_json_object(text: Any) -> Optional[Dict[str, Any]]:
+    """Parse a JSON object from LLM output, including truncated Responses-API text."""
+    if isinstance(text, dict):
+        return _usable_llm_json_object(text)
+    raw = str(text or "").strip()
+    if not raw:
+        return None
+    raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
+    raw = re.sub(r"\s*```\s*$", "", raw)
+    try:
+        usable = _usable_llm_json_object(json.loads(raw))
+        if usable is not None:
+            return usable
+    except Exception:
+        pass
+    decoder = json.JSONDecoder()
+    tries = 0
+    idx = 0
+    n = len(raw)
+    while tries < 32 and idx < n:
+        nxt = raw.find("{", idx)
+        if nxt < 0:
+            break
+        tries += 1
+        try:
+            parsed, end = decoder.raw_decode(raw, nxt)
+        except Exception:
+            idx = nxt + 1
+            continue
+        usable = _usable_llm_json_object(parsed)
+        if usable is not None:
+            return usable
+        idx = max(int(end), nxt + 1)
+    start = raw.find("{")
+    if start < 0:
+        return None
+    blob = raw[start:]
+    for _ in range(12):
+        try:
+            usable = _usable_llm_json_object(json.loads(_balance_truncated_json(blob)))
+            if usable is not None:
+                return usable
+        except Exception:
+            pass
+        cut = max(blob.rfind(","), blob.rfind("\n"))
+        if cut < 1:
+            break
+        blob = blob[:cut].rstrip().rstrip(",").rstrip()
+        if blob.endswith(":"):
+            prev_q = blob.rfind('"')
+            prev_q2 = blob.rfind('"', 0, prev_q)
+            if prev_q2 >= 0:
+                blob = blob[:prev_q2].rstrip().rstrip(",")
+    return None
+
+
 __all__ = [
     "Complexity",
     "PaidProvider",
@@ -405,4 +608,6 @@ __all__ = [
     "claude_extended_thinking_kwargs",
     "gemini_thinking_kwargs",
     "paid_llm_constructor_kwargs",
+    "llm_visible_text_from_content",
+    "extract_llm_json_object",
 ]

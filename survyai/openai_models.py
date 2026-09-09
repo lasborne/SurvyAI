@@ -477,8 +477,19 @@ def chat_openai_official_kwargs(model: str) -> Dict[str, Any]:
         return {}
     return {
         "use_responses_api": True,
+        # v0 keeps reasoning out of AIMessage.content (still computed server-side).
+        "output_version": "v0",
         "reasoning": {"effort": openai_reasoning_effort_for_model(model)},
     }
+
+
+def openai_responses_max_output_tokens(model: str, requested: Optional[int] = None) -> int:
+    """Floor output tokens so high reasoning cannot consume the entire budget."""
+    req = int(requested or 0) or 4096
+    if not openai_model_needs_responses_api(model):
+        return req
+    floor = 32768 if openai_reasoning_effort_for_model(model) == "high" else 16384
+    return max(req, floor)
 
 
 __all__ = [
@@ -504,4 +515,5 @@ __all__ = [
     "openai_model_needs_responses_api",
     "openai_reasoning_effort_for_model",
     "chat_openai_official_kwargs",
+    "openai_responses_max_output_tokens",
 ]

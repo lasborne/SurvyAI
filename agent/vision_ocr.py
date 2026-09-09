@@ -932,29 +932,15 @@ def image_file_to_base64_png(path: str, *, max_edge: int = 2048, enhance: bool =
 
 
 def _message_content_to_text(raw: Any) -> str:
-    if isinstance(raw, list):
-        return "\n".join(
-            str(part.get("text", "") or "") if isinstance(part, dict) else str(part) for part in raw
-        ).strip()
-    return str(raw or "").strip()
+    from survyai.provider_models import llm_visible_text_from_content
+
+    return llm_visible_text_from_content(raw)
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL | re.IGNORECASE)
-    if fence:
-        raw = fence.group(1)
-    else:
-        start, end = raw.find("{"), raw.rfind("}")
-        if start >= 0 and end > start:
-            raw = raw[start : end + 1]
-    try:
-        data = json.loads(raw)
-        return data if isinstance(data, dict) else None
-    except Exception:
-        return None
+    from survyai.provider_models import extract_llm_json_object
+
+    return extract_llm_json_object(text)
 
 
 def _system_prompt_for_mode(mode: VisionOcrMode, *, document_type: str = "generic") -> str:

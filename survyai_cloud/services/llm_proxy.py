@@ -125,7 +125,9 @@ async def run_proxy_chat(
         )
 
         tool_calls = _normalize_tool_calls(ai_message)
-        safe_content = _json_safe_content(ai_message.content)
+        from survyai.provider_models import llm_visible_text_from_content
+
+        safe_content = llm_visible_text_from_content(_json_safe_content(ai_message.content))
 
         billing = {
             "cost_usd": billed_cost_usd,
@@ -266,13 +268,21 @@ def _get_or_create_server_chat_model(
     extra = paid_llm_constructor_kwargs(
         provider, resolved_model, max_tokens=body.max_tokens
     )
+    openai_max_tokens = body.max_tokens
+    if provider == "openai":
+        from survyai.openai_models import openai_responses_max_output_tokens
+
+        openai_max_tokens = openai_responses_max_output_tokens(
+            resolved_model, body.max_tokens
+        )
     cache_key = _server_chat_cache_key(
         provider,
         resolved_model,
         temperature=body.temperature,
-        max_tokens=body.max_tokens,
+        max_tokens=openai_max_tokens if provider == "openai" else body.max_tokens,
     ) + (
         extra.get("use_responses_api"),
+        extra.get("output_version"),
         (extra.get("reasoning") or {}).get("effort"),
         (extra.get("thinking") or {}).get("type"),
         extra.get("thinking_level"),
@@ -285,7 +295,7 @@ def _get_or_create_server_chat_model(
             model=resolved_model,
             api_key=settings.platform_openai_api_key,
             temperature=body.temperature,
-            max_tokens=body.max_tokens,
+            max_tokens=openai_max_tokens,
             **extra,
         )
     elif provider == "deepseek":

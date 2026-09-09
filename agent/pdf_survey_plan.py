@@ -239,7 +239,18 @@ class SurveyTraverseLeg(BaseModel):
     to_pillar: str = ""
     bearing_deg: int = 0
     bearing_min: int = 0
+    bearing_sec: int = 0
     distance_m: float = 0.0
+
+
+def traverse_leg_azimuth_deg(leg: SurveyTraverseLeg) -> float:
+    """Clockwise azimuth from north, including optional seconds."""
+    sec = float(getattr(leg, "bearing_sec", 0) or 0)
+    return (
+        (float(leg.bearing_deg) % 360.0)
+        + float(leg.bearing_min) / 60.0
+        + sec / 3600.0
+    )
 
 
 class SurveyPlanExtraction(BaseModel):
@@ -303,24 +314,15 @@ SurveyPlanOverrides.model_rebuild()
 
 
 def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return parsed
-    except Exception:
-        pass
-    m = re.search(r"\{.*\}", raw, re.S)
-    if m:
-        try:
-            parsed = json.loads(m.group(0))
-            if isinstance(parsed, dict):
-                return parsed
-        except Exception:
-            return None
-    return None
+    from survyai.provider_models import extract_llm_json_object
+
+    return extract_llm_json_object(text)
+
+
+def _llm_message_text(msg: Any) -> str:
+    from survyai.provider_models import llm_visible_text_from_content
+
+    return llm_visible_text_from_content(getattr(msg, "content", msg))
 
 
 def extract_pdf_paths_from_text(text: str) -> List[str]:
@@ -514,18 +516,61 @@ def enrich_extraction_coordinates(
 # Classic: SC/AS 2457, SP/RV 33567. Longer district: SC/AKAB 19155.
 # Alphanumeric peg tokens: SC/DT AS3459RP, SC/RV OA94567KL, SC/EN IL3456PX.
 # Also seen: RV/SP 2345 (series before slash is not always SC/SP).
+# Slash is optional: RFE 2176, RFA 2679, RFAC 112, OU/BC 22578.
 _PILLAR_SERIES = r"(?:SC|SP|RV|RP)"
 _PILLAR_DISTRICT = r"[A-Z]{1,6}"
 _PILLAR_PEG_TOKEN = r"[A-Z0-9]{3,12}"
+_NON_PILLAR_PREFIXES = frozenset(
+    {
+        "ZONE", "AREA", "SCALE", "WIDTH", "YEAR", "UTM", "PLOT", "DATE", "PLAN",
+        "ROAD", "SIDE", "FROM", "WITH", "NAME", "LGA", "STATE", "NORTH", "EAST",
+        "WEST", "SOUTH", "TITLE", "PAGE", "SHEET", "TOTAL", "POINT", "COORD",
+        "ORIGIN", "LOCAL", "RIVER", "NIGER", "BUYER", "OWNER", "FENCE", "ACCESS",
+        "CLOSE", "METRE", "METER", "CHAIN", "BLOCK", "BEAR", "DIST", "UNIT",
+        "THE", "AND", "FOR", "THIS", "THAT", "PLANNO", "BEARING",
+    }
+)
+_PILLAR_TOKEN_CAPTURE = (
+    r"(?:[A-Za-z]{2,6}\s*/\s*[A-Za-z]{1,6}\s+[A-Za-z0-9]*\d[A-Za-z0-9]{2,11}"
+    r"|[A-Za-z]{2,6}\s+\d{3,9}[A-Za-z]{0,4})"
+)
 _PILLAR_ID_TEXT_RE = re.compile(
-    rf"(?:{_PILLAR_SERIES})\s*/?\s*{_PILLAR_DISTRICT}\s*{_PILLAR_PEG_TOKEN}",
+    r"(?:"
+    rf"{_PILLAR_SERIES}\s*/?\s*{_PILLAR_DISTRICT}\s*{_PILLAR_PEG_TOKEN}"
+    r"|[A-Z]{2,6}\s*/\s*[A-Z]{1,6}\s+[A-Z0-9]*\d[A-Z0-9]{2,11}"
+    r"|[A-Z]{2,6}\s+\d{3,9}[A-Z]{0,4}"
+    r")",
     re.IGNORECASE,
 )
 _PILLAR_PREFIX_TOKEN_RE = re.compile(
-    rf"^({_PILLAR_SERIES})\s*/?\s*({_PILLAR_DISTRICT})$",
+    rf"^(?:{_PILLAR_SERIES}\s*/?\s*{_PILLAR_DISTRICT}|[A-Za-z]{{2,6}})$",
     re.IGNORECASE,
 )
 _PILLAR_NUMBER_TOKEN_RE = re.compile(rf"^({_PILLAR_PEG_TOKEN})$", re.IGNORECASE)
+
+
+def _split_letter_series_pillar(text: str) -> Optional[Dict[str, str]]:
+    """Slash-optional series: OU/BC 22578, RFE 2176, RFAC 112, RFE2176."""
+    m = re.match(
+        r"^([A-Za-z]{2,6})\s*/\s*([A-Za-z]{1,6})\s+([A-Za-z0-9]{3,12})$",
+        text,
+    )
+    if m and re.search(r"\d", m.group(3)):
+        return {
+            "prefix": f"{m.group(1).upper()}/{m.group(2).upper()}",
+            "number": m.group(3).upper(),
+        }
+    m = re.match(r"^([A-Za-z]{2,6})\s+([A-Za-z0-9]{3,12})$", text)
+    if m and re.search(r"\d", m.group(2)):
+        prefix = m.group(1).upper()
+        if prefix in _NON_PILLAR_PREFIXES:
+            return None
+        return {"prefix": prefix, "number": m.group(2).upper()}
+    compact = re.sub(r"\s+", "", text.upper())
+    m = re.match(r"^([A-Z]{2,6})(\d{3,9}[A-Z]{0,4})$", compact)
+    if m and m.group(1) not in _NON_PILLAR_PREFIXES and re.search(r"\d", m.group(2)):
+        return {"prefix": m.group(1), "number": m.group(2)}
+    return None
 
 
 def split_cadastral_pillar_label(raw: str) -> Optional[Dict[str, str]]:
@@ -533,7 +578,8 @@ def split_cadastral_pillar_label(raw: str) -> Optional[Dict[str, str]]:
     Split a Nigerian cadastral pillar id into CADA_PILLARNUMBERS table cells.
 
     Returns ``{{"prefix": "SC/DT", "number": "AS3459RP"}}`` (top / bottom rows).
-    Accepts classic digit pegs and longer alphanumeric peg tokens (up to ~9+ chars).
+    Accepts classic digit pegs, longer alphanumeric peg tokens, slash-optional
+    series (RFE 2176, RFAC 112), and other slash districts (OU/BC 22578).
     """
     text = re.sub(r"\s+", " ", (raw or "").strip())
     if not text:
@@ -553,16 +599,19 @@ def split_cadastral_pillar_label(raw: str) -> Optional[Dict[str, str]]:
 
     compact = re.sub(r"\s+", "", text.upper())
     m_head = re.match(rf"^({_PILLAR_SERIES})/?(.*)$", compact)
-    if not m_head:
-        # Last resort: any "XX/YYY rest" with a digit somewhere in rest
-        m = re.match(
-            r"^([A-Za-z]{1,4}\s*/\s*[A-Za-z]{1,6})\s+([A-Za-z0-9]{3,12})$",
-            text,
+    if m_head and "/" not in text:
+        series = m_head.group(1)
+        first_tok = re.split(r"\s+", text.strip())[0].upper()
+        glued_ok = (not re.search(r"\s", text)) and bool(
+            re.match(rf"^{series}[A-Z]{{1,6}}\d+$", compact)
         )
-        if m and re.search(r"\d", m.group(2)):
-            prefix = re.sub(r"\s+", "", m.group(1)).upper()
-            return {"prefix": prefix, "number": m.group(2).upper()}
-        return None
+        if first_tok not in {"SC", "SP", "RV", "RP"} and not glued_ok:
+            m_head = None
+    if not m_head:
+        other = _split_letter_series_pillar(text)
+        if other:
+            return other
+        return _split_incomplete_printed_pillar_label(text)
 
     series = m_head.group(1)
     rest = m_head.group(2) or ""
@@ -595,6 +644,9 @@ def split_cadastral_pillar_label(raw: str) -> Optional[Dict[str, str]]:
     if m and re.search(r"\d", m.group(2)):
         prefix = re.sub(r"\s+", "", m.group(1)).upper()
         return {"prefix": prefix, "number": m.group(2).upper()}
+    other = _split_letter_series_pillar(text)
+    if other:
+        return other
     return _split_incomplete_printed_pillar_label(text)
 
 
@@ -658,7 +710,11 @@ def _parse_pillar_token(tok: str, next_tok: str = "") -> Optional[str]:
         return _normalize_pillar_id(f"{split['prefix']} {split['number']}")
     if _PILLAR_PREFIX_TOKEN_RE.match(raw):
         nxt = (next_tok or "").strip()
-        if _PILLAR_NUMBER_TOKEN_RE.match(nxt) and re.search(r"\d", nxt):
+        if (
+            _PILLAR_NUMBER_TOKEN_RE.match(nxt)
+            and re.search(r"\d", nxt)
+            and (("/" in raw) or (raw.upper() not in _NON_PILLAR_PREFIXES))
+        ):
             return _normalize_pillar_id(f"{raw} {nxt}")
     m2 = _PILLAR_ID_TEXT_RE.match(raw)
     if m2:
@@ -1240,8 +1296,9 @@ def _trim_coordinates_blob(blob: str) -> str:
     if not s:
         return ""
     for pat in (
-        r"\.\s*Add\s+(?:\d+\s+)?(?:Concrete\s+wall\s+fence|Dwarf\s+Concrete|an?\s+access)",
-        r";\s*Add\s+(?:\d+\s+)?(?:Concrete|an?\s+access|another)",
+        r"[.;]\s*Add\s+(?:(?:another|a|an)\s+)?(?:\d+\s+)?"
+        r"(?:Concrete\s+wall\s+fence|Dwarf\s+Concrete|(?:an?\s+)?access)",
+        r"[.;]\s*Add\s+(?:a\s+)?(?:C\.?\s*W\.?\s*F\.?|D\.?\s*C\.?\s*W\.?\s*F)",
         r"\.\s*Generate\b",
         r";\s*Generate\b",
     ):
@@ -1980,7 +2037,7 @@ def _compute_relative_traverse_vertices(
     pts: List[Dict[str, float]] = [{"e": 0.0, "n": 0.0}]
     ce, cn = 0.0, 0.0
     for leg in legs:
-        bdeg = float(leg.bearing_deg) + float(leg.bearing_min) / 60.0
+        bdeg = traverse_leg_azimuth_deg(leg)
         br = math.radians(bdeg)
         de = float(leg.distance_m) * math.sin(br)
         dn = float(leg.distance_m) * math.cos(br)
@@ -2005,7 +2062,7 @@ def traverse_misclosure_metrics(
     for leg in legs:
         try:
             dist = float(leg.distance_m)
-            bdeg = float(leg.bearing_deg) + float(leg.bearing_min) / 60.0
+            bdeg = traverse_leg_azimuth_deg(leg)
         except Exception:
             continue
         peri += dist
@@ -2199,7 +2256,7 @@ def validate_extraction_topology(
         ce = cn = 0.0
         verts = [{"e": 0.0, "n": 0.0}]
         for leg in legs:
-            bdeg = float(leg.bearing_deg) + float(leg.bearing_min) / 60.0
+            bdeg = traverse_leg_azimuth_deg(leg)
             br = math.radians(bdeg)
             ce += float(leg.distance_m) * math.sin(br)
             cn += float(leg.distance_m) * math.cos(br)
@@ -2235,24 +2292,14 @@ def _is_plausible_pillar_id(pillar: str) -> bool:
     """
     Lightweight gate for PDF/layout pillar candidates.
 
-    Accepts classic SC/SP (and RV/RP) labels with digit pegs up to 9 digits, and
-    alphanumeric peg tokens such as AS3459RP / OA94567KL.
+    Accepts classic SC/SP (and RV/RP) labels, other slash series (OU/BC 22578),
+    and slash-optional beacons (RFE 2176, RFAC 112) with a 3–9 digit run.
     """
     if is_incomplete_printed_pillar_label(pillar or ""):
         return False
     split = split_cadastral_pillar_label(pillar or "")
     if not split:
-        # Fall back for already-normalized ids
-        if not re.search(r"^(?:SC|SP|RV|RP)\s*/", pillar or "", re.IGNORECASE):
-            return False
-        nums = re.findall(r"\d+", pillar or "")
-        if not nums:
-            return False
-        try:
-            num = int(nums[-1])
-        except Exception:
-            return False
-        return 100 <= num <= 999_999_999
+        return False
     number = split["number"]
     nums = re.findall(r"\d+", number)
     if not nums:
@@ -2285,12 +2332,13 @@ def _is_plausible_boundary_leg(leg: SurveyTraverseLeg) -> bool:
     try:
         bd = int(leg.bearing_deg)
         bm = int(leg.bearing_min)
+        bs = int(getattr(leg, "bearing_sec", 0) or 0)
         dist = float(leg.distance_m)
     except Exception:
         return False
-    if bd < 0 or bd > 360 or bm < 0 or bm >= 60:
+    if bd < 0 or bd > 360 or bm < 0 or bm >= 60 or bs < 0 or bs >= 60:
         return False
-    if bd == 360 and bm > 0:
+    if bd == 360 and (bm > 0 or bs > 0):
         return False
     if dist < 0.5 or dist > 250.0:
         return False
@@ -2751,7 +2799,7 @@ def infer_fences_from_pdf(
 
     for spec in infer_fences_from_boundary_text(combined_text):
         m = re.search(
-            r"joining\s+(SC/[A-Z]{1,3}\s*\d{3,5})\s+and\s+(SC/[A-Z]{1,3}\s*\d{3,5})",
+            rf"joining\s+({_PILLAR_TOKEN_CAPTURE})\s+and\s+({_PILLAR_TOKEN_CAPTURE})",
             spec,
             re.IGNORECASE,
         )
@@ -2786,7 +2834,7 @@ def infer_fences_from_boundary_text(text: str) -> List[str]:
     seen: set[str] = set()
     default_kind = "DCWF" if re.search(r"d\.?\s*c\.?\s*w\.?\s*f|\bdcwf\b", source, re.I) else "CWF"
 
-    dash_pat = r"(SC/[A-Z]{1,3}\s*\d{3,5})\s*[-–]\s*(SC/[A-Z]{1,3}\s*\d{3,5})"
+    dash_pat = rf"({_PILLAR_TOKEN_CAPTURE})\s*[-–]\s*({_PILLAR_TOKEN_CAPTURE})"
     for chunk in re.split(r"\s+and\s+", source, flags=re.IGNORECASE):
         for m in re.finditer(dash_pat, chunk, flags=re.IGNORECASE):
             spec = _fence_spec_for_pillar_pair(m.group(1), m.group(2), kind=default_kind)
@@ -2799,8 +2847,8 @@ def infer_fences_from_boundary_text(text: str) -> List[str]:
         return found
 
     fallback_patterns = (
-        r"between\s+(SC/[A-Z]{1,3}\s*\d{3,5})\s+and\s+(SC/[A-Z]{1,3}\s*\d{3,5})",
-        r"joining\s+(SC/[A-Z]{1,3}\s*\d{3,5})\s+and\s+(SC/[A-Z]{1,3}\s*\d{3,5})",
+        rf"between\s+({_PILLAR_TOKEN_CAPTURE})\s+and\s+({_PILLAR_TOKEN_CAPTURE})",
+        rf"joining\s+({_PILLAR_TOKEN_CAPTURE})\s+and\s+({_PILLAR_TOKEN_CAPTURE})",
     )
     for pat in fallback_patterns:
         for m in re.finditer(pat, source, flags=re.IGNORECASE):
@@ -2880,8 +2928,15 @@ def _expand_fence_segment_specs(seg: str, *, kind: str) -> List[Dict[str, str]]:
     chain_text = (m.group(1) or "").strip()
     if not chain_text:
         return [{"kind": kind, "spec": seg}]
-    pillars = re.findall(r"(?:SC|SP)/[A-Z]{1,3}\s*\d{3,5}", chain_text, re.IGNORECASE)
-    if len(pillars) < 3 or not re.search(r"\s+to\s+", chain_text, re.IGNORECASE):
+    pillars = re.findall(_PILLAR_TOKEN_CAPTURE, chain_text, re.IGNORECASE)
+    has_to = bool(re.search(r"\s+to\s+", chain_text, re.IGNORECASE))
+    and_count = len(re.findall(r"\s+and\s+", chain_text, re.IGNORECASE))
+    # "A to B and C to D" are two explicit pairs — do not invent the B–C leg.
+    if has_to and and_count >= 1:
+        return [{"kind": kind, "spec": seg}]
+    if len(pillars) < 3:
+        return [{"kind": kind, "spec": seg}]
+    if not has_to and and_count < 2:
         return [{"kind": kind, "spec": seg}]
     out: List[Dict[str, str]] = []
     for i in range(len(pillars) - 1):
@@ -3950,11 +4005,7 @@ def resolve_access_roads_with_llm(
         msg, err, timed_out = run_with_timeout(timeout_s, lambda: llm.invoke(messages))
         if timed_out or err:
             return []
-        raw = msg.content if hasattr(msg, "content") else str(msg)
-        if isinstance(raw, list):
-            raw = "\n".join(
-                str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in raw
-            )
+        raw = _llm_message_text(msg)
         data = _extract_json_object(str(raw))
         if not data:
             return []
@@ -4822,8 +4873,8 @@ def extract_heuristics_from_layout_text(layout_text: str) -> SurveyPlanExtractio
     legs: List[SurveyTraverseLeg] = []
     leg_patterns = [
         re.compile(
-            r"(\d{2,3})\s*°\s*(\d{1,2})\s*['′]?\s*(?:\d{1,2}\s*['′]?\s*)?"
-            r"(\d+(?:\.\d+)?)\s*m\b",
+            r"(\d{2,3})\s*°\s*(\d{1,2})\s*['′](?:\s*(\d{1,2})\s*[\"″])?"
+            r"\D{0,40}?(\d+(?:\.\d+)?)\s*m\b",
             flags=re.IGNORECASE,
         ),
         re.compile(
@@ -4838,10 +4889,17 @@ def extract_heuristics_from_layout_text(layout_text: str) -> SurveyPlanExtractio
     for leg_re in leg_patterns:
         for m in leg_re.finditer(text):
             try:
+                if m.lastindex and m.lastindex >= 4:
+                    dist = float(m.group(4))
+                    sec = int(m.group(3) or 0)
+                else:
+                    dist = float(m.group(3))
+                    sec = 0
                 leg = SurveyTraverseLeg(
                     bearing_deg=int(m.group(1)),
                     bearing_min=int(m.group(2)),
-                    distance_m=float(m.group(3)),
+                    bearing_sec=sec,
+                    distance_m=dist,
                 )
                 if _is_plausible_boundary_leg(leg):
                     legs.append(leg)
@@ -5113,6 +5171,7 @@ def _coerce_legs(raw: Any) -> List[SurveyTraverseLeg]:
                     to_pillar=str(item.get("to_pillar") or item.get("to") or "").strip(),
                     bearing_deg=int(item.get("bearing_deg") or item.get("bearing_d") or 0),
                     bearing_min=int(item.get("bearing_min") or item.get("bearing_m") or 0),
+                    bearing_sec=int(item.get("bearing_sec") or item.get("bearing_s") or 0),
                     distance_m=float(item.get("distance_m") or item.get("distance") or 0.0),
                 )
             )
@@ -5236,7 +5295,7 @@ def _legs_agreeing_with_drawn_edges(
 
     kept: List[SurveyTraverseLeg] = []
     for edge, leg in candidates:
-        label_brg = float(leg.bearing_deg) + float(leg.bearing_min) / 60.0
+        label_brg = traverse_leg_azimuth_deg(leg)
         drawn_brg = float(edge.get("bearing_hint") or 0.0)
         dev = _angular_diff_deg(label_brg, drawn_brg)
         if dev > _MAX_LABEL_EDGE_BEARING_DEV_DEG:
@@ -5468,7 +5527,7 @@ Rules:
 - List traverse_legs in clockwise order around the parcel, one entry per boundary line.
 - pillar_numbers: ordered list of labels printed on the plan, clockwise from the first labelled corner. Copy incomplete/obscured labels exactly as printed (e.g. SC/.. ......) — do not omit them and do not invent the missing district or digits. Never invent sequential IDs (SC/XX N+1, SC/XX N+2, …) to fill the ring. A corner with no printed box at all stays omitted.
 - If one coordinate pair is shown (easting + northing), set anchor_easting, anchor_northing, and anchor_pillar (the pillar that coordinate belongs to). If E and N appear on different grid lines at different pillars, use the pillar where both values apply or the primary/westernmost pillar with a full pair.
-- Normalize pillar IDs like SC/CR 5338, SC/Q 573, SC/CK 2285, SC/BV 6015 (not SCCR5338 or SCQ573).
+- Normalize pillar IDs like SC/CR 5338, SC/Q 573, SC/CK 2285, SC/BV 6015 (not SCCR5338 or SCQ573). Also keep slash-optional beacons as printed: RFE 2176, RFA 2679, RFAC 112, OU/BC 22578 — a valid pillar number need not contain '/' or begin with SC/ or SP/.
 - Do NOT infer concrete wall fence from line work alone. Only note a fence when the plan prints an explicit label such as C.W.F., D.C.W.F., CWF, DCWF, WF, Fence, Wall Fence, or Concrete Wall Fence beside that boundary side.
 - fences: array of machine-parseable specs when C.W.F./D.C.W.F. appears on the plan — one per fenced boundary side. Example: "Add Concrete wall fence on the sides joining SC/CJ 2140 and SC/CJ 2141". List every explicit fence label and its pillar pair.
 - access_roads: array of machine-parseable specs — one entry per road on the plan. Example: "an access road of width 6m on the side of SC/CR 5340 and SC/CR 5341". A plan may have roads on more than one boundary side; list each separately with the TWO pillar labels for that side. Never put instructions or narrative here. Never assume the shortest traverse leg — read each road position from the drawing.
@@ -5681,11 +5740,7 @@ def extract_survey_plan_from_pdf(
             )
         return SurveyPlanExtraction(source="error", notes=f"LLM extraction failed: {err}")
 
-    raw = msg.content if hasattr(msg, "content") else str(msg)
-    if isinstance(raw, list):
-        raw = "\n".join(
-            str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in raw
-        )
+    raw = _llm_message_text(msg)
     data = _extract_json_object(str(raw))
     if not data:
         if heuristic.traverse_legs:
@@ -6829,11 +6884,7 @@ def extract_survey_plan_from_dwg_with_llm(
         base.notes = f"{base.notes or ''} | {note}".strip(" |")
         return base
 
-    raw = msg.content if hasattr(msg, "content") else str(msg)
-    if isinstance(raw, list):
-        raw = "\n".join(
-            str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in raw
-        )
+    raw = _llm_message_text(msg)
     data = _extract_json_object(str(raw))
     if not data:
         base.notes = f"{base.notes or ''} | LLM JSON parse failed; kept heuristics".strip(" |")
@@ -7617,11 +7668,7 @@ def resolve_certification_date_with_llm(
         if timed_out or err:
             logger.debug("Certification date LLM failed: %s", err or "timeout")
             return None
-        raw = msg.content if hasattr(msg, "content") else str(msg)
-        if isinstance(raw, list):
-            raw = "\n".join(
-                str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in raw
-            )
+        raw = _llm_message_text(msg)
         data = _extract_json_object(str(raw))
         if not data:
             return None
@@ -7795,6 +7842,36 @@ def _resolve_buyer_name_fast(scope: str) -> Optional[str]:
     return None
 
 
+_TRAVERSE_BEARING_DISTANCE_LEG_RE = re.compile(
+    r"\bbearing\b\s*(?:(?:=|:|-)|(?:is|of|at)\b)?\s*"
+    r"(\d{1,3})\s*(?:degrees|degree|deg|°|d)\s*"
+    r"([0-5]?\d)\s*(?:min|mins|minute|minutes|['\u2019])"
+    r"(?:\s*([0-5]?\d)\s*(?:sec|secs|second|seconds|[\"\u2033]))?"
+    r"(?:[^0-9]{0,80}?)"
+    r"(?:distance|dist\.?|measured\s+distance)\s*(?:=|is|:)?\s*"
+    r"([0-9]+(?:\.[0-9]+)?)\s*(?:m)?\b",
+    flags=re.IGNORECASE | re.DOTALL,
+)
+
+
+def parse_traverse_bearing_distance_legs(text: str) -> List[Tuple[float, float]]:
+    """Decimal clockwise-from-north bearings and distances from prompt phrasing."""
+    legs: List[Tuple[float, float]] = []
+    for mm in _TRAVERSE_BEARING_DISTANCE_LEG_RE.finditer(text or ""):
+        try:
+            d = int(mm.group(1))
+            minutes = int(mm.group(2))
+            sec = int(mm.group(3) or 0)
+            dist = float(mm.group(4))
+        except Exception:
+            continue
+        if minutes >= 60 or sec >= 60 or dist <= 0:
+            continue
+        bdeg = (float(d) % 360.0) + (float(minutes) / 60.0) + (float(sec) / 3600.0)
+        legs.append((bdeg, dist))
+    return legs
+
+
 def _parse_coords_blob_fields(blob: str, pillars: List[str]) -> Dict[str, Any]:
     """Parse anchor coordinate and traverse legs from a cadastral coordinates blob."""
     out: Dict[str, Any] = {}
@@ -7817,24 +7894,19 @@ def _parse_coords_blob_fields(blob: str, pillars: List[str]) -> Dict[str, Any]:
         out["anchor_easting"] = float(m0.group(1))
         out["anchor_northing"] = float(m0.group(2))
 
-    leg_re = re.compile(
-        r"\bbearing\b\s*(?:(?:=|:|-)|\bis\b)?\s*"
-        r"(\d{1,3})\s*(?:deg|degree|degrees|°|d)\s*"
-        r"([0-5]?\d)\s*(?:min|mins|minute|minutes|['\u2019])"
-        r"(?:[^0-9]{0,80}?)"
-        r"(?:distance|dist\.?|measured\s+distance)\s*(?:=|is|:)?\s*"
-        r"([0-9]+(?:\.[0-9]+)?)\s*(?:m)?\b",
-        flags=re.IGNORECASE | re.DOTALL,
-    )
     legs: List[SurveyTraverseLeg] = []
-    for mm in leg_re.finditer(text):
-        legs.append(
-            SurveyTraverseLeg(
-                bearing_deg=int(mm.group(1)),
-                bearing_min=int(mm.group(2)),
-                distance_m=float(mm.group(3)),
+    for mm in _TRAVERSE_BEARING_DISTANCE_LEG_RE.finditer(text):
+        try:
+            legs.append(
+                SurveyTraverseLeg(
+                    bearing_deg=int(mm.group(1)),
+                    bearing_min=int(mm.group(2)),
+                    bearing_sec=int(mm.group(3) or 0),
+                    distance_m=float(mm.group(4)),
+                )
             )
-        )
+        except Exception:
+            continue
     legs = _filter_plausible_legs(legs)
     if pillars and legs and len(pillars) == len(legs):
         for i, leg in enumerate(legs):
@@ -8049,7 +8121,7 @@ Return ONLY JSON:
 }
 
 Rules:
-- Exact spellings from the user prompt for names and pillar IDs (SC/XX 1234 style).
+- Exact spellings from the user prompt for names and pillar IDs (SC/XX 1234, RFE 2176, OU/BC 22578, and other printed beacons).
 - Bearings: DD° MM' from North clockwise; distances in metres.
 - traverse_legs: clockwise boundary lines when the user specifies geometry changes.
 - certification_date: DD-MM-YYYY Nigerian cadastral style.
@@ -8203,11 +8275,7 @@ def _resolve_plan_overrides_with_llm(
         if timed_out or err:
             logger.debug("Plan override LLM failed: %s", err or "timeout")
             return SurveyPlanOverrides()
-        raw = msg.content if hasattr(msg, "content") else str(msg)
-        if isinstance(raw, list):
-            raw = "\n".join(
-                str(part.get("text", "")) if isinstance(part, dict) else str(part) for part in raw
-            )
+        raw = _llm_message_text(msg)
         data = _extract_json_object(str(raw))
         return _plan_overrides_from_llm_dict(data or {})
     except Exception as exc:
