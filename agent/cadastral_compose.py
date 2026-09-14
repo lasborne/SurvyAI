@@ -26,12 +26,15 @@ import pandas as pd
 from agent.excel_cadastral import (
     FamilyParcel,
     ParcelPoint,
+    apply_requested_crs_conversion,
     build_excel_cadastral_subprompt,
     coordinates_deferred_to_external_source,
     find_reference_dwg_from_query,
     format_absolute_coordinates_blob,
+    is_requested_excel_output_path,
     parse_family_parcels_from_excel,
     parse_family_parcels_from_rows,
+    query_requests_crs_conversion,
     write_dup_xlsx_with_headers,
     _letter_for_index,
 )
@@ -208,6 +211,11 @@ def discover_coordinate_source_files(
                         _add(Path(choice["path"]))
                 except Exception:
                     pass
+
+    # Drop a requested save-as workbook when a real source is also present.
+    sources_only = [p for p in found if not is_requested_excel_output_path(p, q)]
+    if sources_only:
+        found = sources_only
 
     return found[:max_files]
 
@@ -855,13 +863,52 @@ def compose_cadastral_from_files(
             "source_files": [str(p) for p in sources],
         }
 
+    crs_conversion: Dict[str, Any] = {"success": True, "applied": False}
+    if query_requests_crs_conversion(query or ""):
+        if not parcels:
+            return {
+                "success": False,
+                "error": (
+                    "Coordinate conversion was requested, but no Easting/Northing "
+                    "points were parsed from the source file. Conversion cannot be "
+                    "skipped — provide a workbook with Easting/Northing (or owner "
+                    "blocks) so the target CRS can be computed before plotting."
+                ),
+                "notes": notes,
+                "source_files": [str(p) for p in sources],
+                "crs_conversion": {"success": False, "applied": False},
+            }
+        crs_conv = apply_requested_crs_conversion(query or "", parcels)
+        crs_conversion = dict(crs_conv)
+        if not crs_conv.get("success"):
+            return {
+                "success": False,
+                "error": crs_conv.get("error")
+                or "Coordinate conversion was requested but could not be completed.",
+                "notes": notes,
+                "source_files": [str(p) for p in sources],
+                "crs_conversion": crs_conversion,
+            }
+        if crs_conv.get("applied"):
+            parcels = list(crs_conv.get("parcels") or parcels)
+            notes.append(str(crs_conv.get("note") or "Coordinates converted before compose."))
+            if crs_conv.get("target_crs"):
+                llm_meta["origin_crs"] = str(crs_conv["target_crs"])
+    elif parcels:
+        crs_conversion = apply_requested_crs_conversion(query or "", parcels)
+
     # Prompt-level overrides (CRS/date) always win when present.
     m_crs = re.search(
         r"(?:origin_crs|crs_origin)\s*[:=]\s*([^,\n]+)",
         query or "",
         flags=re.IGNORECASE,
     )
-    origin_crs = (m_crs.group(1).strip().strip("'\"") if m_crs else "") or llm_meta.get("origin_crs", "")
+    if m_crs and not crs_conversion.get("applied"):
+        origin_crs = m_crs.group(1).strip().strip("'\"")
+    else:
+        origin_crs = llm_meta.get("origin_crs", "") or (
+            m_crs.group(1).strip().strip("'\"") if m_crs else ""
+        )
     try:
         from agent.pdf_survey_plan import (
             extract_user_requested_certification_date,
@@ -942,6 +989,11 @@ def compose_cadastral_from_files(
                 )
                 if dup.get("success"):
                     dup_path = dup.get("output_path")
+                elif dup.get("cancelled"):
+                    notes.append(
+                        dup.get("error")
+                        or "Kept the existing workbook; overwrite was declined."
+                    )
                 else:
                     notes.append(f"Normalized workbook not written: {dup.get('error')}")
         except Exception as exc:
@@ -985,4 +1037,5 @@ def compose_cadastral_from_files(
         },
         "notes": notes,
         "compose_source": (llm_result or {}).get("source") if llm_result else "deterministic",
+        "crs_conversion": crs_conversion,
     }

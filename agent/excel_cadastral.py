@@ -977,6 +977,188 @@ def query_requests_workbook_copy(query: str) -> bool:
     )
 
 
+def query_requests_crs_conversion(query: str) -> bool:
+    """True when the user asked to convert/reproject coordinates (any wording).
+
+    Requires a real CRS/datum cue so 'convert this Excel to a CAD plan' is not
+    treated as a coordinate-system change.
+    """
+    q = (query or "").lower()
+    if not q:
+        return False
+    crs_cue = bool(
+        re.search(
+            r"\b(utm|wgs\s*84|wgs84|minna|epsg|wkid|crs|zone\s*\d{1,2}\s*[ns]?|"
+            r"mid[\s\-]?belt|west[\s\-]?belt|east[\s\-]?belt|coordinate\s+system|"
+            r"datum)\b",
+            q,
+        )
+    )
+    if not crs_cue:
+        return False
+    if re.search(r"\b(reproject(?:ed|ing)?|transform(?:ed|ing)?)\b", q):
+        return True
+    if re.search(r"\bconvert(?:ed|ing)?\b", q):
+        return True
+    if re.search(r"\b(?:change|switch)\s+(?:the\s+)?(?:datum|crs|coordinate\s+system)\b", q):
+        return True
+    # "from <CRS> to/into <CRS>" — both sides must look like a system, not
+    # "from the existing plan to fill the title block".
+    _crs_tok = (
+        r"(?:utm|wgs\s*84|wgs84|minna|epsg|wkid|zone\s*\d{1,2}|"
+        r"mid[\s\-]?belt|west[\s\-]?belt|east[\s\-]?belt)"
+    )
+    if re.search(
+        rf"\bfrom\b.{{0,80}}{_crs_tok}.{{0,80}}\b(?:to|into)\b.{{0,80}}{_crs_tok}",
+        q,
+    ):
+        return True
+    if re.search(r"\b(?:converted|reprojected)\s+coordinates?\b", q):
+        return True
+    return False
+
+
+def is_requested_excel_output_path(path: str | Path, query: str) -> bool:
+    """True when ``path`` is the workbook the user asked to *create*, not the source."""
+    name = extract_requested_workbook_copy_name(query)
+    if not name:
+        return False
+    try:
+        return Path(path).name.lower() == Path(name).name.lower()
+    except Exception:
+        return False
+
+
+def extract_requested_crs_conversion(query: str) -> Optional[Dict[str, str]]:
+    """Return ``{source_crs, target_crs}`` when both sides can be inferred."""
+    if not query_requests_crs_conversion(query):
+        return None
+    try:
+        from utils.coordinate_parsing import infer_crs_from_text
+    except Exception:
+        return None
+    info = infer_crs_from_text(query or "")
+    src = str(info.get("source_crs") or "").strip()
+    dst = str(info.get("target_crs") or "").strip()
+    if not src or not dst:
+        return None
+    if src.lower() == dst.lower():
+        return None
+    return {"source_crs": src, "target_crs": dst}
+
+
+def reproject_family_parcels(
+    parcels: Sequence[FamilyParcel],
+    *,
+    source_crs: str,
+    target_crs: str,
+) -> Tuple[List[FamilyParcel], int]:
+    """Transform every parcel Easting/Northing from ``source_crs`` to ``target_crs``."""
+    from tools.geographic_calculator_core import BlueMarbleConverter
+
+    converter = BlueMarbleConverter(auto_connect=False)
+    out: List[FamilyParcel] = []
+    count = 0
+    for parcel in parcels:
+        pts: List[ParcelPoint] = []
+        for pt in parcel.points:
+            res = converter.convert_coordinate(
+                float(pt.e),
+                float(pt.n),
+                source_crs=source_crs,
+                target_crs=target_crs,
+                use_geographic_calculator=False,
+            )
+            tgt = (res or {}).get("target") or {}
+            if "x" not in tgt or "y" not in tgt:
+                raise RuntimeError(
+                    f"Converter returned no target XY for {pt.e}, {pt.n} "
+                    f"({source_crs} → {target_crs})."
+                )
+            e2 = float(tgt["x"])
+            n2 = float(tgt["y"])
+            # Guard: projected metres must not collapse to lat/lon.
+            if abs(float(pt.e)) > 1000.0 and abs(e2) <= 180.0 and abs(n2) <= 90.0:
+                raise RuntimeError(
+                    f"Conversion {source_crs} → {target_crs} produced geographic "
+                    f"degrees ({e2}, {n2}) from projected metres ({pt.e}, {pt.n}). "
+                    "Check the source and target CRS names."
+                )
+            pts.append(ParcelPoint(e=e2, n=n2, pillar=pt.pillar))
+            count += 1
+        out.append(
+            FamilyParcel(
+                owner_name=parcel.owner_name,
+                letter=parcel.letter,
+                points=pts,
+            )
+        )
+    return out, count
+
+
+def apply_requested_crs_conversion(
+    query: str,
+    parcels: Sequence[FamilyParcel],
+) -> Dict[str, Any]:
+    """
+    Convert parsed family parcels when the prompt asks for a CRS change.
+
+    Fail closed: if conversion was requested, do not return the original metres.
+    """
+    listed = list(parcels or [])
+    if not query_requests_crs_conversion(query):
+        return {"success": True, "applied": False, "parcels": listed}
+    if not listed:
+        return {
+            "success": False,
+            "applied": False,
+            "error": (
+                "Coordinate conversion was requested, but no Easting/Northing "
+                "points were parsed from the workbook yet."
+            ),
+        }
+    spec = extract_requested_crs_conversion(query)
+    if not spec:
+        return {
+            "success": False,
+            "applied": False,
+            "error": (
+                "Coordinate conversion was requested but the source and target "
+                "systems could not both be read from the prompt. Name both "
+                "(for example: convert from UTM Zone 32N to Minna / Nigeria Mid Belt)."
+            ),
+        }
+    try:
+        converted, n_pts = reproject_family_parcels(
+            listed,
+            source_crs=spec["source_crs"],
+            target_crs=spec["target_crs"],
+        )
+    except Exception as exc:
+        return {
+            "success": False,
+            "applied": False,
+            "error": (
+                f"Coordinate conversion failed "
+                f"({spec['source_crs']} → {spec['target_crs']}): {exc}"
+            ),
+            "source_crs": spec["source_crs"],
+            "target_crs": spec["target_crs"],
+        }
+    return {
+        "success": True,
+        "applied": True,
+        "parcels": converted,
+        "source_crs": spec["source_crs"],
+        "target_crs": spec["target_crs"],
+        "point_count": n_pts,
+        "note": (
+            f"Converted {n_pts} coordinates from {spec['source_crs']} to "
+            f"{spec['target_crs']} before saving Excel and plotting CAD."
+        ),
+    }
+
+
 def resolve_ownership_excel_for_plot(
     query: str,
     workspace: str | Path,
@@ -1012,13 +1194,28 @@ def resolve_ownership_excel_for_plot(
         if p.exists():
             mentioned.append(p)
 
-    preferred_path = Path(preferred).resolve() if preferred else (mentioned[0] if mentioned else None)
+    # Never treat a requested *output* workbook (save as 'dup1.xlsx', etc.) as the
+    # source when the original input is also available — that would re-convert
+    # already-converted metres on a retry.
+    mentioned_sources = [p for p in mentioned if not is_requested_excel_output_path(p, q)]
+    preferred_path = Path(preferred).resolve() if preferred else (
+        mentioned_sources[0] if mentioned_sources else None
+    )
+    if preferred_path is not None and is_requested_excel_output_path(preferred_path, q):
+        preferred_path = mentioned_sources[0] if mentioned_sources else None
     # Candidate pool: workspace workbooks + any explicit mentions.
     pool = {str(p.resolve()).lower(): p.resolve() for p in list_excel_workbooks(ws)}
     for p in mentioned:
         pool[str(p.resolve()).lower()] = p.resolve()
     if preferred_path is not None and preferred_path.exists():
         pool[str(preferred_path).lower()] = preferred_path
+    sources_only = {
+        k: p for k, p in pool.items() if not is_requested_excel_output_path(p, q)
+    }
+    if sources_only:
+        pool = sources_only
+        if preferred_path is not None and is_requested_excel_output_path(preferred_path, q):
+            preferred_path = next(iter(pool.values()), None)
 
     if not pool:
         return {
@@ -1153,6 +1350,30 @@ def write_dup_xlsx_with_headers(
         except Exception:
             dest = (Path.cwd() / Path(requested).name).resolve()
     dest = dest.resolve()
+    try:
+        from agent.output_paths import cancelled_existing_file_write
+
+        blocked = cancelled_existing_file_write(str(dest))
+        if blocked:
+            return blocked
+    except Exception as exc:
+        try:
+            if dest.exists():
+                return {
+                    "success": False,
+                    "cancelled": True,
+                    "error": (
+                        f"Could not confirm overwrite of existing file: {dest} ({exc})"
+                    ),
+                    "output_path": str(dest),
+                }
+        except Exception:
+            return {
+                "success": False,
+                "cancelled": True,
+                "error": f"Could not confirm overwrite of existing file: {dest} ({exc})",
+                "output_path": str(dest),
+            }
     try:
         parse_src = src
         # If this path is weak/placeholder, switch to a better nearby ownership sheet.

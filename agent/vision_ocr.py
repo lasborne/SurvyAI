@@ -2220,6 +2220,16 @@ def export_ocr_extraction_to_excel(
     _append_metadata_block(meta_ws, data, image_paths)
 
     try:
+        from agent.output_paths import cancelled_existing_file_write
+
+        blocked = cancelled_existing_file_write(str(path))
+        if blocked:
+            raise PermissionError(blocked.get("error") or f"Left existing file unchanged: {path}")
+    except PermissionError:
+        raise
+    except Exception:
+        pass
+    try:
         wb.save(path)
         return path.resolve()
     except PermissionError:
@@ -2345,6 +2355,16 @@ def export_ocr_extraction_to_docx(
     else:
         _append_ocr_text_to_docx(document, body)
 
+    try:
+        from agent.output_paths import cancelled_existing_file_write
+
+        blocked = cancelled_existing_file_write(str(path))
+        if blocked:
+            raise PermissionError(blocked.get("error") or f"Left existing file unchanged: {path}")
+    except PermissionError:
+        raise
+    except Exception:
+        pass
     try:
         document.save(str(path))
         return path.resolve()

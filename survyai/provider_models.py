@@ -450,6 +450,55 @@ def _text_from_content_block(block: Any) -> str:
     return ""
 
 
+def strip_trailing_model_envelope(raw: str) -> str:
+    """Drop a trailing Responses-API / chat content-block dump from visible text.
+
+    Some models append a Python/JSON envelope such as
+    ``{'type': 'text', 'text': '...', 'phase': 'final_answer'}`` after the answer.
+    """
+    text = (raw or "").rstrip()
+    if not text:
+        return ""
+    tail = text
+    head = ""
+    idx = text.rfind("\n{")
+    if idx >= 0:
+        head = text[:idx].rstrip()
+        tail = text[idx + 1 :].strip()
+    elif not (text.startswith("{") and text.endswith("}")):
+        return text
+    if not (tail.startswith("{") and tail.endswith("}")):
+        return text
+    looks_envelope = (
+        "final_answer" in tail
+        or ("annotations" in tail and ("'type'" in tail or '"type"' in tail))
+    )
+    if not looks_envelope:
+        return text
+    obj: Any = None
+    try:
+        import ast
+
+        obj = ast.literal_eval(tail)
+    except Exception:
+        try:
+            obj = json.loads(tail)
+        except Exception:
+            return text
+    if not isinstance(obj, dict):
+        return text
+    kind = str(obj.get("type") or "").strip().lower()
+    phase = str(obj.get("phase") or "").strip().lower()
+    if phase != "final_answer" and kind not in {"text", "output_text"}:
+        return text
+    if kind and kind not in {"text", "output_text"}:
+        return text
+    if head:
+        return head
+    inner = obj.get("text") or obj.get("output_text") or ""
+    return str(inner).strip() if inner else text
+
+
 def llm_visible_text_from_content(content: Any) -> str:
     """User-visible model text; skips Responses-API reasoning / encrypted blobs."""
     if content is None:
@@ -462,11 +511,11 @@ def llm_visible_text_from_content(content: Any) -> str:
             key in raw for key in ("traverse_legs", "pillar_numbers", "buyer_name", "plan_number")
         ):
             return ""
-        return raw
+        return strip_trailing_model_envelope(raw)
     if isinstance(content, dict):
         text = _text_from_content_block(content)
         if text:
-            return text
+            return strip_trailing_model_envelope(text)
         if _is_reasoning_payload(content):
             return ""
         kind = str(content.get("type") or "").strip().lower()
@@ -481,15 +530,19 @@ def llm_visible_text_from_content(content: Any) -> str:
         for item in content:
             if isinstance(item, str):
                 parts.append(llm_visible_text_from_content(item))
+            elif isinstance(item, dict) and str(item.get("phase") or "").strip().lower() == "final_answer":
+                extra = _text_from_content_block(item)
+                if extra and not parts:
+                    parts.append(extra)
             else:
                 parts.append(_text_from_content_block(item))
-        return "\n".join(p for p in parts if p).strip()
+        return strip_trailing_model_envelope("\n".join(p for p in parts if p).strip())
     if hasattr(content, "model_dump"):
         try:
             return llm_visible_text_from_content(content.model_dump())
         except Exception:
             pass
-    return str(content).strip()
+    return strip_trailing_model_envelope(str(content).strip())
 
 
 def _balance_truncated_json(s: str) -> str:
@@ -609,5 +662,6 @@ __all__ = [
     "gemini_thinking_kwargs",
     "paid_llm_constructor_kwargs",
     "llm_visible_text_from_content",
+    "strip_trailing_model_envelope",
     "extract_llm_json_object",
 ]

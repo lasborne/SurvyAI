@@ -364,7 +364,7 @@ class Settings(BaseSettings):
     # ==========================================================================
 
     fast_mode_non_file_prompts: bool = Field(
-        default=True,
+        default=False,
         env="FAST_MODE_NON_FILE_PROMPTS",
         description=(
             "If True, generic non-file prompts bypass the full agent graph/tool planning and run a single LLM call. "

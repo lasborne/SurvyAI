@@ -152,7 +152,7 @@ class SurvyLogoWidget(QWidget):
         self._dark_ui = False
         self.setObjectName("survyLogo")
         self.setFixedSize(size, size)
-        self.setToolTip("SurvyAI")
+        self.setToolTip("SurvyAI — AI assistant for surveyors and geospatial work.")
 
     def set_dark_ui(self, dark: bool) -> None:
         if self._dark_ui != dark:

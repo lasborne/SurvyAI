@@ -119,7 +119,7 @@ class DesktopState:
     ollama_last_prompted_at: str = ""
     ollama_prompt_dismissed: bool = False
     # Performance toggles (desktop-only UX; injected into Settings overrides)
-    fast_mode_non_file_prompts: bool = True
+    fast_mode_non_file_prompts: bool = False
     # UI theme: "light" (default) or "dark"
     theme: str = "light"
     # App updates (opt-in). When enabled, SurvyAI checks the cloud manifest
@@ -185,7 +185,7 @@ class DesktopState:
             ollama_model=str(raw.get("ollama_model", "")),
             ollama_last_prompted_at=str(raw.get("ollama_last_prompted_at", "")),
             ollama_prompt_dismissed=bool(raw.get("ollama_prompt_dismissed", False)),
-            fast_mode_non_file_prompts=bool(raw.get("fast_mode_non_file_prompts", True)),
+            fast_mode_non_file_prompts=bool(raw.get("fast_mode_non_file_prompts", False)),
             theme=str(raw.get("theme", "light") or "light"),
             auto_check_updates=bool(raw.get("auto_check_updates", False)),
             update_channel=str(raw.get("update_channel", "stable") or "stable"),

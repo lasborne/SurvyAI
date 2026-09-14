@@ -145,7 +145,7 @@ class AgentRunThread(QThread):
                 kind = message.get("kind")
                 payload = message.get("payload")
                 if kind == "confirm_overwrite":
-                    self.progress_text.emit("Waiting for confirmation about an existing drawing…")
+                    self.progress_text.emit("Waiting for confirmation about an existing file…")
                     # Clear only after capturing any stale set(); then wait for this dialog.
                     self._confirm_accepted = False
                     self._confirm_event.clear()
@@ -155,7 +155,7 @@ class AgentRunThread(QThread):
                             break
                         if not proc.is_alive():
                             self.failed.emit(
-                                "Agent process exited while waiting for drawing overwrite confirmation."
+                                "Agent process exited while waiting for overwrite confirmation."
                             )
                             return
                     accepted = bool(self._confirm_accepted) and not self._cancel_requested
@@ -178,11 +178,9 @@ class AgentRunThread(QThread):
                         self.cancelled.emit("Task cancelled. The active agent run was terminated.")
                         return
                     if accepted:
-                        self.progress_text.emit(
-                            "Overwrite confirmed. Preparing the drawing in AutoCAD…"
-                        )
+                        self.progress_text.emit("Overwrite confirmed. Continuing…")
                     else:
-                        self.progress_text.emit("Existing drawing kept. Finishing…")
+                        self.progress_text.emit("Existing file kept. Continuing…")
                     continue
                 if kind == "confirm_overwrite_waiting":
                     # Heartbeat while agent is blocked on the dialog (UI feedback only).

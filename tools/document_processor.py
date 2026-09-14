@@ -1336,6 +1336,14 @@ class DocumentProcessor:
             
             # Create parent directories if needed
             path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                from agent.output_paths import cancelled_existing_file_write
+
+                blocked = cancelled_existing_file_write(str(path))
+                if blocked:
+                    return blocked
+            except Exception:
+                pass
             
             # Create new document
             doc = docx.Document()
@@ -1505,6 +1513,14 @@ class DocumentProcessor:
                 path = path.with_suffix('.docx')
             
             path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                from agent.output_paths import cancelled_existing_file_write
+
+                blocked = cancelled_existing_file_write(str(path))
+                if blocked:
+                    return blocked
+            except Exception:
+                pass
             
             doc = docx.Document()
             

@@ -96,16 +96,19 @@ class AccountDialog(QDialog):
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Enter the identity details that should appear in the desktop app.\n"
-            "This is local desktop sign-in scaffolding until the cloud backend is added."
+            "Optional local profile shown in the desktop app.\n"
+            "For hosted models and credits, use Sign in from the account menu."
         )
         intro.setWordWrap(True)
         layout.addWidget(intro)
 
         form = QFormLayout()
         self.name_edit = QLineEdit(self._profile.display_name)
+        self.name_edit.setToolTip("Display name shown in the desktop app.")
         self.email_edit = QLineEdit(self._profile.email)
+        self.email_edit.setToolTip("Optional contact email stored on this PC.")
         self.company_edit = QLineEdit(self._profile.company)
+        self.company_edit.setToolTip("Optional company on your local profile.")
         form.addRow("Name", self.name_edit)
         form.addRow("Email", self.email_edit)
         form.addRow("Company", self.company_edit)
@@ -114,8 +117,10 @@ class AccountDialog(QDialog):
         buttons = QHBoxLayout()
         cancel = QPushButton("Cancel")
         cancel.setObjectName("secondaryButton")
+        cancel.setToolTip("Close without changing the local profile.")
         cancel.clicked.connect(self.reject)
         save = QPushButton("Save")
+        save.setToolTip("Save this local profile on this PC.")
         save.clicked.connect(self._accept_if_valid)
         buttons.addStretch()
         buttons.addWidget(cancel)
@@ -140,13 +145,19 @@ class _SignInPage(QWizardPage):
     def __init__(self, initial_profile: Optional[AccountProfile] = None) -> None:
         super().__init__()
         self.setTitle("Account sign-in")
-        self.setSubTitle("Set up the identity shown inside the SurvyAI desktop app.")
+        self.setSubTitle(
+            "Name and company shown in the desktop app. Cloud sign-in for hosted models "
+            "is available later from the account menu."
+        )
 
         initial_profile = initial_profile or AccountProfile()
         layout = QFormLayout(self)
         self.name_edit = QLineEdit(initial_profile.display_name)
+        self.name_edit.setToolTip("Display name shown in the title bar after you finish setup.")
         self.email_edit = QLineEdit(initial_profile.email)
+        self.email_edit.setToolTip("Optional contact email stored on this PC.")
         self.company_edit = QLineEdit(initial_profile.company)
+        self.company_edit.setToolTip("Optional company shown on your local profile.")
         self.registerField("profile_name*", self.name_edit)
         self.registerField("profile_email", self.email_edit)
         self.registerField("profile_company", self.company_edit)
@@ -188,8 +199,12 @@ class _DataFolderPage(QWizardPage):
         layout = QVBoxLayout(self)
         row = QHBoxLayout()
         self.path_edit = QLineEdit(initial_path)
+        self.path_edit.setToolTip(
+            "Folder for logs, local data, and app exports — not the same as your project workspace."
+        )
         browse = QPushButton("Browse…")
         browse.setObjectName("secondaryButton")
+        browse.setToolTip("Choose a stable folder under Documents or AppData.")
         browse.clicked.connect(self._browse)
         row.addWidget(self.path_edit, 1)
         row.addWidget(browse)
@@ -216,10 +231,13 @@ class _TutorialPage(QWizardPage):
         layout = QVBoxLayout(self)
         info = QLabel(
             "1. Choose a workspace folder before generating files.\n"
-            "2. Use the console tab for normal prompting.\n"
-            "3. Output history stores previous runs for reuse.\n"
-            "4. Safe mode disables external integrations when troubleshooting.\n"
-            "5. Diagnostics export creates a support bundle with logs and environment details."
+            "2. Console is for free-form prompts: Enter sends, Shift+Enter starts a new line "
+            "(same as most chat apps). Automated CAD section is a fill-in form — "
+            "press Send to plot. Output History stores previous runs.\n"
+            "3. Follow-up CAD edits (roads, title, subdivision, save as) stay in the same conversation.\n"
+            "4. Fast mode and Fallback LLM start unchecked. Turn them on only when you need them.\n"
+            "5. Use the sun/moon control for light or dark mode. Safe mode in Settings limits "
+            "integrations while troubleshooting. File → Export diagnostics bundle for support."
         )
         info.setWordWrap(True)
         layout.addWidget(info)

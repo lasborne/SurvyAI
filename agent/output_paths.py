@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Callable, Optional, Sequence, Union
 
 _PathLike = Union[str, Path]
 
@@ -169,3 +169,104 @@ def join_workspace_path(
         return p
     ws = Path(workspace).resolve() if workspace else Path.cwd().resolve()
     return (ws / p).resolve()
+
+
+_file_conflict_handler: Optional[Callable[[str, str], bool]] = None
+
+def set_file_conflict_handler(handler: Optional[Callable[[str, str], bool]]) -> None:
+    """Install the GUI/CLI callback used before overwriting an existing file."""
+    global _file_conflict_handler
+    _file_conflict_handler = handler
+
+
+def _existing_output_kind(path: Path) -> str:
+    """Short label for an existing output path (file, folder, or known type)."""
+    ext = path.suffix.lower()
+    if ext == ".gdb" or (path.exists() and path.is_dir() and ext not in {".gdb"}):
+        if ext == ".gdb":
+            return "geodatabase"
+        return "folder"
+    return {
+        ".dwg": "drawing",
+        ".dxf": "drawing",
+        ".docx": "Word document",
+        ".doc": "Word document",
+        ".xlsx": "Excel workbook",
+        ".xls": "Excel workbook",
+        ".xlsm": "Excel workbook",
+        ".csv": "CSV file",
+        ".txt": "text file",
+        ".json": "JSON file",
+        ".pdf": "PDF",
+        ".aprx": "ArcGIS project",
+        ".shp": "shapefile",
+    }.get(ext, "file")
+
+
+def confirm_overwrite_existing_file(path: str, *, mode: str = "overwrite") -> bool:
+    """Ask before replacing or modifying an existing user file or folder. True = proceed."""
+    raw = str(path or "").strip()
+    if not raw:
+        return True
+    try:
+        p = Path(raw)
+        if not p.exists():
+            return True
+        # Never treat the workspace or a drive root as a replaceable output.
+        try:
+            resolved = p.resolve()
+            if resolved == Path.cwd().resolve() or resolved.parent == resolved:
+                return True
+        except Exception:
+            pass
+    except Exception:
+        return True
+    handler = _file_conflict_handler
+    if callable(handler):
+        try:
+            return bool(handler(str(p.resolve()), str(mode or "overwrite")))
+        except Exception:
+            return False
+    try:
+        import ctypes
+
+        mode_l = (mode or "overwrite").strip().lower()
+        kind = _existing_output_kind(p)
+        target = "folder" if (p.is_dir() and p.suffix.lower() != ".gdb") else "file"
+        if mode_l == "modify":
+            text = (
+                f"This {kind} already exists:\n\n{p}\n\n"
+                f"Do you want to apply changes to this existing {target}?\n\n"
+                f"Yes — continue and modify the {target}\n"
+                f"No — cancel and leave the {target} unchanged"
+            )
+            title = f"SurvyAI — Modify existing {kind}"
+        else:
+            text = (
+                f"This {kind} already exists:\n\n{p}\n\n"
+                f"Do you want to overwrite it?\n\n"
+                f"Yes — overwrite the existing {target}\n"
+                f"No — keep the existing {target} unchanged"
+            )
+            title = f"SurvyAI — {kind.capitalize()} already exists"
+        flags = 0x00000004 | 0x00000030 | 0x00010000 | 0x00040000 | 0x00001000
+        try:
+            ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
+        except Exception:
+            pass
+        result = ctypes.windll.user32.MessageBoxW(0, text, title, flags)
+        return int(result) == 6
+    except Exception:
+        return False
+
+
+def cancelled_existing_file_write(path: str, *, mode: str = "overwrite") -> Optional[dict]:
+    """If *path* exists and the user declines, return a cancelled result; else None."""
+    if confirm_overwrite_existing_file(path, mode=mode):
+        return None
+    return {
+        "success": False,
+        "cancelled": True,
+        "error": f"Left existing path unchanged: {path}",
+        "output_path": str(path),
+    }

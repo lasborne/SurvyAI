@@ -24,7 +24,7 @@ class ThemeToggle(QWidget):
         self.setObjectName("themeToggle")
         self.setFixedSize(self._W, self._H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip("Switch light / dark appearance")
+        self.setToolTip("Light or dark appearance. Saved on this PC.")
         self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self._checked = False
         self._thumb_pos = 0.0

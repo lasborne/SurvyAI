@@ -77,18 +77,24 @@ class MarkdownHelpDialog(QDialog):
             self._dont_show = QCheckBox("Don't show this guide automatically again")
             self._dont_show.setChecked(True)
             self._dont_show.setObjectName("helpDontShowAgain")
+            self._dont_show.setToolTip(
+                "Leave checked to skip this playbook on the next launch. "
+                "You can still open it from Help → Getting started guide."
+            )
             root.addWidget(self._dont_show)
 
         actions = QHBoxLayout()
         actions.setSpacing(10)
         open_folder = QPushButton("Open docs folder")
         open_folder.setObjectName("secondaryButton")
+        open_folder.setToolTip("Open the folder that contains this guide in File Explorer.")
         open_folder.clicked.connect(self._open_docs_folder)
         actions.addWidget(open_folder)
         actions.addStretch()
         primary = QPushButton(primary_label)
         primary.setObjectName("primaryButton")
         primary.setDefault(True)
+        primary.setToolTip("Close this guide and return to SurvyAI.")
         primary.clicked.connect(self.accept)
         actions.addWidget(primary)
         root.addLayout(actions)

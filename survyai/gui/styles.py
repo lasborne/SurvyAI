@@ -125,7 +125,7 @@ QPushButton#primaryButton:hover {
     background-color: #1d4ed8;
 }
 
-/* --- Tabs (Console / Output History) -------------------------------- */
+/* --- Tabs (Console / Automated CAD / Output History) ---------------- */
 QTabWidget::pane {
     border: 1px solid #e2e8f0;
     border-radius: 12px;
@@ -154,6 +154,131 @@ QTabBar::tab:hover:!selected {
     background: #f1f5f9;
     border-color: #e2e8f0;
     color: #334155;
+}
+
+/* --- Automated CAD form -------------------------------------------- */
+QWidget#cadFormRoot {
+    background: transparent;
+}
+QScrollArea#cadFormScroll,
+QScrollArea#cadFormScroll::viewport {
+    background: transparent;
+    border: none;
+}
+QLabel#cadHintLabel {
+    color: #64748b;
+    font-size: 9.5pt;
+    line-height: 1.35;
+}
+QLabel#cadSectionTitle {
+    color: #0f172a;
+    font-size: 11pt;
+    font-weight: 700;
+    padding-top: 6px;
+}
+QLabel#cadSubSectionTitle {
+    color: #1e293b;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QLabel#cadFieldLabel {
+    color: #334155;
+    font-weight: 600;
+}
+QLabel#cadUnitLabel {
+    color: #475569;
+    font-weight: 700;
+    min-width: 14px;
+}
+QWidget#cadModeSwitch {
+    background: #f1f5f9;
+    border: 1px solid #e2e8f0;
+    border-radius: 14px;
+}
+QPushButton#cadModeButton {
+    background: transparent;
+    color: #475569;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-weight: 600;
+    min-height: 22px;
+}
+QPushButton#cadModeButton:hover {
+    background: #e2e8f0;
+    color: #0f172a;
+    border-color: transparent;
+}
+QPushButton#cadModeButton:checked {
+    background: #ffffff;
+    color: #0f172a;
+    border: 1px solid #cbd5e1;
+}
+QToolButton#cadAddButton {
+    background: #eff6ff;
+    color: #1d4ed8;
+    border: 1px solid #bfdbfe;
+    border-radius: 8px;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+    font-weight: 700;
+    font-size: 13pt;
+    padding: 0;
+}
+QToolButton#cadAddButton:hover {
+    background: #dbeafe;
+    border-color: #93c5fd;
+}
+QToolButton#cadRemoveButton {
+    background: #fef2f2;
+    color: #b91c1c;
+    border: 1px solid #fecaca;
+    border-radius: 8px;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+    font-weight: 700;
+    font-size: 12pt;
+    padding: 0;
+}
+QToolButton#cadRemoveButton:hover {
+    background: #fee2e2;
+    border-color: #fca5a5;
+}
+QToolButton#cadInfoButton {
+    background: #f8fafc;
+    color: #2563eb;
+    border: 1px solid #bfdbfe;
+    border-radius: 11px;
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    font-weight: 700;
+    font-size: 9pt;
+    font-style: italic;
+    padding: 0;
+}
+QToolButton#cadInfoButton:hover {
+    background: #eff6ff;
+    border-color: #93c5fd;
+}
+QLineEdit#cadDmsEdit {
+    min-width: 52px;
+    max-width: 72px;
+    padding: 6px 8px;
+}
+QWidget#cadNestedGroup {
+    background: #f8fafc;
+    border: 1px solid #e2e8f0;
+    border-radius: 12px;
+}
+QCheckBox#cadAutoScaleCheck {
+    font-weight: 600;
+    color: #1e293b;
 }
 
 /* --- Form controls -------------------------------------------------- */
@@ -858,6 +983,130 @@ QTabBar::tab:selected {
 QTabBar::tab:hover:!selected {
     background: #1a1a1e;
     color: #a1a1aa;
+}
+
+QWidget#cadFormRoot {
+    background: transparent;
+}
+QScrollArea#cadFormScroll,
+QScrollArea#cadFormScroll::viewport {
+    background: transparent;
+    border: none;
+}
+QLabel#cadHintLabel {
+    color: #a1a1aa;
+    font-size: 9.5pt;
+    line-height: 1.35;
+}
+QLabel#cadSectionTitle {
+    color: #fafafa;
+    font-size: 11pt;
+    font-weight: 700;
+    padding-top: 6px;
+}
+QLabel#cadSubSectionTitle {
+    color: #e4e4e7;
+    font-size: 10pt;
+    font-weight: 600;
+}
+QLabel#cadFieldLabel {
+    color: #d4d4d8;
+    font-weight: 600;
+}
+QLabel#cadUnitLabel {
+    color: #a1a1aa;
+    font-weight: 700;
+    min-width: 14px;
+}
+QWidget#cadModeSwitch {
+    background: #18181b;
+    border: 1px solid #3f3f46;
+    border-radius: 14px;
+}
+QPushButton#cadModeButton {
+    background: transparent;
+    color: #a1a1aa;
+    border: 1px solid transparent;
+    border-radius: 10px;
+    padding: 8px 14px;
+    font-weight: 600;
+    min-height: 22px;
+}
+QPushButton#cadModeButton:hover {
+    background: #27272a;
+    color: #fafafa;
+    border-color: transparent;
+}
+QPushButton#cadModeButton:checked {
+    background: #1f1f23;
+    color: #fafafa;
+    border: 1px solid #3f3f46;
+}
+QToolButton#cadAddButton {
+    background: #172554;
+    color: #93c5fd;
+    border: 1px solid #1e3a8a;
+    border-radius: 8px;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+    font-weight: 700;
+    font-size: 13pt;
+    padding: 0;
+}
+QToolButton#cadAddButton:hover {
+    background: #1e3a8a;
+    border-color: #3b82f6;
+}
+QToolButton#cadRemoveButton {
+    background: #450a0a;
+    color: #fecaca;
+    border: 1px solid #7f1d1d;
+    border-radius: 8px;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+    font-weight: 700;
+    font-size: 12pt;
+    padding: 0;
+}
+QToolButton#cadRemoveButton:hover {
+    background: #7f1d1d;
+    border-color: #f87171;
+}
+QToolButton#cadInfoButton {
+    background: #18181b;
+    color: #93c5fd;
+    border: 1px solid #1e3a8a;
+    border-radius: 11px;
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 22px;
+    max-height: 22px;
+    font-weight: 700;
+    font-size: 9pt;
+    font-style: italic;
+    padding: 0;
+}
+QToolButton#cadInfoButton:hover {
+    background: #172554;
+    border-color: #3b82f6;
+}
+QLineEdit#cadDmsEdit {
+    min-width: 52px;
+    max-width: 72px;
+    padding: 6px 8px;
+}
+QWidget#cadNestedGroup {
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 12px;
+}
+QCheckBox#cadAutoScaleCheck {
+    font-weight: 600;
+    color: #e4e4e7;
 }
 
 QLineEdit, QTextEdit, QPlainTextEdit, QListWidget {

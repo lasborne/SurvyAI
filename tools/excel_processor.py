@@ -432,6 +432,14 @@ class ExcelProcessor:
             out_p = join_workspace_path(out_p)
         out_p = out_p.resolve()
         out_p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            from agent.output_paths import cancelled_existing_file_write
+
+            blocked = cancelled_existing_file_write(str(out_p))
+            if blocked:
+                return blocked
+        except Exception:
+            pass
 
         try:
             df = pd.read_csv(csv_p, encoding=encoding)

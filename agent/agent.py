@@ -222,7 +222,8 @@ _ACCESS_ROAD_SPEC_RE = re.compile(
 
 _EXTRA_ROAD_SPEC_RE = re.compile(
     r"(?:,\s*|\s*)(?:and\s+)?(?:yet\s+another\s+|another\s+)road\s+(?:of\s+)?(?:width\s+)?(\d+(?:\.\d+)?)\s*m\s+.*?"
-    r"(?:on\s+the\s+side\s+of|(?:on|along)\s+(?:the\s+)?side(?:\s+of)?)\s+(.+?)"
+    r"(?:on\s+the\s+side\s+(?:of\s+|joining\s+)|(?:on|along)\s+(?:the\s+)?side(?:\s+of)?|"
+    r"joining(?:\s+(?:the\s+)?(?:side|pillars))?(?:\s+of)?)\s+(.+?)"
     r"(?=,\s*and\s+(?:yet\s+)?(?:another\s+)?(?:road|access)|\s+and\s+(?:yet\s+)?(?:another\s+)?(?:road|access)|"
     r"\s*Add\s|\.\s*Add|\.\s*$|$)",
     re.IGNORECASE | re.DOTALL,
@@ -327,6 +328,47 @@ def _cadastral_adjacent_edge_index(
     return -1
 
 
+def _parse_pillar_number_tokens(raw: str) -> List[Dict[str, str]]:
+    """Ordered pillar {prefix, number} tokens from a prompt or stored label list."""
+    text = (raw or "").strip()
+    if not text:
+        return []
+    try:
+        from agent.pdf_survey_plan import split_cadastral_pillar_label
+    except Exception:
+        split_cadastral_pillar_label = None  # type: ignore
+    parts = [p.strip() for p in re.split(r"[,\n]+", text)]
+    out: List[Dict[str, str]] = []
+    for p in parts:
+        if not p:
+            continue
+        split = None
+        if split_cadastral_pillar_label is not None:
+            try:
+                split = split_cadastral_pillar_label(p)
+            except Exception:
+                split = None
+        if split:
+            out.append(
+                {
+                    "prefix": str(split.get("prefix") or ""),
+                    "number": str(split.get("number") or ""),
+                }
+            )
+            continue
+        m = re.search(
+            r"(?:([A-Za-z]+\s*/\s*[A-Za-z]+)|([A-Za-z]{2,6}))\s*([A-Za-z0-9]{3,12})\b",
+            p,
+        )
+        if not m:
+            continue
+        prefix = re.sub(r"\s+", "", (m.group(1) or m.group(2) or "")).upper()
+        num = m.group(3).upper()
+        if prefix and re.search(r"\d", num):
+            out.append({"prefix": prefix, "number": num})
+    return out
+
+
 # Optional GUI/IPC handler: (path, mode) -> bool. Set by the desktop agent worker.
 _cad_file_conflict_handler: Optional[Callable[[str, str], bool]] = None
 
@@ -334,54 +376,22 @@ _cad_file_conflict_handler: Optional[Callable[[str, str], bool]] = None
 def set_cad_file_conflict_handler(
     handler: Optional[Callable[[str, str], bool]],
 ) -> None:
-    """Install a confirm callback used by CAD overwrite/modify prompts (GUI IPC)."""
+    """Install a confirm callback used by overwrite/modify prompts (GUI IPC)."""
     global _cad_file_conflict_handler
     _cad_file_conflict_handler = handler
+    try:
+        from agent.output_paths import set_file_conflict_handler
+
+        set_file_conflict_handler(handler)
+    except Exception:
+        pass
 
 
 def _confirm_overwrite_existing_dwg(path: str, *, mode: str = "overwrite") -> bool:
-    """
-    Ask whether to overwrite or modify an existing output DWG.
+    """Ask before overwriting or modifying an existing output file."""
+    from agent.output_paths import confirm_overwrite_existing_file
 
-    Prefers the GUI handler (styled SurvyAI dialog). Falls back to a native
-    MessageBox only when no handler is installed (e.g. CLI).
-    """
-    handler = _cad_file_conflict_handler
-    if callable(handler):
-        try:
-            return bool(handler(str(path or ""), str(mode or "overwrite")))
-        except Exception:
-            return False
-    try:
-        import ctypes
-
-        mode_l = (mode or "overwrite").strip().lower()
-        if mode_l == "modify":
-            text = (
-                f"This drawing already exists:\n\n{path}\n\n"
-                "Do you want to apply modifications to this existing drawing?\n\n"
-                "Yes — continue and modify the drawing\n"
-                "No — cancel and leave the drawing unchanged"
-            )
-            title = "SurvyAI — Modify existing drawing"
-        else:
-            text = (
-                f"This drawing already exists:\n\n{path}\n\n"
-                "Do you want to overwrite it with a new plan from the template?\n\n"
-                "Yes — overwrite the existing drawing\n"
-                "No — keep the existing drawing unchanged"
-            )
-            title = "SurvyAI — Drawing already exists"
-        # MB_YESNO | MB_ICONWARNING | MB_SETFOREGROUND | MB_TOPMOST | MB_SYSTEMMODAL
-        flags = 0x00000004 | 0x00000030 | 0x00010000 | 0x00040000 | 0x00001000
-        try:
-            ctypes.windll.user32.AllowSetForegroundWindow(0xFFFFFFFF)
-        except Exception:
-            pass
-        result = ctypes.windll.user32.MessageBoxW(0, text, title, flags)
-        return int(result) == 6  # IDYES
-    except Exception:
-        return False
+    return confirm_overwrite_existing_file(path, mode=mode)
 
 
 def _ollama_ram_policy(model_name: str = "") -> Tuple[bool, str, int]:
@@ -704,18 +714,25 @@ def _format_location_for_titleblock(
     return "\\P".join(p.upper() for p in packed)
 
 
+# Title-block "AND" between co-owners: ~1.4 drawing units at the 1:500 template.
+_TITLEBLOCK_AND_HEIGHT_AT_500 = 1.4
+_TITLEBLOCK_NAME_HEIGHT_FALLBACK = 2.0
+_OWNER_NAME_MIN_HEIGHT_SCALE = 0.85
+
+
 def _format_buyer_name_for_titleblock(
     name: str,
     *,
     max_chars_per_line: Optional[int] = None,
+    name_text_height: Optional[float] = None,
 ) -> str:
     """
     Format buyer/owner names for CADA_TITLEBLOCK row 2 (MTEXT with \\P line breaks).
 
-    Multi-owner lists pack consecutive names onto the same row when they fit
-    (cartographic compression of vertical title space). Single / dual names keep
-    a simple readable layout. \"AND\" still appears on its own line when the source
-    used \"and\" between the last two groups and packing is not used (<3 names).
+    Owner lines keep the title cell style (BOLD_SURVEY, same height and font).
+    ``AND`` is smaller via a relative ``\\H`` code, then the next owner is restored
+    so later names do not stay at the AND height. Do not emit ``\\b1;`` (invalid
+    MTEXT in table cells — it showed as ``1;AND``).
     """
     raw = (name or "").strip()
     if not raw:
@@ -724,30 +741,76 @@ def _format_buyer_name_for_titleblock(
     if not names:
         return raw.upper()
 
-    # Multi-owner / multi-parcel title: pack consecutive names to reduce title height.
-    if len(names) >= 3:
-        max_chars = int(max_chars_per_line) if max_chars_per_line else 38
-        packed = _pack_owner_names_into_title_lines(names, max_chars_per_line=max_chars)
-        return "\\P".join(line.upper() for line in packed)
+    display: List[str] = []
+    if len(names) == 1:
+        display = [re.sub(r"\s+", " ", names[0]).strip().upper()]
+    else:
+        for i, nm in enumerate(names):
+            u = re.sub(r"\s+", " ", str(nm or "")).strip().upper()
+            if not u:
+                continue
+            is_last = i == len(names) - 1
+            is_penult = i == len(names) - 2
+            if is_penult:
+                display.append(u)
+                display.append("AND")
+            elif is_last:
+                display.append(u)
+            else:
+                display.append(f"{u},")
 
-    # 1–2 names (or legacy \"A and B\"): keep explicit AND line when present in source.
-    parts = [p.strip() for p in re.split(r",\s*", raw) if p.strip()]
-    lines: List[str] = []
-    if len(parts) > 1:
-        for part in parts[:-1]:
-            lines.append(f"{part},")
-        tail = parts[-1]
-    else:
-        tail = parts[0] if parts else raw
-    and_parts = [p.strip() for p in re.split(r"\s+and\s+", tail, flags=re.IGNORECASE) if p.strip()]
-    if len(and_parts) <= 1:
-        lines.append(and_parts[0] if and_parts else tail)
-    else:
-        for idx, segment in enumerate(and_parts):
-            if idx > 0:
-                lines.append("AND")
-            lines.append(segment)
-    return "\\P".join(line.upper() for line in lines)
+    max_chars = int(max_chars_per_line) if max_chars_per_line else 38
+    name_lines = [ln for ln in display if ln != "AND"]
+    longest = max((_mtext_plain_len(ln) for ln in name_lines), default=1)
+    name_scale = 1.0
+    if longest > max_chars:
+        name_scale = _OWNER_NAME_MIN_HEIGHT_SCALE
+        for candidate in (1.0, 0.97, 0.94, 0.92, 0.9, 0.88, 0.85):
+            if longest * candidate <= max_chars + 1e-9:
+                name_scale = candidate
+                break
+
+    name_h = float(name_text_height or 0.0)
+    if name_h <= 0.05:
+        name_h = _TITLEBLOCK_NAME_HEIGHT_FALLBACK
+    and_rel = _TITLEBLOCK_AND_HEIGHT_AT_500 / name_h
+    if and_rel >= 0.98:
+        and_rel = 0.70
+    if _TITLEBLOCK_AND_HEIGHT_AT_500 > (name_h * name_scale) + 1e-9:
+        and_rel = max(0.55, 0.70 * float(name_scale))
+
+    out: List[str] = []
+    and_rel = max(0.45, min(0.95, float(and_rel)))
+    restore = 1.0 / and_rel
+    restore_after_and = False
+    emitted_name_scale = False
+    for ln in display:
+        if ln == "AND":
+            # Flat height only — ``\b1;`` leaked as visible ``1;AND``.
+            # No extra {…} groups: table cells can treat ``}`` as end of text.
+            out.append(_mtext_rel_height(and_rel) + "AND")
+            restore_after_and = True
+            continue
+        if restore_after_and:
+            # ``\H0.7x;`` is relative to *current* height; ``\H1x;`` would leave
+            # later owners at 70%. Restore undoes AND so names match again.
+            out.append(_mtext_rel_height(restore) + ln)
+            restore_after_and = False
+            continue
+        if name_scale < 0.999 and not emitted_name_scale:
+            out.append(_mtext_rel_height(name_scale) + ln)
+            emitted_name_scale = True
+        else:
+            out.append(ln)
+    return "\\P".join(out)
+
+
+def _mtext_rel_height(scale: float) -> str:
+    """Relative MTEXT height code (``\\H0.9x;``). Always emitted so later lines can reset."""
+    scale_s = f"{float(scale):.3f}".rstrip("0").rstrip(".")
+    if not scale_s:
+        scale_s = "1"
+    return f"\\H{scale_s}x;"
 
 
 def _titleblock_owner_line_count(formatted_buyer: str) -> int:
@@ -2015,6 +2078,38 @@ def _apply_plan_number_table_cell(
     return debug
 
 
+def _split_surveyor_company_and_street(raw_address: str) -> Tuple[str, List[str]]:
+    """Lock company as line 1; remaining comma/newline segments are the street address."""
+    raw = (raw_address or "").strip()
+    if not raw:
+        return "", []
+    chunks: List[str] = []
+    if "\\P" in raw or "\n" in raw:
+        chunks = [ln.strip() for ln in re.split(r"\\P|\n+", raw) if ln.strip()]
+    if len(chunks) >= 2:
+        company = chunks[0].strip(" ,;")
+        rest = ", ".join(chunks[1:])
+        return company.upper(), _merge_city_state_tail(_split_address_segments(rest))
+    m = re.search(
+        r"(.+?\b(?:LTD\.?|LIMITED|LLC|INC\.?|NIG\.?))\s*,?\s*(.*)$",
+        raw,
+        flags=re.IGNORECASE,
+    )
+    if m and (m.group(2) or "").strip():
+        company = m.group(1).strip(" ,;")
+        rest = (m.group(2) or "").strip(" ,;")
+        return company.upper(), _merge_city_state_tail(_split_address_segments(rest))
+    parts = _merge_city_state_tail(_split_address_segments(raw))
+    if len(parts) >= 2:
+        return parts[0], parts[1:]
+    return (parts[0] if parts else raw.upper()), []
+
+
+def _surveyor_line_fits(text: str, *, usable_w: float, text_height: float, scale: float) -> bool:
+    width = _mtext_plain_len(text) * max(0.01, float(text_height) * float(scale)) * _CARTO_CHAR_WIDTH_FACTOR
+    return width <= float(usable_w) + 1e-6
+
+
 def _layout_surveyor_address_mtext(
     raw_address: str,
     *,
@@ -2024,11 +2119,13 @@ def _layout_surveyor_address_mtext(
     line_step: float,
 ) -> str:
     """
-    Pack surveyor company/address inside the table cell without vertical overflow.
-    Uses horizontal joins (city + state on one line) before adding extra lines.
+    Company stays on one line; surveyor address starts on the next.
+
+    Each class (company vs address) uses one uniform shrink factor. Address
+    segments still pack horizontally (city + state) before wrapping.
     """
-    parts = _merge_city_state_tail(_split_address_segments(raw_address))
-    if not parts:
+    company, addr_parts = _split_surveyor_company_and_street(raw_address)
+    if not company and not addr_parts:
         return ""
 
     pad_x = max(0.15, float(text_height) * 0.35)
@@ -2036,31 +2133,57 @@ def _layout_surveyor_address_mtext(
     usable_w = max(float(cell_width) - 2.0 * pad_x, float(text_height) * 4.0)
     usable_h = max(float(cell_height) - 2.0 * pad_y, float(line_step) or float(text_height))
     step = float(line_step) if line_step > 0 else float(text_height) * (5.0 / 3.0)
-    max_lines = max(1, int(usable_h / step))
 
-    height_scale = 1.0
-    for scale in (1.0, 0.97, 0.94, 0.92, 0.9, 0.88, 0.85):
-        chars_per_line = int(usable_w / (max(0.01, text_height * scale) * _CARTO_CHAR_WIDTH_FACTOR))
-        lines = _pack_segments_into_lines(
-            parts, max_chars_per_line=chars_per_line, max_lines=max_lines
-        )
-        if len(lines) <= max_lines and len(lines) * step * scale <= usable_h + 1e-6:
-            height_scale = scale
-            packed = "\\P".join(lines)
-            if scale < 0.999:
-                packed = _mtext_apply_height_scale(packed, scale)
-            return packed
-        height_scale = scale
+    company_scale = 1.0
+    if company:
+        company_scale = 0.85
+        for scale in (1.0, 0.97, 0.94, 0.92, 0.9, 0.88, 0.85):
+            if _surveyor_line_fits(
+                company, usable_w=usable_w, text_height=text_height, scale=scale
+            ):
+                company_scale = scale
+                break
 
-    chars_per_line = int(usable_w / (max(0.01, text_height * 0.85) * _CARTO_CHAR_WIDTH_FACTOR))
-    lines = _pack_segments_into_lines(
-        parts, max_chars_per_line=max(6, chars_per_line), max_lines=max_lines
-    )
-    while len(lines) > max_lines and len(lines) >= 2:
-        tail = lines.pop()
-        lines[-1] = f"{lines[-1]}, {tail}"
-    packed = "\\P".join(lines[:max_lines])
-    return _mtext_apply_height_scale(packed, 0.85)
+    addr_scale = 1.0
+    addr_lines: List[str] = []
+    if addr_parts:
+        reserved = step if company else 0.0
+        usable_h_addr = max(step, usable_h - reserved)
+        max_lines = max(1, int(usable_h_addr / step))
+        packed_ok = False
+        for scale in (1.0, 0.97, 0.94, 0.92, 0.9, 0.88, 0.85):
+            chars_per_line = int(
+                usable_w / (max(0.01, text_height * scale) * _CARTO_CHAR_WIDTH_FACTOR)
+            )
+            lines = _pack_segments_into_lines(
+                addr_parts, max_chars_per_line=chars_per_line, max_lines=max_lines
+            )
+            if len(lines) <= max_lines and len(lines) * step * scale <= usable_h_addr + 1e-6:
+                addr_scale = scale
+                addr_lines = lines
+                packed_ok = True
+                break
+        if not packed_ok:
+            addr_scale = 0.85
+            chars_per_line = int(
+                usable_w / (max(0.01, text_height * 0.85) * _CARTO_CHAR_WIDTH_FACTOR)
+            )
+            addr_lines = _pack_segments_into_lines(
+                addr_parts, max_chars_per_line=max(6, chars_per_line), max_lines=max_lines
+            )
+            while len(addr_lines) > max_lines and len(addr_lines) >= 2:
+                tail = addr_lines.pop()
+                addr_lines[-1] = f"{addr_lines[-1]}, {tail}"
+            addr_lines = addr_lines[:max_lines]
+
+    out: List[str] = []
+    if company:
+        # Always emit \\H so a later address line cannot inherit a company shrink.
+        out.append(_mtext_rel_height(company_scale) + company)
+    if addr_lines:
+        packed = "\\P".join(addr_lines)
+        out.append(_mtext_rel_height(addr_scale) + packed)
+    return "\\P".join(out)
 
 
 def _find_title_scale_label_row(
@@ -2491,7 +2614,9 @@ class SurvyAIAgent:
         # Last cadastral plan output (for in-session modifications without re-prompting)
         # Template file remains read-only; modifications apply only to this output file.
         self._last_cadastral_output_dwg: Optional[str] = None
+        self._last_cadastral_parent_dwg: Optional[str] = None
         self._last_cadastral_profile_path: Optional[str] = None
+        self._last_cadastral_meta: Dict[str, Any] = {}
 
         # STRICT: Survey plan template paths must never be written (read-only to avoid corruption).
         # Populated from template_profiles/*.json and when learning a template.
@@ -4985,11 +5110,16 @@ class SurvyAIAgent:
             compose_cadastral_from_files,
             store_compose_example,
         )
-        from agent.excel_cadastral import build_excel_cadastral_subprompt
+        from agent.excel_cadastral import (
+            apply_requested_crs_conversion,
+            build_excel_cadastral_subprompt,
+            query_requests_crs_conversion,
+        )
         from agent.pdf_survey_plan import extract_plan_details_for_dwg
 
         scope = self._cadastral_user_message_body(query)
         workspace = Path.cwd().resolve()
+        conversion_requested = query_requests_crs_conversion(scope)
 
         llm, _model = self._try_openai_tier_llm("simple")
         if llm is None:
@@ -5015,6 +5145,10 @@ class SurvyAIAgent:
 
         notes = list(composed.get("notes") or [])
         meta = dict(composed.get("metadata") or {})
+        composed_conv = dict(composed.get("crs_conversion") or {})
+        conversion_applied = bool(composed_conv.get("applied"))
+        if conversion_applied and composed_conv.get("target_crs"):
+            meta["origin_crs"] = str(composed_conv["target_crs"])
         ref_dwg = composed.get("reference_dwg")
         if ref_dwg:
             try:
@@ -5050,6 +5184,11 @@ class SurvyAIAgent:
                             val = normalize_lga_name(val) or val
                         if key == "surveyor_name" and val and ensure_surveyor_professional_title is not None:
                             val = ensure_surveyor_professional_title(val) or val
+                        if key == "origin_crs" and (
+                            conversion_requested or conversion_applied
+                        ):
+                            # User asked to change CRS — never keep the reference plan's origin.
+                            continue
                         if val and not meta.get(key):
                             meta[key] = val
                 errs = details.get("errors") or []
@@ -5064,7 +5203,7 @@ class SurvyAIAgent:
             scope,
             flags=re.IGNORECASE,
         )
-        if m_crs:
+        if m_crs and not conversion_applied:
             meta["origin_crs"] = m_crs.group(1).strip().strip("'\"")
         try:
             from agent.pdf_survey_plan import (
@@ -5097,8 +5236,30 @@ class SurvyAIAgent:
                 )
             meta["plan_number"] = user_plan_no
 
-        parcels = composed.get("parcels") or []
+        parcels = list(composed.get("parcels") or [])
         output_dwg = composed.get("output_dwg")
+        # Safety net: convert here only if compose did not already transform the rings.
+        if parcels and conversion_requested and not conversion_applied:
+            crs_conv = apply_requested_crs_conversion(scope, parcels)
+            if not crs_conv.get("success"):
+                return {
+                    "success": False,
+                    "error": crs_conv.get("error")
+                    or "Coordinate conversion was requested but could not be completed.",
+                    "notes": notes,
+                    "source_files": composed.get("source_files") or [],
+                    "crs_conversion": crs_conv,
+                }
+            if crs_conv.get("applied"):
+                parcels = list(crs_conv.get("parcels") or parcels)
+                conversion_applied = True
+                composed_conv = dict(crs_conv)
+                notes.append(str(crs_conv.get("note") or "Coordinates converted before plot."))
+                if crs_conv.get("target_crs"):
+                    meta["origin_crs"] = str(crs_conv["target_crs"])
+        elif conversion_applied and composed_conv.get("note"):
+            if str(composed_conv["note"]) not in notes:
+                notes.append(str(composed_conv["note"]))
 
         # Separate owner plans (Excel/CSV ownership blocks → one DWG each).
         from agent.excel_cadastral import (
@@ -5346,8 +5507,13 @@ class SurvyAIAgent:
 
     def _run_excel_cadastral_pipeline(self, query: str) -> Dict[str, Any]:
         """
-        Excel family/ownership parcels → optional normalized copy (any name the user asks) →
-        metadata from reference DWG → cadastral plot(s).
+        Excel family/ownership parcels → optional CRS conversion → optional
+        normalized copy (any name the user asks) → metadata from reference DWG →
+        cadastral plot(s).
+
+        When the user asks to convert/reproject coordinates, conversion runs
+        BEFORE any Excel copy and BEFORE the plot. The title-block origin is the
+        target CRS (never the source, and never copied from a reference DWG).
 
         Semantic layout:
         - Separate owner plans: one DWG per owner (buyer name = filename; plan nos. increment).
@@ -5360,6 +5526,7 @@ class SurvyAIAgent:
         from pathlib import Path
 
         from agent.excel_cadastral import (
+            apply_requested_crs_conversion,
             build_excel_cadastral_subprompt,
             build_separate_owner_plan_jobs,
             find_reference_dwg_from_query,
@@ -5398,8 +5565,25 @@ class SurvyAIAgent:
         excel_path = Path(resolved["path"])
         parcels = list(resolved.get("parcels") or [])
 
+        # Convert / reproject BEFORE any Excel copy or CAD plot when the user asked.
+        # Never plot or save the source metres as if they were already the target CRS.
+        crs_conv = apply_requested_crs_conversion(scope, parcels)
+        if not crs_conv.get("success"):
+            return {
+                "success": False,
+                "error": crs_conv.get("error")
+                or "Coordinate conversion was requested but could not be completed.",
+                "excel_path": str(excel_path),
+            }
+        converted_crs = ""
+        if crs_conv.get("applied"):
+            parcels = list(crs_conv.get("parcels") or parcels)
+            converted_crs = str(crs_conv.get("target_crs") or "").strip()
+
         # Optional normalized copy — only when the user asked (any filename they choose).
+        # When conversion ran, this file must contain the converted Easting/Northing.
         dup_path = None
+        meta_notes: List[str] = []
         if resolved.get("write_copy"):
             dup = write_dup_xlsx_with_headers(
                 excel_path,
@@ -5407,21 +5591,31 @@ class SurvyAIAgent:
                 parcels=parcels,
                 query=scope,
             )
-            if not dup.get("success"):
+            if dup.get("cancelled"):
+                # Keep the existing workbook; continue the CAD plot from in-memory parcels.
+                meta_notes.append(
+                    str(
+                        dup.get("error")
+                        or "Kept the existing Excel workbook; overwrite was declined."
+                    )
+                )
+            elif not dup.get("success"):
                 return {
                     "success": False,
+                    "cancelled": bool(dup.get("cancelled")),
                     "error": dup.get("error") or "Failed to write the requested Excel copy.",
                 }
-            dup_path = dup.get("output_path")
-            # If the user asked for a copy, prefer plotting from the freshly written names.
-            try:
-                from agent.excel_cadastral import parse_family_parcels_from_excel
+            else:
+                dup_path = dup.get("output_path")
+                # If the user asked for a copy, prefer plotting from the freshly written names.
+                try:
+                    from agent.excel_cadastral import parse_family_parcels_from_excel
 
-                reparsed = parse_family_parcels_from_excel(dup_path)
-                if reparsed.get("success") and reparsed.get("parcels"):
-                    parcels = reparsed["parcels"]
-            except Exception:
-                pass
+                    reparsed = parse_family_parcels_from_excel(dup_path)
+                    if reparsed.get("success") and reparsed.get("parcels"):
+                        parcels = reparsed["parcels"]
+                except Exception:
+                    pass
 
         # Output DWG: honor Generate … .dwg; otherwise derive from first owner (never invent
         # a fixed brand name such as Excel_Families.dwg).
@@ -5430,13 +5624,15 @@ class SurvyAIAgent:
 
         # Metadata from an existing plan named in the prompt (location/LGA/surveyor/plan no.).
         location = lga = state = plan_number = surveyor_name = surveyor_address = ""
-        origin_crs = ""
+        origin_crs = converted_crs
         m_crs = re.search(
             r"(?:origin_crs|crs_origin)\s*[:=]\s*([^,\n]+)",
             scope,
             flags=re.IGNORECASE,
         )
-        if m_crs:
+        if converted_crs:
+            origin_crs = converted_crs
+        elif m_crs:
             origin_crs = m_crs.group(1).strip().strip("'\"")
         cert_date = ""
         try:
@@ -5461,7 +5657,6 @@ class SurvyAIAgent:
                 cert_date = m_cert.group(1).strip()
 
         ref_dwg = find_reference_dwg_from_query(scope, workspace)
-        meta_notes: List[str] = []
         if ref_dwg:
             try:
                 # Warm AutoCAD COM on this worker thread before reference metadata open.
@@ -5508,7 +5703,7 @@ class SurvyAIAgent:
                         )
                     except Exception:
                         pass
-                    if not origin_crs:
+                    if not origin_crs and not converted_crs:
                         origin_crs = (getattr(plan, "origin_crs", None) or "").strip()
                 errs = details.get("errors") or []
                 if errs:
@@ -5520,6 +5715,9 @@ class SurvyAIAgent:
                 "No reference .dwg found in the workspace for location/surveyor/plan number; "
                 "title-block fields from the prompt (if any) will be used."
             )
+        if crs_conv.get("applied") and crs_conv.get("note"):
+            meta_notes.append(str(crs_conv["note"]))
+            origin_crs = converted_crs or origin_crs
 
         # Explicit starting / field plan number in the prompt ALWAYS wins over the
         # reference DWG plan no. (e.g. "start from plan number 'RV/018/2026/SP'").
@@ -5683,6 +5881,8 @@ class SurvyAIAgent:
                 "notes": meta_notes,
                 "mode": "separate_owner_plans",
                 "requested_scale": scope_scale,
+                "crs_conversion": crs_conv,
+                "origin_crs": origin_crs,
                 "error": None
                 if ok > 0
                 else (plan_results[-1].get("error") if plan_results else "No owner plans plotted."),
@@ -5751,6 +5951,8 @@ class SurvyAIAgent:
             "notes": meta_notes,
             "access_road_title": plot.get("access_road_title"),
             "mode": "multi_parcel" if len(parcels) > 1 else "single",
+            "crs_conversion": crs_conv,
+            "origin_crs": origin_crs,
         }
 
     def _should_fastpath_cadastral_cad(self, query: str) -> bool:
@@ -6584,6 +6786,16 @@ class SurvyAIAgent:
                 )
             except Exception:
                 pass
+            self._remember_cadastral_plot(
+                query=q,
+                output_dwg=str(out_p),
+                buyer_name=buyer or "",
+                pillar_numbers=pillars or "",
+                access_roads=access_roads,
+                fences=fences,
+                geometry=result.get("geometry") if isinstance(result.get("geometry"), dict) else {},
+                as_parent=True,
+            )
         return result
 
     def _learn_cadastral_template_profile(
@@ -7086,8 +7298,9 @@ class SurvyAIAgent:
         north_h = str(((tables.get("coordinates") or {}).get("northing_table_handle")) or "")
 
         # Multi-parcel layout jobs are flagged early (extras / multi-owner title).
+        owner_name_count = len(_split_buyer_owner_names(buyer_name or ""))
         multi_parcel_layout = bool(extra_parcels) or bool(main_parcel_label) or (
-            (buyer_name or "").count(",") >= 2
+            owner_name_count >= 3
         )
         # Provisional; refined with title-cell width before write (multi-owner packing).
         formatted_buyer_name = _format_buyer_name_for_titleblock(buyer_name)
@@ -7126,9 +7339,9 @@ class SurvyAIAgent:
                     template_scale_label_bottom = float(ext0["miny"])
             except Exception:
                 pass
-            # Pack consecutive owners into as many names per row as the cell width allows
-            # (no uneven per-name shrinking — vertical title height stays cartographic).
+            # One owner per title line; AND before the last owner; uniform name shrink.
             owner_max_chars = 38
+            owner_text_height = None
             try:
                 ext_owner = self.autocad.get_table_cell_extents(title_h, 2, 0, outer=True)
                 step_owner = self.autocad.get_table_cell_mtext_line_step(
@@ -7137,19 +7350,32 @@ class SurvyAIAgent:
                 if ext_owner.get("success"):
                     ow = float(ext_owner.get("maxx", 0.0)) - float(ext_owner.get("minx", 0.0))
                     oth = float((step_owner or {}).get("text_height") or 0.0)
+                    if oth > 0.05:
+                        owner_text_height = oth
+                    oth_for_chars = oth
                     if multi_parcel_layout and oth > 0.05:
-                        oth = oth * 0.9  # matches uniform multi-parcel title shrink below
-                    if ow > 1.0 and oth > 0.05:
+                        oth_for_chars = oth * 0.9  # matches uniform multi-parcel title shrink below
+                    if ow > 1.0 and oth_for_chars > 0.05:
                         owner_max_chars = max(
                             16,
-                            int(ow / (oth * _CARTO_CHAR_WIDTH_FACTOR)),
+                            int(ow / (oth_for_chars * _CARTO_CHAR_WIDTH_FACTOR)),
                         )
             except Exception:
                 pass
             formatted_buyer_name = _format_buyer_name_for_titleblock(
-                buyer_name, max_chars_per_line=owner_max_chars
+                buyer_name,
+                max_chars_per_line=owner_max_chars,
+                name_text_height=owner_text_height,
             )
-            _set_cell(title_h, 2, 0, _mtxt_replace(template_owner_cell_raw, formatted_buyer_name))
+            # Do not use _mtxt_replace here: rfind(';') would clip at {\H…;AND}.
+            _set_cell(
+                title_h,
+                2,
+                0,
+                _mtext_preserve_style_set_content(
+                    template_owner_cell_raw, formatted_buyer_name
+                ),
+            )
             loc_cell = _get_cell(title_h, 4)
             # Pack AT location into preferably ≤3 lines using measured cell width.
             loc_max_chars = 36
@@ -7275,16 +7501,17 @@ class SurvyAIAgent:
                     _mtext_preserve_style_set_content(surv_cell, surv_fmt),
                 )
 
-            # Surveyor address: pack horizontally (city + state on one line) and
-            # vertically inside the cell — never one comma segment per line by default.
+            # Company on one line; street address starts on the next (uniform shrink per class).
             try:
                 from agent.pdf_survey_plan import scrub_surveyor_metadata_value
 
+                # Keep company vs address as MTEXT line breaks through whitespace scrubbing.
+                surveyor_company_address = (surveyor_company_address or "").replace("\n", "\\P")
                 surveyor_company_address = scrub_surveyor_metadata_value(
                     surveyor_company_address or "", max_len=200
                 )
             except Exception:
-                surveyor_company_address = (surveyor_company_address or "").strip()
+                surveyor_company_address = (surveyor_company_address or "").replace("\n", "\\P").strip()
             addr_template = _get_cell(surv_h, 1, 0)
             addr_th = 0.6
             addr_step = 0.0
@@ -7434,15 +7661,24 @@ class SurvyAIAgent:
                             # only in the trimmed coordinates blob (access-road tails are
                             # stripped from `coordinates` before we get here).
                             try:
-                                from agent.cadastral_intent import user_requests_bowditch_adjustment
+                                from agent.cadastral_intent import preferred_traverse_adjustment_method
 
-                                wants_bowditch = user_requests_bowditch_adjustment(
-                                    user_query, coordinates
+                                wants_bowditch = (
+                                    preferred_traverse_adjustment_method(
+                                        user_query, coordinates
+                                    )
+                                    == "bowditch"
                                 )
                             except Exception:
                                 wants_bowditch = bool(
                                     re.search(
                                         r"\b(?:bowditch|compass\s+(?:rule|method|adjustment))\b",
+                                        "\n".join(t for t in (user_query, coordinates) if t),
+                                        flags=re.IGNORECASE,
+                                    )
+                                ) and not bool(
+                                    re.search(
+                                        r"\bbearing\s+adjustment\b|\bhold\s+distances?\s+constant\b",
                                         "\n".join(t for t in (user_query, coordinates) if t),
                                         flags=re.IGNORECASE,
                                     )
@@ -10934,6 +11170,261 @@ class SurvyAIAgent:
     # IN-SESSION CAD MODIFICATIONS (same output file, template always read-only)
     # ==========================================================================
 
+    def _remember_cadastral_plot(
+        self,
+        *,
+        query: str = "",
+        output_dwg: Optional[str] = None,
+        buyer_name: str = "",
+        pillar_numbers: str = "",
+        access_roads: Optional[List[str]] = None,
+        fences: Optional[List[Any]] = None,
+        geometry: Optional[Dict[str, Any]] = None,
+        as_parent: bool = False,
+    ) -> None:
+        meta = dict(getattr(self, "_last_cadastral_meta", None) or {})
+        if query:
+            meta["query"] = query
+        if output_dwg:
+            meta["output_dwg"] = str(output_dwg)
+        if buyer_name:
+            meta["buyer_name"] = buyer_name
+        if pillar_numbers:
+            meta["pillar_numbers"] = pillar_numbers
+        if access_roads is not None:
+            meta["access_roads"] = list(access_roads)
+        if fences is not None:
+            meta["fences"] = list(fences)
+        if isinstance(geometry, dict) and geometry:
+            meta["geometry"] = geometry
+        self._last_cadastral_meta = meta
+        if output_dwg and as_parent:
+            self._last_cadastral_parent_dwg = str(output_dwg)
+
+    def _cadastral_boundary_points_from_drawing(self) -> List[Dict[str, float]]:
+        all_ents = self.autocad.get_all_entities()
+        entities = (all_ents.get("entities") or []) if all_ents.get("success") else []
+        rings: List[List[Dict[str, float]]] = []
+        for ent in entities:
+            if str(ent.get("layer") or "").upper() != "CADA_BOUNDARY":
+                continue
+            if str(ent.get("type") or "").upper() not in ("LWPOLYLINE", "POLYLINE"):
+                continue
+            points = ent.get("points") or []
+            if not (isinstance(points, list) and len(points) >= 3):
+                continue
+            ring: List[Dict[str, float]] = []
+            for p in points:
+                if isinstance(p, dict) and "x" in p and "y" in p:
+                    ring.append({"x": float(p["x"]), "y": float(p["y"])})
+            if len(ring) >= 3:
+                rings.append(ring)
+        if not rings:
+            return []
+        def _span(ring: List[Dict[str, float]]) -> float:
+            xs = [p["x"] for p in ring]
+            ys = [p["y"] for p in ring]
+            return (max(xs) - min(xs)) + (max(ys) - min(ys))
+        return max(rings, key=_span)
+
+    def _cadastral_pn_list_for_vertices(
+        self,
+        local_pts: Sequence[Dict[str, float]],
+        query: str = "",
+    ) -> List[Dict[str, str]]:
+        n = len(local_pts)
+        if n < 2:
+            return []
+        meta = getattr(self, "_last_cadastral_meta", None) or {}
+        raw = (
+            str(meta.get("pillar_numbers") or "").strip()
+            or str(meta.get("query") or "")
+            or str(query or "")
+        )
+        parsed = _parse_pillar_number_tokens(raw)
+        if parsed and len(parsed) == n:
+            return list(parsed)
+
+        # Snap pillar-number tables / mtext to the nearest vertex.
+        aligned: List[Dict[str, str]] = [{"prefix": "", "number": ""} for _ in range(n)]
+        labels: List[Tuple[str, float, float]] = []
+        try:
+            t_res = self.autocad.list_tables(layer="CADA_PILLARNUMBERS")
+            for t in (t_res.get("tables") or []) if t_res.get("success") else []:
+                h = str(t.get("handle") or "")
+                ip = t.get("insertion_point") or t.get("position") or {}
+                try:
+                    x = float(ip.get("x", ip.get("X")))
+                    y = float(ip.get("y", ip.get("Y")))
+                except (TypeError, ValueError, AttributeError):
+                    continue
+                text = ""
+                if h:
+                    for r, c in ((0, 0), (1, 0), (0, 1), (1, 1)):
+                        try:
+                            cell = self.autocad.get_table_cell_text(h, r, c)
+                            bit = str((cell or {}).get("text") or "").strip()
+                        except Exception:
+                            bit = ""
+                        if bit:
+                            text = f"{text} {bit}".strip()
+                if text:
+                    labels.append((text, x, y))
+        except Exception:
+            pass
+        if not labels:
+            try:
+                ents = self.autocad.get_all_entities()
+                for ent in (ents.get("entities") or []) if ents.get("success") else []:
+                    if str(ent.get("layer") or "").upper() != "CADA_PILLARNUMBERS":
+                        continue
+                    txt = str(ent.get("text") or ent.get("contents") or "").strip()
+                    ip = ent.get("insertion_point") or ent.get("position") or {}
+                    try:
+                        x = float(ip.get("x", ip.get("X")))
+                        y = float(ip.get("y", ip.get("Y")))
+                    except (TypeError, ValueError, AttributeError):
+                        continue
+                    if txt:
+                        labels.append((txt, x, y))
+            except Exception:
+                pass
+        used: set[int] = set()
+        for text, x, y in labels:
+            tokens = _parse_pillar_number_tokens(re.sub(r"\\P", " ", text))
+            if not tokens:
+                continue
+            best_i = None
+            best_d = 1e18
+            for i, p in enumerate(local_pts):
+                if i in used:
+                    continue
+                d = (float(p["x"]) - x) ** 2 + (float(p["y"]) - y) ** 2
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+            if best_i is None:
+                continue
+            used.add(best_i)
+            aligned[best_i] = tokens[0]
+        if any(p.get("prefix") and p.get("number") for p in aligned):
+            return aligned
+        if parsed and len(parsed) == n:
+            return list(parsed)
+        return list(aligned)
+
+    def _cadastral_edge_index_from_road_spec(
+        self,
+        spec: str,
+        local_pts: Sequence[Dict[str, float]],
+        pn_list: Sequence[Dict[str, str]],
+    ) -> int:
+        ar_lower = (spec or "").lower()
+        ref_match = re.search(
+            r"(?:linking|between|connecting|on|along|joining)\s+(?:the\s+)?(?:side\s+)?(?:of\s+)?(?:boundary\s+)?(?:line\s+)?(?:pillars\s+)?(.*)$",
+            ar_lower,
+        )
+        if ref_match and pn_list:
+            ref_str_norm = re.sub(r"\s+", " ", ref_match.group(1).strip())
+            matched = _cadastral_match_pillars_in_text(pn_list, ref_str_norm)
+            return _cadastral_adjacent_edge_index(matched, len(local_pts))
+        return -1
+
+    def _draw_access_road_on_edge(
+        self,
+        local_pts: Sequence[Dict[str, float]],
+        target_idx: int,
+        *,
+        width: float,
+        offset: float = 0.2,
+        road_title: str = "ACCESS    ROAD",
+        road_h: float = 1.2,
+    ) -> bool:
+        import math
+
+        n = len(local_pts)
+        if n < 2 or target_idx < 0:
+            return False
+        p1 = local_pts[target_idx % n]
+        p2 = local_pts[(target_idx + 1) % n]
+        dx = float(p2["x"]) - float(p1["x"])
+        dy = float(p2["y"]) - float(p1["y"])
+        L_bound = math.hypot(dx, dy)
+        if L_bound <= 1e-6:
+            return False
+        L_road = 1.4 * L_bound
+        extension_total = 0.4 * L_bound
+        ext_side = extension_total / 2.0
+        ux, uy = dx / L_bound, dy / L_bound
+        outx, outy = _outward_normal_for_edge(local_pts, p1, p2)
+        rsx = float(p1["x"]) - ext_side * ux
+        rsy = float(p1["y"]) - ext_side * uy
+        rex = float(p2["x"]) + ext_side * ux
+        rey = float(p2["y"]) + ext_side * uy
+        l1_s = {"x": rsx + offset * outx, "y": rsy + offset * outy}
+        l1_e = {"x": rex + offset * outx, "y": rey + offset * outy}
+        l2_s = {"x": rsx + (offset + width) * outx, "y": rsy + (offset + width) * outy}
+        l2_e = {"x": rex + (offset + width) * outx, "y": rey + (offset + width) * outy}
+        self.autocad.create_lwpolyline([l1_s, l1_e], layer="CADA_ROAD", closed=False, linetype_scale=3.0)
+        self.autocad.create_lwpolyline([l2_s, l2_e], layer="CADA_ROAD", closed=False, linetype_scale=3.0)
+        cx = (l1_s["x"] + l1_e["x"]) / 2.0 + (width / 2.0) * outx
+        cy = (l1_s["y"] + l1_e["y"]) / 2.0 + (width / 2.0) * outy
+        rot_rad = math.atan2(uy, ux)
+        deg = math.degrees(rot_rad) % 360
+        if 90 < deg <= 270:
+            rot_rad += math.pi
+        title = (road_title or "ACCESS    ROAD").strip() or "ACCESS    ROAD"
+        road_title_fmt = f"{{\\fVerdana|b0|i0|c0|p34;{title}}}"
+        txt_width = max(10.0, math.hypot(l1_e["x"] - l1_s["x"], l1_e["y"] - l1_s["y"]))
+        self.autocad.add_mtext(
+            road_title_fmt,
+            cx,
+            cy,
+            layer="CADA_ROAD",
+            rotation_rad=rot_rad,
+            height=float(road_h),
+            width=txt_width,
+            attachment_point=5,
+        )
+        return True
+
+    def _extract_save_as_output_path(
+        self,
+        query: str,
+        *,
+        suffixes: Sequence[str] = (".dwg",),
+        relative_to: Optional[str] = None,
+    ) -> Optional[str]:
+        """Filename the user asked to save as — not an incidental path in the prompt."""
+        from pathlib import Path
+
+        q = query or ""
+        suf = "|".join(re.escape(s.lstrip(".")) for s in suffixes if s)
+        if not suf:
+            return None
+        m = re.search(
+            rf"save(?:\s+it)?\s+as:?\s+['\"]([^'\"]+?\.(?:{suf}))['\"]"
+            rf"|save(?:\s+it)?\s+as:?\s+([^\s'\"`,;]+?\.(?:{suf}))",
+            q,
+            flags=re.IGNORECASE,
+        )
+        if not m:
+            return None
+        raw = (m.group(1) or m.group(2) or "").strip().strip("'\"")
+        if not raw:
+            return None
+        p = Path(raw)
+        if not p.is_absolute():
+            base = Path.cwd()
+            if relative_to:
+                try:
+                    rp = Path(str(relative_to))
+                    base = (rp.parent if rp.suffix else rp).resolve()
+                except Exception:
+                    base = Path.cwd()
+            p = (base / p).resolve()
+        return str(p)
+
     def _extract_dwg_path_from_query(self, query: str) -> Optional[str]:
         """Extract a .dwg file path from the query (quoted or path-like). Returns resolved path or None."""
         import re
@@ -10941,6 +11432,14 @@ class SurvyAIAgent:
 
         from survyai.attachments import collect_attached_paths
 
+        save_as = self._extract_save_as_output_path(
+            query,
+            suffixes=(".dwg", ".dxf"),
+            relative_to=getattr(self, "_last_cadastral_parent_dwg", None)
+            or self._last_cadastral_output_dwg,
+        )
+        if save_as:
+            return save_as
         q = query or ""
         for raw in collect_attached_paths(q, suffixes=(".dwg",), existing_only=False):
             p = Path(raw)
@@ -10961,6 +11460,46 @@ class SurvyAIAgent:
                 if p.suffix.lower() == ".dwg":
                     return str(p)
         return None
+
+    def _activate_output_drawing(self, path: str) -> Dict[str, Any]:
+        """Open *path* and pin COM to that tab. Fail if another drawing stays active."""
+        from pathlib import Path
+
+        want = Path(path).resolve()
+        opened = self.autocad.open_drawing(str(want), read_only=False)
+        if not opened.get("success"):
+            return {
+                "success": False,
+                "error": opened.get("error") or f"Failed to open {want}",
+            }
+        try:
+            self.autocad.set_workflow_document(str(want))
+        except Exception:
+            pass
+        try:
+            if hasattr(self.autocad, "_activate_document_by_path"):
+                self.autocad._activate_document_by_path(want)
+        except Exception:
+            pass
+        active = ""
+        try:
+            if getattr(self.autocad, "get_active_document_path", None):
+                active = str(self.autocad.get_active_document_path() or "")
+        except Exception:
+            active = ""
+        if active:
+            try:
+                if Path(active).resolve() != want:
+                    return {
+                        "success": False,
+                        "error": (
+                            f"AutoCAD stayed on {active} instead of {want}. "
+                            "Close extra drawings and try again."
+                        ),
+                    }
+            except Exception:
+                pass
+        return {"success": True, "path": str(want)}
 
     def _touch_cadastral_template_last_used(self, template_path: str) -> None:
         """Update last_used_at once after a successful plot (not during read-only resolve)."""
@@ -11132,18 +11671,57 @@ class SurvyAIAgent:
         import re
         from pathlib import Path
 
-        # Resolve target file: explicit path in query or last-generated output
-        target = self._extract_dwg_path_from_query(query) or (self._last_cadastral_output_dwg and str(Path(self._last_cadastral_output_dwg).resolve()))
-        if not target:
+        # Parent is the original plotted parcel. Last output may be a later layout.
+        # Save-as: copy parent → named file, then edit only that file.
+        # No filename: edit the last output in place after modify permission.
+        parent = (
+            getattr(self, "_last_cadastral_parent_dwg", None)
+            or self._last_cadastral_output_dwg
+        )
+        last = self._last_cadastral_output_dwg or parent
+        save_as = self._extract_save_as_output_path(
+            query,
+            suffixes=(".dwg", ".dxf"),
+            relative_to=parent or last,
+        )
+        if not parent and not save_as:
+            parent = self._extract_dwg_path_from_query(query)
+            last = last or parent
+        source = parent if save_as else last
+        if not source:
             return {"success": False, "error": "No plan file specified and no plan was generated in this session. Generate a plan first or specify the output .dwg file."}
-        target_p = Path(target).resolve()
-        if not target_p.exists():
-            return {"success": False, "error": f"Plan file not found: {target_p}"}
-        if self._is_template_path(target):
+        source_p = Path(source).resolve()
+        if not source_p.exists():
+            return {"success": False, "error": f"Plan file not found: {source_p}"}
+        if self._is_template_path(str(source_p)):
             return {"success": False, "error": "The template file is read-only and cannot be modified. Use the output plan file or the plan we just generated."}
 
-        # Same path/name already on disk — confirm before modifying (never the template).
-        if target_p.exists():
+        if not self.autocad.is_connected and not self.autocad.connect():
+            return {"success": False, "error": "Could not connect to AutoCAD via COM"}
+
+        if save_as:
+            target_p = Path(save_as).resolve()
+            if target_p == source_p:
+                if not _confirm_overwrite_existing_dwg(str(target_p), mode="modify"):
+                    return {
+                        "success": False,
+                        "cancelled": True,
+                        "error": f"Left existing drawing unchanged: {target_p}",
+                    }
+            else:
+                if target_p.exists() and not _confirm_overwrite_existing_dwg(
+                    str(target_p), mode="overwrite"
+                ):
+                    return {
+                        "success": False,
+                        "cancelled": True,
+                        "error": f"Left existing drawing unchanged: {target_p}",
+                    }
+                copied = self._copy_cadastral_dwg(str(source_p), str(target_p))
+                if not copied.get("success"):
+                    return copied
+        else:
+            target_p = source_p
             if not _confirm_overwrite_existing_dwg(str(target_p), mode="modify"):
                 return {
                     "success": False,
@@ -11153,9 +11731,6 @@ class SurvyAIAgent:
                         "Modification was declined."
                     ),
                 }
-
-        if not self.autocad.is_connected and not self.autocad.connect():
-            return {"success": False, "error": "Could not connect to AutoCAD via COM"}
 
         # Save/close other unsaved drawings (never the protected template, keep the target open).
         try:
@@ -11168,7 +11743,7 @@ class SurvyAIAgent:
         except Exception as e:
             logger.warning("save_and_close_other_drawings (modification) failed: %s", e)
 
-        opened = self.autocad.open_drawing(str(target_p), read_only=False)
+        opened = self._activate_output_drawing(str(target_p))
         if not opened.get("success"):
             return {"success": False, "error": opened.get("error", "Failed to open plan drawing")}
 
@@ -11225,6 +11800,7 @@ class SurvyAIAgent:
                 if title_h:
                     cur = _get_cell(title_h, 2, 0)
                     owner_max_chars = 38
+                    owner_text_height = None
                     try:
                         ext_owner = self.autocad.get_table_cell_extents(title_h, 2, 0, outer=True)
                         step_owner = self.autocad.get_table_cell_mtext_line_step(
@@ -11235,6 +11811,8 @@ class SurvyAIAgent:
                                 ext_owner.get("minx", 0.0)
                             )
                             oth = float((step_owner or {}).get("text_height") or 0.0)
+                            if oth > 0.05:
+                                owner_text_height = oth
                             if ow > 1.0 and oth > 0.05:
                                 owner_max_chars = max(
                                     16,
@@ -11246,10 +11824,12 @@ class SurvyAIAgent:
                         title_h,
                         2,
                         0,
-                        _mtxt_replace(
+                        _mtext_preserve_style_set_content(
                             cur,
                             _format_buyer_name_for_titleblock(
-                                new_title, max_chars_per_line=owner_max_chars
+                                new_title,
+                                max_chars_per_line=owner_max_chars,
+                                name_text_height=owner_text_height,
                             ),
                         ),
                     )
@@ -11259,92 +11839,728 @@ class SurvyAIAgent:
 
         # --- Add (another) access road ---
         add_road = any(phrase in q.lower() for phrase in ["add another road", "add a road", "add road", "add access road", "add road on the other side"])
+        road_notes: List[str] = []
         if add_road:
-            # Parse width, offset, pillar ref from query
-            width = 7.0
-            offset = 0.0
-            m_w = re.search(r"(?:width|wide)\s+(?:of\s+)?(\d+(?:\.\d+)?)\s*m", q, re.IGNORECASE)
-            if m_w:
-                width = float(m_w.group(1))
-            m_off = re.search(r"offset\s+(?:of\s+)?(\d+(?:\.\d+)?)\s*m", q, re.IGNORECASE)
-            if m_off:
-                offset = float(m_off.group(1))
-            # Boundary points from current drawing (get_all_entities returns "points" for LWPOLYLINE)
-            all_ents = self.autocad.get_all_entities()
-            entities = (all_ents.get("entities") or []) if all_ents.get("success") else []
-            local_pts = []
-            for ent in entities:
-                if str(ent.get("layer") or "").upper() != "CADA_BOUNDARY":
-                    continue
-                if str(ent.get("type") or "").upper() not in ("LWPOLYLINE", "POLYLINE"):
-                    continue
-                points = ent.get("points") or []
-                if isinstance(points, list) and len(points) >= 3:
-                    for p in points:
-                        if isinstance(p, dict) and "x" in p and "y" in p:
-                            local_pts.append({"x": float(p["x"]), "y": float(p["y"])})
-                    break
-            if len(local_pts) >= 3:
-                # Edge index: use 1 for "another" road, 0 otherwise
-                target_idx = 1 if "another" in q.lower() or "other side" in q.lower() else 0
-                if target_idx >= len(local_pts):
-                    target_idx = 0
-                p1 = local_pts[target_idx]
-                p2 = local_pts[(target_idx + 1) % len(local_pts)]
-                dx = p2["x"] - p1["x"]
-                dy = p2["y"] - p1["y"]
-                L_bound = math.hypot(dx, dy)
-                if L_bound > 1e-6:
-                    # Road length = 1.4 × traverse leg length
-                    extension_total = 0.4 * L_bound
-                    ext_side = extension_total / 2.0
-                    ux, uy = dx / L_bound, dy / L_bound
-                    outx, outy = _outward_normal_for_edge(local_pts, p1, p2)
-                    rsx = p1["x"] - ext_side * ux
-                    rsy = p1["y"] - ext_side * uy
-                    rex = p2["x"] + ext_side * ux
-                    rey = p2["y"] + ext_side * uy
-                    l1_s = {"x": rsx + offset * outx, "y": rsy + offset * outy}
-                    l1_e = {"x": rex + offset * outx, "y": rey + offset * outy}
-                    l2_s = {"x": rsx + (offset + width) * outx, "y": rsy + (offset + width) * outy}
-                    l2_e = {"x": rex + (offset + width) * outx, "y": rey + (offset + width) * outy}
-                    self.autocad.create_lwpolyline([l1_s, l1_e], layer="CADA_ROAD", closed=False, linetype_scale=3.0)
-                    self.autocad.create_lwpolyline([l2_s, l2_e], layer="CADA_ROAD", closed=False, linetype_scale=3.0)
-                    road_title = "ACCESS    ROAD"
-                    m_title = re.search(r"(?:title|labeled|named)\s+['\"]([^'\"]+)['\"]", q, re.IGNORECASE)
-                    if m_title:
-                        road_title = m_title.group(1).strip()
-                    cx = (l1_s["x"] + l1_e["x"]) / 2.0 + (width / 2.0) * outx
-                    cy = (l1_s["y"] + l1_e["y"]) / 2.0 + (width / 2.0) * outy
-                    rot_rad = math.atan2(uy, ux)
-                    deg = math.degrees(rot_rad) % 360
-                    if 90 < deg <= 270:
-                        rot_rad += math.pi
-                    road_title_fmt = f"{{\\fVerdana|b0|i0|c0|p34;{road_title}}}"
-                    L_road = math.hypot(l1_e["x"] - l1_s["x"], l1_e["y"] - l1_s["y"])
-                    txt_width = max(10.0, L_road)
-                    road_h = float((profile.get("text_heights") or {}).get("bearing_dist_road") or 1.2)
-                    try:
-                        hr = self.autocad.get_sample_text_height(layers=["CADA_BEARING_DIST", "CADA_ROAD"])
-                        if hr.get("success") and hr.get("height"):
-                            road_h = float(hr["height"])
-                    except Exception:
-                        pass
-                    self.autocad.add_mtext(road_title_fmt, cx, cy, layer="CADA_ROAD", rotation_rad=rot_rad, height=road_h, width=txt_width, attachment_point=5)
-                    modifications_done.append("access_road")
-            elif add_road:
+            local_pts = self._cadastral_boundary_points_from_drawing()
+            if len(local_pts) < 3:
                 return {"success": False, "error": "Could not find boundary (CADA_BOUNDARY) in the plan to add the road."}
+            pn_list = self._cadastral_pn_list_for_vertices(local_pts, q)
+            specs = _parse_access_road_specs_from_query(q)
+            if not specs:
+                m_w = re.search(
+                    r"(?:width|wide)\s+(?:of\s+)?(\d+(?:\.\d+)?)\s*m"
+                    r"|(\d+(?:\.\d+)?)\s*m\s+width",
+                    q,
+                    re.IGNORECASE,
+                )
+                width = float((m_w.group(1) or m_w.group(2)) if m_w else 4)
+                specs = [f"{width}m width on the side of {q}"]
+            road_h = float((profile.get("text_heights") or {}).get("bearing_dist_road") or 1.2)
+            try:
+                hr = self.autocad.get_sample_text_height(layers=["CADA_BEARING_DIST", "CADA_ROAD"])
+                if hr.get("success") and hr.get("height"):
+                    road_h = float(hr["height"])
+            except Exception:
+                pass
+            used_edges: set[int] = set()
+            drawn = 0
+            for spec in specs:
+                ar_lower = spec.lower()
+                width = 4.0
+                m_w = (
+                    re.search(r"(\d+(?:\.\d+)?)\s*m\s+width", ar_lower)
+                    or re.search(r"width\s+(\d+(?:\.\d+)?)\s*m", ar_lower)
+                    or re.search(r"(\d+(?:\.\d+)?)\s*m\s+road", ar_lower)
+                )
+                if m_w:
+                    width = float(m_w.group(1))
+                offset = 0.2
+                m_o = re.search(r"offset\s+(?:of\s+)?(\d+(?:\.\d+)?)\s*m", ar_lower)
+                if m_o:
+                    offset = float(m_o.group(1))
+                target_idx = self._cadastral_edge_index_from_road_spec(spec, local_pts, pn_list)
+                if target_idx < 0:
+                    # Last resort only when the user named no pillars.
+                    if not pn_list or not re.search(r"sp\s*/|pillar|[A-Z]{1,4}\s*/", spec, re.I):
+                        target_idx = 0
+                    else:
+                        continue
+                if target_idx in used_edges:
+                    continue
+                road_title = "ACCESS    ROAD"
+                m_title = re.search(r"(?:title|labeled|named|titled)\s+['\"]([^'\"]+)['\"]", spec, re.I)
+                if m_title:
+                    road_title = m_title.group(1).strip()
+                if self._draw_access_road_on_edge(
+                    local_pts,
+                    target_idx,
+                    width=width,
+                    offset=offset,
+                    road_title=road_title,
+                    road_h=road_h,
+                ):
+                    used_edges.add(target_idx)
+                    drawn += 1
+                    a = pn_list[target_idx] if target_idx < len(pn_list) else {}
+                    b = pn_list[(target_idx + 1) % len(pn_list)] if pn_list else {}
+                    side = ""
+                    if a.get("number") and b.get("number"):
+                        side = f"{a.get('prefix', '')} {a.get('number')} to {b.get('prefix', '')} {b.get('number')}"
+                        side = re.sub(r"\s+", " ", side).strip()
+                    road_notes.append(
+                        f"{width:g} m access on {side}" if side else f"{width:g} m access added"
+                    )
+            if drawn:
+                modifications_done.append("access_road")
+                meta = getattr(self, "_last_cadastral_meta", None) or {}
+                roads = list(meta.get("access_roads") or [])
+                roads.extend(specs)
+                self._remember_cadastral_plot(access_roads=roads)
+            else:
+                return {
+                    "success": False,
+                    "error": (
+                        "Could not match the named pillars to a boundary side. "
+                        "Name the two stations, e.g. 'add a 4m road on the side joining SP/RV 1000 and SP/RV 1003'."
+                    ),
+                }
 
         if not modifications_done:
             return {"success": False, "error": "Could not parse a modification from your request (e.g. 'change title to X' or 'add another road on the other side')."}
 
         # STRICT: Never save if active doc is template (read-only to avoid corruption).
-        self._safe_save_active_drawing()
+        self._ensure_output_saved(str(target_p))
         try:
             self.autocad.execute_command("ZOOM E")
         except Exception:
             pass
-        return {"success": True, "output_dwg": str(target_p), "modifications": modifications_done}
+        self._last_cadastral_output_dwg = str(target_p)
+        return {
+            "success": True,
+            "output_dwg": str(target_p),
+            "modifications": modifications_done,
+            "notes": road_notes,
+        }
+
+    def _should_fastpath_cadastral_subdivision(self, query: str) -> bool:
+        """True when the user wants an ownership layout on the last plotted parcel."""
+        q = (query or "").strip()
+        if not q or not self._last_cadastral_output_dwg:
+            return False
+        low = q.lower()
+        if self._should_fastpath_cad_modification(q):
+            return False
+        subdiv = (
+            "subdivision",
+            "subdivide",
+            "parcellation",
+            "parcelation",
+            "split the parcel",
+            "split this parcel",
+            "divide the parcel",
+            "divide this parcel",
+            "owner subdivision",
+            "share the parcel",
+            "share this parcel",
+            "layout for this exact parcel",
+            "layout for the parcel",
+            "ownership layout",
+        )
+        if any(k in low for k in subdiv):
+            return True
+        save_as = bool(re.search(r"\bsave(?:\s+it)?\s+as\b", low) and ".dwg" in low)
+        if save_as and re.search(r"\b(layout|sketch|owner|share|plot)\b", low):
+            return True
+        if save_as and re.search(r"\b(yes|go ahead|proceed|please do)\b", low):
+            from pathlib import Path
+
+            dest = self._extract_dwg_path_from_query(q)
+            try:
+                last = str(Path(str(self._last_cadastral_output_dwg)).resolve()).lower()
+                if dest and str(Path(dest).resolve()).lower() != last:
+                    return True
+            except Exception:
+                if dest:
+                    return True
+        return False
+
+    def _cadastral_owners_for_subdivision(self, query: str) -> List[str]:
+        meta = getattr(self, "_last_cadastral_meta", None) or {}
+        names = _split_buyer_owner_names(str(meta.get("buyer_name") or ""))
+        if names:
+            return names
+        names = _split_buyer_owner_names(query or "")
+        if len(names) >= 2:
+            return names
+        qprev = str(meta.get("query") or "")
+        m = re.search(
+            r"buyer\s*names?\s*[:=]\s*(.+?)(?:\n|location|pillar|plan\s*number)",
+            qprev,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if m:
+            names = _split_buyer_owner_names(m.group(1))
+            if names:
+                return names
+        try:
+            tables = self.autocad.list_tables(layer="CADA_TITLEBLOCK")
+            for t in (tables.get("tables") or []) if tables.get("success") else []:
+                h = str(t.get("handle") or "")
+                if not h:
+                    continue
+                for row in (2, 1, 3, 0):
+                    cell = self.autocad.get_table_cell_text(h, row, 0)
+                    raw = str((cell or {}).get("text") or "")
+                    plain = re.sub(r"\\[^;]*;", " ", raw)
+                    plain = re.sub(r"[{}]", " ", plain)
+                    plain = re.sub(r"\\P", ", ", plain)
+                    found = _split_buyer_owner_names(plain)
+                    if len(found) >= 2:
+                        return found
+        except Exception:
+            pass
+        return names
+
+    def _copy_cadastral_dwg(self, src: str, dest: str) -> Dict[str, Any]:
+        import shutil
+        from pathlib import Path
+
+        src_p = Path(src).resolve()
+        dest_p = Path(dest).resolve()
+        if src_p == dest_p:
+            return {"success": True, "path": str(dest_p)}
+        dest_p.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._ensure_output_saved(str(src_p))
+        except Exception:
+            pass
+        # Never SaveAs the source tab — that rebinds AutoCAD onto the new name
+        # and leaves later COM edits on the wrong drawing. Close dest first so
+        # the disk copy is not locked, then open dest after the copy.
+        try:
+            if getattr(self.autocad, "is_drawing_open", None) and self.autocad.is_drawing_open(str(dest_p)):
+                self.autocad.save_and_close_drawing(str(dest_p), save=False)
+        except Exception:
+            pass
+        try:
+            shutil.copy2(str(src_p), str(dest_p))
+            return {"success": True, "path": str(dest_p)}
+        except Exception as e:
+            return {"success": False, "error": f"Could not copy plan to {dest_p}: {e}"}
+
+    def _cadastral_bd_min_span(self, height: float) -> float:
+        """Along-edge length needed for a readable bearing/distance pair at *height*."""
+        return 9.0 * 0.6 * float(height)
+
+    def _subdivision_bd_too_many_arrows(
+        self,
+        n_arrows: int,
+        n_edges: int,
+        n_lots: int,
+    ) -> bool:
+        """True when leaders would crowd a large parcellation more than a 70% on-leg shrink."""
+        if n_arrows <= 0:
+            return False
+        if n_lots >= 6 and n_arrows >= 4:
+            return True
+        if n_edges >= 14 and n_arrows >= max(6, int(0.30 * n_edges)):
+            return True
+        return n_arrows >= 8
+
+    def _annotate_subdivision_lot_edge(
+        self,
+        p1: Dict[str, float],
+        p2: Dict[str, float],
+        inward: Tuple[float, float],
+        *,
+        height: float,
+    ) -> None:
+        """Distance inside the lot; bearing outside the lot — two compact labels on the line."""
+        import math
+
+        x1, y1 = float(p1["x"]), float(p1["y"])
+        x2, y2 = float(p2["x"]), float(p2["y"])
+        dx, dy = x2 - x1, y2 - y1
+        leng = math.hypot(dx, dy)
+        if leng <= 1e-6:
+            return
+        n1x, n1y = dy / leng, -dx / leng
+        n2x, n2y = -n1x, -n1y
+        ivx, ivy = float(inward[0]), float(inward[1])
+        if (n1x * ivx + n1y * ivy) >= (n2x * ivx + n2y * ivy):
+            inx, iny = n1x, n1y
+        else:
+            inx, iny = n2x, n2y
+        outx, outy = -inx, -iny
+        az = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+        d = int(az)
+        mins = int(round((az - d) * 60.0))
+        if mins == 60:
+            d = (d + 1) % 360
+            mins = 0
+        bearing = f"{d:03d}°\\~{mins:02d}'"
+        dist = f"{leng:.2f}m"
+        az_orient = az if az <= 180.0 else (az - 180.0)
+        rot = math.radians((90.0 - az_orient) % 360.0)
+        h = float(height)
+        char_w = 0.62 * h
+        off = 0.62 * h
+        midx = 0.5 * (x1 + x2)
+        midy = 0.5 * (y1 + y2)
+        bearing_w = min(max(3.2 * h, char_w * 8.0), max(3.2 * h, 0.62 * leng))
+        dist_w = min(max(3.0 * h, char_w * 6.5), max(3.0 * h, 0.50 * leng))
+        self.autocad.add_mtext(
+            f"{{\\fVerdana|b0|i0|c0|p34;{bearing}}}",
+            midx + off * outx,
+            midy + off * outy,
+            layer="CADA_BEARING_DIST",
+            rotation_rad=rot,
+            height=h,
+            width=bearing_w,
+            attachment_point=5,
+            assume_active=True,
+        )
+        self.autocad.add_mtext(
+            f"{{\\fVerdana|b0|i0|c0|p34;{dist}}}",
+            midx + off * inx,
+            midy + off * iny,
+            layer="CADA_BEARING_DIST",
+            rotation_rad=rot,
+            height=h,
+            width=dist_w,
+            attachment_point=5,
+            assume_active=True,
+        )
+
+    def _annotate_subdivision_lot_edge_arrow(
+        self,
+        p1: Dict[str, float],
+        p2: Dict[str, float],
+        inward: Tuple[float, float],
+        *,
+        height: float,
+    ) -> None:
+        """Standard projecting arrow when the pair will not sit on the leg."""
+        import math
+
+        x1, y1 = float(p1["x"]), float(p1["y"])
+        x2, y2 = float(p2["x"]), float(p2["y"])
+        dx, dy = x2 - x1, y2 - y1
+        leng = math.hypot(dx, dy)
+        if leng <= 1e-6:
+            return
+        n1x, n1y = dy / leng, -dx / leng
+        n2x, n2y = -n1x, -n1y
+        ivx, ivy = float(inward[0]), float(inward[1])
+        if (n1x * ivx + n1y * ivy) >= (n2x * ivx + n2y * ivy):
+            inx, iny = n1x, n1y
+        else:
+            inx, iny = n2x, n2y
+        outx, outy = -inx, -iny
+        az = (math.degrees(math.atan2(dx, dy)) + 360.0) % 360.0
+        d = int(az)
+        mins = int(round((az - d) * 60.0))
+        if mins == 60:
+            d = (d + 1) % 360
+            mins = 0
+        h = float(height)
+        stacked = (
+            f"{{\\fVerdana|b0|i0|c0|p34;{d:03d}°\\~{mins:02d}'\\P{leng:.2f}m}}"
+        )
+        midx = 0.5 * (x1 + x2)
+        midy = 0.5 * (y1 + y2)
+        stem = max(self._cadastral_bd_min_span(h) * 0.9, 6.0 * h)
+        branch = max(self._cadastral_bd_min_span(h) * 1.35, 10.0 * h)
+        ex, ey = midx + outx * stem * 1.6, midy + outy * stem * 1.6
+        bx = ex + (1.0 if outx >= 0 else -1.0) * branch
+        by = ey
+        tcx, tcy = 0.5 * (ex + bx), 0.5 * (ey + by)
+        try:
+            self.autocad.create_lwpolyline(
+                [
+                    {"x": midx, "y": midy},
+                    {"x": ex, "y": ey},
+                    {"x": bx, "y": by},
+                ],
+                layer="CADA_BEARING_DIST",
+                closed=False,
+                assume_active=True,
+            )
+        except Exception:
+            pass
+        try:
+            arrow = 0.6 * h
+            sl = math.hypot(ex - midx, ey - midy) or 1.0
+            su, sv = (ex - midx) / sl, (ey - midy) / sl
+            sp, sq = -sv, su
+            self.autocad.create_lwpolyline(
+                [
+                    {"x": midx, "y": midy},
+                    {
+                        "x": midx + su * arrow + sp * arrow * 0.35,
+                        "y": midy + sv * arrow + sq * arrow * 0.35,
+                    },
+                    {
+                        "x": midx + su * arrow - sp * arrow * 0.35,
+                        "y": midy + sv * arrow - sq * arrow * 0.35,
+                    },
+                ],
+                layer="CADA_BEARING_DIST",
+                closed=True,
+                assume_active=True,
+            )
+        except Exception:
+            pass
+        self.autocad.add_mtext(
+            stacked,
+            tcx,
+            tcy,
+            layer="CADA_BEARING_DIST",
+            rotation_rad=0.0,
+            height=h,
+            width=max(2.0, math.hypot(bx - ex, by - ey) * 0.95),
+            attachment_point=5,
+            assume_active=True,
+        )
+
+    def _place_subdivision_lot_dimensions(
+        self,
+        edges: Sequence[Dict[str, Any]],
+        *,
+        standard_height: float,
+        n_lots: int,
+    ) -> None:
+        """On-leg at full size, then 85%; arrows if still short; 70% only to thin a crowded sheet."""
+        std = float(standard_height)
+        if std <= 1e-9:
+            return
+        on_leg: List[Tuple[Dict[str, Any], float]] = []
+        need_arrow: List[Dict[str, Any]] = []
+        for rec in edges:
+            try:
+                leng = float(rec.get("length") or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if leng <= 1e-6:
+                continue
+            if leng + 1e-9 >= self._cadastral_bd_min_span(std):
+                on_leg.append((rec, std))
+            elif leng + 1e-9 >= self._cadastral_bd_min_span(0.85 * std):
+                on_leg.append((rec, 0.85 * std))
+            else:
+                need_arrow.append(rec)
+        if self._subdivision_bd_too_many_arrows(len(need_arrow), len(edges), n_lots):
+            still: List[Dict[str, Any]] = []
+            floor_h = 0.70 * std
+            for rec in need_arrow:
+                leng = float(rec.get("length") or 0.0)
+                if leng + 1e-9 >= self._cadastral_bd_min_span(floor_h):
+                    on_leg.append((rec, floor_h))
+                else:
+                    still.append(rec)
+            need_arrow = still
+        for rec, h in on_leg:
+            self._annotate_subdivision_lot_edge(
+                rec["p1"], rec["p2"], rec["inward"], height=h
+            )
+        for rec in need_arrow:
+            self._annotate_subdivision_lot_edge_arrow(
+                rec["p1"], rec["p2"], rec["inward"], height=std
+            )
+
+    def _run_cadastral_subdivision_pipeline(self, query: str) -> Dict[str, Any]:
+        """Copy the parent plan into the user-named file and add dimensioned lots."""
+        import math
+        from pathlib import Path
+
+        from agent.cadastral_intent import (
+            interpret_owner_share_plan_with_llm,
+            merge_owner_share_plans,
+            parse_owner_share_plan,
+            pick_frontage_edge_index,
+            query_has_share_or_placement_language,
+            resolve_frontage_owner_order,
+            share_plan_needs_llm,
+            subdivide_parcel_frontage_strips,
+            _ring_area,
+        )
+
+        src = (
+            getattr(self, "_last_cadastral_parent_dwg", None)
+            or self._last_cadastral_output_dwg
+        )
+        if not src:
+            return {"success": False, "error": "No plotted parcel is available in this conversation to subdivide."}
+        src_p = Path(src).resolve()
+        if not src_p.exists():
+            return {"success": False, "error": f"Source plan not found: {src_p}"}
+
+        save_as = self._extract_save_as_output_path(
+            query,
+            suffixes=(".dwg", ".dxf"),
+            relative_to=str(src_p),
+        )
+        if save_as:
+            dest_p = Path(save_as).resolve()
+        else:
+            dest_p = src_p
+        if dest_p == src_p:
+            if not _confirm_overwrite_existing_dwg(str(dest_p), mode="modify"):
+                return {
+                    "success": False,
+                    "cancelled": True,
+                    "error": f"Left existing drawing unchanged: {dest_p}",
+                }
+        elif dest_p.exists():
+            if not _confirm_overwrite_existing_dwg(str(dest_p), mode="overwrite"):
+                return {
+                    "success": False,
+                    "cancelled": True,
+                    "error": f"Left existing drawing unchanged: {dest_p}",
+                }
+
+        if not self.autocad.is_connected and not self.autocad.connect():
+            return {"success": False, "error": "Could not connect to AutoCAD via COM"}
+        if dest_p != src_p:
+            copied = self._copy_cadastral_dwg(str(src_p), str(dest_p))
+            if not copied.get("success"):
+                return copied
+        opened = self._activate_output_drawing(str(dest_p))
+        if not opened.get("success"):
+            return {"success": False, "error": opened.get("error") or "Failed to open the layout drawing."}
+
+        local_pts = self._cadastral_boundary_points_from_drawing()
+        if len(local_pts) < 4:
+            return {"success": False, "error": "Could not read the parent parcel boundary to subdivide."}
+
+        owners = self._cadastral_owners_for_subdivision(query)
+        if len(owners) < 2:
+            return {
+                "success": False,
+                "error": "Need the parent plan's owner names to share the parcel. Plot the cadastral plan first.",
+            }
+        parent_area = _ring_area(local_pts)
+        share_plan = parse_owner_share_plan(
+            query, owners, parent_area_m2=parent_area
+        )
+        unclear = share_plan_needs_llm(share_plan, query)
+        if unclear or query_has_share_or_placement_language(query):
+            try:
+                tiers = ("simple", "average") if unclear else ("simple",)
+                llm_plan = None
+                for tier in tiers:
+                    llm = None
+                    model_name = None
+                    try:
+                        llm, model_name = self._try_openai_tier_llm(tier)
+                    except Exception:
+                        llm = None
+                    if llm is None:
+                        llm = getattr(self, "llm_primary", None)
+                    if llm is None:
+                        continue
+                    llm_plan = interpret_owner_share_plan_with_llm(
+                        query,
+                        owners,
+                        llm=llm,
+                        run_with_timeout=self._run_with_timeout,
+                        parent_area_m2=parent_area,
+                        draft=share_plan,
+                    )
+                    if not llm_plan:
+                        continue
+                    fr = list(llm_plan.get("fractions") or [])
+                    n = max(1, len(owners))
+                    equalish = (
+                        len(fr) == n
+                        and max(fr) - min(fr) < 0.02
+                    )
+                    if unclear and equalish and tier == "simple":
+                        continue
+                    break
+                share_plan = merge_owner_share_plans(share_plan, llm_plan)
+            except Exception:
+                pass
+        pn_list = self._cadastral_pn_list_for_vertices(local_pts, query)
+        road_edges: List[int] = []
+        for spec in list((getattr(self, "_last_cadastral_meta", {}) or {}).get("access_roads") or []):
+            idx = self._cadastral_edge_index_from_road_spec(str(spec), local_pts, pn_list)
+            if idx >= 0 and idx not in road_edges:
+                road_edges.append(idx)
+        front = pick_frontage_edge_index(local_pts, road_edges)
+        order = resolve_frontage_owner_order(
+            share_plan, local_pts, front, pn_list=pn_list
+        )
+        fractions_along = [
+            float((share_plan.get("fractions") or [1.0])[i]) for i in order
+        ]
+        split = subdivide_parcel_frontage_strips(
+            local_pts, fractions_along, front_edge_index=front
+        )
+        if not split.get("ok"):
+            return {
+                "success": False,
+                "error": "Could not compute a non-crossing ownership split for this parcel outline.",
+            }
+
+        meta = getattr(self, "_last_cadastral_meta", None) or {}
+        geom = meta.get("geometry") if isinstance(meta.get("geometry"), dict) else {}
+        try:
+            denom = float(geom.get("output_plan_denom") or 500.0)
+        except (TypeError, ValueError):
+            denom = 500.0
+        bd_h = 1.2 * (denom / 500.0)
+        try:
+            hr = self.autocad.get_sample_text_height(layers=["CADA_BEARING_DIST"])
+            if hr.get("success") and hr.get("height"):
+                bd_h = float(hr["height"])
+        except Exception:
+            pass
+        try:
+            # Parent copy still has one bearing per original side. Lot frontages
+            # are shorter, so replace those labels with per-lot dimensions.
+            self.autocad.delete_entities(
+                "CADA_BEARING_DIST",
+                entity_object_names=["AcDbMText", "AcDbText"],
+            )
+        except Exception:
+            pass
+        name_h = 0.7 * bd_h
+        try:
+            scale_k = float(geom.get("output_scale_k") or (denom / 500.0))
+        except (TypeError, ValueError):
+            scale_k = max(0.25, denom / 500.0)
+        blk_name = "PEG_SYMBOL"
+        try:
+            prof_path = getattr(self, "_last_cadastral_profile_path", None)
+            if prof_path:
+                import json as _json
+
+                prof = _json.loads(Path(str(prof_path)).read_text(encoding="utf-8"))
+                blk_name = (
+                    ((prof.get("blocks") or {}).get("pillars") or {}).get("block_name")
+                    or blk_name
+                )
+        except Exception:
+            pass
+        orig_keys = {
+            (round(float(p["x"]), 3), round(float(p["y"]), 3)) for p in local_pts
+        }
+        letters = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+        lot_summaries: List[Dict[str, Any]] = []
+        seen_edges: set = set()
+        dim_edges: List[Dict[str, Any]] = []
+        new_pegs: List[Dict[str, float]] = []
+        seen_pegs: set = set()
+
+        for i, lot in enumerate(split.get("lots") or []):
+            owner_i = order[i] if i < len(order) else i
+            name = owners[owner_i] if owner_i < len(owners) else f"Owner {i + 1}"
+            letter = letters[owner_i] if owner_i < len(letters) else str(i + 1)
+            pts = lot.get("points") or []
+            area = float(lot.get("area_m2") or 0.0)
+            if len(pts) >= 3:
+                self.autocad.create_lwpolyline(
+                    [{"x": float(p["x"]), "y": float(p["y"])} for p in pts],
+                    layer="CADA_BOUNDARY",
+                    closed=True,
+                    linetype_scale=3.0,
+                )
+                cx = sum(float(p["x"]) for p in pts) / float(len(pts))
+                cy = sum(float(p["y"]) for p in pts) / float(len(pts))
+                label = f"{letter}  {name}\\P{area:,.0f} m²"
+                self.autocad.add_mtext(
+                    f"{{\\fVerdana|b0|i0|c0|p34;{label}}}",
+                    cx,
+                    cy,
+                    layer="CADA_TEXT",
+                    height=float(name_h),
+                    width=max(8.0, min(16.0, 0.62 * name_h * max(10, len(name)))),
+                    attachment_point=5,
+                )
+                n = len(pts)
+                for k in range(n):
+                    a, b = pts[k], pts[(k + 1) % n]
+                    try:
+                        k1 = (round(float(a["x"]), 3), round(float(a["y"]), 3))
+                        k2 = (round(float(b["x"]), 3), round(float(b["y"]), 3))
+                    except (TypeError, ValueError):
+                        continue
+                    if k1 == k2:
+                        continue
+                    ek = (k1, k2) if k1 <= k2 else (k2, k1)
+                    if ek in seen_edges:
+                        continue
+                    seen_edges.add(ek)
+                    midx = 0.5 * (float(a["x"]) + float(b["x"]))
+                    midy = 0.5 * (float(a["y"]) + float(b["y"]))
+                    vx, vy = cx - midx, cy - midy
+                    vl = math.hypot(vx, vy) or 1.0
+                    dim_edges.append(
+                        {
+                            "p1": a,
+                            "p2": b,
+                            "inward": (vx / vl, vy / vl),
+                            "length": math.hypot(
+                                float(b["x"]) - float(a["x"]),
+                                float(b["y"]) - float(a["y"]),
+                            ),
+                        }
+                    )
+                    for key, pt in ((k1, a), (k2, b)):
+                        if key in orig_keys or key in seen_pegs:
+                            continue
+                        seen_pegs.add(key)
+                        new_pegs.append({"x": float(pt["x"]), "y": float(pt["y"])})
+            plan_fracs = list(share_plan.get("fractions") or [])
+            lot_summaries.append(
+                {
+                    "letter": letter,
+                    "name": name,
+                    "area_m2": area,
+                    "share": float(
+                        plan_fracs[owner_i]
+                        if owner_i < len(plan_fracs)
+                        else (lot.get("share") or 0.0)
+                    ),
+                }
+            )
+
+        self._place_subdivision_lot_dimensions(
+            dim_edges,
+            standard_height=bd_h,
+            n_lots=len(split.get("lots") or []),
+        )
+
+        if new_pegs:
+            try:
+                for p in new_pegs:
+                    self.autocad.insert_block(
+                        str(blk_name),
+                        float(p["x"]),
+                        float(p["y"]),
+                        layer="CADA_PILLARS",
+                        xscale=float(scale_k),
+                        yscale=float(scale_k),
+                        zscale=float(scale_k),
+                    )
+            except Exception:
+                pass
+
+        self._ensure_output_saved(str(dest_p))
+        try:
+            self.autocad.execute_command("ZOOM E")
+        except Exception:
+            pass
+        self._last_cadastral_output_dwg = str(dest_p)
+        return {
+            "success": True,
+            "output_dwg": str(dest_p),
+            "source_dwg": str(src_p),
+            "parent_area_m2": parent_area,
+            "lots": lot_summaries,
+            "front_edge_index": split.get("front_edge_index"),
+        }
 
     def _run_docx_report_pipeline(
         self,
@@ -13309,15 +14525,12 @@ class SurvyAIAgent:
             }
         if err:
             return {"success": False, "error": str(err)}
+        from survyai.provider_models import llm_visible_text_from_content
+
         raw = getattr(msg, "content", msg)
-        if isinstance(raw, list):
-            raw = "\n".join(
-                str(part.get("text", "")) if isinstance(part, dict) else str(part)
-                for part in raw
-            )
         return {
             "success": True,
-            "response": str(raw or "").strip(),
+            "response": llm_visible_text_from_content(raw),
             "model_name": model_name_used,
         }
 
@@ -15407,8 +16620,11 @@ class SurvyAIAgent:
 
         def excel_cadastral_plot(user_request: str) -> str:
             """
-            Parse family/ownership parcels from Excel (any workbook name), optionally write a
-            normalized copy when the user asks (any filename), pull title-block metadata from a
+            Parse family/ownership parcels from Excel (any workbook name), convert/reproject
+            Easting/Northing when the user asks (any wording; before any Excel copy and before
+            plot; title-block origin becomes the target CRS), optionally write a
+            normalized copy when the user asks (any filename; converted values if conversion
+            ran), pull title-block metadata from a
             named reference DWG when present, then plot:
             - SEPARATE owner plans when the user asks for different/unique CAD plans per owner
               (each buyer's coordinates → that buyer's .dwg; plan numbers increment from the
@@ -16565,6 +17781,11 @@ class SurvyAIAgent:
                     "Use ONLY when the user explicitly wants Generate/create/plot … .dwg / CAD plan(s) "
                     "and Easting/Northing/pillar values are in a spreadsheet (owner blocks "
                     "separated by blank rows), optionally with metadata from an existing plan DWG. "
+                    "If the user also asked to convert/reproject coordinates (from one CRS/datum "
+                    "into another, any wording), this tool converts ALL parsed Easting/Northing "
+                    "FIRST, writes any requested Excel copy from those converted metres, sets "
+                    "origin_crs to the TARGET system, then plots. Never plot or save the source "
+                    "metres as if they were already converted. Pass the full user request. "
                     "Do NOT use for read/extract/inspect/summarize Excel turns, or bare 'yes/go ahead' "
                     "after those turns (that means deeper extract/search, not CAD). "
                     "SEMANTICS (critical): "
@@ -16599,7 +17820,9 @@ class SurvyAIAgent:
                     "INTELLIGENT multi-format cadastral composition for complex prompts that "
                     "explicitly ask to Generate/create/plot a .dwg/CAD plan: "
                     "reads coordinates/bearings from Excel, CSV, TXT, or DOCX (deterministic extract first, "
-                    "then one RAG-informed LLM compose when structure is ambiguous), pulls metadata from a "
+                    "then one RAG-informed LLM compose when structure is ambiguous), converts/reprojects "
+                    "when the user asked (before any Excel copy and before plot; origin_crs = target), "
+                    "pulls metadata from a "
                     "named reference DWG when asked, optionally writes a normalized workbook when requested, and plots the DWG. "
                     "Use when the user did NOT paste inline EmE/NmN traverse text. "
                     "Do NOT use for simple conventional Generate … prompts that already include coordinates/bearings. "
@@ -16803,6 +18026,8 @@ class SurvyAIAgent:
                     "If excel_inspect_workbook reports ownership.family_blocks / Unnamed columns, call "
                     "excel_normalize_ownership_workbook first (or pass the raw file — SurvyAI will auto-normalize "
                     "on 'no valid coordinates' and retry with Easting/Northing). "
+                    "If the same request also asks to generate/plot a cadastral CAD/.dwg, prefer "
+                    "excel_cadastral_plot / cadastral_compose_and_plot instead — they convert then plot. "
                     "For GIS follow-on (polygons/buffers/overlaps), convert the normalized/headed workbook, "
                     "keep the Owner column, then use geopandas_execute or arcgis_execute_python_code on the "
                     "converted file — never use arcgis_fill_volume_* for polygon/buffer/overlap work. "
@@ -19201,7 +20426,12 @@ class SurvyAIAgent:
                             and ocr_result.structured
                         ):
                             try:
+                                from agent.output_paths import cancelled_existing_file_write
+
                                 out_json = _ws / "ocr_result.json"
+                                blocked = cancelled_existing_file_write(str(out_json))
+                                if blocked:
+                                    raise PermissionError(blocked.get("error") or "Left existing file unchanged")
                                 out_json.write_text(
                                     json.dumps(ocr_result.structured, indent=2, ensure_ascii=False),
                                     encoding="utf-8",
@@ -19626,48 +20856,61 @@ class SurvyAIAgent:
                 fast = self._run_excel_cadastral_pipeline(tool_routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if fast.get("success"):
+                    from agent.cadastral_intent import format_cadastral_status_message
+
                     if fast.get("mode") == "separate_owner_plans":
-                        resp_lines = [
-                            "✅ Separate owner cadastral plans generated from Excel coordinates "
-                            "(one DWG per owner — not a multi-parcel layout).",
-                            f"- Plans succeeded: {fast.get('plans_success')}/{fast.get('plans_total')}",
-                            f"- Source Excel: {fast.get('excel_path')}",
-                            f"- Duplicate workbook: {fast.get('dup_xlsx')}",
-                            f"- Owners: {fast.get('buyer_name')}",
-                        ]
+                        extra = []
                         for plan in (fast.get("plans") or [])[:25]:
-                            status = "OK" if plan.get("success") else "FAIL"
-                            resp_lines.append(
-                                f"  • [{status}] {plan.get('owner_name')}: "
+                            status = "Ready" if plan.get("success") else "Failed"
+                            extra.append(
+                                f"• [{status}] {plan.get('owner_name')}: "
                                 f"{plan.get('output_dwg')}"
                                 + (
-                                    f" (plan no. {plan.get('plan_number')})"
+                                    f"  (plan no. {plan.get('plan_number')})"
                                     if plan.get("plan_number")
                                     else ""
                                 )
                             )
-                    else:
-                        resp_lines = [
-                            "✅ Multi-parcel cadastral plan generated from Excel coordinates.",
-                            f"- Output: {fast.get('output_dwg')}",
-                            f"- Source Excel: {fast.get('excel_path')}",
-                            f"- Duplicate workbook: {fast.get('dup_xlsx')}",
-                            f"- Parcels plotted: {fast.get('parcel_count')}",
-                            f"- Buyer/owner labels: {fast.get('buyer_name')}",
+                        bullets = [
+                            f"Plans succeeded: {fast.get('plans_success')}/{fast.get('plans_total')}",
+                            f"Source Excel: {fast.get('excel_path')}",
+                            f"Duplicate workbook: {fast.get('dup_xlsx')}",
+                            f"Owners: {fast.get('buyer_name')}",
                         ]
-                    if fast.get("reference_dwg"):
-                        resp_lines.append(f"- Metadata source plan: {fast.get('reference_dwg')}")
-                    for note in fast.get("notes") or []:
-                        resp_lines.append(f"- Note: {note}")
-                    if fast.get("access_road_title"):
-                        resp_lines.append(f"- Access road title (as plotted): {fast.get('access_road_title')!r}")
-                    resp_lines.append(
-                        "\nYou can request modifications in this session "
-                        "(e.g. add a road, change the title) without re-prompting."
-                    )
+                        if fast.get("reference_dwg"):
+                            bullets.append(f"Metadata source plan: {fast.get('reference_dwg')}")
+                        for note in fast.get("notes") or []:
+                            bullets.append(str(note))
+                        if fast.get("access_road_title"):
+                            bullets.append(f"Access road label: {fast.get('access_road_title')}")
+                        success_text = format_cadastral_status_message(
+                            opener="Separate owner plans ready.",
+                            bullets=bullets,
+                            extra_lines=extra,
+                        )
+                    else:
+                        bullets = [
+                            f"Source Excel: {fast.get('excel_path')}",
+                            f"Duplicate workbook: {fast.get('dup_xlsx')}",
+                            f"Parcels plotted: {fast.get('parcel_count')}",
+                            f"Owners: {fast.get('buyer_name')}",
+                        ]
+                        if fast.get("reference_dwg"):
+                            bullets.append(f"Metadata source plan: {fast.get('reference_dwg')}")
+                        for note in fast.get("notes") or []:
+                            bullets.append(str(note))
+                        if fast.get("access_road_title"):
+                            bullets.append(
+                                f"Access road label: {fast.get('access_road_title')}"
+                            )
+                        success_text = format_cadastral_status_message(
+                            opener="Cadastral plan ready.",
+                            file_path=fast.get("output_dwg"),
+                            bullets=bullets,
+                        )
                     return {
                         "query": query,
-                        "response": "\n".join(resp_lines) + "\n",
+                        "response": success_text,
                         "llm_used": llm_used,
                         "model_name": model_name_used,
                         "complexity": complexity,
@@ -19702,37 +20945,44 @@ class SurvyAIAgent:
                 )
                 intel = self._run_intelligent_cadastral_pipeline(tool_routing_query)
                 if intel.get("success"):
+                    from agent.cadastral_intent import format_cadastral_status_message
+
+                    extra = []
+                    bullets = []
                     if intel.get("mode") == "separate_owner_plans":
-                        resp_lines = [
-                            "✅ Separate owner cadastral plans generated via intelligent composition "
-                            "(one DWG per owner).",
-                            f"- Plans succeeded: {intel.get('plans_success')}/{intel.get('plans_total')}",
-                            f"- Sources: {', '.join(intel.get('source_files') or [])}",
-                            f"- Owners: {intel.get('buyer_name')}",
+                        opener = "Separate owner plans ready."
+                        bullets = [
+                            f"Plans succeeded: {intel.get('plans_success')}/{intel.get('plans_total')}",
+                            f"Sources: {', '.join(intel.get('source_files') or [])}",
+                            f"Owners: {intel.get('buyer_name')}",
                         ]
                         for plan in (intel.get("plans") or [])[:25]:
-                            status = "OK" if plan.get("success") else "FAIL"
-                            resp_lines.append(
-                                f"  • [{status}] {plan.get('owner_name')}: {plan.get('output_dwg')}"
+                            status = "Ready" if plan.get("success") else "Failed"
+                            extra.append(
+                                f"• [{status}] {plan.get('owner_name')}: {plan.get('output_dwg')}"
                             )
                     else:
-                        resp_lines = [
-                            "✅ Cadastral plan generated via intelligent file composition.",
-                            f"- Output: {intel.get('output_dwg')}",
-                            f"- Sources: {', '.join(intel.get('source_files') or [])}",
-                            f"- Compose mode: {intel.get('compose_source')}",
-                            f"- Parcels plotted: {intel.get('parcel_count')}",
-                            f"- Buyer/owner labels: {intel.get('buyer_name')}",
+                        opener = "Cadastral plan ready."
+                        bullets = [
+                            f"Sources: {', '.join(intel.get('source_files') or [])}",
+                            f"Compose mode: {intel.get('compose_source')}",
+                            f"Parcels plotted: {intel.get('parcel_count')}",
+                            f"Owners: {intel.get('buyer_name')}",
                         ]
                     if intel.get("dup_xlsx"):
-                        resp_lines.append(f"- Duplicate workbook: {intel.get('dup_xlsx')}")
+                        bullets.append(f"Duplicate workbook: {intel.get('dup_xlsx')}")
                     if intel.get("reference_dwg"):
-                        resp_lines.append(f"- Metadata source plan: {intel.get('reference_dwg')}")
+                        bullets.append(f"Metadata source plan: {intel.get('reference_dwg')}")
                     for note in intel.get("notes") or []:
-                        resp_lines.append(f"- Note: {note}")
+                        bullets.append(str(note))
                     return {
                         "query": query,
-                        "response": "\n".join(resp_lines) + "\n",
+                        "response": format_cadastral_status_message(
+                            opener=opener,
+                            file_path=None if intel.get("mode") == "separate_owner_plans" else intel.get("output_dwg"),
+                            bullets=bullets,
+                            extra_lines=extra,
+                        ),
                         "llm_used": llm_used,
                         "model_name": model_name_used,
                         "complexity": complexity,
@@ -19752,43 +21002,45 @@ class SurvyAIAgent:
                 fast = self._run_intelligent_cadastral_pipeline(tool_routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if fast.get("success"):
+                    from agent.cadastral_intent import format_cadastral_status_message
+
+                    extra = []
                     if fast.get("mode") == "separate_owner_plans":
-                        resp_lines = [
-                            "✅ Separate owner cadastral plans generated via intelligent composition "
-                            "(one DWG per owner).",
-                            f"- Plans succeeded: {fast.get('plans_success')}/{fast.get('plans_total')}",
-                            f"- Sources: {', '.join(fast.get('source_files') or [])}",
-                            f"- Owners: {fast.get('buyer_name')}",
+                        opener = "Separate owner plans ready."
+                        bullets = [
+                            f"Plans succeeded: {fast.get('plans_success')}/{fast.get('plans_total')}",
+                            f"Sources: {', '.join(fast.get('source_files') or [])}",
+                            f"Owners: {fast.get('buyer_name')}",
                         ]
                         for plan in (fast.get("plans") or [])[:25]:
-                            status = "OK" if plan.get("success") else "FAIL"
-                            resp_lines.append(
-                                f"  • [{status}] {plan.get('owner_name')}: {plan.get('output_dwg')}"
+                            status = "Ready" if plan.get("success") else "Failed"
+                            extra.append(
+                                f"• [{status}] {plan.get('owner_name')}: {plan.get('output_dwg')}"
                             )
                     else:
-                        resp_lines = [
-                            "✅ Cadastral plan generated via intelligent file composition.",
-                            f"- Output: {fast.get('output_dwg')}",
-                            f"- Sources: {', '.join(fast.get('source_files') or [])}",
-                            f"- Compose mode: {fast.get('compose_source')}",
-                            f"- Parcels plotted: {fast.get('parcel_count')}",
-                            f"- Buyer/owner labels: {fast.get('buyer_name')}",
+                        opener = "Cadastral plan ready."
+                        bullets = [
+                            f"Sources: {', '.join(fast.get('source_files') or [])}",
+                            f"Compose mode: {fast.get('compose_source')}",
+                            f"Parcels plotted: {fast.get('parcel_count')}",
+                            f"Owners: {fast.get('buyer_name')}",
                         ]
                     if fast.get("dup_xlsx"):
-                        resp_lines.append(f"- Duplicate workbook: {fast.get('dup_xlsx')}")
+                        bullets.append(f"Duplicate workbook: {fast.get('dup_xlsx')}")
                     if fast.get("reference_dwg"):
-                        resp_lines.append(f"- Metadata source plan: {fast.get('reference_dwg')}")
+                        bullets.append(f"Metadata source plan: {fast.get('reference_dwg')}")
                     for note in fast.get("notes") or []:
-                        resp_lines.append(f"- Note: {note}")
+                        bullets.append(str(note))
                     if fast.get("access_road_title"):
-                        resp_lines.append(f"- Access road title (as plotted): {fast.get('access_road_title')!r}")
-                    resp_lines.append(
-                        "\nYou can request modifications in this session "
-                        "(e.g. add a road, change the title) without re-prompting."
-                    )
+                        bullets.append(f"Access road label: {fast.get('access_road_title')}")
                     return {
                         "query": query,
-                        "response": "\n".join(resp_lines) + "\n",
+                        "response": format_cadastral_status_message(
+                            opener=opener,
+                            file_path=None if fast.get("mode") == "separate_owner_plans" else fast.get("output_dwg"),
+                            bullets=bullets,
+                            extra_lines=extra,
+                        ),
                         "llm_used": llm_used,
                         "model_name": model_name_used,
                         "complexity": complexity,
@@ -19807,26 +21059,27 @@ class SurvyAIAgent:
                 fast = self._run_cadastral_cad_batch_pipeline(tool_routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if fast.get("success"):
-                    res = fast.get("results") or []
-                    lines = [
-                        "✅ Batch cadastral plotting completed.",
-                        f"- Plans requested: {fast.get('plans_total')}",
-                        f"- Successful: {fast.get('plans_success')}",
-                        f"- Failed: {fast.get('plans_failed')}",
-                        "",
-                        "Outputs:",
-                    ]
-                    for item in res:
+                    from agent.cadastral_intent import format_cadastral_status_message
+
+                    extra = []
+                    for item in fast.get("results") or []:
                         idx = item.get("_plan_index")
                         if item.get("success"):
-                            lines.append(f"- Plan {idx}: {item.get('output_dwg')}")
+                            extra.append(f"• Plan {idx}: {item.get('output_dwg')}")
                         else:
                             err = item.get("error") or "Failed"
-                            lines.append(f"- Plan {idx}: FAILED ({err})")
-                    lines.append("\nYou can request modifications in this session for the last successful plan (e.g. add road, change title).")
+                            extra.append(f"• Plan {idx}: Failed ({err})")
                     return {
                         "query": query,
-                        "response": "\n".join(lines) + "\n",
+                        "response": format_cadastral_status_message(
+                            opener="Batch cadastral plotting complete.",
+                            bullets=[
+                                f"Plans requested: {fast.get('plans_total')}",
+                                f"Successful: {fast.get('plans_success')}",
+                                f"Failed: {fast.get('plans_failed')}",
+                            ],
+                            extra_lines=extra,
+                        ),
                         "llm_used": llm_used,
                         "model_name": model_name_used,
                         "complexity": complexity,
@@ -19854,24 +21107,23 @@ class SurvyAIAgent:
                 if fast.get("success"):
                     self._last_cadastral_output_dwg = fast.get("output_dwg")
                     self._last_cadastral_profile_path = fast.get("profile_path")
-                    resp_lines = [
-                        "✅ Cadastral plan generated from template.",
-                        f"- Output: {fast.get('output_dwg')}",
-                        f"- Geometry: {fast.get('geometry')}",
-                    ]
-                    if fast.get("access_road_title"):
-                        resp_lines.append(f"- Access road title (as plotted): {fast.get('access_road_title')!r}")
                     try:
-                        from agent.cadastral_intent import format_traverse_adjustment_chat_lines
+                        from agent.cadastral_intent import format_cadastral_plot_success_message
 
-                        bow = (fast.get("geometry") or {}).get("bowditch") if isinstance(fast, dict) else None
-                        resp_lines.extend(format_traverse_adjustment_chat_lines(bow))
+                        success_text = format_cadastral_plot_success_message(
+                            output_dwg=fast.get("output_dwg"),
+                            geometry=fast.get("geometry") if isinstance(fast.get("geometry"), dict) else {},
+                            access_road_title=fast.get("access_road_title"),
+                            opener="Cadastral plan ready.",
+                        )
                     except Exception:
-                        pass
-                    resp_lines.append("\nYou can request modifications in this session (e.g. add another road, change the title) without closing or re-prompting.")
+                        success_text = (
+                            "Cadastral plan ready.\n\n"
+                            f"File\n{fast.get('output_dwg') or '—'}\n"
+                        )
                     return {
                         "query": query,
-                        "response": "\n".join(resp_lines) + "\n",
+                        "response": success_text,
                         "llm_used": llm_used,
                         "model_name": model_name_used,
                         "complexity": complexity,
@@ -19920,16 +21172,17 @@ class SurvyAIAgent:
                 mod = self._run_cad_modification_pipeline(tool_routing_query)
                 llm_used = "fallback" if use_fallback else "primary"
                 if mod.get("success"):
-                    resp_lines = [
-                        "✅ Plan updated.",
-                        f"- File: {mod.get('output_dwg')}",
-                        f"- Modifications: {mod.get('modifications', [])}",
-                    ]
-                    if mod.get("save_warning"):
-                        resp_lines.append(f"- Note: {mod.get('save_warning')}")
+                    from agent.cadastral_intent import format_cadastral_status_message
+
+                    notes = [str(n) for n in (mod.get("notes") or []) if n]
                     return {
                         "query": query,
-                        "response": "\n".join(resp_lines) + "\n",
+                        "response": format_cadastral_status_message(
+                            opener="Plan updated.",
+                            file_path=mod.get("output_dwg"),
+                            bullets=notes
+                            or [f"Changes: {', '.join(mod.get('modifications') or []) or 'saved'}"],
+                        ),
                         "llm_used": llm_used,
                         "model_name": model_name_used,
                         "complexity": complexity,
@@ -19949,6 +21202,53 @@ class SurvyAIAgent:
                     "context_retrieved": False,
                     "output_path": None,
                     "error": mod.get("error") if isinstance(mod, dict) else "CAD modification failed",
+                }
+
+            if self._should_fastpath_cadastral_subdivision(tool_routing_query):
+                sub = self._run_cadastral_subdivision_pipeline(tool_routing_query)
+                llm_used = "fallback" if use_fallback else "primary"
+                if sub.get("success"):
+                    from agent.cadastral_intent import format_cadastral_status_message
+
+                    extras = []
+                    for lot in sub.get("lots") or []:
+                        extras.append(
+                            f"• {lot.get('letter')} — {lot.get('name')}: "
+                            f"{float(lot.get('area_m2') or 0):,.0f} m² "
+                            f"({100.0 * float(lot.get('share') or 0):.1f}%)"
+                        )
+                    return {
+                        "query": query,
+                        "response": format_cadastral_status_message(
+                            opener="Ownership layout ready.",
+                            file_path=sub.get("output_dwg"),
+                            bullets=[
+                                f"Parent parcel: {float(sub.get('parent_area_m2') or 0):,.0f} m²",
+                                "Lots are frontage strips from the primary access — internals do not cross.",
+                                "Each lot is dimensioned with bearings and distances.",
+                                "Owner names are taken from the plotted title, not invented.",
+                            ],
+                            extra_lines=extras,
+                        ),
+                        "llm_used": llm_used,
+                        "model_name": model_name_used,
+                        "complexity": complexity,
+                        "success": True,
+                        "session_id": self.get_session_id(),
+                        "context_retrieved": False,
+                        "output_path": sub.get("output_dwg"),
+                    }
+                return {
+                    "query": query,
+                    "response": str(sub.get("error") or sub),
+                    "llm_used": llm_used,
+                    "model_name": model_name_used,
+                    "complexity": complexity,
+                    "success": False,
+                    "session_id": self.get_session_id(),
+                    "context_retrieved": False,
+                    "output_path": None,
+                    "error": sub.get("error") if isinstance(sub, dict) else "Subdivision layout failed",
                 }
 
             # AUTOMATIC DOCUMENT PRE-PROCESSING: Detect document paths and get resource estimation
@@ -21020,6 +22320,11 @@ class SurvyAIAgent:
 
             return llm_visible_text_from_content(content)
 
+        def _visible(text: str) -> str:
+            from survyai.provider_models import strip_trailing_model_envelope
+
+            return strip_trailing_model_envelope(text or "")
+
         def _maybe_parse_tool_payload(raw_text: str) -> Optional[Dict[str, Any]]:
             if not raw_text:
                 return None
@@ -21114,7 +22419,7 @@ class SurvyAIAgent:
                 # Check if this message has text content
                 text = _stringify_content(message.content)
                 if text:
-                    return text
+                    return _visible(text)
 
         # If the graph ended immediately after a tool call (for example because a
         # same-error guard stopped another retry), there may be no final AI message.
@@ -21128,8 +22433,8 @@ class SurvyAIAgent:
                 if payload:
                     summary = _summarize_tool_payload(payload)
                     if summary:
-                        return summary
-                return tool_text
+                        return _visible(summary)
+                return _visible(tool_text)
 
         return "Task finished, but no final assistant message was produced. Check the latest tool output in the saved logs or output files."
 

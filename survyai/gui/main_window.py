@@ -70,6 +70,7 @@ from survyai.llm_routing import (
     resolve_primary_llm_selection,
 )
 from survyai.gui.branding import SurvyLogoWidget, make_app_icon
+from survyai.gui.automated_cad_form import AutomatedCadForm
 from survyai.gui.cad_prompt_defaults import (
     SYSTEM_DEFAULT_CAD_PROMPT,
     is_system_default_text,
@@ -385,6 +386,8 @@ def _is_clearly_new_topic(raw_query: str, last_exchange_messages: list) -> bool:
     """
     if _looks_like_gis_session_followup(raw_query):
         return False
+    if _looks_like_cadastral_plot_followup(raw_query):
+        return False
     if _fu_anaphora(raw_query):
         return False
     prev_text = " ".join((m.content or "") for m in last_exchange_messages)
@@ -402,6 +405,34 @@ def _is_clearly_new_topic(raw_query: str, last_exchange_messages: list) -> bool:
     return False
 
 
+def _looks_like_cadastral_plot_followup(raw_query: str) -> bool:
+    """True when the user is asking about the parcel/plan already plotted this session."""
+    q = (raw_query or "").strip().lower()
+    if not q:
+        return False
+    if re.search(
+        r"\b(?:this|the|that)\s+"
+        r"(?:parcel|plot|plan|traverse|survey|site|dwg|drawing|land|cadastral)\b"
+        r"|\bthis land\b|\bthe plotted\b|\bthe generated\b|\bon (?:this|the) (?:parcel|plot|site|land)\b"
+        r"|\bcan this (?:parcel|plot|land)\b",
+        q,
+    ):
+        return True
+    return False
+
+
+def _looks_like_cadastral_plot_prompt(text: str) -> bool:
+    """True for a conventional cadastral Generate-… prompt (Automated CAD or Console)."""
+    t = (text or "").strip().lower()
+    if not t:
+        return False
+    if ".dwg" not in t or "generate" not in t:
+        return False
+    return ("buyer name" in t or "pillar" in t) and (
+        "coordinates" in t or "bearing" in t
+    )
+
+
 def _is_standalone_knowledge_question(raw_query: str) -> bool:
     """True for self-contained explanatory questions that should not inherit task context."""
     q = (raw_query or "").strip().lower()
@@ -409,6 +440,8 @@ def _is_standalone_knowledge_question(raw_query: str) -> bool:
         return False
     # GIS session follow-ups / fit tests must keep prior verified layers.
     if _looks_like_gis_session_followup(raw_query):
+        return False
+    if _looks_like_cadastral_plot_followup(raw_query):
         return False
     if re.search(r"[a-z]:\\|/[^ \n]+\.(dwg|dxf|docx|pdf|xlsx?|csv|txt|json|aprx|gdb)\b", q, flags=re.I):
         return False
@@ -480,6 +513,8 @@ def _should_inject_conversation_context(raw: str, prior_user_assistant_text: str
     # Always keep full recent history for GIS fit / open-result continuations.
     if _looks_like_gis_session_followup(raw):
         return True
+    if _looks_like_cadastral_plot_followup(raw):
+        return True
     # Bare "go ahead" / "yes" after a GIS fit offer must keep the full session (aprx/gdb/xlsx),
     # not only the last failed CURRENT-map exchange.
     if _fu_short_affirm(raw) and _assistant_offered_session_gis_analysis(prev):
@@ -519,12 +554,15 @@ def _should_inject_conversation_context(raw: str, prior_user_assistant_text: str
     return nt < 1 and nw < 8
 
 
-# Central stack: main tabs (Console + History), then full-page Settings, Diagnostics, Credits, CAD prompt
+# Central stack: main tabs (Console / Automated CAD / History), then Settings, Diagnostics, Credits, CAD prompt
 _PAGE_MAIN = 0
 _PAGE_SETTINGS = 1
 _PAGE_DIAGNOSTICS = 2
 _PAGE_CREDITS = 3
 _PAGE_CAD_PROMPT = 4
+_TAB_CONSOLE = 0
+_TAB_AUTOMATED_CAD = 1
+_TAB_OUTPUT_HISTORY = 2
 
 
 def _cloud_entitlements_allow_platform_llm(me: dict, ent: dict) -> bool:
@@ -1069,7 +1107,7 @@ def _cloud_error_text_for_user(exc: BaseException) -> str:
 
 
 class _CadFileConflictDialog(QDialog):
-    """Professional confirmation when an existing CAD drawing would be overwritten or modified."""
+    """Professional confirmation when an existing file would be overwritten or modified."""
 
     def __init__(
         self,
@@ -1086,8 +1124,29 @@ class _CadFileConflictDialog(QDialog):
         self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         mode_l = (mode or "overwrite").strip().lower()
         is_modify = mode_l == "modify"
+        pth = Path(path or "")
+        ext = pth.suffix.lower()
+        kind = {
+            ".dwg": "drawing",
+            ".dxf": "drawing",
+            ".docx": "Word document",
+            ".doc": "Word document",
+            ".xlsx": "Excel workbook",
+            ".xls": "Excel workbook",
+            ".xlsm": "Excel workbook",
+            ".csv": "CSV file",
+            ".txt": "text file",
+            ".json": "JSON file",
+            ".pdf": "PDF",
+            ".aprx": "ArcGIS project",
+            ".gdb": "geodatabase",
+            ".shp": "shapefile",
+        }.get(ext, "file")
+        if ext not in {".gdb"} and pth.exists() and pth.is_dir():
+            kind = "folder"
+        is_cad = ext in {".dwg", ".dxf"}
         self.setWindowTitle(
-            "Modify existing drawing" if is_modify else "Drawing already exists"
+            f"Modify existing {kind}" if is_modify else f"This {kind} already exists"
         )
         self.setMinimumWidth(460)
         self.setMaximumWidth(560)
@@ -1109,16 +1168,16 @@ class _CadFileConflictDialog(QDialog):
         titles = QVBoxLayout()
         titles.setSpacing(4)
         title = QLabel(
-            "Modify this drawing?" if is_modify else "This drawing already exists"
+            f"Modify this {kind}?" if is_modify else f"This {kind} already exists"
         )
         title.setObjectName("cadConflictTitle")
         title.setWordWrap(True)
         subtitle = QLabel(
-            "SurvyAI is about to change an existing AutoCAD file at this path. "
+            "SurvyAI is about to change an existing file at this path. "
             "Confirm to continue, or cancel to leave the file as it is."
             if is_modify
-            else "A drawing with this name is already in the folder. "
-            "Overwrite it with a new plan from the template, or keep the current file."
+            else "A file or folder with this name is already in the destination. "
+            "Overwrite it, or keep the current one."
         )
         subtitle.setObjectName("cadConflictSubtitle")
         subtitle.setWordWrap(True)
@@ -1132,7 +1191,7 @@ class _CadFileConflictDialog(QDialog):
         path_layout = QVBoxLayout(path_box)
         path_layout.setContentsMargins(12, 10, 12, 10)
         path_layout.setSpacing(4)
-        path_label = QLabel("File path")
+        path_label = QLabel("Path")
         path_label.setObjectName("cadConflictPathLabel")
         path_value = QLabel(path or "—")
         path_value.setObjectName("cadConflictPathValue")
@@ -1144,6 +1203,8 @@ class _CadFileConflictDialog(QDialog):
 
         hint = QLabel(
             "The survey plan template is never overwritten."
+            if is_cad
+            else "Confirm only if you intend to replace this existing file or folder."
         )
         hint.setObjectName("cadConflictHint")
         hint.setWordWrap(True)
@@ -1308,6 +1369,8 @@ class MainWindow(QMainWindow):
         self._startup_auto_run = bool(auto_run_query and self._startup_initial_query)
 
         self._console_content_panel: Optional[QWidget] = None
+        self._applied_stylesheet_theme: str = ""
+        self._workspace_chrome_sizes: list[int] = [220, 780, 240]
 
         self._build_ui()
         self._build_menu()
@@ -1391,10 +1454,19 @@ class MainWindow(QMainWindow):
 
     def _apply_prompt_controls_scale(self) -> None:
         """Resize prompt strip buttons/checkboxes with available width (no fixed strip)."""
-        panel = getattr(self, "_console_content_panel", None)
-        if panel is None:
-            return
-        cw = int(panel.contentsRect().width())
+        split = getattr(self, "_workspace_body_split", None)
+        if split is not None:
+            cw = int(split.contentsRect().width())
+            conv = getattr(self, "_conversation_panel", None)
+            if conv is not None and conv.isVisible():
+                cw -= max(0, int(conv.width()))
+        else:
+            panel = getattr(self, "_console_content_panel", None)
+            if self._is_automated_cad_tab():
+                panel = getattr(self, "_cad_content_panel", None) or panel
+            if panel is None:
+                return
+            cw = int(panel.contentsRect().width())
         if cw <= 0:
             return
 
@@ -1431,8 +1503,8 @@ class MainWindow(QMainWindow):
             sb = self.statusBar()
             self._fast_mode_indicator = QLabel("")
             self._fast_mode_indicator.setToolTip(
-                "Fast mode affects only non-file prompts.\n"
-                "CAD/doc/ArcGIS/file workflows are unchanged."
+                "Fast mode (off by default) speeds general questions only.\n"
+                "CAD, documents, ArcGIS, and other file jobs are unchanged."
             )
             self._fast_mode_indicator.setTextInteractionFlags(Qt.TextSelectableByMouse)
             sb.addPermanentWidget(self._fast_mode_indicator)
@@ -1572,7 +1644,11 @@ class MainWindow(QMainWindow):
         self._state_store.save(self._state)
         self._rebuild_service(skip_cloud_refresh=True)
         self._refresh_license_card()
-        self._refresh_diagnostics()
+        if (
+            getattr(self, "_central_stack", None) is not None
+            and int(self._central_stack.currentIndex()) == _PAGE_DIAGNOSTICS
+        ):
+            self._refresh_diagnostics()
         self._refresh_account_views()
 
         if result.bootstrap_status == "skipped_no_device":
@@ -1857,6 +1933,7 @@ class MainWindow(QMainWindow):
         sub.setObjectName("wordmarkSub")
         version_badge = QLabel(f"v{__version__}")
         version_badge.setObjectName("versionBadge")
+        version_badge.setToolTip("This SurvyAI build. Help → About for details.")
         title_row.addWidget(title)
         title_row.addWidget(sub)
         title_row.addWidget(version_badge)
@@ -1864,7 +1941,9 @@ class MainWindow(QMainWindow):
         self._back_workspace_btn = QPushButton("Back to workspace")
         self._back_workspace_btn.setObjectName("secondaryButton")
         self._back_workspace_btn.setVisible(False)
-        self._back_workspace_btn.setToolTip("Return to Console and Output History")
+        self._back_workspace_btn.setToolTip(
+            "Return to Console, Automated CAD section, and Output History"
+        )
         self._back_workspace_btn.clicked.connect(self._back_to_workspace)
         top_row.addWidget(self._back_workspace_btn)
         top_row.addWidget(title_wrap, 1)
@@ -1896,10 +1975,13 @@ class MainWindow(QMainWindow):
         ws_label = QLabel("Workspace")
         ws_label.setMinimumWidth(72)
         ws_label.setObjectName("sectionHeader")
+        ws_label.setToolTip("Project folder for drawings, documents, and exports.")
         workspace_row.addWidget(ws_label)
         self._workspace_edit = QLineEdit()
         self._workspace_edit.setPlaceholderText("Project folder for prompts, exports, and CAD context")
-        self._workspace_edit.setToolTip("Folder used for prompts, exports, and project context.")
+        self._workspace_edit.setToolTip(
+            "Project folder for inputs and outputs. Short file names in prompts resolve here."
+        )
         self._workspace_edit.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
@@ -1907,12 +1989,12 @@ class MainWindow(QMainWindow):
         browse_workspace = QPushButton("Browse…")
         browse_workspace.setObjectName("secondaryButton")
         browse_workspace.clicked.connect(self._choose_workspace)
-        browse_workspace.setToolTip("Pick a workspace folder.")
+        browse_workspace.setToolTip("Choose the project folder SurvyAI should read and write.")
         workspace_row.addWidget(browse_workspace)
         open_workspace = QPushButton("Open")
         open_workspace.setObjectName("secondaryButton")
         open_workspace.clicked.connect(self._open_workspace_folder)
-        open_workspace.setToolTip("Open the workspace folder in File Explorer.")
+        open_workspace.setToolTip("Open the current workspace in File Explorer.")
         workspace_row.addWidget(open_workspace)
         top_bar_outer.addLayout(workspace_row)
 
@@ -1923,11 +2005,13 @@ class MainWindow(QMainWindow):
         self._central_stack.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self._tabs = QTabWidget()
         self._tabs.setDocumentMode(True)
-        self._central_stack.addWidget(self._tabs)
         root.addWidget(self._central_stack, 1)
 
         self._build_console_tab()
+        self._build_automated_cad_tab()
         self._build_history_tab()
+        self._install_persistent_workspace_chrome()
+        self._tabs.currentChanged.connect(self._on_workspace_tab_changed)
         self._settings_page = self._build_settings_page()
         self._diagnostics_page = self._build_diagnostics_page()
         self._credits_page = self._build_credits_page()
@@ -1940,21 +2024,25 @@ class MainWindow(QMainWindow):
     def _build_console_tab(self) -> None:
         tab = QWidget()
         layout = QVBoxLayout(tab)
-        layout.setContentsMargins(8, 4, 8, 6)
+        layout.setContentsMargins(4, 0, 4, 0)
         layout.setSpacing(4)
 
-        body_split = QSplitter(Qt.Horizontal)
-
-        conversation_panel = QWidget()
+        conversation_panel = QWidget(self)
+        conversation_panel.hide()
+        self._conversation_panel = conversation_panel
         conversation_panel.setObjectName("sidebarConversations")
         conversation_panel.setMinimumWidth(160)
         conversation_layout = QVBoxLayout(conversation_panel)
         conversation_layout.setContentsMargins(8, 8, 8, 8)
         conv_hdr = QLabel("Conversations")
         conv_hdr.setObjectName("sectionHeader")
+        conv_hdr.setToolTip("Each conversation keeps its own history and CAD follow-up context.")
         conversation_layout.addWidget(conv_hdr)
         self._conversation_list = QListWidget()
         self._conversation_list.setObjectName("conversationList")
+        self._conversation_list.setToolTip(
+            "Select a conversation to view it. A running task still returns here even if you switch."
+        )
         self._conversation_list.setHorizontalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
@@ -1965,14 +2053,15 @@ class MainWindow(QMainWindow):
         conversation_actions = QHBoxLayout()
         new_conv_btn = QPushButton("New")
         new_conv_btn.setObjectName("secondaryButton")
+        new_conv_btn.setToolTip("Start a fresh conversation. Previous CAD or GIS context is not carried over.")
         new_conv_btn.clicked.connect(self._new_session)
         conversation_actions.addWidget(new_conv_btn)
         delete_conv_btn = QPushButton("Delete")
         delete_conv_btn.setObjectName("secondaryButton")
+        delete_conv_btn.setToolTip("Remove the selected conversation from this PC.")
         delete_conv_btn.clicked.connect(self._delete_selected_conversation)
         conversation_actions.addWidget(delete_conv_btn)
         conversation_layout.addLayout(conversation_actions)
-        body_split.addWidget(conversation_panel)
 
         content_panel = QWidget()
         self._console_content_panel = content_panel
@@ -1986,33 +2075,47 @@ class MainWindow(QMainWindow):
         self._transcript.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
         self._transcript.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self._transcript.setPlaceholderText("Your conversation with SurvyAI will appear here…")
+        self._transcript.setToolTip("Messages for the selected conversation. Scroll to review earlier turns.")
         self._transcript.setMinimumWidth(200)
         self._transcript.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
 
-        activity_panel = QWidget()
+        activity_panel = QWidget(self)
+        activity_panel.hide()
+        self._activity_panel = activity_panel
         activity_panel.setMinimumWidth(200)
         activity_layout = QVBoxLayout(activity_panel)
         activity_layout.setContentsMargins(0, 0, 0, 0)
         activity_layout.setSpacing(4)
         act_hdr = QLabel("Live activity")
         act_hdr.setObjectName("sectionHeader")
+        act_hdr.setToolTip("Progress for the current run — tools, stages, and status.")
         activity_layout.addWidget(act_hdr)
         self._activity_log = QPlainTextEdit()
         self._activity_log.setObjectName("activityLog")
         self._activity_log.setReadOnly(True)
         self._activity_log.setPlaceholderText("Agent progress, tool calls, and status updates…")
+        self._activity_log.setToolTip("Live log of the current or last run. Does not change your drawing.")
         activity_layout.addWidget(self._activity_log, 1)
         self._run_status_label = QLabel("Ready")
         self._run_status_label.setObjectName("runStatusLabel")
+        self._run_status_label.setToolTip("Status of the current or last run.")
         self._elapsed_label = QLabel("Elapsed: 0s")
         self._elapsed_label.setObjectName("elapsedLabel")
+        self._elapsed_label.setToolTip("Time since the current run started.")
         activity_layout.addWidget(self._run_status_label)
         activity_layout.addWidget(self._elapsed_label)
 
         self._input = ChatInput()
         self._input.setPlaceholderText("Ask SurvyAI to create CAD drawings, open drawings, run calculations, export reports, perform geospatial analysis, etc.…")
+        self._input.setToolTip(
+            "Enter sends your request. Shift+Enter starts a new line "
+            "(same as most chat apps). Attach files with + or drop them here."
+        )
+        self._input.setStatusTip(
+            "Enter sends. Shift+Enter starts a new line in the Console prompt."
+        )
         self._input.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
@@ -2036,7 +2139,10 @@ class MainWindow(QMainWindow):
         self._send_btn.setObjectName("sendButton")
         self._send_btn.setDefault(True)
         self._send_btn.clicked.connect(self._on_send_clicked)
-        self._send_btn.setToolTip("Send prompt (Enter).")
+        self._send_btn.setToolTip(
+            "Send the Console prompt (Enter), or plot the Automated CAD form. "
+            "In Console, Shift+Enter starts a new line."
+        )
         self._send_btn.setSizePolicy(
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
         )
@@ -2046,7 +2152,7 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setObjectName("secondaryButton")
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.clicked.connect(self._request_cancel_current_run)
-        self._cancel_btn.setToolTip("Stop the current run.")
+        self._cancel_btn.setToolTip("Stop the current run. Partial files already written stay on disk.")
         self._cancel_btn.setSizePolicy(
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
         )
@@ -2055,7 +2161,7 @@ class MainWindow(QMainWindow):
         self._retry_btn = QPushButton("Retry last")
         self._retry_btn.setObjectName("secondaryButton")
         self._retry_btn.clicked.connect(self._retry_last_query)
-        self._retry_btn.setToolTip("Re-run the last prompt.")
+        self._retry_btn.setToolTip("Re-run the last prompt or Automated CAD send in this conversation.")
         self._retry_btn.setSizePolicy(
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
         )
@@ -2075,6 +2181,10 @@ class MainWindow(QMainWindow):
         controls.addWidget(self._cad_prompt_btn)
 
         self._fallback_cb = QCheckBox("Use fallback LLM")
+        self._fallback_cb.setToolTip(
+            "Off by default. When on, SurvyAI uses the fallback provider even if the primary is healthy. "
+            "Unavailable while Primary is Ollama."
+        )
         self._fallback_cb.toggled.connect(self._on_fallback_toggled)
         self._fallback_cb.setSizePolicy(
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
@@ -2083,8 +2193,8 @@ class MainWindow(QMainWindow):
 
         self._fast_mode_cb = QCheckBox("Fast mode (non-file prompts)")
         self._fast_mode_cb.setToolTip(
-            "Faster responses for general questions by bypassing tool planning.\n"
-            "CAD/doc/ArcGIS/file workflows are unchanged."
+            "Off by default. Faster answers for general questions by skipping tool planning.\n"
+            "CAD, documents, ArcGIS, and other file jobs are unchanged."
         )
         self._fast_mode_cb.toggled.connect(self._on_fast_mode_toggled)
         self._fast_mode_cb.setSizePolicy(
@@ -2112,7 +2222,7 @@ class MainWindow(QMainWindow):
         self._credit_notice_dismiss_btn = QToolButton()
         self._credit_notice_dismiss_btn.setObjectName("creditUsageNoticeDismiss")
         self._credit_notice_dismiss_btn.setText("\u00d7")
-        self._credit_notice_dismiss_btn.setToolTip("Dismiss this reminder")
+        self._credit_notice_dismiss_btn.setToolTip("Hide this reminder until the next usage band or billing window.")
         self._credit_notice_dismiss_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._credit_notice_dismiss_btn.setVisible(False)
         self._credit_notice_dismiss_btn.setAutoRaise(True)
@@ -2136,29 +2246,163 @@ class MainWindow(QMainWindow):
         # Left: tall transcript + compact input strip. Right: activity + Send/Cancel stack.
         # Transcript extends down to the input row; buttons sit beside it on the right.
         chat_column = QWidget()
+        self._console_chat_column = chat_column
         chat_column_layout = QVBoxLayout(chat_column)
+        self._console_chat_column_layout = chat_column_layout
         chat_column_layout.setContentsMargins(0, 0, 0, 0)
         chat_column_layout.setSpacing(4)
         chat_column_layout.addWidget(self._transcript, 1)
         chat_column_layout.addWidget(self._input_strip, 0)
 
-        self._console_main_split = QSplitter(Qt.Orientation.Horizontal)
-        self._console_main_split.setObjectName("consoleMainSplit")
-        self._console_main_split.setChildrenCollapsible(True)
-        self._console_main_split.addWidget(chat_column)
-        self._console_main_split.addWidget(activity_panel)
-        self._console_main_split.setSizes([780, 240])
-        self._console_main_split.setStretchFactor(0, 2)
-        self._console_main_split.setStretchFactor(1, 1)
-        content_layout.addWidget(self._console_main_split, 1)
-
-        body_split.addWidget(content_panel)
-        body_split.setSizes([220, 980])
-        body_split.setChildrenCollapsible(True)
-        body_split.setStretchFactor(0, 0)
-        body_split.setStretchFactor(1, 1)
-        layout.addWidget(body_split, 1)
+        content_layout.addWidget(chat_column, 1)
+        layout.addWidget(content_panel, 1)
         self._tabs.addTab(tab, "Console")
+        self._tabs.setTabToolTip(
+            _TAB_CONSOLE,
+            "Free-form prompts, attachments, and follow-up CAD or GIS edits. "
+            "Enter sends; Shift+Enter starts a new line.",
+        )
+        self._workspace_chrome_dock = "shared"
+        self._cad_prompt_btn_console_tip = self._cad_prompt_btn.toolTip()
+        self._send_btn_console_tip = self._send_btn.toolTip()
+
+    def _build_automated_cad_tab(self) -> None:
+        """Form-driven CAD plotting tab. Console and Output History stay unchanged."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(4)
+
+        cad_content = QWidget()
+        self._cad_content_panel = cad_content
+        cad_content_layout = QVBoxLayout(cad_content)
+        cad_content_layout.setContentsMargins(0, 0, 0, 0)
+        cad_content_layout.setSpacing(0)
+
+        self._cad_form = AutomatedCadForm()
+        form_scroll = QScrollArea()
+        self._cad_form_scroll = form_scroll
+        form_scroll.setObjectName("cadFormScroll")
+        form_scroll.setWidgetResizable(True)
+        form_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        form_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        form_scroll.setWidget(self._cad_form)
+        form_scroll.setMinimumWidth(200)
+        form_scroll.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        cad_content_layout.addWidget(form_scroll, 1)
+        layout.addWidget(cad_content, 1)
+        self._tabs.addTab(tab, "Automated CAD section")
+        self._tabs.setTabToolTip(
+            _TAB_AUTOMATED_CAD,
+            "Fill survey values and press Send to plot. No prompt writing required.",
+        )
+
+    def _is_automated_cad_tab(self) -> bool:
+        tabs = getattr(self, "_tabs", None)
+        if tabs is None:
+            return False
+        return int(tabs.currentIndex()) == _TAB_AUTOMATED_CAD
+
+    def _install_persistent_workspace_chrome(self) -> None:
+        """Keep Conversations + Live activity outside the tab widget.
+
+        Reparenting those panes on every Console ↔ Automated CAD click was the
+        main workspace hitch (full relayout of the transcript, activity log, and CAD form).
+        """
+        conversation = getattr(self, "_conversation_panel", None)
+        activity = getattr(self, "_activity_panel", None)
+        tabs = getattr(self, "_tabs", None)
+        stack = getattr(self, "_central_stack", None)
+        if conversation is None or activity is None or tabs is None or stack is None:
+            return
+        workspace = QWidget()
+        workspace.setObjectName("workspacePage")
+        lay = QHBoxLayout(workspace)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        split = QSplitter(Qt.Horizontal)
+        split.setObjectName("workspaceBodySplit")
+        split.setChildrenCollapsible(True)
+        split.addWidget(conversation)
+        split.addWidget(tabs)
+        split.addWidget(activity)
+        conversation.show()
+        activity.show()
+        sizes = list(getattr(self, "_workspace_chrome_sizes", [220, 780, 240]))
+        split.setSizes(sizes)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setStretchFactor(2, 0)
+        lay.addWidget(split)
+        self._workspace_page = workspace
+        self._workspace_body_split = split
+        self._workspace_chrome_dock = "shared"
+        stack.insertWidget(_PAGE_MAIN, workspace)
+
+    def _remember_workspace_chrome_sizes(self) -> None:
+        split = getattr(self, "_workspace_body_split", None)
+        if split is None:
+            return
+        sizes = [int(v) for v in split.sizes()]
+        if len(sizes) == 3 and sizes[0] >= 80 and sizes[2] >= 80:
+            self._workspace_chrome_sizes = sizes
+
+    @Slot(int)
+    def _on_workspace_tab_changed(self, index: int) -> None:
+        show_chrome = index != _TAB_OUTPUT_HISTORY
+        conversation = getattr(self, "_conversation_panel", None)
+        activity = getattr(self, "_activity_panel", None)
+        split = getattr(self, "_workspace_body_split", None)
+        if show_chrome:
+            if conversation is not None and not conversation.isVisible():
+                conversation.setVisible(True)
+            if activity is not None and not activity.isVisible():
+                activity.setVisible(True)
+            if split is not None:
+                split.setSizes(list(getattr(self, "_workspace_chrome_sizes", [220, 780, 240])))
+        else:
+            self._remember_workspace_chrome_sizes()
+            if conversation is not None and conversation.isVisible():
+                conversation.setVisible(False)
+            if activity is not None and activity.isVisible():
+                activity.setVisible(False)
+        if index == _TAB_AUTOMATED_CAD:
+            self._dock_workspace_chrome("cad")
+        else:
+            self._dock_workspace_chrome("console")
+
+    def _dock_workspace_chrome(self, where: str) -> None:
+        """Update Send / CAD-prompt tips for the active tab. Panes stay put."""
+        if where == "cad":
+            if getattr(self, "_cad_prompt_btn", None) is not None:
+                self._cad_prompt_btn.setToolTip(
+                    "Fill the value boxes from your current default CAD survey-plan prompt "
+                    "(Account → Edit Default CAD Prompt). Console still inserts the full prompt text."
+                )
+            if getattr(self, "_send_btn", None) is not None:
+                self._send_btn.setToolTip(
+                    "Plot the cadastral plan from the form values. Existing files ask before overwrite."
+                )
+                self._send_btn.setDefault(False)
+                self._send_btn.setAutoDefault(False)
+            return
+        if getattr(self, "_cad_prompt_btn", None) is not None:
+            self._cad_prompt_btn.setToolTip(
+                getattr(self, "_cad_prompt_btn_console_tip", None)
+                or self._cad_prompt_btn.toolTip()
+            )
+        if getattr(self, "_send_btn", None) is not None:
+            self._send_btn.setToolTip(
+                getattr(self, "_send_btn_console_tip", None)
+                or (
+                    "Send the Console prompt (Enter). "
+                    "Shift+Enter starts a new line in the box."
+                )
+            )
+            self._send_btn.setDefault(True)
 
     def _build_history_tab(self) -> None:
         tab = QWidget()
@@ -2175,12 +2419,14 @@ class MainWindow(QMainWindow):
 
         self._history_list = QListWidget()
         self._history_list.setObjectName("historyList")
+        self._history_list.setToolTip("Select a past run to inspect its prompt and response.")
         self._history_list.setAlternatingRowColors(True)
         self._history_list.currentItemChanged.connect(self._on_history_selection_changed)
         split.addWidget(self._history_list)
 
         self._history_detail = QPlainTextEdit()
         self._history_detail.setReadOnly(True)
+        self._history_detail.setToolTip("Full details for the selected run. This view is read-only.")
         split.addWidget(self._history_detail)
         split.setSizes([360, 640])
         layout.addWidget(split, 1)
@@ -2188,15 +2434,21 @@ class MainWindow(QMainWindow):
         actions = QHBoxLayout()
         use_query = QPushButton("Use selected query")
         use_query.setObjectName("secondaryButton")
+        use_query.setToolTip("Copy this run’s prompt into Console so you can edit it before sending.")
         use_query.clicked.connect(self._reuse_selected_history_query)
         actions.addWidget(use_query)
         retry_selected = QPushButton("Retry selected")
         retry_selected.setObjectName("secondaryButton")
+        retry_selected.setToolTip("Run this history item again in the current conversation.")
         retry_selected.clicked.connect(self._retry_selected_history_item)
         actions.addWidget(retry_selected)
         actions.addStretch()
         layout.addLayout(actions)
         self._tabs.addTab(tab, "Output History")
+        self._tabs.setTabToolTip(
+            _TAB_OUTPUT_HISTORY,
+            "Past runs: inspect the response, reuse a query, or retry.",
+        )
 
     def _build_settings_page(self) -> QWidget:
         """Full-page settings (opened from the account menu, not a main tab)."""
@@ -2316,13 +2568,26 @@ class MainWindow(QMainWindow):
         )
         self._fallback_llm_combo = QComboBox()
         self._fallback_llm_combo.addItems(["gemini", "openai", "claude", "deepseek", "ollama"])
+        self._fallback_llm_combo.setToolTip(
+            "Used when Fallback LLM is checked, or if the primary provider fails. "
+            "Does not change Fast mode."
+        )
         self._settings_workspace = QLineEdit()
         self._settings_data_folder = QLineEdit()
+        self._settings_workspace.setToolTip(
+            "Same project folder as the Workspace bar. Apply settings to save the change."
+        )
+        self._settings_data_folder.setToolTip(
+            "App data, logs, and local stores — not your drawing workspace."
+        )
         self._settings_workspace.setPlaceholderText("e.g. C:\\Users\\You\\Projects\\SurvyAI")
         self._settings_data_folder.setPlaceholderText("Where SurvyAI stores data and exports")
         runtime_form.addRow("Primary LLM", self._primary_llm_combo)
         runtime_form.addRow("Fallback LLM", self._fallback_llm_combo)
         self._safe_mode_cb = QCheckBox("Enable safe mode (troubleshooting)")
+        self._safe_mode_cb.setToolTip(
+            "Limits AutoCAD, ArcGIS, and similar integrations while you diagnose a problem."
+        )
         self._safe_mode_cb.toggled.connect(self._on_safe_mode_toggled)
         runtime_form.addRow("Safe mode", self._safe_mode_cb)
         self._safe_mode_note = QLabel(
@@ -2334,18 +2599,18 @@ class MainWindow(QMainWindow):
         browse_ws = QPushButton("Browse…")
         browse_ws.setObjectName("secondaryButton")
         browse_ws.clicked.connect(self._choose_workspace)
-        browse_ws.setToolTip("Pick the workspace folder.")
+        browse_ws.setToolTip("Choose the project workspace folder.")
         runtime_form.addRow("Workspace", self._pair_widget(self._settings_workspace, browse_ws))
 
         browse_data = QPushButton("Browse…")
         browse_data.setObjectName("secondaryButton")
         browse_data.clicked.connect(self._choose_data_folder)
-        browse_data.setToolTip("Pick the data folder.")
+        browse_data.setToolTip("Choose where SurvyAI stores logs and local app data.")
         runtime_form.addRow("Data folder", self._pair_widget(self._settings_data_folder, browse_data))
 
         save_runtime = QPushButton("Apply settings")
         save_runtime.clicked.connect(self._apply_runtime_settings)
-        save_runtime.setToolTip("Apply changes for this desktop session.")
+        save_runtime.setToolTip("Apply these runtime choices to this session.")
         runtime_form.addRow("", save_runtime)
         page_layout.addWidget(runtime_group)
 
@@ -2489,16 +2754,19 @@ class MainWindow(QMainWindow):
 
         actions = QHBoxLayout()
         export_btn = QPushButton("Export diagnostics bundle")
+        export_btn.setToolTip("Create a redacted ZIP of logs and settings to send to support.")
         export_btn.clicked.connect(self._export_diagnostics_bundle)
         actions.addWidget(export_btn)
 
         open_log = QPushButton("Open log folder")
         open_log.setObjectName("secondaryButton")
+        open_log.setToolTip("Open the folder where SurvyAI writes desktop logs.")
         open_log.clicked.connect(self._open_log_folder)
         actions.addWidget(open_log)
 
         refresh = QPushButton("Refresh diagnostics")
         refresh.setObjectName("secondaryButton")
+        refresh.setToolTip("Rebuild this snapshot from the current environment and desktop state.")
         refresh.clicked.connect(self._refresh_diagnostics)
         actions.addWidget(refresh)
 
@@ -2543,6 +2811,9 @@ class MainWindow(QMainWindow):
         self._credits_total_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._credits_used_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self._credits_remaining_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._credits_total_label.setToolTip("Subscription credit pool for this billing window, in USD.")
+        self._credits_used_label.setToolTip("Hosted-model usage billed in this window. Local Ollama is free.")
+        self._credits_remaining_label.setToolTip("Credit pool minus used. Top up or renew when this reaches zero.")
 
         summary_form.addRow("Credit pool (subscription USD)", self._credits_total_label)
         summary_form.addRow("Used", self._credits_used_label)
@@ -2601,12 +2872,18 @@ class MainWindow(QMainWindow):
         self._credits_history_text = QPlainTextEdit()
         self._credits_history_text.setReadOnly(True)
         self._credits_history_text.setMaximumHeight(280)
+        self._credits_history_text.setToolTip(
+            "Recent billed hosted runs in this window. Local models do not appear here."
+        )
         usage_layout.addWidget(self._credits_history_text)
         page_layout.addWidget(usage_group)
 
         # --- Refresh ---
         btn_row = QHBoxLayout()
         self._credits_refresh_btn = QPushButton("Refresh usage")
+        self._credits_refresh_btn.setToolTip(
+            "Reload local usage, then sync the credit pool from your SurvyAI account in the background."
+        )
         self._credits_refresh_btn.clicked.connect(self._on_refresh_credits_from_cloud)
         btn_row.addWidget(self._credits_refresh_btn)
         btn_row.addStretch()
@@ -2629,11 +2906,10 @@ class MainWindow(QMainWindow):
         title = QLabel("Edit Default CAD Prompt")
         title.setObjectName("pageTitle")
         subtitle = QLabel(
-            "Customize the default field layout used when creating new AutoCAD (.dwg) survey "
-            "plans — surveyor name and address, plan number, location, state or country, "
-            "coordinates, roads, fences, and related metadata. The accepted template is "
-            "inserted into the console via the CAD plan prompt button. You can still type "
-            "any valid generation prompt manually in the console."
+            "Customize the default survey-plan fields — surveyor, company, address, plan "
+            "number, location, and related metadata. On Automated CAD, Input CAD plan prompt "
+            "fills the form from this template. On Console, the same button inserts the full "
+            "prompt text. You can still type any valid generation prompt in Console."
         )
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
@@ -2646,6 +2922,9 @@ class MainWindow(QMainWindow):
         self._cad_prompt_editor.setObjectName("chatInput")
         self._cad_prompt_editor.setMinimumHeight(280)
         self._cad_prompt_editor.setPlaceholderText("Enter your default CAD survey-plan prompt…")
+        self._cad_prompt_editor.setToolTip(
+            "Saved on this PC. Used by Input CAD plan prompt on Console and Automated CAD."
+        )
         editor_layout.addWidget(self._cad_prompt_editor)
 
         self._cad_prompt_status = QLabel("")
@@ -2696,6 +2975,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._caps_label)
         refresh = QPushButton("Refresh detection")
         refresh.setObjectName("secondaryButton")
+        refresh.setToolTip("Re-scan this PC for AutoCAD, ArcGIS, and other optional tools.")
         refresh.clicked.connect(self._refresh_capabilities)
         layout.addWidget(refresh)
         return group
@@ -2713,6 +2993,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self._session_status)
         new_conv = QPushButton("New conversation")
         new_conv.setObjectName("secondaryButton")
+        new_conv.setToolTip("Start a fresh conversation without prior CAD or GIS context.")
         new_conv.clicked.connect(self._new_session)
         layout.addWidget(new_conv)
         return group
@@ -2806,8 +3087,7 @@ class MainWindow(QMainWindow):
         act_credits.triggered.connect(self._show_credits_page)
         self._describe_menu_action(
             act_credits,
-            "See your subscription USD credit pool, dollars used so far, remaining balance, "
-            "and estimated runs remaining.",
+            "Credit pool, used and remaining USD, recent billed runs, and estimated CAD plots left.",
         )
         account_menu.addAction(act_credits)
 
@@ -2815,8 +3095,8 @@ class MainWindow(QMainWindow):
         act_cad_prompt.triggered.connect(self._show_cad_prompt_page)
         self._describe_menu_action(
             act_cad_prompt,
-            "Edit the default CAD survey-plan prompt template used when inserting via "
-            "CAD plan prompt — surveyor details, plan number, location, and related fields.",
+            "Edit the default survey-plan template. Automated CAD fills the form from it; "
+            "Console inserts the full prompt text.",
         )
         account_menu.addAction(act_cad_prompt)
 
@@ -2879,15 +3159,17 @@ class MainWindow(QMainWindow):
         help_menu = menubar.addMenu("&Help")
         help_menu.setToolTipsVisible(True)
         help_menu.menuAction().setToolTip(
-            "Getting started guide, documentation, tutorial, and product version — hover each link for details."
+            "Getting started, product documentation, updates, first-run tutorial, and About."
         )
-        help_menu.menuAction().setStatusTip("Getting started, README, tutorial wizard, and About SurvyAI.")
+        help_menu.menuAction().setStatusTip(
+            "Guides for Automated CAD, Console, credits, and version information."
+        )
 
         getting_started = QAction("Getting started guide", self)
         getting_started.triggered.connect(self._open_getting_started_guide)
         self._describe_menu_action(
             getting_started,
-            "Short playbook with examples for CAD plotting, PDF-to-CAD, ArcGIS, and everyday SurvyAI use.",
+            "Short playbook: Automated CAD form, Console follow-ups, PDF-to-CAD, ArcGIS, and credits.",
         )
         help_menu.addAction(getting_started)
 
@@ -2895,8 +3177,7 @@ class MainWindow(QMainWindow):
         readme.triggered.connect(self._open_readme_docs)
         self._describe_menu_action(
             readme,
-            "Opens the project README / user guide so you can read how features, tools, and workflows "
-            "are meant to be used.",
+            "Product overview: tabs, Automated CAD, Fast Mode, credits, privacy, and support.",
         )
         help_menu.addAction(readme)
 
@@ -2948,17 +3229,16 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _show_diagnostics_page(self) -> None:
-        self._refresh_diagnostics()
         self._central_stack.setCurrentIndex(_PAGE_DIAGNOSTICS)
         self._back_workspace_btn.setVisible(True)
+        QTimer.singleShot(0, self._refresh_diagnostics)
 
     @Slot()
     def _show_credits_page(self) -> None:
-        self._silent_pull_entitlements_from_cloud()
-        self._refresh_credits_page()
-        self._central_stack.setCurrentWidget(self._credits_page)
         self._central_stack.setCurrentIndex(_PAGE_CREDITS)
         self._back_workspace_btn.setVisible(True)
+        self._refresh_credits_page()
+        QTimer.singleShot(0, self._schedule_silent_credits_pull)
 
     @Slot()
     def _show_cad_prompt_page(self) -> None:
@@ -3043,7 +3323,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _insert_cad_plan_prompt(self) -> None:
-        """Insert the active default CAD prompt into the console input box."""
+        """Console: insert the default CAD prompt. Automated CAD: fill the value boxes."""
         if self._thread is not None and self._thread.isRunning():
             if self._active_conversation_id == self._running_conversation_id:
                 QMessageBox.information(
@@ -3053,6 +3333,15 @@ class MainWindow(QMainWindow):
                 )
                 return
         template = resolve_active_cad_prompt(self._state.default_cad_prompt)
+        if self._is_automated_cad_tab():
+            form = getattr(self, "_cad_form", None)
+            if form is None:
+                return
+            form.apply_prompt_template(template)
+            self.statusBar().showMessage(
+                "CAD form filled from the default survey-plan prompt.", 4000
+            )
+            return
         existing = self._input.toPlainText()
         if existing.strip():
             # Keep existing text; start the template on a new line.
@@ -3120,8 +3409,8 @@ class MainWindow(QMainWindow):
             act_cad_prompt.triggered.connect(self._show_cad_prompt_page)
             self._describe_menu_action(
                 act_cad_prompt,
-                "Edit the default CAD survey-plan prompt template (surveyor details, plan number, "
-                "location, and related fields) used by the CAD plan prompt button.",
+                "Edit the default survey-plan template used by Input CAD plan prompt "
+                "on Automated CAD (form) and Console (full text).",
             )
             self._user_menu.addAction(act_cad_prompt)
 
@@ -3687,28 +3976,35 @@ class MainWindow(QMainWindow):
     def _is_dark_theme(self) -> bool:
         return (getattr(self._state, "theme", THEME_LIGHT) or THEME_LIGHT).strip().lower() == THEME_DARK
 
-    def _apply_theme(self, theme: Optional[str] = None) -> None:
+    def _apply_theme(self, theme: Optional[str] = None, *, restyle_conversation: bool = True) -> None:
         t = (theme or getattr(self._state, "theme", THEME_LIGHT) or THEME_LIGHT).strip().lower()
         if t not in (THEME_LIGHT, THEME_DARK):
             t = THEME_LIGHT
         self._state.theme = t
-        app = QApplication.instance()
-        if app is not None:
-            app.setStyleSheet(get_stylesheet(t))
         dark = t == THEME_DARK
-        if hasattr(self, "_logo"):
-            self._logo.set_dark_ui(dark)
+        already = getattr(self, "_applied_stylesheet_theme", "") == t
+        if not already:
+            app = QApplication.instance()
+            self.setUpdatesEnabled(False)
+            try:
+                if app is not None:
+                    app.setStyleSheet(get_stylesheet(t))
+                if hasattr(self, "_logo"):
+                    self._logo.set_dark_ui(dark)
+            finally:
+                self.setUpdatesEnabled(True)
+            self._applied_stylesheet_theme = t
         if hasattr(self, "_theme_toggle"):
             self._theme_toggle.blockSignals(True)
             self._theme_toggle.setChecked(dark, animate=False)
             self._theme_toggle.blockSignals(False)
-        if hasattr(self, "_transcript"):
-            self._render_active_conversation()
+        if restyle_conversation and (not already) and hasattr(self, "_transcript"):
+            QTimer.singleShot(0, self._render_active_conversation)
 
     @Slot(bool)
     def _on_dark_mode_toggled(self, checked: bool) -> None:
         self._apply_theme(THEME_DARK if checked else THEME_LIGHT)
-        self._state_store.save(self._state)
+        self._schedule_desktop_state_save()
         self.statusBar().showMessage(
             f"{'Dark' if checked else 'Light'} mode enabled.",
             3000,
@@ -3721,10 +4017,14 @@ class MainWindow(QMainWindow):
         if composer is not None:
             composer.set_workspace_path(self._state.workspace_path)
         self._settings_data_folder.setText(self._state.data_folder)
+        self._fallback_cb.blockSignals(True)
         self._fallback_cb.setChecked(self._state.use_fallback_llm)
+        self._fallback_cb.blockSignals(False)
         self._safe_mode_cb.setChecked(self._state.safe_mode)
-        self._apply_theme()
+        self._apply_theme(restyle_conversation=False)
+        self._fast_mode_cb.blockSignals(True)
         self._fast_mode_cb.setChecked(bool(getattr(self._state, "fast_mode_non_file_prompts", False)))
+        self._fast_mode_cb.blockSignals(False)
         self._refresh_fast_mode_indicator()
         if hasattr(self, "_auto_check_updates_cb"):
             self._auto_check_updates_cb.blockSignals(True)
@@ -3748,8 +4048,12 @@ class MainWindow(QMainWindow):
         self._refresh_history_list()
         self._refresh_conversation_list()
         self._render_active_conversation()
-        self._refresh_diagnostics()
-        self._refresh_credits_page()
+        stack = getattr(self, "_central_stack", None)
+        page = int(stack.currentIndex()) if stack is not None else _PAGE_MAIN
+        if page == _PAGE_DIAGNOSTICS:
+            self._refresh_diagnostics()
+        if page == _PAGE_CREDITS:
+            self._refresh_credits_page()
         self._session_settings_label.setText(f"{self._session_id}\nStatus: Ready")
 
     def _refresh_account_views(self) -> None:
@@ -3981,8 +4285,93 @@ class MainWindow(QMainWindow):
                 self._conversation_list.setCurrentItem(item)
         self._conversation_list_sync = False
 
+    @staticmethod
+    def _visible_assistant_text(text: str) -> str:
+        try:
+            from survyai.provider_models import strip_trailing_model_envelope
+
+            return strip_trailing_model_envelope(text or "")
+        except Exception:
+            return text or ""
+
+    @staticmethod
+    def _visible_user_text(text: str) -> str:
+        raw = text or ""
+        try:
+            from survyai.gui.automated_cad_prompt import format_cad_prompt_for_display
+
+            pretty = format_cad_prompt_for_display(raw)
+            return pretty if (pretty or "").strip() else raw
+        except Exception:
+            return raw
+
+    @staticmethod
+    def _inline_md_html(escaped: str) -> str:
+        styled = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped)
+        styled = re.sub(
+            r"`([^`]+)`",
+            r'<span style="font-family:Consolas,\'Cascadia Mono\',monospace;">\1</span>',
+            styled,
+        )
+        return styled
+
+    def _chat_body_html(self, role: str, text: str) -> str:
+        if role == "assistant":
+            return self._assistant_body_html(self._visible_assistant_text(text))
+        if role == "user":
+            return html.escape(self._visible_user_text(text)).replace("\n", "<br/>")
+        return html.escape(text or "").replace("\n", "<br/>")
+
+    def _assistant_body_html(self, text: str) -> str:
+        section_titles = {
+            "file",
+            "plot",
+            "traverse",
+            "stations (as plotted)",
+            "legs (as plotted)",
+            "plot request",
+            "fit assessment",
+            "from the plotted parcel",
+            "best way to build on this parcel",
+        }
+        parts: list[str] = []
+        saw_text = False
+        for raw in (text or "").split("\n"):
+            s = raw.rstrip()
+            if not s:
+                parts.append("<br/>")
+                continue
+            hm = re.match(r"^(#{1,3})\s+(.+)$", s)
+            if hm:
+                title = self._inline_md_html(html.escape(hm.group(2)))
+                parts.append(f"<b>{title}</b><br/>")
+                saw_text = True
+                continue
+            bm = re.match(r"^[-*•]\s+(.+)$", s)
+            if bm:
+                item = self._inline_md_html(html.escape(bm.group(1)))
+                parts.append(f"• {item}<br/>")
+                saw_text = True
+                continue
+            nm = re.match(r"^(\d+)[.)]\s+(.+)$", s)
+            if nm:
+                item = self._inline_md_html(html.escape(nm.group(2)))
+                parts.append(f"{html.escape(nm.group(1))}. {item}<br/>")
+                saw_text = True
+                continue
+            if s.lower() in section_titles:
+                parts.append(f"<b>{html.escape(s)}</b><br/>")
+                saw_text = True
+                continue
+            line = self._inline_md_html(html.escape(s))
+            if not saw_text and len(s) <= 90:
+                line = f"<b>{line}</b>"
+            parts.append(f"{line}<br/>")
+            saw_text = True
+        return "".join(parts)
+
     def _message_html(self, role: str, text: str, *, error: bool = False) -> str:
-        body = html.escape(text).replace("\n", "<br/>")
+        body = self._chat_body_html(role, text)
         dark = self._is_dark_theme()
         # Use <p> tags for label: Qt QTextEdit treats <p> as a block element reliably,
         # avoiding the inline-span issue where label and bubble merge on the same line.
@@ -4072,11 +4461,12 @@ class MainWindow(QMainWindow):
         switches tabs while a query is running.
         """
         target_id = conversation_id or self._active_conversation().conversation_id
+        stored = self._visible_assistant_text(text) if role == "assistant" else text
         self._state_store.append_conversation_message(
             self._state,
             conversation_id=target_id,
             role=role,
-            content=text,
+            content=stored,
             error=error,
             attachments=list(attachments or []),
             ocr_review=ocr_review if isinstance(ocr_review, dict) else None,
@@ -4422,7 +4812,7 @@ class MainWindow(QMainWindow):
         if ab < 0.0 and au < 0.0:
             self._state.credit_banner_anchor_budget_usd = b
             self._state.credit_banner_anchor_used_usd = u
-            self._state_store.save(self._state)
+            self._schedule_desktop_state_save()
             return
         reset = False
         if abs(b - ab) > 1e-4:
@@ -4436,7 +4826,7 @@ class MainWindow(QMainWindow):
         self._state.credit_banner_anchor_budget_usd = b
         self._state.credit_banner_anchor_used_usd = u
         if reset:
-            self._state_store.save(self._state)
+            self._schedule_desktop_state_save()
 
     def _update_credit_usage_notice(self) -> None:
         """Low-contrast strip directly under the console prompt: 50/80/95% (dismissible) or 100% (persistent)."""
@@ -4628,6 +5018,50 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+    def _schedule_silent_credits_pull(self) -> None:
+        """Refresh credits from the cloud after the Credits page is already visible."""
+        stack = getattr(self, "_central_stack", None)
+        if stack is None or int(stack.currentIndex()) != _PAGE_CREDITS:
+            return
+        base, token = self._cloud_base_and_token()
+        if not base or not token:
+            return
+        if self._cloud_network_busy():
+            return
+        thread = CloudCreditsSyncThread(self._make_cloud_credits_sync_payload(), parent=self)
+        self._cloud_credits_sync_thread = thread
+
+        def _done() -> None:
+            if self._cloud_credits_sync_thread is thread:
+                self._cloud_credits_sync_thread = None
+
+        def _on_ok(result_obj: object) -> None:
+            result = result_obj if isinstance(result_obj, CloudCreditsSyncResult) else None
+            if result is None:
+                return
+            if result.access_token:
+                self._state.cloud_access_token = result.access_token
+            if result.refresh_token:
+                self._state.cloud_refresh_token = result.refresh_token
+            if result.access_token_expires_at:
+                self._state.cloud_access_token_expires_at = result.access_token_expires_at
+            ent_d = result.ent if isinstance(result.ent, dict) else {}
+            self._sync_credits_from_entitlements(ent_d)
+            self._schedule_desktop_state_save()
+            if (
+                getattr(self, "_central_stack", None) is not None
+                and int(self._central_stack.currentIndex()) == _PAGE_CREDITS
+            ):
+                self._refresh_credits_page()
+
+        def _on_fail(msg: str) -> None:
+            self._handle_expired_cloud_session_if_needed(msg, prompt=False)
+
+        thread.succeeded.connect(_on_ok)
+        thread.failed.connect(_on_fail)
+        thread.finished.connect(_done)
+        thread.start()
+
     @Slot()
     def _on_refresh_credits_from_cloud(self) -> None:
         self._refresh_credits_page()
@@ -4716,7 +5150,7 @@ class MainWindow(QMainWindow):
             workspace_path=self._state.workspace_path,
             session_id=result.session_id or self._session_id,
             query=self._pending_plain_query or result.query or self._last_query,
-            response=(result.response or "")[:40000],
+            response=self._visible_assistant_text(result.response or "")[:40000],
             success=bool(result.success),
             error=str(result.error or ""),
             llm_used=str(result.llm_used or ""),
@@ -4942,10 +5376,37 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_send_clicked(self) -> None:
+        if self._is_automated_cad_tab():
+            self._send_automated_cad_form()
+            return
         composer = getattr(self, "_composer", None)
         attachments = list(composer.attachment_paths()) if composer is not None else []
         text = self._input.toPlainText().strip()
         if not text and not attachments:
+            return
+        self._dispatch_user_query(text, attachments, clear_console_input=True)
+
+    def _send_automated_cad_form(self) -> None:
+        form = getattr(self, "_cad_form", None)
+        if form is None:
+            return
+        text, err = form.compose_prompt()
+        if err:
+            QMessageBox.warning(self, "Automated CAD section", err)
+            return
+        if not (text or "").strip():
+            return
+        self._dispatch_user_query(text, attachments=[], clear_console_input=False)
+
+    def _dispatch_user_query(
+        self,
+        text: str,
+        attachments: Optional[list] = None,
+        *,
+        clear_console_input: bool = True,
+    ) -> None:
+        attachments = list(attachments or [])
+        if not (text or "").strip() and not attachments:
             return
         if self._thread is not None and self._thread.isRunning():
             if self._active_conversation_id == self._running_conversation_id:
@@ -4966,6 +5427,7 @@ class MainWindow(QMainWindow):
         # Agent-facing query embeds attachment paths; transcript shows filenames only.
         from survyai.attachments import format_attachments_block, format_user_transcript
 
+        composer = getattr(self, "_composer", None)
         agent_query = format_attachments_block(attachments, text)
         transcript_text = format_user_transcript(text, attachments)
 
@@ -4974,9 +5436,10 @@ class MainWindow(QMainWindow):
             self._pending_plain_query = agent_query
             self._last_query = text or agent_query
             self._last_attachments = list(attachments)
-            self._input.clear()
-            if composer is not None:
-                composer.clear_attachments()
+            if clear_console_input:
+                self._input.clear()
+                if composer is not None:
+                    composer.clear_attachments()
             self._store_conversation_message("user", transcript_text, attachments=attachments)
             self._append_user_message(transcript_text)
             self._store_conversation_message("assistant", credit_msg, error=True)
@@ -4987,9 +5450,10 @@ class MainWindow(QMainWindow):
         self._pending_plain_query = agent_query
         self._last_query = text or agent_query
         self._last_attachments = list(attachments)
-        self._input.clear()
-        if composer is not None:
-            composer.clear_attachments()
+        if clear_console_input:
+            self._input.clear()
+            if composer is not None:
+                composer.clear_attachments()
         self._store_conversation_message("user", transcript_text, attachments=attachments)
         self._append_user_message(transcript_text)
         resolved = self._try_resolve_internet_permission_reply(agent_query)
@@ -5009,6 +5473,7 @@ class MainWindow(QMainWindow):
 
     _MAX_HISTORY_TURNS = 12       # user + assistant messages to keep
     _MAX_MSG_CHARS     = 3000     # truncation per message (raised: GIS results are verbose)
+    _MAX_MSG_CHARS_CAD = 12000    # keep plotted parcel geometry for site-analysis follow-ups
     _MAX_MSG_CHARS_ESSAY_SAVE = 1_000_000  # preserve full assistant answers for essay export
 
     def _try_resolve_internet_permission_reply(self, raw_query: str) -> Optional[str]:
@@ -5150,6 +5615,22 @@ class MainWindow(QMainWindow):
                 "5. Prior outputs are reference for paths/CRS defaults only — not permission to no-op.",
                 "",
             ]
+        elif _looks_like_cadastral_plot_followup(raw_query):
+            parts = [
+                "=== CONVERSATION CONTEXT (ACTIVE SURVEY PLOT — MUST USE) ===",
+                "This message continues work on a cadastral parcel already plotted in this conversation.",
+                "Treat the prior Generate/plot turn as a real Console prompt whose geometry is in session.",
+                "Rules:",
+                "1. USE the owner/buyer names, location, pillar numbers, coordinates or",
+                "   bearings-and-distances, computed area/shape, and generated DWG path from the history.",
+                "2. Do NOT claim you lack dimensions, shape, or a survey/site plan if that geometry",
+                "   was already used to plot the parcel or is listed below.",
+                "3. For building-fit / bungalow / parking / setback / 'best section' questions,",
+                "   analyse THIS plotted parcel (open the DWG with tools if you need area, edges,",
+                "   or orientation). Give a definite answer from the plot, not a generic rule of thumb.",
+                "4. Answer the CURRENT REQUEST at the bottom using that parcel.",
+                "",
+            ]
         elif _looks_like_gis_session_followup(raw_query) or (
             _fu_short_affirm(raw_query) and _assistant_offered_session_gis_analysis(prior_blob)
         ):
@@ -5179,14 +5660,18 @@ class MainWindow(QMainWindow):
                 "",
             ]
         preserve_full_assistant = _is_save_session_docx_request(raw_query)
+        cad_follow = _looks_like_cadastral_plot_followup(raw_query)
         exchange = 0
         for t in turns:
             content = t.content
-            max_chars = (
-                self._MAX_MSG_CHARS_ESSAY_SAVE
-                if preserve_full_assistant and t.role == "assistant"
-                else self._MAX_MSG_CHARS
-            )
+            if preserve_full_assistant and t.role == "assistant":
+                max_chars = self._MAX_MSG_CHARS_ESSAY_SAVE
+            elif cad_follow or (
+                t.role == "user" and _looks_like_cadastral_plot_prompt(content or "")
+            ):
+                max_chars = self._MAX_MSG_CHARS_CAD
+            else:
+                max_chars = self._MAX_MSG_CHARS
             if len(content) > max_chars:
                 content = content[:max_chars] + "…[truncated]"
             if t.role == "user":
@@ -5270,7 +5755,7 @@ class MainWindow(QMainWindow):
 
     @Slot(object)
     def _on_cad_file_conflict(self, payload: object) -> None:
-        """Show a foreground SurvyAI dialog for CAD overwrite/modify confirmation."""
+        """Show a foreground SurvyAI dialog before replacing an existing file or folder."""
         data = payload if isinstance(payload, dict) else {}
         path = str(data.get("path") or "").strip()
         mode = str(data.get("mode") or "overwrite").strip().lower()
@@ -5291,11 +5776,11 @@ class MainWindow(QMainWindow):
             if thread is not None:
                 thread.provide_confirm_result(accepted)
             if accepted:
-                self._append_activity("Overwrite confirmed — continuing CAD generation…")
-                self.statusBar().showMessage("Overwrite confirmed — preparing drawing…")
+                self._append_activity("Overwrite confirmed — continuing…")
+                self.statusBar().showMessage("Overwrite confirmed — continuing…")
             else:
-                self._append_activity("Kept existing drawing; agent was told not to overwrite.")
-                self.statusBar().showMessage("Existing drawing kept.")
+                self._append_activity("Kept existing file; SurvyAI will not replace it.")
+                self.statusBar().showMessage("Existing file kept.")
 
         try:
             # Bring SurvyAI forward so the dialog is visible (not only a taskbar flash).
@@ -5530,7 +6015,11 @@ class MainWindow(QMainWindow):
         composer = getattr(self, "_composer", None)
         if composer is not None:
             composer.set_attachments(self._last_attachments)
-        self._on_send_clicked()
+        self._dispatch_user_query(
+            self._last_query.strip(),
+            list(self._last_attachments),
+            clear_console_input=True,
+        )
 
     @Slot()
     def _new_session(self) -> None:
@@ -6996,7 +7485,7 @@ class MainWindow(QMainWindow):
         dlg = MarkdownHelpDialog(
             self,
             title="Getting started with SurvyAI",
-            subtitle="Learn the basics: workspace, CAD plans, PDF-to-CAD, ArcGIS, and everyday tips.",
+            subtitle="Workspace, Automated CAD, Console (Enter sends, Shift+Enter new line), PDF-to-CAD, ArcGIS, and credits.",
             markdown_path=path,
             primary_label="Got it" if first_run else "Close",
             show_dont_show_again=first_run,
@@ -7015,7 +7504,7 @@ class MainWindow(QMainWindow):
             self._show_markdown_dialog(
                 readme,
                 "SurvyAI Documentation",
-                subtitle="Product overview, billing, privacy, and support — shown inside SurvyAI.",
+                subtitle="Tabs, Automated CAD, Console (Enter sends, Shift+Enter new line), Fast Mode, billing, privacy, and support.",
             )
         else:
             QMessageBox.information(self, "Documentation", "README.md was not found.")
@@ -7049,8 +7538,10 @@ class MainWindow(QMainWindow):
             "About SurvyAI",
             f"<h3>SurvyAI Desktop</h3>"
             f"<p>Version {html.escape(__version__)}</p>"
-            f"<p>Professional Windows GUI for the SurvyAI agent.</p>"
-            f"<p>The GUI is the primary product experience; the CLI remains available for support/testing.</p>"
+            f"<p>Windows assistant for cadastral CAD, documents, coordinates, and GIS.</p>"
+            f"<p>Use Console, Automated CAD section, and Output History. "
+            f"In Console, <b>Enter</b> sends and <b>Shift+Enter</b> starts a new line. "
+            f"Help → Getting started guide for a short playbook.</p>"
         )
 
     @Slot()

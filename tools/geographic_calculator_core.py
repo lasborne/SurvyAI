@@ -937,6 +937,16 @@ class BlueMarbleConverter:
         if raw.upper() in common:
             return CRS.from_user_input(common[raw.upper()])
 
+        # Nigerian Minna / NTM belts (common survey wording, not only official EPSG names).
+        low_crs = re.sub(r"[\s_\-]+", " ", raw.lower()).strip()
+        if "minna" in low_crs or "ntm" in low_crs:
+            if re.search(r"mid\s*belt", low_crs):
+                return CRS.from_epsg(26392)
+            if re.search(r"west\s*belt", low_crs):
+                return CRS.from_epsg(26391)
+            if re.search(r"east\s*belt", low_crs):
+                return CRS.from_epsg(26393)
+
         # UTM detection (from explicit zone arg or embedded in string)
         utm_zone, utm_hemi = self._parse_utm_zone(raw)
         z = zone or utm_zone
@@ -1276,6 +1286,14 @@ class BlueMarbleConverter:
                 output_path = join_workspace_path(out_p)
         
         # Save results
+        try:
+            from agent.output_paths import cancelled_existing_file_write
+
+            blocked = cancelled_existing_file_write(str(output_path))
+            if blocked:
+                return blocked
+        except Exception:
+            pass
         try:
             # Write with numeric-friendly engine. openpyxl is typical; if missing, pandas will raise clearly.
             df_to_write.to_excel(output_path, index=False)

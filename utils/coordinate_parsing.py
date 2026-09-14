@@ -234,8 +234,14 @@ def infer_crs_from_text(text: str) -> Dict[str, Any]:
 
     def _clean_crs(s: str) -> str:
         s2 = re.sub(r"\s+", " ", (s or "").strip())
-        # avoid trailing punctuation
-        s2 = s2.strip(" ,;:.")
+        # Trim trailing clause words that are not part of a CRS name.
+        s2 = re.split(
+            r"\b(?:and|then|using|with|save|plot|generate|create|before|after)\b",
+            s2,
+            maxsplit=1,
+            flags=re.I,
+        )[0]
+        s2 = s2.strip(" ,;:.\"'()[]")
         return s2
 
     # EPSG explicit
@@ -243,10 +249,31 @@ def infer_crs_from_text(text: str) -> Dict[str, Any]:
     wkid_codes = re.findall(r"(?i)\bWKID\s*[: ]\s*(\d{3,6})\b", q)
     codes = [*epsg_codes, *wkid_codes]
 
-    # "from ... to ..." extraction
-    m = re.search(r"(?i)\bfrom\s+([^,\n;:]+?)\s+\bto\s+([^,\n;:]+)", q)
+    # "from … to/into …" — stop before the next clause (save / plot / comma).
+    m = re.search(
+        r"(?i)\bfrom\s+(.+?)\s+\b(?:to|into)\s+(.+?)(?:"
+        r",|\band\s+save\b|\bthen\b|\busing\b|\bwith\b|\band\s+use\b|"
+        r"\bplot\b|\bgenerate\b|\n|$)",
+        q,
+    )
     src = _clean_crs(m.group(1)) if m else None
     dst = _clean_crs(m.group(2)) if m else None
+    if not src or not dst:
+        m2 = re.search(
+            r"(?i)\b(?:convert(?:ed|ing)?|reproject(?:ed|ing)?|transform(?:ed|ing)?)\b"
+            r".{0,48}?"
+            r"("
+            r"(?:utm|wgs|epsg|minna|nad|osgb)[^,\n;:]{0,48}"
+            r")"
+            r"\s+\b(?:to|into)\s+"
+            r"(.+?)(?:"
+            r",|\band\s+save\b|\bthen\b|\busing\b|\bwith\b|\band\s+use\b|"
+            r"\bplot\b|\bgenerate\b|\n|$)",
+            q,
+        )
+        if m2:
+            src = src or _clean_crs(m2.group(1))
+            dst = dst or _clean_crs(m2.group(2))
 
     # If EPSG codes appear and from/to wasn't clean, map in order
     if codes and (not src or not dst):
@@ -273,13 +300,35 @@ def infer_crs_from_text(text: str) -> Dict[str, Any]:
         elif not src:
             src = utm_str
 
-    # Common named systems
+    def _canon_named(label: Optional[str]) -> Optional[str]:
+        if not label:
+            return label
+        low = label.lower()
+        if "minna" in low and re.search(r"mid[\s\-]?belt", low):
+            return "Minna / Nigeria Mid Belt"
+        if "minna" in low and re.search(r"west[\s\-]?belt", low):
+            return "Minna / Nigeria West Belt"
+        if "minna" in low and re.search(r"east[\s\-]?belt", low):
+            return "Minna / Nigeria East Belt"
+        um = re.search(r"utm\s*(?:zone\s*)?(\d{1,2})\s*([ns])\b", low)
+        if um:
+            return f"UTM Zone {um.group(1)}{um.group(2).upper()}"
+        if re.search(r"\bwgs\s*84\b", low):
+            return "WGS84"
+        return label
+
+    src = _canon_named(src)
+    dst = _canon_named(dst)
+
+    if not dst and re.search(r"minna", q_low) and re.search(r"mid[\s\-]?belt", q_low):
+        if not (src and "minna" in src.lower()):
+            dst = "Minna / Nigeria Mid Belt"
+
+    # Common named systems — fill only a missing *source*, never invent a target
+    # just because WGS84 appeared as the from-system.
     if not src:
         if "wgs84" in q_low or "wgs 84" in q_low:
             src = "WGS84"
-    if not dst:
-        if "wgs84" in q_low or "wgs 84" in q_low:
-            dst = "WGS84"
 
     return {
         "source_crs": src,

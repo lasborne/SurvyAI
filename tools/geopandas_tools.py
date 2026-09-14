@@ -276,6 +276,18 @@ def export_to_excel(gdf, output_path, sheet_name="Results", drop_geometry=True):
     if drop_geometry:
         df = df.drop(columns=["geometry"], errors="ignore")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from agent.output_paths import cancelled_existing_file_write
+
+        blocked = cancelled_existing_file_write(str(output_path))
+        if blocked:
+            raise PermissionError(
+                blocked.get("error") or f"Left existing file unchanged: {output_path}"
+            )
+    except PermissionError:
+        raise
+    except Exception:
+        pass
     df.to_excel(str(output_path), index=False, sheet_name=sheet_name)
     result_log("OUTPUT_FILE", str(output_path))
     result_log("ROW_COUNT", len(df))
@@ -290,6 +302,18 @@ def export_to_csv(gdf, output_path, drop_geometry=True):
     if drop_geometry:
         df = df.drop(columns=["geometry"], errors="ignore")
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from agent.output_paths import cancelled_existing_file_write
+
+        blocked = cancelled_existing_file_write(str(output_path))
+        if blocked:
+            raise PermissionError(
+                blocked.get("error") or f"Left existing file unchanged: {output_path}"
+            )
+    except PermissionError:
+        raise
+    except Exception:
+        pass
     df.to_csv(str(output_path), index=False)
     result_log("OUTPUT_FILE", str(output_path))
     result_log("ROW_COUNT", len(df))
@@ -299,6 +323,18 @@ def export_to_csv(gdf, output_path, drop_geometry=True):
 def export_to_shapefile(gdf, output_path):
     \"\"\"Export a GeoDataFrame to shapefile.\"\"\"
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    try:
+        from agent.output_paths import cancelled_existing_file_write
+
+        blocked = cancelled_existing_file_write(str(output_path))
+        if blocked:
+            raise PermissionError(
+                blocked.get("error") or f"Left existing file unchanged: {output_path}"
+            )
+    except PermissionError:
+        raise
+    except Exception:
+        pass
     gdf.to_file(str(output_path))
     result_log("OUTPUT_FILE", str(output_path))
     result_log("ROW_COUNT", len(gdf))
@@ -366,6 +402,16 @@ class GeoPandasExecutor:
         output_files, missing_outputs, return_code.
         """
         full_code = GEOPANDAS_SCRIPT_PREAMBLE + "\n\n# ── LLM-GENERATED SCRIPT ────\n" + code
+
+        for raw in expected_output_files or []:
+            try:
+                from agent.output_paths import cancelled_existing_file_write
+
+                blocked = cancelled_existing_file_write(str(raw))
+                if blocked:
+                    return self._error(str(blocked.get("error") or f"Left existing file unchanged: {raw}"))
+            except Exception:
+                pass
 
         # Resolve working dir
         wdir = Path(working_dir).resolve() if working_dir else Path.cwd().resolve()
