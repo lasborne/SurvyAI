@@ -205,6 +205,27 @@ class PaymentEventLog(Base):
     )
 
 
+class BetaSignup(Base):
+    """First-user form on survyai.com. Used later to grant Pro and read demand."""
+
+    __tablename__ = "beta_signups"
+
+    id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    email: Mapped[str] = mapped_column(String(320), unique=True, index=True, nullable=False)
+    profession: Mapped[Optional[str]] = mapped_column(String(80))
+    profession_other: Mapped[Optional[str]] = mapped_column(String(200))
+    use_for: Mapped[Optional[str]] = mapped_column(String(120))
+    use_for_other: Mapped[Optional[str]] = mapped_column(String(400))
+    windows_specs: Mapped[Optional[str]] = mapped_column(String(400))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False
+    )
+
+
 class DiagnosticsBundle(Base):
     __tablename__ = "diagnostics_bundles"
 
@@ -226,6 +247,7 @@ __all__ = [
     "RefreshToken",
     "UsageEvent",
     "PaymentEventLog",
+    "BetaSignup",
     "DiagnosticsBundle",
     "SubscriptionStatus",
 ]

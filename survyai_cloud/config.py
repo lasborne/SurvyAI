@@ -133,6 +133,12 @@ class CloudSettings(BaseSettings):
         le=10_000,
         description="Max POST /v1/auth/change-password per user+IP per window; 0 disables.",
     )
+    rate_limit_beta_join_per_window: int = Field(
+        default=8,
+        ge=0,
+        le=10_000,
+        description="Max POST /v1/beta/join per IP per hour; 0 disables.",
+    )
 
     # CORS (comma-separated origins; * for dev only)
     cors_origins: str = Field(default="*")
@@ -303,7 +309,12 @@ class CloudSettings(BaseSettings):
         raw = self.cors_origins.strip()
         if raw == "*":
             return ["*"]
-        return [o.strip() for o in raw.split(",") if o.strip()]
+        origins = [o.strip() for o in raw.split(",") if o.strip()]
+        # Public marketing site posts first-user signups to this API.
+        for extra in ("https://survyai.com", "https://www.survyai.com"):
+            if extra not in origins:
+                origins.append(extra)
+        return origins
 
     def is_production(self) -> bool:
         return self.deployment_env == "production"

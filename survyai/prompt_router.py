@@ -347,6 +347,32 @@ def parse_router_response(
     )
 
 
+_ADVISORY_EXPLANATION_RE = re.compile(
+    r"\b(?:"
+    r"outline|step[- ]by[- ]step|all steps|the steps|steps to|"
+    r"how to|how would|how should|how can|how do i|"
+    r"technical details|methodology|best practices?|"
+    r"walk me through|workflow for|approach to|approach for|"
+    r"explain (?:how|the|a)|describe (?:how|the|a)|"
+    r"what(?:'s| is) the (?:process|workflow|approach)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def looks_like_advisory_explanation(query: str) -> bool:
+    """
+    True when the user wants a design, outline, or how-to in prose.
+
+    Callers must still reject file-driven jobs. This does not match a named
+    project, industry, or dataset — only the shape of an explanation request.
+    """
+    text = (query or "").strip()
+    if len(text) < 12:
+        return False
+    return _ADVISORY_EXPLANATION_RE.search(text) is not None
+
+
 def is_heavy_geospatial_task(query: str) -> bool:
     """True for raster / volume / unordered multi-step GIS that needs the flagship tier."""
     raw = query or ""
@@ -594,6 +620,7 @@ __all__ = [
     "match_candidate_model",
     "parse_router_response",
     "is_heavy_geospatial_task",
+    "looks_like_advisory_explanation",
     "heuristic_route_confidence",
     "apply_route_floors",
     "truncate_router_query",

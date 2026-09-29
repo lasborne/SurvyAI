@@ -21,6 +21,9 @@ FENCE_CONCRETE = "Concrete Wall Fence"
 ADJUST_BEARING = "bearing"
 ADJUST_BOWDITCH = "bowditch"
 
+# Automated CAD section: one sheet per cadastral plan (Console batch cap is 10).
+MAX_CAD_PLANS = 10
+
 # Canonical sentences the cadastral engine already honours.
 BEARING_ADJUST_INSTRUCTION = (
     "Use bearing adjustment (hold distances constant) to close the traverse."
@@ -343,6 +346,120 @@ def compose_cad_prompt(state: CadFormState) -> Tuple[str, str]:
 
     lines.append(CAD_SESSION_KEEP_LINE)
     return "\n".join(lines), ""
+
+
+def cad_form_state_is_blank(state: Optional[CadFormState]) -> bool:
+    """True when a plan sheet has no survey values worth plotting or warning about."""
+    if state is None:
+        return True
+    if _nonempty(state.owners):
+        return False
+    identity = (
+        state.save_as,
+        state.location,
+        state.lga,
+        state.state,
+        state.origin,
+        state.plan_number,
+        state.surveyor_name,
+        state.surveyor_company,
+        state.surveyor_address,
+    )
+    if any(str(v or "").strip() for v in identity):
+        return False
+    if not state.auto_scale and str(state.scale or "").strip():
+        return False
+    if _nonempty(state.pillars):
+        return False
+    if any(parse_en_pair(raw) for raw in (state.coordinates or [])):
+        return False
+    if parse_en_pair(state.start_coordinate):
+        return False
+    for leg in state.legs or []:
+        if str(leg.degrees or "").strip() and str(leg.distance or "").strip():
+            return False
+    for road in state.roads or []:
+        if (
+            str(road.width or "").strip()
+            and str(road.start_pillar or "").strip()
+            and str(road.end_pillar or "").strip()
+        ):
+            return False
+    for fence in state.fences or []:
+        kind = (fence.fence_type or FENCE_NONE).strip()
+        if kind and kind != FENCE_NONE:
+            return False
+    return True
+
+
+def plan_sheet_caption(state: Optional[CadFormState], index: int) -> str:
+    """Short label for the plan-sheet chip (owner, save-as, or untitled)."""
+    n = max(1, int(index) + 1)
+    st = state or CadFormState()
+    save_as = str(st.save_as or "").strip()
+    if save_as:
+        hint = save_as
+    else:
+        owners = _nonempty(st.owners)
+        hint = owners[0] if owners else (str(st.plan_number or "").strip() or "untitled")
+    return f"Plan {n} — {hint}"
+
+
+def compose_cad_prompts(states: Sequence[CadFormState]) -> Tuple[str, str]:
+    """Compose one or more plan sheets. Blank sheets are skipped; incomplete sheets error."""
+    from copy import deepcopy
+
+    pages = list(states or [])[:MAX_CAD_PLANS]
+    if not pages:
+        pages = [CadFormState()]
+
+    ready: List[CadFormState] = []
+    errors: List[str] = []
+    for i, raw in enumerate(pages):
+        state = raw or CadFormState()
+        if cad_form_state_is_blank(state):
+            continue
+        prompt, err = compose_cad_prompt(state)
+        if err:
+            errors.append(f"Plan {i + 1}: {err}")
+            continue
+        ready.append(state)
+
+    if errors:
+        extra = (
+            " Finish or remove the incomplete plan sheet(s), then Send. "
+            "Empty sheets are skipped."
+            if ready
+            else ""
+        )
+        return "", "\n".join(errors) + extra
+    if not ready:
+        prompt, err = compose_cad_prompt(pages[0] if pages else CadFormState())
+        return prompt, err
+
+    if len(ready) == 1:
+        return compose_cad_prompt(ready[0])
+
+    used: set[str] = set()
+    chunks: List[str] = []
+    for i, state in enumerate(ready, start=1):
+        adjusted = deepcopy(state)
+        owners = _nonempty(adjusted.owners)
+        stem = _sanitize_dwg_stem(
+            (adjusted.save_as or "").strip() or (owners[0] if owners else "survey_plan")
+        )
+        base = stem
+        n = 2
+        while stem.lower() in used:
+            stem = f"{base}_{n}"
+            n += 1
+        used.add(stem.lower())
+        adjusted.save_as = stem
+        prompt, err = compose_cad_prompt(adjusted)
+        if err:
+            return "", f"Plan {i}: {err}"
+        chunks.append(f"Plan {i}:\n{prompt}")
+    return "\n\n".join(chunks), ""
 
 
 def _format_bearing_phrase(leg: TraverseLeg) -> str:
@@ -707,6 +824,8 @@ def format_cad_prompt_for_display(text: str) -> str:
     if not raw:
         return text or ""
     low = raw.lower()
+    if re.search(r"(?:^|\n)\s*(?:plan|plot)\s*#?\s*\d+\s*[:\-]", raw, flags=re.IGNORECASE):
+        return raw
     if "generate" not in low or ".dwg" not in low:
         return raw
     if "buyer name" not in low and "pillar" not in low:

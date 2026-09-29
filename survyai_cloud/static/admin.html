@@ -141,6 +141,16 @@
     </section>
 
     <section>
+      <h2>First-user signups</h2>
+      <div class="toolbar">
+        <div class="grow" id="betaSummary">Save an admin key, then refresh to see people who joined from the website.</div>
+        <button type="button" class="secondary" id="refreshBetaBtn">Refresh signups</button>
+      </div>
+      <div id="betaWrap"><p class="sub">No signups loaded yet.</p></div>
+      <div id="betaMsg" class="msg"></div>
+    </section>
+
+    <section>
       <h2>2. Privileged access</h2>
       <div class="toolbar">
         <div class="grow" id="privSummary">Save an admin key, then refresh to list users with admin-granted access.</div>
@@ -392,6 +402,61 @@
       });
     }
 
+    function esc(v) {
+      return fmt(v).replace(/[&<>"']/g, function (c) {
+        return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+      });
+    }
+
+    function betaDetail(primary, extra) {
+      if (!primary && !extra) return "—";
+      if (primary === "Others" && extra) return "Others: " + extra;
+      return primary || extra || "—";
+    }
+
+    function renderBetaSignups(rows) {
+      const summary = document.getElementById("betaSummary");
+      if (!rows || !rows.length) {
+        summary.textContent = "No first-user signups yet.";
+        document.getElementById("betaWrap").innerHTML = "<p class='sub'>No signups.</p>";
+        return;
+      }
+      summary.textContent = rows.length + " signup" + (rows.length === 1 ? "" : "s") + ". Find account opens a matching SurvyAI login so you can grant Pro.";
+      let html = "<table><thead><tr>"
+        + "<th>Name</th><th>Email</th><th>Profession</th><th>Wants to use for</th><th>Windows</th><th>Joined</th><th></th>"
+        + "</tr></thead><tbody>";
+      for (const row of rows) {
+        html += "<tr>"
+          + "<td>" + esc(row.name) + "</td>"
+          + "<td class='mono'>" + esc(row.email) + "</td>"
+          + "<td>" + esc(betaDetail(row.profession, row.profession_other)) + "</td>"
+          + "<td>" + esc(betaDetail(row.use_for, row.use_for_other)) + "</td>"
+          + "<td>" + esc(row.windows_specs) + "</td>"
+          + "<td class='mono'>" + esc(row.created_at) + "</td>"
+          + "<td><button type='button' class='small secondary' data-email='" + esc(row.email) + "'>Find account</button></td>"
+          + "</tr>";
+      }
+      html += "</tbody></table>";
+      document.getElementById("betaWrap").innerHTML = html;
+      document.querySelectorAll("#betaWrap button[data-email]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          document.getElementById("email").value = btn.getAttribute("data-email") || "";
+          lookup();
+        });
+      });
+    }
+
+    async function refreshBetaSignups() {
+      setMsg("betaMsg", "");
+      try {
+        const rows = await api("/v1/admin/beta-signups?limit=200");
+        renderBetaSignups(rows);
+        setMsg("betaMsg", "Signup list updated.", true);
+      } catch (e) {
+        setMsg("betaMsg", e.message || String(e), false);
+      }
+    }
+
     async function refreshPrivileges() {
       setMsg("privMsg", "");
       try {
@@ -619,11 +684,13 @@
       }
       sessionStorage.setItem(KEY_STORAGE, key);
       setMsg("keyMsg", "Admin key saved for this browser session.", true);
+      refreshBetaSignups();
       refreshPrivileges();
     });
     document.getElementById("lookupBtn").addEventListener("click", lookup);
     document.getElementById("applyOverrideBtn").addEventListener("click", applyOverrides);
     document.getElementById("refreshPrivBtn").addEventListener("click", refreshPrivileges);
+    document.getElementById("refreshBetaBtn").addEventListener("click", refreshBetaSignups);
     document.getElementById("email").addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") lookup();
     });
@@ -632,6 +699,7 @@
     if (existing) {
       document.getElementById("adminKey").value = existing;
       setMsg("keyMsg", "Admin key loaded from sessionStorage.", true);
+      refreshBetaSignups();
       refreshPrivileges();
     }
   </script>

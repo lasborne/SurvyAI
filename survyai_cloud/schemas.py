@@ -4,7 +4,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, EmailStr, Field, field_validator
+from pydantic import BaseModel, EmailStr, Field, field_validator, model_validator
 
 
 # --- Auth ---
@@ -398,5 +398,87 @@ class AdminDiagnosticsOut(BaseModel):
     client_version: Optional[str] = None
     notes: Optional[str] = None
     created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+BETA_PROFESSIONS = frozenset(
+    {
+        "Not selected",
+        "Geospatial/GIS analyst",
+        "Surveyor",
+        "Cartographer",
+        "Others",
+    }
+)
+BETA_USES = frozenset(
+    {
+        "Not selected",
+        "Geospatial/GIS analysis",
+        "As a Survey AI assistant",
+        "Survey plan production/Cartography",
+        "Extracting and generating Geoinformation",
+        "Others",
+    }
+)
+
+
+class BetaJoinIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: EmailStr
+    profession: str = "Not selected"
+    profession_other: str = Field(default="", max_length=200)
+    use_for: str = "Not selected"
+    use_for_other: str = Field(default="", max_length=400)
+    windows_specs: str = Field(default="", max_length=400)
+    company_website: str = Field(default="", max_length=200)
+
+    @field_validator(
+        "name",
+        "profession",
+        "profession_other",
+        "use_for",
+        "use_for_other",
+        "windows_specs",
+        "company_website",
+    )
+    @classmethod
+    def _collapse(cls, v: str) -> str:
+        return " ".join((v or "").split())
+
+    @model_validator(mode="after")
+    def _choices(self) -> "BetaJoinIn":
+        if not self.name:
+            raise ValueError("Enter your name.")
+        if self.profession not in BETA_PROFESSIONS:
+            raise ValueError("Choose a profession from the list.")
+        if self.use_for not in BETA_USES:
+            raise ValueError("Choose what you want to use the app for from the list.")
+        if self.profession == "Others" and len(self.profession_other) < 2:
+            raise ValueError("Type what you do in a few words.")
+        if self.use_for == "Others" and len(self.use_for_other) < 2:
+            raise ValueError("Type what you want to use the app for.")
+        if self.profession != "Others":
+            self.profession_other = ""
+        if self.use_for != "Others":
+            self.use_for_other = ""
+        return self
+
+
+class BetaJoinOut(BaseModel):
+    detail: str = "You're on the first-user list. We'll use this when granting access."
+
+
+class BetaSignupOut(BaseModel):
+    id: uuid.UUID
+    name: str
+    email: str
+    profession: Optional[str] = None
+    profession_other: Optional[str] = None
+    use_for: Optional[str] = None
+    use_for_other: Optional[str] = None
+    windows_specs: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
 
     model_config = {"from_attributes": True}

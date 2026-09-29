@@ -143,4 +143,90 @@ class ThemeToggle(QWidget):
         p.drawPath(crescent)
 
 
-__all__ = ["ThemeToggle"]
+class PillToggle(QWidget):
+    """Compact on/off pill. Checked means on. Same motion as the theme switch."""
+
+    toggled = Signal(bool)
+
+    _W = 58
+    _H = 30
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("pillToggle")
+        self.setFixedSize(self._W, self._H)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self._checked = False
+        self._thumb_pos = 0.0
+        self._anim = QPropertyAnimation(self, b"thumbPos", self)
+        self._anim.setDuration(160)
+        self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+
+    def isChecked(self) -> bool:
+        return self._checked
+
+    def setChecked(self, checked: bool, *, animate: bool = True) -> None:
+        checked = bool(checked)
+        target = 1.0 if checked else 0.0
+        if self._checked == checked and abs(self._thumb_pos - target) < 0.02:
+            return
+        self._checked = checked
+        self._anim.stop()
+        if animate:
+            self._anim.setStartValue(self._thumb_pos)
+            self._anim.setEndValue(target)
+            self._anim.start()
+        else:
+            self._thumb_pos = target
+            self.update()
+
+    def _get_thumb_pos(self) -> float:
+        return self._thumb_pos
+
+    def _set_thumb_pos(self, value: float) -> None:
+        self._thumb_pos = max(0.0, min(1.0, float(value)))
+        self.update()
+
+    thumbPos = Property(float, _get_thumb_pos, _set_thumb_pos)
+
+    def mousePressEvent(self, event) -> None:  # noqa: N802
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.setChecked(not self._checked)
+            self.toggled.emit(self._checked)
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+
+        w, h = float(self.width()), float(self.height())
+        pad = 3.0
+        track = QRectF(pad, pad, w - 2 * pad, h - 2 * pad)
+        radius = track.height() / 2.0
+
+        if self._checked:
+            track_bg = QColor("#2563eb")
+            track_border = QColor("#1d4ed8")
+        else:
+            track_bg = QColor("#e4e4e7")
+            track_border = QColor("#d4d4d8")
+
+        p.setPen(QPen(track_border, 1.0))
+        p.setBrush(track_bg)
+        p.drawRoundedRect(track, radius, radius)
+
+        thumb_d = track.height() - 4.0
+        travel = track.width() - thumb_d - 4.0
+        thumb_x = track.left() + 2.0 + travel * self._thumb_pos
+        thumb_y = track.top() + 2.0
+        thumb_rect = QRectF(thumb_x, thumb_y, thumb_d, thumb_d)
+
+        p.setPen(QPen(QColor(0, 0, 0, 28), 1.0))
+        p.setBrush(QColor("#ffffff"))
+        p.drawEllipse(thumb_rect)
+        p.end()
+
+
+__all__ = ["ThemeToggle", "PillToggle"]

@@ -280,6 +280,88 @@ QCheckBox#cadAutoScaleCheck {
     font-weight: 600;
     color: #1e293b;
 }
+QWidget#cadPlanStrip {
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #e8edf4;
+    min-height: 26px;
+    max-height: 30px;
+}
+QWidget#cadPlanChipHost,
+QWidget#cadPlanChipWrap {
+    background: transparent;
+}
+QLabel#cadPlanCount {
+    color: #94a3b8;
+    font-size: 8pt;
+    font-weight: 500;
+    padding: 0 2px 0 4px;
+}
+QToolButton#cadPlanChip {
+    background: transparent;
+    color: #64748b;
+    border: none;
+    border-radius: 4px;
+    padding: 1px 8px;
+    min-width: 48px;
+    max-height: 22px;
+    min-height: 20px;
+    font-size: 8.5pt;
+    font-weight: 500;
+}
+QToolButton#cadPlanChip:hover {
+    background: #f1f5f9;
+    color: #334155;
+}
+QToolButton#cadPlanChip:checked {
+    background: #e8edf4;
+    color: #0f172a;
+    font-weight: 600;
+}
+QToolButton#cadPlanClose {
+    background: transparent;
+    color: #94a3b8;
+    border: none;
+    border-radius: 3px;
+    min-width: 14px;
+    max-width: 14px;
+    min-height: 14px;
+    max-height: 14px;
+    font-size: 8pt;
+    padding: 0;
+    margin-right: 2px;
+}
+QToolButton#cadPlanClose:hover {
+    background: #fee2e2;
+    color: #b91c1c;
+}
+QToolButton#cadPlanAdd {
+    background: transparent;
+    color: #64748b;
+    border: 1px solid #e2e8f0;
+    border-radius: 4px;
+    min-width: 20px;
+    max-width: 20px;
+    min-height: 20px;
+    max-height: 20px;
+    font-size: 11pt;
+    font-weight: 600;
+    padding: 0;
+}
+QToolButton#cadPlanAdd:hover {
+    background: #f8fafc;
+    color: #0f172a;
+    border-color: #cbd5e1;
+}
+QToolButton#cadPlanAdd:disabled {
+    color: #cbd5e1;
+    border-color: #f1f5f9;
+}
+QScrollArea#cadPlanChipScroll,
+QScrollArea#cadPlanChipScroll::viewport {
+    background: transparent;
+    border: none;
+}
 
 /* --- Form controls -------------------------------------------------- */
 QLineEdit, QTextEdit, QPlainTextEdit, QListWidget {
@@ -1107,6 +1189,88 @@ QWidget#cadNestedGroup {
 QCheckBox#cadAutoScaleCheck {
     font-weight: 600;
     color: #e4e4e7;
+}
+QWidget#cadPlanStrip {
+    background: transparent;
+    border: none;
+    border-bottom: 1px solid #27272a;
+    min-height: 26px;
+    max-height: 30px;
+}
+QWidget#cadPlanChipHost,
+QWidget#cadPlanChipWrap {
+    background: transparent;
+}
+QLabel#cadPlanCount {
+    color: #71717a;
+    font-size: 8pt;
+    font-weight: 500;
+    padding: 0 2px 0 4px;
+}
+QToolButton#cadPlanChip {
+    background: transparent;
+    color: #71717a;
+    border: none;
+    border-radius: 4px;
+    padding: 1px 8px;
+    min-width: 48px;
+    max-height: 22px;
+    min-height: 20px;
+    font-size: 8.5pt;
+    font-weight: 500;
+}
+QToolButton#cadPlanChip:hover {
+    background: #27272a;
+    color: #d4d4d8;
+}
+QToolButton#cadPlanChip:checked {
+    background: #27272a;
+    color: #fafafa;
+    font-weight: 600;
+}
+QToolButton#cadPlanClose {
+    background: transparent;
+    color: #71717a;
+    border: none;
+    border-radius: 3px;
+    min-width: 14px;
+    max-width: 14px;
+    min-height: 14px;
+    max-height: 14px;
+    font-size: 8pt;
+    padding: 0;
+    margin-right: 2px;
+}
+QToolButton#cadPlanClose:hover {
+    background: #450a0a;
+    color: #fecaca;
+}
+QToolButton#cadPlanAdd {
+    background: transparent;
+    color: #71717a;
+    border: 1px solid #3f3f46;
+    border-radius: 4px;
+    min-width: 20px;
+    max-width: 20px;
+    min-height: 20px;
+    max-height: 20px;
+    font-size: 11pt;
+    font-weight: 600;
+    padding: 0;
+}
+QToolButton#cadPlanAdd:hover {
+    background: #27272a;
+    color: #fafafa;
+    border-color: #52525b;
+}
+QToolButton#cadPlanAdd:disabled {
+    color: #3f3f46;
+    border-color: #27272a;
+}
+QScrollArea#cadPlanChipScroll,
+QScrollArea#cadPlanChipScroll::viewport {
+    background: transparent;
+    border: none;
 }
 
 QLineEdit, QTextEdit, QPlainTextEdit, QListWidget {

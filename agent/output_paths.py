@@ -172,11 +172,42 @@ def join_workspace_path(
 
 
 _file_conflict_handler: Optional[Callable[[str, str], bool]] = None
+_pending_survey_notice: dict[str, str] = {}
 
 def set_file_conflict_handler(handler: Optional[Callable[[str, str], bool]]) -> None:
     """Install the GUI/CLI callback used before overwriting an existing file."""
     global _file_conflict_handler
     _file_conflict_handler = handler
+
+
+def show_survey_notice(
+    message: str,
+    *,
+    title: str = "SurvyAI — Coordinate check",
+    transformation_text: str = "",
+) -> None:
+    """
+    Hold a survey reminder for the Console result window.
+
+    No popup: ``finalize_query_result_dict`` appends this text to the agent
+    response so it appears with the conversion result. The converter already
+    logs one summary line for CLI/headless runs.
+    """
+    del title  # kept so existing callers stay valid
+    text = (message or "").strip()
+    if not text:
+        return
+    _pending_survey_notice["text"] = text
+    xf = (transformation_text or "").strip()
+    if xf:
+        _pending_survey_notice["transformation"] = xf
+
+
+def consume_survey_notice() -> dict[str, str]:
+    """Return and clear the pending Console survey reminder (if any)."""
+    data = dict(_pending_survey_notice)
+    _pending_survey_notice.clear()
+    return data
 
 
 def _existing_output_kind(path: Path) -> str:

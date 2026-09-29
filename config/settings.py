@@ -338,6 +338,15 @@ class Settings(BaseSettings):
         description="Which LLM to use if primary fails. Same options as PRIMARY_LLM."
     )
 
+    enable_free_ai_model: bool = Field(
+        default=False,
+        env="ENABLE_FREE_AI_MODEL",
+        description=(
+            "When False (default), Ollama is not a provider and is not used as a startup "
+            "fallback. Desktop Settings → 'Turn on the Free AI model abilities' turns this on."
+        ),
+    )
+
     # ==========================================================================
     # Ollama (local models) Configuration
     # ==========================================================================

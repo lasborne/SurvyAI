@@ -65,22 +65,28 @@ def environment_validation_report(settings: Settings) -> str:
     lines.append("")
     lines.append("Primary LLM: " + str(settings.primary_llm))
     lines.append("Fallback LLM: " + str(settings.fallback_llm))
-    lines.append("Ollama URL: " + str(getattr(settings, "ollama_base_url", "http://localhost:11434")))
-    lines.append("Ollama model: " + str(getattr(settings, "ollama_model", "llama3.2:1b")))
+    free_ai = bool(getattr(settings, "enable_free_ai_model", False))
+    if free_ai:
+        lines.append("Ollama URL: " + str(getattr(settings, "ollama_base_url", "http://localhost:11434")))
+        lines.append("Ollama model: " + str(getattr(settings, "ollama_model", "llama3.2:1b")))
     cloud_base = str(getattr(settings, "survyai_api_base_url", "") or "").strip()
     lines.append("SurvyAI cloud API: " + (cloud_base or "production default"))
     lines.append("Vector store: " + ("enabled" if settings.vector_store_enabled else "disabled"))
-    local_ready = str(settings.primary_llm).lower() == "ollama" or str(settings.fallback_llm).lower() == "ollama"
+    local_ready = free_ai and (
+        str(settings.primary_llm).lower() == "ollama" or str(settings.fallback_llm).lower() == "ollama"
+    )
     # Desktop always has a production cloud default (users are not asked for the URL).
     cloud_ready = True
     ready = any_direct_provider_key or local_ready or cloud_ready
+    if free_ai:
+        ready_text = "ready (local Ollama/cloud sign-in/direct keys supported)"
+        needs_text = "needs Ollama, cloud sign-in, or a direct provider API key"
+    else:
+        ready_text = "ready (cloud sign-in or a direct provider API key)"
+        needs_text = "needs cloud sign-in or a direct provider API key"
     lines.append(
         "Overall readiness: "
-        + (
-            "ready (local Ollama/cloud sign-in/direct keys supported)"
-            if ready
-            else "needs Ollama, cloud sign-in, or a direct provider API key"
-        )
+        + (ready_text if ready else needs_text)
     )
     return "\n".join(lines)
 
@@ -233,7 +239,8 @@ class _TutorialPage(QWizardPage):
             "1. Choose a workspace folder before generating files.\n"
             "2. Console is for free-form prompts: Enter sends, Shift+Enter starts a new line "
             "(same as most chat apps). Automated CAD section is a fill-in form — "
-            "press Send to plot. Output History stores previous runs.\n"
+            "press Send to plot (up to 10 plan sheets; empty extra sheets are skipped). "
+            "Output History stores previous runs.\n"
             "3. Follow-up CAD edits (roads, title, subdivision, save as) stay in the same conversation.\n"
             "4. Fast mode and Fallback LLM start unchecked. Turn them on only when you need them.\n"
             "5. Use the sun/moon control for light or dark mode. Safe mode in Settings limits "

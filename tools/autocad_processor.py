@@ -471,7 +471,9 @@ class AutoCADProcessor:
         catalog = {year: aliases for year, aliases in self._autocad_version_catalog()}
         progids: List[str] = []
 
-        # Default preferred release
+        # Launch the registered default AutoCAD first so a stale versioned ProgID
+        # (e.g. leftover 2021) cannot hang for minutes without opening a window.
+        progids.append("AutoCAD.Application")
         progids.extend(catalog.get(2021, []))
 
         # Then newest -> oldest, excluding the already-preferred 2021
@@ -480,7 +482,6 @@ class AutoCADProcessor:
                 continue
             progids.extend(aliases)
 
-        progids.append("AutoCAD.Application")
         return self._unique_progids(progids)
     
     # ==========================================================================
@@ -556,7 +557,21 @@ class AutoCADProcessor:
                         self.acad.Visible = True
 
                         logger.info("Waiting for AutoCAD to initialize...")
-                        time.sleep(3)
+                        ready = False
+                        for _ in range(20):
+                            try:
+                                _ = self.acad.Name
+                                ready = True
+                                break
+                            except Exception:
+                                time.sleep(1)
+                        if not ready:
+                            logger.debug(
+                                "AutoCAD started via %s but did not become ready; trying next ProgID",
+                                progid,
+                            )
+                            self.acad = None
+                            continue
 
                         connected = True
                         break

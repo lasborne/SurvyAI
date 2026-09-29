@@ -12,19 +12,20 @@ anytime. Hover a control in the app for a one-line tip.
    here and writes outputs here unless you give a full path.
 2. **Appearance** — Use the sun/moon control (top right) for light or dark
    mode. The choice is saved on this PC.
-3. **Choose an AI path**
-   - **Local (Ollama)** — free, private, works offline after models are
-     installed. Prefer this for simple questions, not complex CAD or GIS.
-   - **Hosted (cloud sign-in)** — stronger models for CAD, documents, and GIS.
-     Uses your credit balance.
-4. **Pick a tab**
+3. **Hosted models** — Sign in from **Account** for Pro models used on CAD,
+   documents, and GIS. Hosted use draws from your credit balance. Paid models
+   stay unavailable until you subscribe.
+4. **Optional free local model** — Off by default. To use Ollama on this PC,
+   open **Settings** and turn on **Turn on the Free AI model abilities**.
+   SurvyAI does not ask you to install Ollama unless that switch is on.
+5. **Pick a tab**
    - **Automated CAD section** — fill the form, press **Send**. No prompt
      writing.
    - **Console** — type a request, attach files if needed, press **Send**
      (**Enter**). **Shift+Enter** starts a new line in the prompt box
      (same as most chat apps). Hover or click the box to see this shortcut.
    - **Output History** — review past runs.
-5. Watch **Live activity** and the conversation for progress. Long CAD or GIS
+6. Watch **Live activity** and the conversation for progress. Long CAD or GIS
    jobs can take a few minutes.
 
 Tip: Keep related files in one workspace so you can mention short file names.
@@ -42,24 +43,28 @@ helps; SurvyAI also ships a default template.
 **Do this:**
 
 1. Open the **Automated CAD section** tab.
-2. Choose **Coordinates** or **Bearings and distances**.
-3. Fill **Save File As** only if you want a specific `.dwg` name. Leave it
+2. Use the compact numbered strip if you have more than one plan (up to 10).
+   **+** adds a sheet; **×** removes a sheet other than the first. Blank extra
+   sheets are skipped on **Send**.
+3. Choose **Coordinates** or **Bearings and distances**.
+4. Fill **Save File As** only if you want a specific `.dwg` name. Leave it
    blank to use the first owner name.
-4. Enter every real **Owner / buyer**. Use **+** on the last row to add
+5. Enter every real **Owner / buyer**. Use **+** on the last row to add
    another. Names appear together on the title block.
-5. Fill site, origin (CRS), and at least three pillar numbers.
-6. Enter coordinates, or one start coordinate plus traverse legs.
-7. Optional: access roads (width + start/end pillars) and wall fences
+6. Fill site, origin (CRS), and at least three pillar numbers.
+7. Enter coordinates, or one start coordinate plus traverse legs.
+8. Optional: access roads (width + start/end pillars) and wall fences
    (concrete or dwarf concrete only).
-8. Choose one traverse adjustment: **Bearing adjustment** (default) or
+9. Choose one traverse adjustment: **Bearing adjustment** (default) or
    **Bowditch**.
-9. Fill certification (plan number, surveyor, company, address) as needed.
-10. Press **Send**. If the file already exists, confirm overwrite or pick
+10. Fill certification (plan number, surveyor, company, address) as needed.
+11. Press **Send**. If the file already exists, confirm overwrite or pick
     another name.
 
-**Input CAD plan prompt** fills the form from
+**Input CAD Template** fills **only the sheet you are on** from
 **Account → Edit Default CAD Prompt** (surveyor defaults, plan number, and
-similar). Console still inserts the full prompt text.
+similar). Other sheets stay as you left them. Console still inserts the full
+template text.
 
 ---
 
@@ -175,7 +180,7 @@ Optional integrations (not bundled): **AutoCAD**, **ArcGIS Pro**,
 - Prefer **one clear job per message**. Unrelated topics do not continue the
   previous CAD or GIS job.
 - **Account → Credits & Usage** shows pool, used, remaining, and recent billed
-  runs. Local Ollama usage is free.
+  runs. Local Ollama usage is free only after you turn on Free AI model abilities in Settings.
 - Console reminders appear near 50%, 80%, and 95% of the period pool.
 - **Safe Mode** in Settings limits advanced integrations while you
   troubleshoot.

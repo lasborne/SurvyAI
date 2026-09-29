@@ -219,6 +219,18 @@ a:hover {
   padding-inline: 1.5rem;
 }
 
+.btn--soft {
+  background: var(--blue-50);
+  border-color: var(--blue-200);
+  color: var(--blue-800);
+}
+
+.btn--soft:hover {
+  background: var(--blue-100);
+  border-color: var(--blue-400);
+  color: var(--blue-800);
+}
+
 .btn-row {
   display: flex;
   flex-wrap: wrap;
@@ -292,7 +304,16 @@ a:hover {
 }
 
 .hero__content {
-  max-width: 38rem;
+  max-width: 44rem;
+}
+
+.hero--compact {
+  min-height: 0;
+  padding: clamp(2.5rem, 6vw, 4rem) 0 clamp(1.5rem, 4vw, 2.5rem);
+}
+
+.hero--compact h1 {
+  font-size: clamp(2.1rem, 5vw, 3rem);
 }
 
 .hero h1 {
@@ -308,10 +329,19 @@ a:hover {
 }
 
 .hero__lead {
-  margin: 0 0 1.75rem;
+  margin: 0 0 0.75rem;
   font-size: clamp(1.05rem, 2.2vw, 1.2rem);
   color: var(--slate-600);
-  max-width: 32rem;
+  max-width: 34rem;
+}
+
+.hero__point {
+  margin: 0 0 1.75rem;
+  max-width: 34rem;
+  font-size: 1.05rem;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  color: var(--slate-900);
 }
 
 .badge {
@@ -395,6 +425,196 @@ a:hover {
   margin: 0;
   color: var(--slate-500);
   font-size: 0.95rem;
+}
+
+.demo {
+  margin: 1.75rem 0 0;
+  max-width: 40rem;
+}
+
+.demo__frame {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background:
+    radial-gradient(ellipse 80% 70% at 70% 20%, rgb(37 99 235 / 0.35), transparent 55%),
+    #0f172a;
+  border: 1px solid var(--slate-200);
+  box-shadow: var(--shadow);
+}
+
+.demo video {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  background: #0f172a;
+}
+
+.demo__pending {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0;
+  padding: 1.5rem;
+  text-align: center;
+  color: #e2e8f0;
+  font-size: 0.95rem;
+}
+
+.demo__pending[hidden],
+.demo video[hidden] {
+  display: none;
+}
+
+.demo figcaption {
+  margin-top: 0.55rem;
+  color: var(--slate-500);
+  font-size: 0.875rem;
+}
+
+.can-do {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1.15rem 1.5rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.can-do strong {
+  display: block;
+  margin-bottom: 0.25rem;
+}
+
+.can-do span {
+  color: var(--slate-500);
+  font-size: 0.95rem;
+}
+
+.faq {
+  display: grid;
+  gap: 0.65rem;
+  max-width: 40rem;
+}
+
+.faq details {
+  border: 1px solid var(--slate-200);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 0.85rem 1rem;
+}
+
+.section--alt .faq details {
+  background: var(--slate-50);
+}
+
+.faq summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.faq details p {
+  margin: 0.55rem 0 0;
+  color: var(--slate-600);
+  font-size: 0.95rem;
+}
+
+.privacy p {
+  margin: 0 0 0.85rem;
+  max-width: 40rem;
+  color: var(--slate-600);
+}
+
+.privacy p:last-child {
+  margin-bottom: 0;
+}
+
+.signup {
+  max-width: 34rem;
+}
+
+.field {
+  margin-bottom: 1rem;
+}
+
+.field label {
+  display: block;
+  margin-bottom: 0.35rem;
+  font-size: 0.92rem;
+  font-weight: 600;
+}
+
+.field input,
+.field select,
+.field textarea {
+  width: 100%;
+  font: inherit;
+  color: var(--slate-900);
+  padding: 0.65rem 0.75rem;
+  border-radius: 10px;
+  border: 1px solid var(--slate-300);
+  background: #fff;
+}
+
+.field select {
+  cursor: pointer;
+}
+
+.req {
+  color: var(--blue-700);
+}
+
+.field-more:not([hidden]) {
+  display: block;
+  margin: -0.25rem 0 1rem;
+  padding: 0.8rem 0.85rem 0.15rem;
+  border-radius: 10px;
+  background: var(--blue-50);
+  border: 1px solid var(--blue-200);
+}
+
+.guide {
+  margin: 0.4rem 0 0.75rem;
+  color: var(--slate-600);
+  font-size: 0.82rem;
+}
+
+.form-note,
+.form-msg {
+  margin: 0 0 1rem;
+  font-size: 0.9rem;
+}
+
+.form-note {
+  color: var(--slate-500);
+}
+
+.form-msg {
+  padding: 0.75rem 0.9rem;
+  border-radius: 10px;
+}
+
+.form-msg.is-ok {
+  background: #ecfdf5;
+  border: 1px solid #a7f3d0;
+  color: #065f46;
+}
+
+.form-msg.is-err {
+  background: #fef2f2;
+  border: 1px solid #fecaca;
+  color: #991b1b;
+}
+
+.hp {
+  position: absolute;
+  left: -9999px;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
 }
 
 /* Download / Updates panels — interaction containers */
@@ -654,7 +874,8 @@ a:hover {
 @media (max-width: 860px) {
   .features,
   .panel,
-  .about-grid {
+  .about-grid,
+  .can-do {
     grid-template-columns: 1fr;
   }
 

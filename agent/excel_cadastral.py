@@ -988,7 +988,10 @@ def query_requests_crs_conversion(query: str) -> bool:
         return False
     crs_cue = bool(
         re.search(
-            r"\b(utm|wgs\s*84|wgs84|minna|epsg|wkid|crs|zone\s*\d{1,2}\s*[ns]?|"
+            r"\b(utm|wgs\s*84|wgs84|minna|epsg|wkid|crs|"
+            r"nad\s*83|nad83|nad\s*27|nad27|etrs|gda|mga|itrf|sirgas|"
+            r"sad\s*69|sad69|psad|ed\s*50|ed50|osgb|arc\s*19|"
+            r"zone\s*\d{1,2}\s*[ns]?|"
             r"mid[\s\-]?belt|west[\s\-]?belt|east[\s\-]?belt|coordinate\s+system|"
             r"datum)\b",
             q,
@@ -1006,6 +1009,7 @@ def query_requests_crs_conversion(query: str) -> bool:
     # "from the existing plan to fill the title block".
     _crs_tok = (
         r"(?:utm|wgs\s*84|wgs84|minna|epsg|wkid|zone\s*\d{1,2}|"
+        r"nad\s*83|nad83|nad\s*27|etrs|gda|mga|itrf|sirgas|osgb|"
         r"mid[\s\-]?belt|west[\s\-]?belt|east[\s\-]?belt)"
     )
     if re.search(
@@ -1052,47 +1056,57 @@ def reproject_family_parcels(
     *,
     source_crs: str,
     target_crs: str,
+    survey_out: Optional[Dict[str, Any]] = None,
 ) -> Tuple[List[FamilyParcel], int]:
     """Transform every parcel Easting/Northing from ``source_crs`` to ``target_crs``."""
     from tools.geographic_calculator_core import BlueMarbleConverter
 
     converter = BlueMarbleConverter(auto_connect=False)
-    out: List[FamilyParcel] = []
-    count = 0
-    for parcel in parcels:
-        pts: List[ParcelPoint] = []
+    coords: List[Tuple[float, float]] = []
+    owners: List[Tuple[int, ParcelPoint]] = []
+    for pi, parcel in enumerate(parcels):
         for pt in parcel.points:
-            res = converter.convert_coordinate(
-                float(pt.e),
-                float(pt.n),
-                source_crs=source_crs,
-                target_crs=target_crs,
-                use_geographic_calculator=False,
+            coords.append((float(pt.e), float(pt.n)))
+            owners.append((pi, pt))
+    results = converter.batch_convert(
+        coords, source_crs, target_crs, use_geographic_calculator=False,
+    )
+    by_parcel: Dict[int, List[ParcelPoint]] = {i: [] for i in range(len(parcels))}
+    count = 0
+    for (pi, pt), res in zip(owners, results):
+        if res.get("error"):
+            raise RuntimeError(
+                f"Converter failed for {pt.e}, {pt.n} "
+                f"({source_crs} → {target_crs}): {res.get('error')}"
             )
-            tgt = (res or {}).get("target") or {}
-            if "x" not in tgt or "y" not in tgt:
-                raise RuntimeError(
-                    f"Converter returned no target XY for {pt.e}, {pt.n} "
-                    f"({source_crs} → {target_crs})."
-                )
-            e2 = float(tgt["x"])
-            n2 = float(tgt["y"])
-            # Guard: projected metres must not collapse to lat/lon.
-            if abs(float(pt.e)) > 1000.0 and abs(e2) <= 180.0 and abs(n2) <= 90.0:
-                raise RuntimeError(
-                    f"Conversion {source_crs} → {target_crs} produced geographic "
-                    f"degrees ({e2}, {n2}) from projected metres ({pt.e}, {pt.n}). "
-                    "Check the source and target CRS names."
-                )
-            pts.append(ParcelPoint(e=e2, n=n2, pillar=pt.pillar))
-            count += 1
-        out.append(
-            FamilyParcel(
-                owner_name=parcel.owner_name,
-                letter=parcel.letter,
-                points=pts,
+        tgt = (res or {}).get("target") or {}
+        if "x" not in tgt or "y" not in tgt:
+            raise RuntimeError(
+                f"Converter returned no target XY for {pt.e}, {pt.n} "
+                f"({source_crs} → {target_crs})."
             )
+        e2 = float(tgt["x"])
+        n2 = float(tgt["y"])
+        if abs(float(pt.e)) > 1000.0 and abs(e2) <= 180.0 and abs(n2) <= 90.0:
+            raise RuntimeError(
+                f"Conversion {source_crs} → {target_crs} produced geographic "
+                f"degrees ({e2}, {n2}) from projected metres ({pt.e}, {pt.n}). "
+                "Check the source and target CRS names."
+            )
+        by_parcel[pi].append(ParcelPoint(e=e2, n=n2, pillar=pt.pillar))
+        count += 1
+    out = [
+        FamilyParcel(
+            owner_name=parcel.owner_name,
+            letter=parcel.letter,
+            points=by_parcel[i],
         )
+        for i, parcel in enumerate(parcels)
+    ]
+    survey = getattr(converter, "_last_survey_summary", None)
+    if isinstance(survey_out, dict) and survey:
+        survey_out.clear()
+        survey_out.update(survey)
     return out, count
 
 
@@ -1129,10 +1143,12 @@ def apply_requested_crs_conversion(
             ),
         }
     try:
+        survey: Dict[str, Any] = {}
         converted, n_pts = reproject_family_parcels(
             listed,
             source_crs=spec["source_crs"],
             target_crs=spec["target_crs"],
+            survey_out=survey,
         )
     except Exception as exc:
         return {
@@ -1145,18 +1161,30 @@ def apply_requested_crs_conversion(
             "source_crs": spec["source_crs"],
             "target_crs": spec["target_crs"],
         }
-    return {
+    note = (
+        f"Converted {n_pts} coordinates from {spec['source_crs']} to "
+        f"{spec['target_crs']} before saving Excel and plotting CAD."
+    )
+    xf = str(survey.get("transformation_text") or "").strip()
+    if xf:
+        note = f"{note}\n{xf}"
+    notice = str(survey.get("text") or "").strip()
+    if notice:
+        note = f"{note}\n{notice}"
+    out: Dict[str, Any] = {
         "success": True,
         "applied": True,
         "parcels": converted,
         "source_crs": spec["source_crs"],
         "target_crs": spec["target_crs"],
         "point_count": n_pts,
-        "note": (
-            f"Converted {n_pts} coordinates from {spec['source_crs']} to "
-            f"{spec['target_crs']} before saving Excel and plotting CAD."
-        ),
+        "note": note,
     }
+    if notice:
+        out["survey_notice"] = notice
+    if xf:
+        out["transformation_text"] = xf
+    return out
 
 
 def resolve_ownership_excel_for_plot(

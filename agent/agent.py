@@ -2423,7 +2423,10 @@ class SurvyAIAgent:
         # We have a primary LLM (default: OpenAI) and a fallback (default: Gemini)
         # If the primary fails, we automatically try the fallback
         
-        requested_primary = str(self.settings.primary_llm or "ollama").strip().lower()
+        free_ai = bool(getattr(self.settings, "enable_free_ai_model", False))
+        requested_primary = str(
+            self.settings.primary_llm or ("ollama" if free_ai else "openai")
+        ).strip().lower()
         # Symbolic "auto" (best paid hosted model) must never reach provider init.
         if requested_primary == "auto":
             try:
@@ -2432,7 +2435,13 @@ class SurvyAIAgent:
                 requested_primary = resolve_primary_llm_selection("auto")
             except Exception:
                 requested_primary = "openai"
-        requested_fallback = str(self.settings.fallback_llm or "ollama").strip().lower()
+        if not free_ai and requested_primary == "ollama":
+            requested_primary = "openai"
+        requested_fallback = str(
+            self.settings.fallback_llm or ("ollama" if free_ai else "gemini")
+        ).strip().lower()
+        if not free_ai and requested_fallback == "ollama":
+            requested_fallback = "gemini"
         logger.info(f"Initializing primary LLM: {requested_primary}")
         logger.info(f"Initializing fallback LLM: {requested_fallback}")
 
@@ -2442,13 +2451,13 @@ class SurvyAIAgent:
         def _startup_candidates(preferred: str) -> List[str]:
             """Provider order for installed desktop startup.
 
-            A fresh installed app has no provider .env.  It should still start
-            with Ollama (or cloud proxy after sign-in) instead of crashing.
-            Skip Ollama entirely when the host already failed the RAM cap so
-            startup does not print/retry the same rejection three times.
+            Free local models (Ollama) are included only when that ability is on.
+            When it is off, SurvyAI tries the selected hosted providers only.
+            Skip Ollama when the host already failed the RAM cap.
             """
             out: List[str] = []
-            for item in (preferred, requested_fallback, "ollama"):
+            chain = (preferred, requested_fallback, "ollama") if free_ai else (preferred, requested_fallback)
+            for item in chain:
                 item = str(item or "").strip().lower()
                 if item and item not in out:
                     out.append(item)
@@ -2482,9 +2491,15 @@ class SurvyAIAgent:
                 logger.warning(f"⚠ Could not initialize startup LLM '{candidate}': {e}")
 
         if self.llm_primary is None or not selected_primary:
+            if free_ai:
+                raise ValueError(
+                    "Could not initialize any LLM backend. Install/start Ollama, sign in "
+                    "for the SurvyAI cloud proxy, or configure a provider API key. "
+                    f"Last error: {last_primary_error}"
+                )
             raise ValueError(
-                "Could not initialize any LLM backend. Install/start Ollama, sign in "
-                "for the SurvyAI cloud proxy, or configure a provider API key. "
+                "Could not initialize a hosted LLM. Sign in to SurvyAI Cloud for Pro "
+                "models, or configure a provider API key. "
                 f"Last error: {last_primary_error}"
             )
 
@@ -4583,11 +4598,21 @@ class SurvyAIAgent:
         return False
 
     def _ensure_autocad_connected(self) -> bool:
-        """Connect to AutoCAD early so COM is warm before template plotting."""
+        """Connect to AutoCAD on the current thread so COM is warm before plotting."""
         try:
             if self.autocad.is_connected:
+                try:
+                    self.autocad.acad.Visible = True
+                except Exception:
+                    pass
                 return True
-            return bool(self.autocad.connect())
+            ok = bool(self.autocad.connect())
+            if ok:
+                try:
+                    self.autocad.acad.Visible = True
+                except Exception:
+                    pass
+            return ok
         except Exception as exc:
             logger.debug("AutoCAD pre-connect failed: %s", exc)
             return False
@@ -6079,7 +6104,9 @@ class SurvyAIAgent:
             if bn not in seen:
                 seen.add(bn)
                 distinct_out.append(bn)
-        return bool(has_blocks or len(distinct_out) >= 2)
+        if has_blocks or len(distinct_out) >= 2:
+            return True
+        return len(self._split_cadastral_batch_requests(query)) >= 2
 
     def _split_cadastral_batch_requests(self, query: str) -> List[str]:
         """
@@ -6165,6 +6192,10 @@ class SurvyAIAgent:
         """
         Run up to 10 cadastral plan plots in one request by reusing the existing
         single-plan deterministic pipeline.
+
+        Each plan is isolated: own output DWG, own coordinates/pillars/roads/fences
+        from that plan block only, and AutoCAD tabs are closed between plots so
+        Plan N cannot draw into Plan N-1.
         """
         subs = self._split_cadastral_batch_requests(query)
         if not subs:
@@ -6180,9 +6211,35 @@ class SurvyAIAgent:
 
         results: List[Dict[str, Any]] = []
         ok = 0
+        n_jobs = len(subs)
+        batch_template: Optional[str] = None
+        batch_profile: Optional[str] = None
+        try:
+            mem = self._resolve_cadastral_template_from_memory(query)
+            if mem:
+                batch_template = mem.get("template_path") or None
+                batch_profile = mem.get("profile_path") or None
+        except Exception:
+            pass
+
         for i, sub in enumerate(subs, start=1):
+            is_first = i == 1
+            is_last = i >= n_jobs
             try:
-                r = self._run_cadastral_cad_prompt_pipeline(sub)
+                r = self._run_cadastral_cad_prompt_pipeline(
+                    sub,
+                    # Each Plan N block already carries its own roads/fences/coords.
+                    # Do not assess against the whole batch (or vector-store of prior plots).
+                    skip_intent_assessment=True,
+                    extra_parcels=[],
+                    extent_points=[],
+                    main_parcel_label="",
+                    skip_session_prep=not is_first,
+                    batch_mode=not is_first,
+                    template_override_path=batch_template,
+                    profile_override_path=batch_profile,
+                    close_output_after_save=not is_last,
+                )
             except Exception as e:
                 r = {"success": False, "error": f"Unhandled exception: {type(e).__name__}: {e}"}
             r["_plan_index"] = i
@@ -6192,14 +6249,162 @@ class SurvyAIAgent:
                 # Keep last successful plan for in-session modifications.
                 self._last_cadastral_output_dwg = r.get("output_dwg")
                 self._last_cadastral_profile_path = r.get("profile_path")
+                if r.get("template_path"):
+                    batch_template = str(r.get("template_path"))
+                if r.get("profile_path"):
+                    batch_profile = str(r.get("profile_path"))
+            elif not is_last:
+                # Failed mid-batch: drop any half-open tab before the next plan.
+                try:
+                    out_try = r.get("output_dwg")
+                    if out_try and hasattr(self.autocad, "save_and_close_drawing"):
+                        self.autocad.save_and_close_drawing(str(out_try), save=False)
+                    elif hasattr(self.autocad, "recover_com_session"):
+                        self.autocad.recover_com_session(reason="batch cadastral plan failed")
+                except Exception:
+                    pass
 
+        outputs = [r.get("output_dwg") for r in results if r.get("success")]
         return {
             "success": ok > 0,
+            "output_dwg": outputs[-1] if outputs else None,
+            "output_dwgs": outputs,
             "plans_total": len(subs),
             "plans_success": ok,
             "plans_failed": len(subs) - ok,
             "results": results,
         }
+
+    def _try_cadastral_cad_fastpath_result(
+        self,
+        tool_routing_query: str,
+        *,
+        query: str,
+        use_fallback: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Plot conventional cadastral Generate-.dwg prompts without paid routing.
+
+        Automated CAD (and Console Plan 1 / Plan 2 blocks) already contain
+        coordinates, pillars, and metadata. Classifying the bundled text as one
+        "complex" file job is what sent multi-plan plots through gpt-5.6-sol.
+        Each plan is plotted sequentially by the existing CAD pipeline instead.
+        Returns None when this is not a conventional CAD plot (caller continues).
+        """
+        llm_used = "fallback" if use_fallback else "primary"
+        session_id = self.get_session_id()
+
+        def _base(**extra: Any) -> Dict[str, Any]:
+            out: Dict[str, Any] = {
+                "query": query,
+                "llm_used": llm_used,
+                "model_name": extra.pop("model_name", None),
+                "complexity": "simple",
+                "session_id": session_id,
+                "context_retrieved": False,
+            }
+            out.update(extra)
+            return out
+
+        body = self._cadastral_user_message_body(tool_routing_query)
+        excluded = any(m in body.lower() for m in _CADASTRAL_FASTPATH_EXCLUDE_MARKERS)
+        deferred = coordinates_deferred_to_external_source(body)
+        n_plans = 0 if (excluded or deferred) else len(
+            self._split_cadastral_batch_requests(tool_routing_query)
+        )
+        # Classify Plan 1…N separately and plot one after another. Do not send
+        # the bundled Automated CAD text through the paid router/graph.
+        if n_plans >= 2 or self._should_fastpath_cadastral_cad_batch(tool_routing_query):
+            logger.info(
+                "Cadastral CAD batch fast-path (%s plan(s), sequential, no paid router)",
+                n_plans or "multi",
+            )
+            fast = self._run_cadastral_cad_batch_pipeline(tool_routing_query)
+            if fast.get("success"):
+                from agent.cadastral_intent import format_cadastral_status_message
+
+                extra_lines = []
+                for item in fast.get("results") or []:
+                    idx = item.get("_plan_index")
+                    if item.get("success"):
+                        extra_lines.append(f"• Plan {idx}: {item.get('output_dwg')}")
+                    else:
+                        err = item.get("error") or "Failed"
+                        extra_lines.append(f"• Plan {idx}: Failed ({err})")
+                return _base(
+                    response=format_cadastral_status_message(
+                        opener="Batch cadastral plotting complete.",
+                        bullets=[
+                            f"Plans requested: {fast.get('plans_total')}",
+                            f"Successful: {fast.get('plans_success')}",
+                            f"Failed: {fast.get('plans_failed')}",
+                        ],
+                        extra_lines=extra_lines,
+                    ),
+                    success=True,
+                    output_path=fast.get("output_dwg"),
+                )
+            return _base(
+                response=str(fast),
+                success=False,
+                output_path=None,
+                error=(
+                    fast.get("error")
+                    if isinstance(fast, dict)
+                    else "Batch cadastral pipeline failed"
+                ),
+            )
+
+        if self._should_fastpath_cadastral_cad(tool_routing_query):
+            logger.info("Cadastral CAD fast-path (deterministic plot, no paid router)")
+            fast = self._run_cadastral_cad_prompt_pipeline(tool_routing_query)
+            if fast.get("success"):
+                self._last_cadastral_output_dwg = fast.get("output_dwg")
+                self._last_cadastral_profile_path = fast.get("profile_path")
+                try:
+                    from agent.cadastral_intent import format_cadastral_plot_success_message
+
+                    success_text = format_cadastral_plot_success_message(
+                        output_dwg=fast.get("output_dwg"),
+                        geometry=fast.get("geometry") if isinstance(fast.get("geometry"), dict) else {},
+                        access_road_title=fast.get("access_road_title"),
+                        opener="Cadastral plan ready.",
+                    )
+                except Exception:
+                    success_text = (
+                        "Cadastral plan ready.\n\n"
+                        f"File\n{fast.get('output_dwg') or '—'}\n"
+                    )
+                return _base(
+                    response=success_text,
+                    success=True,
+                    output_path=fast.get("output_dwg"),
+                )
+            err_txt = str((fast or {}).get("error") or "")
+            if coordinates_deferred_to_external_source(tool_routing_query) or (
+                "could not parse coordinates" in err_txt.lower()
+                and any(
+                    k in (tool_routing_query or "").lower()
+                    for k in ("excel", ".xlsx", ".xls", "spreadsheet")
+                )
+            ):
+                logger.warning(
+                    "Cadastral fastpath failed on deferred/Excel coords (%s); "
+                    "falling through to agent tools.",
+                    err_txt,
+                )
+                return None
+            return _base(
+                response=str(fast),
+                success=False,
+                output_path=None,
+                error=(
+                    fast.get("error")
+                    if isinstance(fast, dict)
+                    else "Fastpath cadastral pipeline failed"
+                ),
+            )
+        return None
 
     def _enrich_cadastral_extras_with_intent_assessment(
         self,
@@ -6312,11 +6517,12 @@ class SurvyAIAgent:
           ``extent_points`` enlarge scale fit. Legacy post-move overlay is a fallback only.
         """
         import re
-        from concurrent.futures import ThreadPoolExecutor
         from pathlib import Path
 
-        cad_pool = ThreadPoolExecutor(max_workers=1)
-        cad_future = cad_pool.submit(self._ensure_autocad_connected)
+        # AutoCAD COM is STA: connect on this thread. A worker-pool DispatchEx
+        # can start (or fail to start) AutoCAD on a dying apartment so the plot
+        # thread never sees a usable application — and never opens the window.
+        self._ensure_autocad_connected()
 
         q = self._cadastral_user_message_body(query or "")
         extra_parcels = list(extra_parcels or [])
@@ -6382,12 +6588,10 @@ class SurvyAIAgent:
             try:
                 from agent.pdf_survey_plan import resolve_buyer_name_from_query
 
-                buyer = resolve_buyer_name_from_query(
-                    q,
-                    scope_text=q,
-                    llm=_simple_override_llm(),
-                    run_with_timeout=self._run_with_timeout,
-                )
+                # Regex / labelled fields only. Passing an LLM here treated every
+                # Automated CAD "buyer name:" sheet as an override and billed a
+                # full-prompt completion per plan.
+                buyer = resolve_buyer_name_from_query(q, scope_text=q)
             except Exception:
                 buyer = None
         location = _pick(
@@ -6454,8 +6658,6 @@ class SurvyAIAgent:
                     cert_date = resolve_plan_overrides_from_query(
                         q,
                         scope_text=q,
-                        llm=_simple_override_llm(),
-                        run_with_timeout=self._run_with_timeout,
                     ).certification_date
             except Exception:
                 cert_date = None
@@ -6494,12 +6696,17 @@ class SurvyAIAgent:
         pillars = ", ".join(pillar_list)
 
         coords_blob = extract_coordinates_blob_from_cadastral_query(q)
-        if not coords_blob:
+        labelled_coords = bool(
+            re.search(r"coordinates\s+for\s+the\s+points?\s*[:=]", q, flags=re.IGNORECASE)
+        )
+        # Automated CAD / labelled Console blocks already have EmE,NmN (or bearings).
+        # A last-resort LLM here is only for free-text phrasing — never for labelled sheets.
+        if not coords_blob and not labelled_coords:
             coords_blob = resolve_cadastral_coordinates_blob(
                 q,
                 pillar_list=pillar_list,
                 llm=_simple_override_llm(),
-                run_with_timeout=self._run_with_timeout,
+                run_with_timeout=self._llm_run_with_timeout(simple_override_model),
                 vector_store=self.vector_store,
                 search_fn=self._vs_search,
             )
@@ -6508,7 +6715,6 @@ class SurvyAIAgent:
             q,
             re.IGNORECASE,
         ):
-            cad_pool.shutdown(wait=False)
             return {
                 "success": False,
                 "error": (
@@ -6537,6 +6743,7 @@ class SurvyAIAgent:
             getattr(self.settings, "cadastral_intent_assessment_enabled", True)
             and not (access_roads or fences)
             and (not skip_intent_assessment or extras_requested)
+            and not (labelled_coords and not extras_requested)
         )
         intent_title: Optional[str] = None
         if run_intent_assessment:
@@ -6551,9 +6758,6 @@ class SurvyAIAgent:
                 "Cadastral intent assessment skipped "
                 "(regex extras sufficient, assessment disabled, or skipped with no extras in user scope)"
             )
-
-        cad_future.result()
-        cad_pool.shutdown(wait=False)
 
         # Parse user-requested plot scale (honour explicit request; fit may coarsen later).
         # Prefer the composed cadastral prompt, then the parent user scope (Excel/batch),
@@ -14438,6 +14642,12 @@ class SurvyAIAgent:
         # 1) Explicit task signals in the CURRENT message (paths / file types / verbs).
         if looks_like_file_driven_task(q):
             return "task"
+        # Design / outline / how-to with no files is an explanation, not a tool run.
+        # Checked before task-verb substrings so "generate an outline" is not a CAD job.
+        from survyai.prompt_router import looks_like_advisory_explanation
+
+        if looks_like_advisory_explanation(q):
+            return "knowledge"
         task_verbs = (
             "plot", "draw", "generate", "create plan", "create a plan", "cadastral",
             "export", "convert", "compute volume", "cutfill", "cut fill", "idw",
@@ -14476,15 +14686,26 @@ class SurvyAIAgent:
         return "other"
 
     def _should_direct_answer_non_file_prompt(self, routing_query: str, prompt_action: Any, intent: str) -> bool:
-        """Bypass LangGraph/tools for self-contained non-file knowledge prompts."""
+        """Bypass LangGraph/tools for self-contained non-file explanations.
+
+        Tool-bound calls attach the full CAD/GIS schema and can sit until the
+        180s invoke limit on a long how-to. A single completion is the reliable
+        path whenever there is nothing to open, plot, or convert.
+        """
         q = (routing_query or "").strip()
         if not q:
             return False
         if looks_like_file_driven_task(q) or self._extract_document_paths(q):
             return False
-        if prompt_action.kind in ("current_fact_lookup", "permission_affirm"):
+        if self._extract_image_paths(q):
             return False
-        return bool(getattr(self.settings, "fast_mode_non_file_prompts", False) and intent == "knowledge")
+        if prompt_action.kind in ("current_fact_lookup", "permission_affirm", "permission_deny"):
+            return False
+        if intent == "knowledge" or str(getattr(prompt_action, "kind", "") or "") == "general_knowledge":
+            return True
+        from survyai.prompt_router import looks_like_advisory_explanation
+
+        return looks_like_advisory_explanation(q)
 
     def _run_direct_knowledge_answer(
         self,
@@ -14508,15 +14729,23 @@ class SurvyAIAgent:
         system = (
             "You are SurvyAI, a professional surveying, geospatial, and CAD assistant. "
             "Answer only the user's current question. Do not continue previous CAD/file tasks, "
-            "do not propose file operations, and do not mention unrelated prior work. "
-            "For surveying history/principles, be accurate, practical, and concise."
+            "do not claim you ran software or created files, and do not mention unrelated prior work. "
+            "When the user asks for steps, a workflow, or technical detail, give the full practical "
+            "answer they asked for: numbered steps, then the technical method for each step "
+            "(data, tools, checks). Be accurate and specific, and finish the answer."
         )
         user = (question or "").strip()
+        # High reasoning effort spends the timeout before any answer text exists.
+        # Output length stays on the normal agent budget.
+        answer_llm = self._explanation_llm(llm, model_name_used)
         msg, err, timed_out = self._run_with_timeout(
             timeout_seconds,
-            lambda: llm.invoke([SystemMessage(content=system), HumanMessage(content=user)]),
+            lambda: answer_llm.invoke(
+                [SystemMessage(content=system), HumanMessage(content=user)]
+            ),
             llm_model_name=model_name_used,
-            serialize_llm=True,
+            # Do not wait on a stuck tool-graph call. That gate is for local models.
+            serialize_llm=self._llm_is_ollama(llm),
         )
         if timed_out:
             return {
@@ -14533,6 +14762,18 @@ class SurvyAIAgent:
             "response": llm_visible_text_from_content(raw),
             "model_name": model_name_used,
         }
+
+    def _explanation_llm(self, llm: Any, model_name: Optional[str]) -> Any:
+        """Low reasoning effort so a how-to starts promptly. Token budget is unchanged."""
+        name = str(model_name or getattr(llm, "model_name", None) or getattr(llm, "model", "") or "")
+        try:
+            from survyai.openai_models import openai_model_needs_responses_api
+
+            if name and openai_model_needs_responses_api(name) and hasattr(llm, "model_copy"):
+                return llm.model_copy(update={"reasoning": {"effort": "low"}})
+        except Exception:
+            pass
+        return llm
 
     @staticmethod
     def _is_retry_request(current_query: str) -> bool:
@@ -17127,11 +17368,18 @@ class SurvyAIAgent:
             y: float = Field(description="Y coordinate (Northing or Latitude)")
             source_crs: str = Field(
                 "WGS84", 
-                description="Source coordinate reference system"
+                description=(
+                    "Source CRS: EPSG code or official/survey name. "
+                    "Keep datum+UTM together (e.g. 'ETRS89 / UTM zone 32N'). "
+                    "Bare 'UTM Zone 32N' means WGS 84 UTM."
+                )
             )
             target_crs: str = Field(
                 "WGS84", 
-                description="Target coordinate reference system"
+                description=(
+                    "Target CRS: EPSG code or official/survey name "
+                    "(e.g. 'Minna / Nigeria Mid Belt', 'NAD83 / UTM zone 17N')."
+                )
             )
             use_geographic_calculator: bool = Field(
                 False,
@@ -17159,7 +17407,13 @@ class SurvyAIAgent:
             # Detect if user explicitly requested Geographic Calculator
             # This is a simple heuristic - in practice, the LLM should detect this from context
             use_geocalc = kwargs.pop('use_geographic_calculator', False)
-            return str(self.blue_marble.convert_coordinate(use_geographic_calculator=use_geocalc, **kwargs))
+            result = self.blue_marble.convert_coordinate(use_geographic_calculator=use_geocalc, **kwargs)
+            try:
+                from tools.geographic_calculator_core import BlueMarbleConverter
+
+                return BlueMarbleConverter.format_conversion_user_text(result)
+            except Exception:
+                return str(result)
 
         class CoordConvertAutoInput(BaseModel):
             """
@@ -17225,25 +17479,31 @@ class SurvyAIAgent:
                     )
 
                 results = []
-                for p in points:
-                    r = self.blue_marble.convert_coordinate(
-                        x=p.x,
-                        y=p.y,
-                        source_crs=src,
-                        target_crs=dst,
-                        use_geographic_calculator=use_geographic_calculator,
-                    )
-                    results.append(
-                        {
-                            "parsed": {
-                                "x": p.x,
-                                "y": p.y,
-                                "kind": p.kind,
-                                "source_text": p.source_text,
-                                "notes": p.notes,
-                            },
-                            "conversion": r,
-                        }
+                self.blue_marble._batch_depth = getattr(self.blue_marble, "_batch_depth", 0) + 1
+                try:
+                    for p in points:
+                        r = self.blue_marble.convert_coordinate(
+                            x=p.x,
+                            y=p.y,
+                            source_crs=src,
+                            target_crs=dst,
+                            use_geographic_calculator=use_geographic_calculator,
+                        )
+                        results.append(
+                            {
+                                "parsed": {
+                                    "x": p.x,
+                                    "y": p.y,
+                                    "kind": p.kind,
+                                    "source_text": p.source_text,
+                                    "notes": p.notes,
+                                },
+                                "conversion": r,
+                            }
+                        )
+                finally:
+                    self.blue_marble._batch_depth = max(
+                        0, getattr(self.blue_marble, "_batch_depth", 1) - 1
                     )
 
                 payload = {
@@ -17253,6 +17513,14 @@ class SurvyAIAgent:
                     "count": len(results),
                     "results": results,
                 }
+                summary = self.blue_marble._summarize_conversion_results(  # noqa: SLF001
+                    [r.get("conversion") or {} for r in results], src, dst
+                )
+                self.blue_marble._publish_survey_summary(summary)  # noqa: SLF001
+                if summary.get("text"):
+                    payload["survey_notice"] = summary["text"]
+                if summary.get("transformation_text"):
+                    payload["transformation_text"] = summary["transformation_text"]
                 return json.dumps(payload, indent=2, ensure_ascii=False)
             except Exception as e:
                 return f"✗ Auto coordinate conversion failed: {e}"
@@ -17263,19 +17531,22 @@ class SurvyAIAgent:
             excel_path: str = Field(description="Path to Excel file containing coordinates")
             x_column: str = Field(
                 default="X",
-                description="Name of column containing X/Easting coordinates"
+                description="X/Easting column. If omitted, Easting/Northing columns are used when present."
             )
             y_column: str = Field(
                 default="Y",
-                description="Name of column containing Y/Northing coordinates"
+                description="Y/Northing column. If omitted, Easting/Northing columns are used when present."
             )
             source_crs: str = Field(
                 default="WGS84",
-                description="Source coordinate reference system"
+                description=(
+                    "Source CRS name or EPSG. Keep datum with UTM "
+                    "(e.g. 'UTM Zone 32N' or 'ETRS89 / UTM zone 32N')."
+                )
             )
             target_crs: str = Field(
                 default="WGS84",
-                description="Target coordinate reference system"
+                description="Target CRS name or EPSG (e.g. 'Minna / Nigeria Mid Belt')."
             )
             source_zone: Optional[int] = Field(
                 default=None,
@@ -17437,6 +17708,16 @@ class SurvyAIAgent:
                         if result.get("owners")
                         else ""
                     )
+                    + (
+                        f"\n\n{result.get('transformation_text')}"
+                        if result.get("transformation_text")
+                        else ""
+                    )
+                    + (
+                        f"\n\n{result.get('survey_notice')}"
+                        if result.get("survey_notice")
+                        else ""
+                    )
                 )
             except Exception as e:
                 return (
@@ -17572,6 +17853,10 @@ class SurvyAIAgent:
                         "computed_on": area_choice,
                     },
                 }
+                if conv.get("survey_notice"):
+                    summary["survey_notice"] = conv["survey_notice"]
+                if conv.get("transformation_text"):
+                    summary["transformation_text"] = conv["transformation_text"]
                 return json.dumps(summary, indent=2, ensure_ascii=False)
             except Exception as e:
                 return f"✗ Excel convert+area failed: {e}"
@@ -19335,6 +19620,25 @@ class SurvyAIAgent:
             out["llm_cost_usd"] = round(tracked, 6)
         else:
             out.setdefault("llm_cost_usd", 0.0)
+        try:
+            from agent.output_paths import consume_survey_notice
+
+            pending = consume_survey_notice()
+            notice = str(pending.get("text") or "").strip()
+            if notice:
+                response = str(out.get("response") or "")
+                if "SURVEY NOTICE" not in response.upper():
+                    parts: List[str] = []
+                    xf = str(pending.get("transformation") or "").strip()
+                    if xf and "transformation parameters" not in response.lower():
+                        parts.append(xf)
+                    parts.append(notice)
+                    suffix = "\n\n".join(parts)
+                    out["response"] = (
+                        f"{response}\n\n{suffix}".strip() if response else suffix
+                    )
+        except Exception:
+            pass
         return out
 
     def _llm_run_with_timeout(self, model_name: Optional[str] = None) -> Callable[..., Any]:
@@ -19833,10 +20137,23 @@ class SurvyAIAgent:
                     actual_query_for_routing = parts[-1].strip()
                     logger.info(f"🔍 Detected continuation query - extracted actual request: {actual_query_for_routing[:100]}...")
             elif "\n\n" in query:
-                # Fallback: get the last part after double newline
-                parts = query.split("\n\n")
-                actual_query_for_routing = parts[-1].strip()
-                logger.info(f"🔍 Detected continuation query - using last part: {actual_query_for_routing[:100]}...")
+                # Fallback: never take the last blank-line paragraph of a Plan 1…N
+                # CAD sheet (that is the keep-line, not the job). Prefer the
+                # cadastral current-request body when it is a Generate-.dwg plot.
+                cad_body = self._cadastral_user_message_body(query)
+                if self._should_fastpath_cadastral_cad_batch(cad_body) or self._should_fastpath_cadastral_cad(
+                    cad_body
+                ):
+                    actual_query_for_routing = cad_body
+                    logger.info(
+                        "Continuation fallback: using full cadastral current request "
+                        "(%s chars), not the last paragraph.",
+                        len(cad_body),
+                    )
+                else:
+                    parts = query.split("\n\n")
+                    actual_query_for_routing = parts[-1].strip()
+                    logger.info(f"🔍 Detected continuation query - using last part: {actual_query_for_routing[:100]}...")
 
         # ==================================================================
         # CONVERSATIONAL INTERNET-PERMISSION GRANT (anti-loop)
@@ -20161,6 +20478,25 @@ class SurvyAIAgent:
                     "context_retrieved": False,
                     "error": fast.get("error") if not fast.get("success") else None,
                 }
+
+            # FAST PATH (early): conventional cadastral Generate-.dwg (Automated CAD /
+            # Console Plan 1…Plan 10). Must run BEFORE complexity routing so a bundled
+            # multi-plan prompt is not sent to gpt-5.6-sol as one "complex" file job.
+            # Use the current-request body (after history markers), not a truncated
+            # routing tail — Automated CAD keep-lines have no .dwg and would miss.
+            _cad_src = self._cadastral_user_message_body(query) or tool_routing_query
+            if not self._extract_image_paths(_cad_src) and (
+                _pre_intent != "knowledge"
+                or self._should_fastpath_cadastral_cad_batch(_cad_src)
+                or self._should_fastpath_cadastral_cad(_cad_src)
+            ):
+                cad_fast = self._try_cadastral_cad_fastpath_result(
+                    _cad_src,
+                    query=query,
+                    use_fallback=use_fallback,
+                )
+                if cad_fast is not None:
+                    return cad_fast
 
             # VISION OCR (images): preprocess only — LangGraph stays text-only.
             self._vision_ocr_context = None
@@ -20493,6 +20829,23 @@ class SurvyAIAgent:
                             "If the user asked about this image, explain the failure clearly."
                         )
 
+            # Second CAD chance after OCR (image attachments skip the earlier CAD gate).
+            # Must still run BEFORE complexity routing so multi-plan Automated CAD is
+            # not billed as one gpt-5.6-sol file job.
+            _cad_src = self._cadastral_user_message_body(query) or tool_routing_query
+            if not self._extract_image_paths(_cad_src) and (
+                _pre_intent != "knowledge"
+                or self._should_fastpath_cadastral_cad_batch(_cad_src)
+                or self._should_fastpath_cadastral_cad(_cad_src)
+            ):
+                cad_fast = self._try_cadastral_cad_fastpath_result(
+                    _cad_src,
+                    query=query,
+                    use_fallback=use_fallback,
+                )
+                if cad_fast is not None:
+                    return cad_fast
+
             prompt_action = self._assess_prompt_action(
                 raw_query=query,
                 routing_query=routing_query,
@@ -20554,7 +20907,37 @@ class SurvyAIAgent:
                 intent=intent,
                 kind=str(getattr(prompt_action, "kind", "") or ""),
             )
-            if should_use_llm_prompt_router(
+            cadastral_deterministic = bool(
+                self._should_fastpath_cadastral_cad_batch(tool_routing_query)
+                or self._should_fastpath_cadastral_cad(tool_routing_query)
+            )
+            if cadastral_deterministic and tier_override is None and not fast_mode_forced_simple:
+                complexity = "simple"
+                logger.info("Model tier: simple (conventional cadastral CAD plot)")
+
+            from survyai.prompt_router import looks_like_advisory_explanation
+
+            explanatory = bool(
+                not file_driven_route
+                and not cadastral_deterministic
+                and (
+                    intent == "knowledge"
+                    or str(getattr(prompt_action, "kind", "") or "") == "general_knowledge"
+                    or looks_like_advisory_explanation(route_query)
+                )
+            )
+            if explanatory and tier_override is None and not fast_mode_forced_simple:
+                if complexity == "complex":
+                    complexity = "average"
+                logger.info(
+                    "Explanatory non-file question — keep tier at %s and skip the paid router",
+                    complexity,
+                )
+
+            if (
+                not cadastral_deterministic
+                and not explanatory
+                and should_use_llm_prompt_router(
                 provider=active_provider,
                 enable_tiered=bool(getattr(self.settings, "enable_tiered_models", True)),
                 enable_llm_prompt_router=bool(
@@ -20563,6 +20946,7 @@ class SurvyAIAgent:
                 user_tier_override=tier_override,
                 fast_mode_forced_simple=fast_mode_forced_simple,
                 heuristic_confidence=route_confidence,
+            )
             ):
                 route = self._route_task_with_cheap_model(
                     provider=active_provider,
@@ -20598,7 +20982,11 @@ class SurvyAIAgent:
             if not used_llm_router:
                 # Assessment may require a stronger tier (e.g. factual web synthesis).
                 _tier_rank = {"simple": 0, "average": 1, "complex": 2}
-                if _tier_rank.get(prompt_action.min_complexity, 0) > _tier_rank.get(complexity, 0):
+                if (
+                    not cadastral_deterministic
+                    and not explanatory
+                    and _tier_rank.get(prompt_action.min_complexity, 0) > _tier_rank.get(complexity, 0)
+                ):
                     complexity = prompt_action.min_complexity
                     logger.info("Model tier raised by prompt assessment: %s", complexity)
                 elevated_average = bool(
@@ -20698,11 +21086,20 @@ class SurvyAIAgent:
             # This is intentionally before any tool-enabled graph execution to avoid
             # stale CAD/file context and multi-minute planner loops for simple Q&A.
             if self._should_direct_answer_non_file_prompt(routing_query, prompt_action, intent):
+                question = prompt_action.effective_query or routing_query
+                # Long outlines use the normal invoke budget so a full answer is not
+                # cut off. Short questions stay on a tighter limit.
+                long_answer = len((question or "").split()) > 40
+                direct_timeout = (
+                    int(getattr(self.settings, "llm_invoke_timeout_seconds", 180) or 180)
+                    if long_answer
+                    else 60
+                )
                 direct = self._run_direct_knowledge_answer(
-                    question=prompt_action.effective_query or routing_query,
+                    question=question,
                     llm=llm_to_use,
                     model_name_used=model_name_used,
-                    timeout_seconds=60,
+                    timeout_seconds=direct_timeout,
                 )
                 llm_used = "fallback" if use_fallback else "primary"
                 return {
@@ -21054,112 +21451,15 @@ class SurvyAIAgent:
                     fast.get("error"),
                 )
 
-            # FAST PATH: cadastral CAD prompt (template DWG -> output DWG with parcel replot)
-            if self._should_fastpath_cadastral_cad_batch(tool_routing_query):
-                fast = self._run_cadastral_cad_batch_pipeline(tool_routing_query)
-                llm_used = "fallback" if use_fallback else "primary"
-                if fast.get("success"):
-                    from agent.cadastral_intent import format_cadastral_status_message
-
-                    extra = []
-                    for item in fast.get("results") or []:
-                        idx = item.get("_plan_index")
-                        if item.get("success"):
-                            extra.append(f"• Plan {idx}: {item.get('output_dwg')}")
-                        else:
-                            err = item.get("error") or "Failed"
-                            extra.append(f"• Plan {idx}: Failed ({err})")
-                    return {
-                        "query": query,
-                        "response": format_cadastral_status_message(
-                            opener="Batch cadastral plotting complete.",
-                            bullets=[
-                                f"Plans requested: {fast.get('plans_total')}",
-                                f"Successful: {fast.get('plans_success')}",
-                                f"Failed: {fast.get('plans_failed')}",
-                            ],
-                            extra_lines=extra,
-                        ),
-                        "llm_used": llm_used,
-                        "model_name": model_name_used,
-                        "complexity": complexity,
-                        "success": True,
-                        "session_id": self.get_session_id(),
-                        "context_retrieved": False,
-                        "output_path": None,
-                    }
-                return {
-                    "query": query,
-                    "response": str(fast),
-                    "llm_used": llm_used,
-                    "model_name": model_name_used,
-                    "complexity": complexity,
-                    "success": False,
-                    "session_id": self.get_session_id(),
-                    "context_retrieved": False,
-                    "output_path": None,
-                    "error": fast.get("error") if isinstance(fast, dict) else "Batch cadastral pipeline failed",
-                }
-
-            if self._should_fastpath_cadastral_cad(tool_routing_query):
-                fast = self._run_cadastral_cad_prompt_pipeline(tool_routing_query)
-                llm_used = "fallback" if use_fallback else "primary"
-                if fast.get("success"):
-                    self._last_cadastral_output_dwg = fast.get("output_dwg")
-                    self._last_cadastral_profile_path = fast.get("profile_path")
-                    try:
-                        from agent.cadastral_intent import format_cadastral_plot_success_message
-
-                        success_text = format_cadastral_plot_success_message(
-                            output_dwg=fast.get("output_dwg"),
-                            geometry=fast.get("geometry") if isinstance(fast.get("geometry"), dict) else {},
-                            access_road_title=fast.get("access_road_title"),
-                            opener="Cadastral plan ready.",
-                        )
-                    except Exception:
-                        success_text = (
-                            "Cadastral plan ready.\n\n"
-                            f"File\n{fast.get('output_dwg') or '—'}\n"
-                        )
-                    return {
-                        "query": query,
-                        "response": success_text,
-                        "llm_used": llm_used,
-                        "model_name": model_name_used,
-                        "complexity": complexity,
-                        "success": True,
-                        "session_id": self.get_session_id(),
-                        "context_retrieved": False,
-                        "output_path": fast.get("output_dwg"),
-                    }
-                # Do not hard-fail when the prompt only *mentioned* coordinates but left
-                # values in Excel/files — let the agent compose a valid cadastral prompt.
-                err_txt = str((fast or {}).get("error") or "")
-                if coordinates_deferred_to_external_source(tool_routing_query) or (
-                    "could not parse coordinates" in err_txt.lower()
-                    and any(
-                        k in (tool_routing_query or "").lower()
-                        for k in ("excel", ".xlsx", ".xls", "spreadsheet")
-                    )
-                ):
-                    logger.warning(
-                        "Cadastral fastpath failed on deferred/Excel coords (%s); "
-                        "falling through to agent tools.",
-                        err_txt,
-                    )
-                else:
-                    return {
-                        "query": query,
-                        "response": str(fast),
-                        "llm_used": llm_used,
-                        "model_name": model_name_used,
-                        "complexity": complexity,
-                        "success": False,
-                        "session_id": self.get_session_id(),
-                        "context_retrieved": False,
-                        "output_path": None,
-                        "error": fast.get("error") if isinstance(fast, dict) else "Fastpath cadastral pipeline failed",
-                    }
+            # FAST PATH: cadastral CAD prompt (after OCR / if early path was skipped).
+            _cad_src = self._cadastral_user_message_body(query) or tool_routing_query
+            cad_fast = self._try_cadastral_cad_fastpath_result(
+                _cad_src,
+                query=query,
+                use_fallback=use_fallback,
+            )
+            if cad_fast is not None:
+                return cad_fast
 
             # FAST PATH: in-session CAD plan modifications (add road, change title, etc.)
             # Template remains read-only; modifications apply to the output plan file (even if open).

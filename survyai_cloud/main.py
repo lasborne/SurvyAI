@@ -21,6 +21,7 @@ from survyai_cloud.db import init_db, is_database_available
 from survyai_cloud.routers import (
     admin,
     auth,
+    beta,
     billing,
     diagnostics,
     devices,
@@ -127,6 +128,7 @@ def create_app() -> FastAPI:
         )
 
     app.include_router(health.router)
+    app.include_router(beta.router, prefix="/v1")
     app.include_router(auth.router, prefix="/v1")
     app.include_router(me.router, prefix="/v1")
     app.include_router(admin.router, prefix="/v1")

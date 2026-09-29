@@ -17,7 +17,11 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from utils.coordinate_parsing import parse_angle
+from utils.coordinate_parsing import (
+    extract_named_datum,
+    is_ellipsoid_only_crs_label,
+    parse_angle,
+)
 
 try:
     import pythoncom
@@ -622,26 +626,32 @@ class BlueMarbleConverter:
         """
         # Default: Use pyproj (fast, reliable, no external dependencies)
         if not use_geographic_calculator:
-            return self._convert_with_pyproj(x, y, z, source_crs, target_crs, source_zone, target_zone)
-        
-        # User explicitly requested Geographic Calculator - try COM if available
-        # Lazy-connect so COM isn't triggered during unrelated workflows.
-        if use_geographic_calculator and (self.geocalc is None):
-            self.geocalc = self._connect_via_com()
-
-        if self.geocalc:
-            try:
-                result = self._convert_with_com(x, y, z, source_crs, target_crs, source_zone, target_zone)
-                logger.debug("Used Geographic Calculator COM as requested")
-                return result
-            except Exception as exc:
-                logger.warning("Geographic Calculator COM conversion failed; falling back to pyproj: %s", exc)
-                # Fall through to pyproj fallback
+            result = self._convert_with_pyproj(x, y, z, source_crs, target_crs, source_zone, target_zone)
         else:
-            logger.debug("Geographic Calculator COM not available; using pyproj as requested")
-        
-        # Always fallback to pyproj (even if user requested COM but it's unavailable/failed)
-        return self._convert_with_pyproj(x, y, z, source_crs, target_crs, source_zone, target_zone)
+            # User explicitly requested Geographic Calculator - try COM if available
+            # Lazy-connect so COM isn't triggered during unrelated workflows.
+            if self.geocalc is None:
+                self.geocalc = self._connect_via_com()
+
+            if self.geocalc:
+                try:
+                    result = self._convert_with_com(x, y, z, source_crs, target_crs, source_zone, target_zone)
+                    logger.debug("Used Geographic Calculator COM as requested")
+                    result = self._enrich_conversion_result(
+                        result, source_crs, target_crs, source_zone, target_zone,
+                    )
+                except Exception as exc:
+                    logger.warning("Geographic Calculator COM conversion failed; falling back to pyproj: %s", exc)
+                    result = self._convert_with_pyproj(x, y, z, source_crs, target_crs, source_zone, target_zone)
+            else:
+                logger.debug("Geographic Calculator COM not available; using pyproj as requested")
+                result = self._convert_with_pyproj(x, y, z, source_crs, target_crs, source_zone, target_zone)
+
+        if not getattr(self, "_batch_depth", 0):
+            self._publish_survey_summary(
+                self._summarize_conversion_results([result], source_crs, target_crs)
+            )
+        return result
     
     def _normalize_crs_name(self, crs: str, zone: Optional[int] = None) -> str:
         """Normalize CRS name for Geographic Calculator COM interface."""
@@ -752,11 +762,9 @@ class BlueMarbleConverter:
         self, x: float, y: float, z: Optional[float],
         source_crs: str, target_crs: str, source_zone: Optional[int], target_zone: Optional[int],
     ) -> Dict[str, Any]:
-        from pyproj import CRS, Transformer
-
         source = self._resolve_crs_pyproj(source_crs, source_zone, role="source")
         target = self._resolve_crs_pyproj(target_crs, target_zone, role="target")
-        transformer = Transformer.from_crs(source, target, always_xy=True)
+        transformer = self._cached_transformer(source, target)
         
         if z is not None:
             x_new, y_new, z_new = transformer.transform(x, y, z)
@@ -777,7 +785,9 @@ class BlueMarbleConverter:
             result["source"]["z"] = z
             result["target"]["z"] = float(z_new)
         logger.debug("Converted using pyproj: %s -> %s", source_crs, target_crs)
-        return result
+        return self._enrich_conversion_result(
+            result, source_crs, target_crs, source_zone, target_zone, transformer=transformer,
+        )
     
     @staticmethod
     def _crs_summary(crs_obj: Any) -> Dict[str, Any]:
@@ -790,7 +800,26 @@ class BlueMarbleConverter:
             name = getattr(crs_obj, "name", None) or str(crs_obj)
         except Exception:
             name = str(crs_obj)
-        return {"authority": auth, "name": name}
+        summary: Dict[str, Any] = {"authority": auth, "name": name}
+        try:
+            summary["epsg"] = crs_obj.to_epsg()
+        except Exception:
+            summary["epsg"] = None
+        try:
+            summary["datum"] = getattr(getattr(crs_obj, "datum", None), "name", None)
+        except Exception:
+            pass
+        try:
+            axes = getattr(crs_obj, "axis_info", None) or []
+            if axes:
+                summary["units"] = str(getattr(axes[0], "unit_name", None) or "")
+                summary["axis_order"] = [
+                    str(getattr(ax, "abbrev", None) or getattr(ax, "name", "") or "")
+                    for ax in axes[:2]
+                ]
+        except Exception:
+            pass
+        return summary
 
     @staticmethod
     def _normalize_user_crs_text(text: str) -> str:
@@ -805,6 +834,622 @@ class BlueMarbleConverter:
         t = re.sub(r"\bmidbelt\b", "mid belt", t, flags=re.IGNORECASE)
         t = re.sub(r"\bmid-belt\b", "mid belt", t, flags=re.IGNORECASE)
         return t.strip()
+
+    @staticmethod
+    def _compact_crs_key(text: str) -> str:
+        return re.sub(r"[\s_\-/]+", " ", (text or "").strip().lower())
+
+    _CRS_NAME_ALIASES = {
+        "minna ntm midbelt": "EPSG:26392",
+        "minna ntm mid belt": "EPSG:26392",
+        "minna nigeria ntm midbelt": "EPSG:26392",
+        "minna nigeria ntm mid belt": "EPSG:26392",
+        "nsidc sea ice polar stereographic north": "EPSG:3413",
+        "wgs 84 nsidc sea ice polar stereographic north": "EPSG:3413",
+        "wgs 84 / nsidc sea ice polar stereographic north": "EPSG:3413",
+        "international terrestrial reference frame 2014": "EPSG:9000",
+        "international terrestrial reference frame 2008": "EPSG:8999",
+        "international terrestrial reference frame 2000": "EPSG:8997",
+        "british national grid": "EPSG:27700",
+        "osgb36": "EPSG:27700",
+        "web mercator": "EPSG:3857",
+        "world mercator": "EPSG:3395",
+    }
+
+    _GEOG_EPSG_BY_DATUM = {
+        "WGS 84": 4326,
+        "NAD83": 4269,
+        "NAD83(2011)": 6318,
+        "NAD83(CSRS)": 4617,
+        "NAD83(HARN)": 4152,
+        "NAD83(NSRS2007)": 4759,
+        "NAD27": 4267,
+        "ETRS89": 4258,
+        "GDA94": 4283,
+        "GDA2020": 7844,
+        "SIRGAS 2000": 4674,
+        "SAD69": 4618,
+        "PSAD56": 4248,
+        "ED50": 4230,
+        "Arc 1960": 4210,
+        "Arc 1950": 4209,
+        "ITRF2014": 9000,
+        "ITRF2008": 8999,
+        "ITRF2000": 8997,
+        "OSGB36": 4277,
+        "Minna": 4263,
+        "NZGD2000": 4167,
+        "NZGD49": 4272,
+        "Hartebeesthoek94": 4148,
+        "AGD66": 4202,
+        "AGD84": 4203,
+        "Tokyo": 4301,
+        "Pulkovo 1942": 4178,
+        "Kertau 1968": 4245,
+        "Timbalai 1948": 4298,
+    }
+
+    _PROJECTED_WITHOUT_UTM = re.compile(
+        r"\b(ntm|mid belt|west belt|east belt|stereographic|mercator|lambert|"
+        r"albers|polar|ups\b|state plane|spcs|national grid|transverse mercator|"
+        r"mga)\b",
+        flags=re.IGNORECASE,
+    )
+
+    def _cached_transformer(self, source: Any, target: Any):
+        from pyproj import Transformer
+
+        cache = getattr(self, "_transformer_cache", None)
+        if cache is None:
+            self._transformer_cache = cache = {}
+        key = (id(source), id(target))
+        transformer = cache.get(key)
+        if transformer is None:
+            transformer = Transformer.from_crs(source, target, always_xy=True)
+            cache[key] = transformer
+        return transformer
+
+    def _area_of_use_warning(
+        self, crs_obj: Any, x: float, y: float, *, role: str = "source",
+    ) -> Optional[str]:
+        """Advise when metres/degrees fall outside the CRS published usage box."""
+        aou = getattr(crs_obj, "area_of_use", None)
+        if aou is None:
+            return None
+        try:
+            if getattr(crs_obj, "is_geographic", False):
+                lon, lat = float(x), float(y)
+            else:
+                geog = getattr(crs_obj, "geodetic_crs", None)
+                if geog is None:
+                    return None
+                to_geog = self._cached_transformer(crs_obj, geog)
+                lon, lat = to_geog.transform(x, y)
+            west, south, east, north = aou.west, aou.south, aou.east, aou.north
+            if south <= lat <= north:
+                if west <= east:
+                    in_lon = west <= lon <= east
+                else:
+                    in_lon = lon >= west or lon <= east
+            else:
+                in_lon = False
+            if in_lon:
+                return None
+            name = getattr(crs_obj, "name", "the CRS")
+            label = "Source" if role == "source" else "Converted"
+            return (
+                f"{label} coordinates (E={float(x):.3f}, N={float(y):.3f}) are outside "
+                f"the EPSG area of use for {name} "
+                f"({west:.2f}°–{east:.2f}°E, {south:.2f}°–{north:.2f}°N)."
+            )
+        except Exception:
+            return None
+
+    def _implausible_range_warning(self, crs_obj: Any, x: float, y: float, *, role: str) -> Optional[str]:
+        """Catch values that cannot be legitimate metres/degrees in the named CRS."""
+        name = getattr(crs_obj, "name", None) or "the CRS"
+        nlow = str(name).lower()
+        label = "Source" if role == "source" else "Converted"
+        try:
+            if getattr(crs_obj, "is_geographic", False):
+                if abs(x) > 180.5 or abs(y) > 90.5:
+                    return (
+                        f"{label} values (E={x:.3f}, N={y:.3f}) are not geographic degrees "
+                        f"for {name}."
+                    )
+                return None
+            ax, ay = abs(float(x)), abs(float(y))
+            utm_like = ("utm" in nlow) or ("mga" in nlow)
+            if utm_like and (ax > 1.5e6 or ay > 2.0e7 or ax < 1.0):
+                return (
+                    f"{label} values E={x:.3f}, N={y:.3f} are outside the usual UTM/MGA "
+                    f"metre range for {name}. They are likely in a different system or zone."
+                )
+            if ax > 5.0e7 or ay > 5.0e7:
+                return (
+                    f"{label} values E={x:.3f}, N={y:.3f} are implausibly large for {name}."
+                )
+        except Exception:
+            return None
+        return None
+
+    def _kind_mismatch_warning(self, crs_obj: Any, x: float, y: float) -> Optional[str]:
+        """Degrees fed into a metre grid, or metres fed into a geographic CRS."""
+        name = getattr(crs_obj, "name", None) or "the source CRS"
+        try:
+            if getattr(crs_obj, "is_geographic", False):
+                if abs(float(x)) > 180.5 or abs(float(y)) > 90.5:
+                    return (
+                        f"Source CRS '{name}' is geographic (degrees) but the values "
+                        f"({x:.3f}, {y:.3f}) look like projected metres."
+                    )
+                return None
+            if not getattr(crs_obj, "is_projected", False):
+                return None
+            if abs(float(x)) > 180.0 or abs(float(y)) > 90.0:
+                return None
+            false_easting = 0.0
+            try:
+                conv = (crs_obj.to_json_dict() or {}).get("conversion") or {}
+                for item in conv.get("parameters") or []:
+                    pname = str(item.get("name") or "").lower()
+                    if "false easting" in pname:
+                        false_easting = abs(float(item.get("value") or 0.0))
+                        break
+            except Exception:
+                false_easting = 0.0
+            if false_easting > 1000.0:
+                return (
+                    f"Source CRS '{name}' is projected (metres) but the values "
+                    f"({x:.3f}, {y:.3f}) look like latitude/longitude."
+                )
+        except Exception:
+            return None
+        return None
+
+    def _transformer_group(self, source: Any, target: Any):
+        from pyproj.transformer import TransformerGroup
+
+        cache = getattr(self, "_tg_cache", None)
+        if cache is None:
+            self._tg_cache = cache = {}
+        key = (id(source), id(target))
+        if key not in cache:
+            cache[key] = TransformerGroup(source, target, always_xy=True)
+        return cache[key]
+
+    def _reporting_transformer(
+        self,
+        source: Any,
+        target: Any,
+        transformer: Any,
+        sample: Optional[Tuple[float, float, float, float]] = None,
+    ):
+        """Return the PROJ pipeline that actually produced the converted point."""
+        try:
+            if transformer is not None and list(getattr(transformer, "operations", None) or []):
+                return transformer
+        except Exception:
+            pass
+        try:
+            group = self._transformer_group(source, target)
+        except Exception:
+            return transformer
+        candidates = list(getattr(group, "transformers", None) or [])
+        if sample and candidates:
+            x, y, x_new, y_new = sample
+            for cand in candidates:
+                try:
+                    cx, cy = cand.transform(x, y)
+                    if abs(float(cx) - float(x_new)) <= 0.002 and abs(float(cy) - float(y_new)) <= 0.002:
+                        return cand
+                except Exception:
+                    continue
+        return candidates[0] if candidates else transformer
+
+    def _transformation_report(
+        self,
+        source: Any,
+        target: Any,
+        transformer: Any = None,
+        sample: Optional[Tuple[float, float, float, float]] = None,
+    ) -> Dict[str, Any]:
+        """Explicit PROJ steps, Helmert/grid parameters, and axis convention."""
+        report: Dict[str, Any] = {
+            "engine": "PROJ/pyproj",
+            "always_xy": True,
+            "axis_convention": "X/Easting then Y/Northing (always_xy=True)",
+            "source": self._crs_summary(source),
+            "target": self._crs_summary(target),
+            "operations": [],
+            "grids": [],
+            "pipeline": None,
+            "accuracy_m": None,
+            "pipeline_name": None,
+        }
+        if transformer is None:
+            try:
+                transformer = self._cached_transformer(source, target)
+            except Exception:
+                transformer = None
+        reporter = self._reporting_transformer(source, target, transformer, sample)
+        if reporter is None:
+            return report
+        try:
+            report["pipeline_name"] = getattr(reporter, "description", None) or getattr(
+                reporter, "name", None
+            )
+        except Exception:
+            pass
+        try:
+            report["accuracy_m"] = getattr(reporter, "accuracy", None)
+        except Exception:
+            pass
+        try:
+            report["pipeline"] = reporter.to_proj4()
+        except Exception:
+            report["pipeline"] = None
+        if not report["pipeline"]:
+            try:
+                desc = getattr(reporter, "description", None)
+                if desc:
+                    report["pipeline"] = str(desc)
+            except Exception:
+                pass
+        ops: List[Dict[str, Any]] = []
+        grids: List[str] = []
+        try:
+            for op in getattr(reporter, "operations", None) or []:
+                item: Dict[str, Any] = {
+                    "name": getattr(op, "name", None),
+                    "method": getattr(op, "method_name", None),
+                    "accuracy_m": getattr(op, "accuracy", None),
+                }
+                params: Dict[str, Any] = {}
+                try:
+                    for p in getattr(op, "params", None) or []:
+                        pname = str(getattr(p, "name", "") or "")
+                        params[pname] = getattr(p, "value", None)
+                except Exception:
+                    params = {}
+                method_l = str(item.get("method") or item.get("name") or "").lower()
+                keep_all = any(
+                    k in method_l
+                    for k in (
+                        "helmert",
+                        "position vector",
+                        "molodensky",
+                        "coordinate frame",
+                        "geocentric translation",
+                    )
+                )
+                interesting = {}
+                for pname, pval in params.items():
+                    pl = pname.lower()
+                    if keep_all or any(
+                        k in pl
+                        for k in (
+                            "x-axis", "y-axis", "z-axis", "scale difference",
+                            "translation", "rotation", "towgs",
+                        )
+                    ):
+                        interesting[pname] = pval
+                if interesting:
+                    item["parameters"] = interesting
+                elif keep_all and report.get("pipeline"):
+                    helmert = self._helmert_from_pipeline(str(report["pipeline"]))
+                    if helmert:
+                        item["parameters"] = helmert
+                try:
+                    for g in getattr(op, "grids", None) or []:
+                        gname = str(
+                            getattr(g, "short_name", None)
+                            or getattr(g, "full_name", None)
+                            or g
+                        )
+                        if gname and gname not in grids:
+                            grids.append(gname)
+                except Exception:
+                    pass
+                ops.append(item)
+        except Exception:
+            pass
+        if not ops:
+            helmert = self._helmert_from_pipeline(str(report.get("pipeline") or ""))
+            if helmert:
+                ops.append(
+                    {
+                        "name": report.get("pipeline_name") or "Helmert datum shift",
+                        "method": "Helmert",
+                        "parameters": helmert,
+                    }
+                )
+        report["operations"] = ops
+        report["grids"] = grids
+        return report
+
+    @staticmethod
+    def _helmert_from_pipeline(pipeline: str) -> Dict[str, Any]:
+        if not pipeline or "helmert" not in pipeline.lower():
+            return {}
+        out: Dict[str, Any] = {}
+        for token in pipeline.replace("\n", " ").split():
+            if not token.startswith("+"):
+                continue
+            body = token[1:]
+            if "=" not in body:
+                continue
+            key, val = body.split("=", 1)
+            if key in {"x", "y", "z", "rx", "ry", "rz", "s", "convention"}:
+                label = {
+                    "x": "X translation (m)",
+                    "y": "Y translation (m)",
+                    "z": "Z translation (m)",
+                    "rx": "X rotation (arcsec)",
+                    "ry": "Y rotation (arcsec)",
+                    "rz": "Z rotation (arcsec)",
+                    "s": "Scale (ppm)",
+                    "convention": "Rotation convention",
+                }[key]
+                out[label] = val
+        return out
+
+    @staticmethod
+    def format_transformation_block(report: Optional[Dict[str, Any]]) -> str:
+        """Human-readable transformation parameters for Console / GUI."""
+        if not report:
+            return ""
+        lines = [
+            "Transformation parameters (PROJ/pyproj; axis order Easting/X then Northing/Y):"
+        ]
+        src = report.get("source") or {}
+        tgt = report.get("target") or {}
+
+        def _crs_line(label: str, info: Dict[str, Any]) -> str:
+            auth = info.get("authority")
+            epsg = info.get("epsg")
+            extra = ""
+            if epsg:
+                extra = f" EPSG:{epsg}"
+            elif auth:
+                extra = f" {auth}"
+            datum = info.get("datum")
+            datum_bit = f"; datum {datum}" if datum else ""
+            return f"  {label}: {info.get('name') or '?'}{extra}{datum_bit}"
+
+        lines.append(_crs_line("Source", src))
+        lines.append(_crs_line("Target", tgt))
+        pname = report.get("pipeline_name")
+        acc = report.get("accuracy_m")
+        if pname:
+            acc_bit = ""
+            try:
+                if acc is not None and float(acc) >= 0:
+                    acc_bit = f" (nominal accuracy ~ {acc} m)"
+            except Exception:
+                acc_bit = ""
+            lines.append(f"  Pipeline: {pname}{acc_bit}")
+        ops = report.get("operations") or []
+        if not ops:
+            pipe = str(report.get("pipeline") or "").strip()
+            if pipe:
+                lines.append(f"  Pipeline: {pipe[:400]}")
+        for i, op in enumerate(ops, 1):
+            acc = op.get("accuracy_m")
+            acc_bit = ""
+            try:
+                if acc is not None and float(acc) >= 0:
+                    acc_bit = f" (nominal accuracy ~ {acc} m)"
+            except Exception:
+                acc_bit = ""
+            lines.append(
+                f"  {i}. {op.get('name') or op.get('method') or 'operation'}{acc_bit}"
+            )
+            params = op.get("parameters") or {}
+            for pname, pval in params.items():
+                lines.append(f"      {pname}: {pval}")
+        grids = report.get("grids") or []
+        if grids:
+            lines.append("  Grid files: " + ", ".join(str(g) for g in grids))
+        elif ops:
+            methods = " ".join(
+                str(op.get("method") or op.get("name") or "") for op in ops
+            ).lower()
+            src_d = str((src or {}).get("datum") or "")
+            tgt_d = str((tgt or {}).get("datum") or "")
+            has_shift_params = any(op.get("parameters") for op in ops)
+            if (
+                src_d
+                and tgt_d
+                and src_d != tgt_d
+                and not has_shift_params
+                and "helmert" not in methods
+                and "grid" not in methods
+                and "geocentric" not in methods
+                and "position vector" not in methods
+            ):
+                lines.append(
+                    "  Datum shift: no Helmert parameters or NTv2 grid were applied "
+                    "(PROJ may have used a ballpark/null shift). Treat as provisional."
+                )
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_conversion_user_text(result: Optional[Dict[str, Any]]) -> str:
+        """Console-ready conversion report: coordinates, parameters, one survey notice."""
+        if not result:
+            return ""
+        if result.get("error"):
+            return f"Conversion error: {result['error']}"
+        src = result.get("source") or {}
+        tgt = result.get("target") or {}
+        lines = [
+            f"Converted: E {src.get('x')}, N {src.get('y')}  ->  E {tgt.get('x')}, N {tgt.get('y')}",
+            f"Source CRS: {src.get('crs')}",
+            f"Target CRS: {tgt.get('crs')}",
+            f"Method: {result.get('method')}",
+        ]
+        resolved = result.get("resolved") or {}
+        if resolved:
+            s = resolved.get("source") or {}
+            t = resolved.get("target") or {}
+            if s:
+                lines.append(f"Resolved source: {s.get('name')} {s.get('authority') or ''}".rstrip())
+            if t:
+                lines.append(f"Resolved target: {t.get('name')} {t.get('authority') or ''}".rstrip())
+        xf = BlueMarbleConverter.format_transformation_block(result.get("transformation"))
+        if xf:
+            lines.append(xf)
+        warns = result.get("warnings") or []
+        if warns:
+            lines.append("SURVEY NOTICE: " + warns[0])
+            if len(warns) > 1:
+                lines.append(warns[1])
+        return "\n".join(str(x) for x in lines)
+
+    def _collect_point_warnings(
+        self,
+        source: Any,
+        target: Any,
+        x: float,
+        y: float,
+        x_new: float,
+        y_new: float,
+    ) -> List[str]:
+        warnings: List[str] = []
+        for w in (
+            self._kind_mismatch_warning(source, x, y),
+            self._implausible_range_warning(source, x, y, role="source"),
+            self._area_of_use_warning(source, x, y, role="source"),
+            self._implausible_range_warning(target, x_new, y_new, role="target"),
+            self._area_of_use_warning(target, x_new, y_new, role="target"),
+        ):
+            if w:
+                warnings.append(w)
+        return warnings
+
+    def _enrich_conversion_result(
+        self,
+        result: Dict[str, Any],
+        source_crs: str,
+        target_crs: str,
+        source_zone: Optional[int],
+        target_zone: Optional[int],
+        transformer: Any = None,
+    ) -> Dict[str, Any]:
+        if not result or result.get("error"):
+            return result
+        try:
+            source = self._resolve_crs_pyproj(source_crs, source_zone, role="source")
+            target = self._resolve_crs_pyproj(target_crs, target_zone, role="target")
+        except Exception:
+            return result
+        src = result.get("source") or {}
+        tgt = result.get("target") or {}
+        try:
+            x = float(src.get("x"))
+            y = float(src.get("y"))
+            x_new = float(tgt.get("x"))
+            y_new = float(tgt.get("y"))
+        except Exception:
+            return result
+        if transformer is None:
+            try:
+                transformer = self._cached_transformer(source, target)
+            except Exception:
+                transformer = None
+        result["transformation"] = self._transformation_report(
+            source, target, transformer, sample=(x, y, x_new, y_new),
+        )
+        warnings = self._collect_point_warnings(source, target, x, y, x_new, y_new)
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    @staticmethod
+    def _summarize_conversion_results(
+        results: List[Dict[str, Any]],
+        source_crs: str,
+        target_crs: str,
+    ) -> Dict[str, Any]:
+        total = len(results or [])
+        warned = [r for r in (results or []) if r.get("warnings")]
+        example = None
+        codes: List[str] = []
+        for r in warned:
+            for w in r.get("warnings") or []:
+                if example is None:
+                    tgt = r.get("target") or {}
+                    example = (tgt.get("x"), tgt.get("y"), w)
+                low = str(w).lower()
+                if "implausibl" in low or "usual utm/mga" in low:
+                    codes.append("implausible")
+                elif "outside" in low and "area of use" in low:
+                    codes.append("area_of_use")
+                elif "look like" in low:
+                    codes.append("kind_mismatch")
+        transform = None
+        for r in results or []:
+            if r.get("transformation"):
+                transform = r["transformation"]
+                break
+        n_warn = len(warned)
+        severe = bool(
+            "implausible" in codes
+            or "kind_mismatch" in codes
+            or (total > 0 and n_warn >= max(1, int(0.5 * total)) and "area_of_use" in codes)
+        )
+        lines: List[str] = []
+        if n_warn:
+            lines.append(
+                f"SURVEY NOTICE: {n_warn} of {total} converted point(s) look off "
+                f"for {source_crs} -> {target_crs}."
+            )
+            if example:
+                ex, ny, w0 = example
+                try:
+                    lines.append(
+                        f"Example: E={float(ex):.3f}, N={float(ny):.3f}. {w0}"
+                    )
+                except Exception:
+                    lines.append(str(w0))
+            lines.append(
+                "Conversion still ran. Verify the source CRS, zone and hemisphere "
+                "before using these values on a survey plan."
+            )
+        text = "\n".join(lines)
+        return {
+            "text": text,
+            "severe": severe,
+            "warning_count": n_warn,
+            "total": total,
+            "transformation": transform,
+            "transformation_text": BlueMarbleConverter.format_transformation_block(transform),
+        }
+
+    def _publish_survey_summary(self, summary: Dict[str, Any]) -> None:
+        """One CLI log line and one Console reminder — never one message per point."""
+        self._last_survey_summary = summary
+        text = str((summary or {}).get("text") or "").strip()
+        if not text:
+            return
+        first = text.split("\n", 1)[0]
+        seen = getattr(self, "_survey_log_seen", None)
+        if seen is None:
+            self._survey_log_seen = seen = set()
+        key = re.sub(r"-?\d+(?:\.\d+)?", "#", first)
+        if key not in seen:
+            seen.add(key)
+            logger.warning(first)
+        try:
+            from agent.output_paths import show_survey_notice
+
+            show_survey_notice(
+                text,
+                transformation_text=str((summary or {}).get("transformation_text") or ""),
+            )
+        except Exception:
+            pass
 
     @staticmethod
     def _parse_utm_zone(text: str) -> Tuple[Optional[int], Optional[str]]:
@@ -826,11 +1471,38 @@ class BlueMarbleConverter:
         return zone, hemi
 
     @staticmethod
+    def _parse_mga_zone(text: str) -> Optional[int]:
+        t = (text or "").upper().replace("_", " ")
+        m = re.search(r"\bMGA\b\s*(?:ZONE\s*)?(\d{1,2})\b", t)
+        if not m:
+            return None
+        zone = int(m.group(1))
+        if zone < 1 or zone > 60:
+            return None
+        return zone
+
+    @staticmethod
+    def _try_crs_user_input(candidates: Iterable[str]):
+        from pyproj import CRS
+
+        seen = set()
+        for cand in candidates:
+            name = (cand or "").strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            try:
+                return CRS.from_user_input(name)
+            except Exception:
+                continue
+        return None
+
+    @staticmethod
     @lru_cache(maxsize=512)
     def _fuzzy_find_epsg_crs(normalized_query: str) -> Optional[str]:
         """
         Fuzzy match an EPSG CRS name and return an 'EPSG:####' string.
-        Keeps this intentionally conservative: only returns a best guess when score is strong.
+        Conservative: never substitute WGS 84 when the query names another datum.
         """
         try:
             from pyproj.database import query_crs_info
@@ -841,41 +1513,67 @@ class BlueMarbleConverter:
         q = (normalized_query or "").strip()
         if not q:
             return None
+        if is_ellipsoid_only_crs_label(q):
+            return None
 
-        q_lower = q.lower()
-        # Quick aliases for common user tokens seen in this project
-        alias_map = {
-            "minna ntm midbelt": "Minna / Nigeria Mid Belt",
-            "minna ntm mid belt": "Minna / Nigeria Mid Belt",
-            "minna nigeria ntm midbelt": "Minna / Nigeria Mid Belt",
-            "minna nigeria ntm mid belt": "Minna / Nigeria Mid Belt",
-        }
+        q_lower = re.sub(r"[\s_\-/]+", " ", q.lower()).strip()
+        alias_map = BlueMarbleConverter._CRS_NAME_ALIASES
         if q_lower in alias_map:
-            try:
-                from pyproj import CRS
-                return CRS.from_user_input(alias_map[q_lower]).to_string()
-            except Exception:
-                pass
+            return alias_map[q_lower]
 
-        # Candidate filtering: require at least one meaningful keyword to reduce scan.
-        keywords = [k for k in re.split(r"[^a-z0-9]+", q_lower) if len(k) >= 4]
-        keywords = keywords[:6]
+        query_datum = extract_named_datum(q)
+        raw_tokens = [k for k in re.split(r"[^a-z0-9]+", q_lower) if k]
+        keywords = [k for k in raw_tokens if len(k) >= 4][:8]
+        for special in ("utm", "mga", "nad", "ed50", "ups", "bng", "ntm"):
+            if special in raw_tokens and special not in keywords:
+                keywords.append(special)
         if not keywords:
             return None
 
-        # Query projected CRSs first (what the user usually means for grids like NTM/UTM).
+        utm_zone, utm_hemi = BlueMarbleConverter._parse_utm_zone(q)
+        mga_zone = BlueMarbleConverter._parse_mga_zone(q)
+
         candidates = query_crs_info(
             auth_name="EPSG",
             pj_types=[PJType.PROJECTED_CRS, PJType.GEOGRAPHIC_2D_CRS, PJType.GEOGRAPHIC_3D_CRS],
         )
 
         filtered = []
+        datum_lock = query_datum and query_datum != "WGS 84"
+        datum_needles = []
+        if datum_lock:
+            compact = query_datum.lower().replace(" ", "")
+            datum_needles = [query_datum.lower(), compact]
+            if query_datum == "NAD83":
+                datum_needles.extend(["nad83", "nad 83"])
+            if query_datum == "ETRS89":
+                datum_needles.extend(["etrs89", "etrs 89"])
+
         for info in candidates:
             name = (info.name or "")
             nlow = name.lower()
+            ncompact = nlow.replace(" ", "")
+            if datum_lock and not any(d in nlow or d in ncompact for d in datum_needles):
+                continue
+            if datum_lock and (nlow.startswith("wgs 84") or nlow.startswith("wgs84")):
+                continue
+            if utm_zone is not None:
+                zone_ok = (
+                    f"utm zone {utm_zone}" in nlow
+                    or f"utm {utm_zone}" in nlow
+                    or ("utm" in nlow and f"zone {utm_zone}" in nlow)
+                )
+                if not zone_ok:
+                    continue
+                if utm_hemi:
+                    hemi_token = f"{utm_zone}{utm_hemi.lower()}"
+                    if hemi_token not in ncompact and f"zone {utm_zone} {utm_hemi.lower()}" not in nlow:
+                        continue
+            if mga_zone is not None and f"mga zone {mga_zone}" not in nlow:
+                continue
             if any(k in nlow for k in keywords):
                 filtered.append(info)
-            if len(filtered) >= 800:
+            if len(filtered) >= 400:
                 break
 
         if not filtered:
@@ -884,61 +1582,63 @@ class BlueMarbleConverter:
         def score(info) -> float:
             name = info.name or ""
             n = name.lower()
-            # token overlap
             overlap = sum(1 for k in keywords if k in n)
-            # sequence similarity (after stripping punctuation)
             a = re.sub(r"[^a-z0-9 ]+", " ", q_lower)
             b = re.sub(r"[^a-z0-9 ]+", " ", n)
             ratio = difflib.SequenceMatcher(None, a, b).ratio()
-            return overlap * 2.0 + ratio
+            bonus = 0.0
+            if datum_lock and query_datum.lower() in n:
+                bonus += 1.5
+            return overlap * 2.0 + ratio + bonus
 
         best = max(filtered, key=score)
         best_score = score(best)
-
-        # Conservative threshold to avoid surprising mismatches.
         if best_score < 3.4:
             return None
-
         return f"EPSG:{best.code}"
 
     def _resolve_crs_pyproj(self, crs: str, zone: Optional[int], role: str = "crs"):
         """
         Resolve a user-provided CRS into a pyproj.CRS object.
 
-        Strategy:
-        - Handle EPSG:#### and numeric EPSG directly
-        - Handle common names (WGS84) and UTM zone patterns
-        - Try pyproj parsing as-is
-        - Normalize text and retry
-        - Fuzzy match to closest EPSG CRS name and retry
+        Named datums on UTM (NAD83 / UTM zone 17N, ETRS89 / UTM zone 32N, …)
+        keep that datum. Bare 'UTM Zone 32N' remains WGS 84 UTM.
         """
+        cache = getattr(self, "_crs_resolve_cache", None)
+        if cache is None:
+            self._crs_resolve_cache = cache = {}
+        key = ((crs or "").strip().lower(), zone, role)
+        if key in cache:
+            return cache[key]
+        resolved = self._resolve_crs_pyproj_uncached(crs, zone, role=role)
+        cache[key] = resolved
+        return resolved
+
+    def _resolve_crs_pyproj_uncached(self, crs: str, zone: Optional[int], role: str = "crs"):
         from pyproj import CRS
 
         raw = (crs or "").strip()
         if not raw:
-            # Default to WGS84 if user passes empty
             return CRS.from_epsg(4326)
 
-        # EPSG direct
+        if is_ellipsoid_only_crs_label(raw):
+            raise ValueError(
+                f"'{raw}' is an ellipsoid, not a coordinate reference system. "
+                "Name a full CRS (for example NAD83, ETRS89, or WGS 84), or an EPSG code."
+            )
+
         if re.match(r"^epsg:\d+$", raw, flags=re.IGNORECASE):
             return CRS.from_user_input(raw)
         if raw.isdigit():
             return CRS.from_epsg(int(raw))
 
-        # Quick common names
-        common = {
-            "WGS84": "EPSG:4326",
-            "WGS 84": "EPSG:4326",
-            "NAD83": "EPSG:4269",
-            "NAD 83": "EPSG:4269",
-            "NAD27": "EPSG:4267",
-            "NAD 27": "EPSG:4267",
-        }
-        if raw.upper() in common:
-            return CRS.from_user_input(common[raw.upper()])
+        normalized = self._normalize_user_crs_text(raw)
+        compact = self._compact_crs_key(normalized or raw)
+        alias = self._CRS_NAME_ALIASES.get(compact)
+        if alias:
+            return CRS.from_user_input(alias)
 
-        # Nigerian Minna / NTM belts (common survey wording, not only official EPSG names).
-        low_crs = re.sub(r"[\s_\-]+", " ", raw.lower()).strip()
+        low_crs = compact
         if "minna" in low_crs or "ntm" in low_crs:
             if re.search(r"mid\s*belt", low_crs):
                 return CRS.from_epsg(26392)
@@ -947,49 +1647,116 @@ class BlueMarbleConverter:
             if re.search(r"east\s*belt", low_crs):
                 return CRS.from_epsg(26393)
 
-        # UTM detection (from explicit zone arg or embedded in string)
+        datum = extract_named_datum(raw)
         utm_zone, utm_hemi = self._parse_utm_zone(raw)
-        z = zone or utm_zone
+        mga_zone = self._parse_mga_zone(raw)
+        z = abs(zone) if zone is not None else utm_zone
+        already_projected = bool(
+            self._PROJECTED_WITHOUT_UTM.search(raw) and "utm" not in raw.lower()
+        )
+
+        if mga_zone:
+            gda = datum if datum in ("GDA94", "GDA2020") else None
+            mga_names = []
+            if gda:
+                mga_names.append(f"{gda} / MGA zone {mga_zone}")
+            mga_names.extend([raw, normalized])
+            parsed = self._try_crs_user_input(mga_names)
+            if parsed is not None:
+                return parsed
+            if not gda:
+                raise ValueError(
+                    f"Unable to resolve {role} CRS '{raw}'. "
+                    "Australian MGA requires GDA94 or GDA2020 (for example "
+                    "'GDA2020 / MGA zone 56')."
+                )
+            raise ValueError(
+                f"Unable to resolve {role} CRS '{gda} / MGA zone {mga_zone}'."
+            )
+
         if z:
-            # Determine hemisphere: explicit in string wins; else assume north unless zone passed negative
             hemi = utm_hemi
             if hemi is None and zone is not None and zone < 0:
                 hemi = "S"
             if hemi is None:
                 hemi = "N"
-            epsg = 32600 + z if hemi == "N" else 32700 + z
-            # Only use this shortcut if the user *actually* meant UTM
-            if ("UTM" in raw.upper()) or (zone is not None):
+            named_utm = bool(datum and datum != "WGS 84")
+            combine_zone = (utm_zone is not None) or (
+                zone is not None and not already_projected
+            )
+            if named_utm and combine_zone:
+                constructed = [
+                    f"{datum} / UTM zone {z}{hemi}",
+                    f"{datum} / UTM zone {z} {hemi}",
+                ]
+                # Only parse the original string first when it already includes UTM.
+                # Otherwise 'NAD83' + zone=17 would stay geographic NAD83.
+                candidates = (
+                    [raw, normalized, *constructed]
+                    if "utm" in raw.lower()
+                    else constructed
+                )
+                parsed = self._try_crs_user_input(candidates)
+                if parsed is not None:
+                    return parsed
+                epsg_guess = self._fuzzy_find_epsg_crs(f"{datum} / UTM zone {z}{hemi}")
+                if epsg_guess:
+                    try:
+                        return CRS.from_user_input(epsg_guess)
+                    except Exception:
+                        pass
+                raise ValueError(
+                    f"Unable to resolve {role} CRS '{datum} / UTM zone {z}{hemi}'. "
+                    "Use the official name or an EPSG code; SurvyAI will not "
+                    "substitute WGS 84 UTM when another datum was named."
+                )
+            if combine_zone and (("UTM" in raw.upper()) or (zone is not None)):
+                epsg = 32600 + int(z) if hemi == "N" else 32700 + int(z)
                 return CRS.from_epsg(epsg)
 
-        # Attempt direct parse
-        try:
-            return CRS.from_user_input(raw)
-        except Exception:
-            pass
+        if not utm_zone and zone is None and not mga_zone:
+            common = {
+                "WGS84": "EPSG:4326",
+                "WGS 84": "EPSG:4326",
+                "NAD83": "EPSG:4269",
+                "NAD 83": "EPSG:4269",
+                "NAD27": "EPSG:4267",
+                "NAD 27": "EPSG:4267",
+            }
+            if raw.upper() in common:
+                return CRS.from_user_input(common[raw.upper()])
+            if datum and datum in self._GEOG_EPSG_BY_DATUM and not already_projected:
+                datum_key = self._compact_crs_key(datum)
+                extras = {
+                    datum_key,
+                    datum_key.replace(" ", ""),
+                    f"{datum_key} datum",
+                    f"{datum_key} crs",
+                    f"{datum_key} geographic",
+                }
+                if compact in extras or compact.replace(" ", "") in extras:
+                    return CRS.from_epsg(self._GEOG_EPSG_BY_DATUM[datum])
 
-        # Normalize and retry
-        normalized = self._normalize_user_crs_text(raw)
-        if normalized and normalized != raw:
-            try:
-                return CRS.from_user_input(normalized)
-            except Exception:
-                pass
+        parsed = self._try_crs_user_input([raw, normalized])
+        if parsed is not None:
+            return parsed
 
-        # Fuzzy: pick best EPSG match from database
         epsg_guess = self._fuzzy_find_epsg_crs(normalized or raw)
         if epsg_guess:
             try:
                 guessed = CRS.from_user_input(epsg_guess)
-                logger.info("Resolved %s CRS '%s' -> %s (%s)", role, raw, epsg_guess, getattr(guessed, "name", epsg_guess))
+                logger.info(
+                    "Resolved %s CRS '%s' -> %s (%s)",
+                    role, raw, epsg_guess, getattr(guessed, "name", epsg_guess),
+                )
                 return guessed
             except Exception:
                 pass
 
-        # Give a clearer error than "unknown name"
         raise ValueError(
             f"Unable to resolve {role} CRS '{raw}'. "
-            f"Try an EPSG code (e.g., 'EPSG:4326') or a standard name like 'Minna / Nigeria Mid Belt'."
+            f"Try an EPSG code (e.g., 'EPSG:4326') or a standard name like "
+            f"'Minna / Nigeria Mid Belt' or 'ETRS89 / UTM zone 32N'."
         )
     
     def batch_convert(
@@ -1015,22 +1782,27 @@ class BlueMarbleConverter:
         total = len(coordinates)
         method = "Geographic Calculator COM" if use_geographic_calculator else "pyproj"
         logger.info(f"Starting batch conversion of {total} coordinates using {method}: {source_crs} -> {target_crs}")
-        
-        for idx, (x, y) in enumerate(coordinates, 1):
-            try:
-                result = self.convert_coordinate(
-                    x, y, None, source_crs, target_crs, source_zone, target_zone,
-                    use_geographic_calculator=use_geographic_calculator
-                )
-                results.append(result)
-                if idx % 100 == 0:
-                    logger.debug(f"Converted {idx}/{total} coordinates")
-            except Exception as exc:
-                logger.warning("Failed to convert (%s, %s): %s", x, y, exc)
-                results.append({"source": {"x": x, "y": y, "crs": source_crs}, "error": str(exc)})
+        self._batch_depth = getattr(self, "_batch_depth", 0) + 1
+        try:
+            for idx, (x, y) in enumerate(coordinates, 1):
+                try:
+                    result = self.convert_coordinate(
+                        x, y, None, source_crs, target_crs, source_zone, target_zone,
+                        use_geographic_calculator=use_geographic_calculator
+                    )
+                    results.append(result)
+                    if idx % 100 == 0:
+                        logger.debug(f"Converted {idx}/{total} coordinates")
+                except Exception as exc:
+                    logger.warning("Failed to convert (%s, %s): %s", x, y, exc)
+                    results.append({"source": {"x": x, "y": y, "crs": source_crs}, "error": str(exc)})
+        finally:
+            self._batch_depth = max(0, getattr(self, "_batch_depth", 1) - 1)
         
         successful = sum(1 for r in results if "error" not in r)
         logger.info(f"Batch conversion complete: {successful}/{total} successful")
+        summary = self._summarize_conversion_results(results, source_crs, target_crs)
+        self._publish_survey_summary(summary)
         return results
     
     def convert_excel_file(
@@ -1105,6 +1877,24 @@ class BlueMarbleConverter:
 
         x_column_resolved = _resolve_col(x_column)
         y_column_resolved = _resolve_col(y_column)
+        if x_column_resolved is None or y_column_resolved is None:
+            def _first_col(*names: str) -> Optional[str]:
+                for n in names:
+                    hit = norm_map.get(n)
+                    if hit is not None:
+                        return hit
+                return None
+
+            req_x = _norm_col(x_column)
+            req_y = _norm_col(y_column)
+            if x_column_resolved is None and req_x in ("x", "easting", "east"):
+                x_column_resolved = _first_col("easting", "east")
+            if y_column_resolved is None and req_y in ("y", "northing", "north"):
+                y_column_resolved = _first_col("northing", "north")
+            if x_column_resolved is None and y_column_resolved is None:
+                if "e" in norm_map and "n" in norm_map:
+                    x_column_resolved = norm_map["e"]
+                    y_column_resolved = norm_map["n"]
         if x_column_resolved is None:
             raise ValueError(f"Column '{x_column}' not found. Available columns: {list(df.columns)}")
         if y_column_resolved is None:
@@ -1241,9 +2031,14 @@ class BlueMarbleConverter:
                     # Drop if it's entirely empty
                     df_out = df_out.drop(columns=["conversion_error"], errors="ignore")
 
-            # Drop verbose/debug columns
-            df_out = df_out.drop(columns=["conversion_method"], errors="ignore")
-            df_out = df_out.drop(columns=[x_conv_col, y_conv_col], errors="ignore")
+            # Drop helper columns, but never drop the converted XY if those
+            # names *are* the output columns (X/Y source → X_converted).
+            drop_helper = ["conversion_method"]
+            if x_conv_col != out_x:
+                drop_helper.append(x_conv_col)
+            if y_conv_col != out_y:
+                drop_helper.append(y_conv_col)
+            df_out = df_out.drop(columns=drop_helper, errors="ignore")
 
             if include_crs_metadata:
                 try:
@@ -1310,7 +2105,10 @@ class BlueMarbleConverter:
         if results and "error" not in results[0]:
             actual_method = results[0].get("method", "pyproj")
         
-        return {
+        summary = getattr(self, "_last_survey_summary", None) or self._summarize_conversion_results(
+            results, source_crs, target_crs
+        )
+        payload = {
             "success": True,
             "input_file": str(excel_file),
             "output_file": str(output_path),
@@ -1327,6 +2125,14 @@ class BlueMarbleConverter:
             "output_y_column": out_y if schema == "clean" else y_conv_col,
             "output_columns": written_xy_columns,
         }
+        if summary.get("text"):
+            payload["survey_notice"] = summary["text"]
+        if summary.get("transformation_text"):
+            payload["transformation_text"] = summary["transformation_text"]
+        if summary.get("transformation"):
+            payload["transformation"] = summary["transformation"]
+        payload["survey_warning_count"] = int(summary.get("warning_count") or 0)
+        return payload
 
 
 class GeographicCalculatorCLI:

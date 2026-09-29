@@ -12,12 +12,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from survyai_cloud.db import get_db
 from survyai_cloud.deps import require_admin
-from survyai_cloud.models import Device, DiagnosticsBundle, SubscriptionStatus, UsageEvent, User
+from survyai_cloud.models import (
+    BetaSignup,
+    Device,
+    DiagnosticsBundle,
+    SubscriptionStatus,
+    UsageEvent,
+    User,
+)
 from survyai_cloud.schemas import (
     AdminDiagnosticsOut,
     AdminUsageEventOut,
     AdminUserBillingPatch,
     AdminUserSnapshot,
+    BetaSignupOut,
     DeviceOut,
 )
 from survyai_cloud.services.entitlements import apply_free_defaults, apply_pro_defaults
@@ -319,6 +327,17 @@ async def admin_patch_user_billing(
         "admin_privilege_active": bool(getattr(user, "admin_privilege_active", False)),
         "admin_privilege_note": getattr(user, "admin_privilege_note", None),
     }
+
+
+@router.get("/beta-signups", response_model=list[BetaSignupOut])
+async def admin_list_beta_signups(
+    _: Annotated[None, Depends(require_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    limit: Annotated[int, Query(ge=1, le=500)] = 200,
+) -> list[BetaSignup]:
+    """First-user form rows, newest first. Used to grant Pro and read demand."""
+    res = await db.execute(select(BetaSignup).order_by(BetaSignup.created_at.desc()).limit(limit))
+    return list(res.scalars().all())
 
 
 @router.delete("/users/{user_id}/devices/{device_id}", status_code=status.HTTP_204_NO_CONTENT)

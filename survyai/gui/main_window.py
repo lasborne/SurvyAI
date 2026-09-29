@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QAction, QDesktopServices, QFont, QTextCursor
+from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence, QTextCursor
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -78,7 +78,7 @@ from survyai.gui.cad_prompt_defaults import (
 )
 from survyai.gui.chat_composer import ChatComposer
 from survyai.gui.manage_pcs_dialog import ManagePcsDialog
-from survyai.gui.theme_toggle import ThemeToggle
+from survyai.gui.theme_toggle import PillToggle, ThemeToggle
 from survyai.gui.styles import THEME_DARK, THEME_LIGHT, get_stylesheet
 from survyai.gui.onboarding import OnboardingWizard, environment_validation_report
 from survyai.gui.help_dialog import MarkdownHelpDialog
@@ -386,6 +386,8 @@ def _is_clearly_new_topic(raw_query: str, last_exchange_messages: list) -> bool:
     """
     if _looks_like_gis_session_followup(raw_query):
         return False
+    if _looks_like_cadastral_plot_prompt(raw_query):
+        return True
     if _looks_like_cadastral_plot_followup(raw_query):
         return False
     if _fu_anaphora(raw_query):
@@ -407,6 +409,8 @@ def _is_clearly_new_topic(raw_query: str, last_exchange_messages: list) -> bool:
 
 def _looks_like_cadastral_plot_followup(raw_query: str) -> bool:
     """True when the user is asking about the parcel/plan already plotted this session."""
+    if _looks_like_cadastral_plot_prompt(raw_query):
+        return False
     q = (raw_query or "").strip().lower()
     if not q:
         return False
@@ -579,6 +583,46 @@ def _email_local_part(email: str) -> str:
     if "@" not in e:
         return e
     return e.split("@", 1)[0].strip()
+
+
+def _label_exposes_secret(label: str, secret: str) -> bool:
+    """True when a visible label is the password or most of it.
+
+    A short real name that happens to sit inside a longer password is kept.
+    An exact copy, or a field that captured most of the password, is not.
+    """
+    lab = "".join((label or "").split()).casefold()
+    sec = "".join((secret or "").split()).casefold()
+    if not lab or not sec:
+        return False
+    if lab == sec or sec in lab:
+        return True
+    if len(lab) >= 8 and lab in sec and len(lab) >= int(len(sec) * 0.6):
+        return True
+    return False
+
+
+def _safe_public_label(label: str, secret: str = "") -> str:
+    text = (label or "").strip()
+    if not text or _label_exposes_secret(text, secret):
+        return ""
+    return text
+
+
+def _greeting_name(
+    *,
+    name: str = "",
+    company: str = "",
+    email: str = "",
+    secret: str = "",
+) -> str:
+    """Hi-menu name: entered name, then company, then email local-part, then User."""
+    for candidate in (name, company):
+        safe = _safe_public_label(candidate, secret)
+        if safe:
+            return safe
+    local = _safe_public_label(_email_local_part(email), secret)
+    return local or "User"
 
 
 class ChatInput(QPlainTextEdit):
@@ -901,6 +945,14 @@ class _PasswordLineEdit(QWidget):
         row.setSpacing(4)
         self._edit = QLineEdit()
         self._edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._edit.setInputMethodHints(
+            Qt.InputMethodHint.ImhHiddenText
+            | Qt.InputMethodHint.ImhSensitiveData
+            | Qt.InputMethodHint.ImhNoPredictiveText
+            | Qt.InputMethodHint.ImhNoAutoUppercase
+        )
+        self._edit.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self._edit.installEventFilter(self)
         if placeholder:
             self._edit.setPlaceholderText(placeholder)
         self._toggle = QToolButton()
@@ -925,8 +977,17 @@ class _PasswordLineEdit(QWidget):
         self._toggle.setText("\u25ce" if checked else "\u25c9")
         self._toggle.setToolTip("Hide password" if checked else "Show password")
 
+    def eventFilter(self, obj, event) -> bool:  # noqa: N802
+        if obj is self._edit and event.type() == QEvent.Type.KeyPress:
+            if event.matches(QKeySequence.StandardKey.Copy) or event.matches(QKeySequence.StandardKey.Cut):
+                return True
+        return super().eventFilter(obj, event)
+
     def text(self) -> str:
         return self._edit.text()
+
+    def clear(self) -> None:
+        self._edit.clear()
 
     def setText(self, value: str) -> None:  # noqa: N802
         self._edit.setText(value)
@@ -962,7 +1023,105 @@ class _PasswordPromptDialog(QDialog):
         self._password.setFocus()
 
     def password(self) -> str:
+        cached = getattr(self, "_accepted_password", None)
+        if cached is not None:
+            return cached
         return self._password.text()
+
+    def clear(self) -> None:
+        self._accepted_password = ""
+        self._password.clear()
+
+    def done(self, code: int) -> None:  # noqa: N802
+        accepted = code == int(QDialog.DialogCode.Accepted)
+        self._accepted_password = self._password.text() if accepted else ""
+        self._password.clear()
+        super().done(code)
+
+
+class _SignInIdentityDialog(QDialog):
+    """Name and company collected after the password dialog.
+
+    Fields start empty of any password autofill. A value that is the password
+    (or most of it) is dropped and never stored.
+    """
+
+    def __init__(
+        self,
+        parent: QWidget | None,
+        *,
+        title: str,
+        name: str = "",
+        company: str = "",
+        secret: str = "",
+    ) -> None:
+        super().__init__(parent)
+        self._secret = secret or ""
+        self.setWindowTitle(title)
+        self.setMinimumWidth(440)
+        root = QVBoxLayout(self)
+        intro = QLabel("This is the Username displayed on SurvyAI.")
+        intro.setWordWrap(True)
+        intro.setObjectName("hintLabel")
+        root.addWidget(intro)
+        form = QFormLayout()
+        self._name = QLineEdit()
+        self._name.setEchoMode(QLineEdit.EchoMode.Normal)
+        self._name.setPlaceholderText("Your name")
+        self._name.setInputMethodHints(Qt.InputMethodHint.ImhNone)
+        safe_name = _safe_public_label(name, self._secret)
+        if safe_name:
+            self._name.setText(safe_name)
+        self._company = QLineEdit()
+        self._company.setEchoMode(QLineEdit.EchoMode.Normal)
+        self._company.setPlaceholderText("Optional")
+        self._company.setInputMethodHints(Qt.InputMethodHint.ImhNone)
+        safe_company = _safe_public_label(company, self._secret)
+        if safe_company:
+            self._company.setText(safe_company)
+        form.addRow("Name", self._name)
+        form.addRow("Company", self._company)
+        root.addLayout(form)
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+        self._name.setFocus()
+        self._name.textChanged.connect(self._drop_secret_autofill)
+        self._company.textChanged.connect(self._drop_secret_autofill)
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        QTimer.singleShot(0, self._drop_secret_autofill)
+        QTimer.singleShot(60, self._drop_secret_autofill)
+
+    def _drop_secret_autofill(self) -> None:
+        if _label_exposes_secret(self._name.text(), self._secret):
+            self._name.clear()
+        if _label_exposes_secret(self._company.text(), self._secret):
+            self._company.clear()
+
+    def name(self) -> str:
+        cached = getattr(self, "_accepted_name", None)
+        if cached is not None:
+            return cached
+        return _safe_public_label(self._name.text(), self._secret)
+
+    def company(self) -> str:
+        cached = getattr(self, "_accepted_company", None)
+        if cached is not None:
+            return cached
+        return _safe_public_label(self._company.text(), self._secret)
+
+    def done(self, code: int) -> None:  # noqa: N802
+        self._accepted_name = _safe_public_label(self._name.text(), self._secret)
+        self._accepted_company = _safe_public_label(self._company.text(), self._secret)
+        self._name.clear()
+        self._company.clear()
+        self._secret = ""
+        super().done(code)
 
 
 class _NewPasswordDialog(QDialog):
@@ -1028,7 +1187,22 @@ class _NewPasswordDialog(QDialog):
         self._ok.setEnabled(True)
 
     def password(self) -> str:
+        cached = getattr(self, "_accepted_password", None)
+        if cached is not None:
+            return cached
         return self._password.text()
+
+    def clear(self) -> None:
+        self._accepted_password = ""
+        self._password.clear()
+        self._confirm.clear()
+
+    def done(self, code: int) -> None:  # noqa: N802
+        accepted = code == int(QDialog.DialogCode.Accepted)
+        self._accepted_password = self._password.text() if accepted else ""
+        self._password.clear()
+        self._confirm.clear()
+        super().done(code)
 
 
 class _CloudAuthChoiceDialog(QDialog):
@@ -1338,6 +1512,7 @@ class MainWindow(QMainWindow):
             self._state_store.save(self._state)
         else:
             self._state.preferred_primary_llm = AUTO_PRIMARY_LLM
+        self._coerce_providers_if_free_ai_off()
         self._caps = scan_machine_capabilities()
         self._display_feature_flags = FeatureFlags.from_env()
         self._feature_flags = self._display_feature_flags
@@ -2167,11 +2342,11 @@ class MainWindow(QMainWindow):
         )
         controls.addWidget(self._retry_btn)
 
-        self._cad_prompt_btn = QPushButton("Input CAD plan prompt")
+        self._cad_prompt_btn = QPushButton("Input CAD Template")
         self._cad_prompt_btn.setObjectName("secondaryButton")
         self._cad_prompt_btn.clicked.connect(self._insert_cad_plan_prompt)
         self._cad_prompt_btn.setToolTip(
-            "Insert your current default CAD survey-plan prompt into the input box "
+            "Insert your current default CAD survey-plan template into the input box "
             "(from Account → Edit Default CAD Prompt). Existing text is kept; "
             "the template starts on a new line."
         )
@@ -2280,24 +2455,15 @@ class MainWindow(QMainWindow):
         cad_content_layout.setSpacing(0)
 
         self._cad_form = AutomatedCadForm()
-        form_scroll = QScrollArea()
-        self._cad_form_scroll = form_scroll
-        form_scroll.setObjectName("cadFormScroll")
-        form_scroll.setWidgetResizable(True)
-        form_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        form_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        form_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        form_scroll.setWidget(self._cad_form)
-        form_scroll.setMinimumWidth(200)
-        form_scroll.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
-        )
-        cad_content_layout.addWidget(form_scroll, 1)
+        self._cad_form.setMinimumWidth(200)
+        self._cad_form_scroll = getattr(self._cad_form, "_fields_scroll", None)
+        cad_content_layout.addWidget(self._cad_form, 1)
         layout.addWidget(cad_content, 1)
         self._tabs.addTab(tab, "Automated CAD section")
         self._tabs.setTabToolTip(
             _TAB_AUTOMATED_CAD,
-            "Fill survey values and press Send to plot. No prompt writing required.",
+            "Fill one or more survey-plan sheets (up to 10) and press Send to plot. "
+            "Empty extra sheets are skipped.",
         )
 
     def _is_automated_cad_tab(self) -> bool:
@@ -2379,12 +2545,14 @@ class MainWindow(QMainWindow):
         if where == "cad":
             if getattr(self, "_cad_prompt_btn", None) is not None:
                 self._cad_prompt_btn.setToolTip(
-                    "Fill the value boxes from your current default CAD survey-plan prompt "
-                    "(Account → Edit Default CAD Prompt). Console still inserts the full prompt text."
+                    "Fill the current plan sheet from your default CAD template "
+                    "(Account → Edit Default CAD Prompt). Other sheets are not changed. "
+                    "On Console this button inserts the full template text."
                 )
             if getattr(self, "_send_btn", None) is not None:
                 self._send_btn.setToolTip(
-                    "Plot the cadastral plan from the form values. Existing files ask before overwrite."
+                    "Plot every completed plan sheet (up to 10). Empty sheets are skipped. "
+                    "Existing files ask before overwrite."
                 )
                 self._send_btn.setDefault(False)
                 self._send_btn.setAutoDefault(False)
@@ -2557,17 +2725,34 @@ class MainWindow(QMainWindow):
         runtime_form.setFormAlignment(Qt.AlignTop)
         runtime_form.setHorizontalSpacing(14)
         runtime_form.setVerticalSpacing(10)
-        self._primary_llm_combo = QComboBox()
-        # "auto" is the product default: routes to the best paid hosted model for the task.
-        self._primary_llm_combo.addItems(
-            ["auto", "openai", "gemini", "claude", "deepseek", "ollama"]
+        free_ai_host = QWidget()
+        free_ai_row = QHBoxLayout(free_ai_host)
+        free_ai_row.setContentsMargins(0, 0, 0, 0)
+        free_ai_row.setSpacing(12)
+        self._free_ai_toggle = PillToggle()
+        self._free_ai_toggle.setToolTip(
+            "Off by default. When on, SurvyAI can use a free local Ollama model. "
+            "When off, Ollama is not offered and SurvyAI will not ask you to install it."
         )
+        self._free_ai_toggle.toggled.connect(self._on_free_ai_model_toggled)
+        free_ai_name = QLabel("Turn on the Free AI model abilities")
+        free_ai_name.setWordWrap(True)
+        free_ai_row.addWidget(self._free_ai_toggle, 0, Qt.AlignmentFlag.AlignVCenter)
+        free_ai_row.addWidget(free_ai_name, 1)
+        runtime_form.addRow("Free AI model", free_ai_host)
+        self._free_ai_note = QLabel(
+            "Leave this off unless you want a free local model on this PC. "
+            "Hosted models still require a SurvyAI subscription."
+        )
+        self._free_ai_note.setWordWrap(True)
+        self._free_ai_note.setObjectName("hintLabel")
+        runtime_form.addRow("", self._free_ai_note)
+        self._primary_llm_combo = QComboBox()
         self._primary_llm_combo.setToolTip(
             "Auto selects the best paid hosted model for the task "
             "(currently OpenAI). Choose a specific provider to lock it."
         )
         self._fallback_llm_combo = QComboBox()
-        self._fallback_llm_combo.addItems(["gemini", "openai", "claude", "deepseek", "ollama"])
         self._fallback_llm_combo.setToolTip(
             "Used when Fallback LLM is checked, or if the primary provider fails. "
             "Does not change Fast mode."
@@ -2781,13 +2966,11 @@ class MainWindow(QMainWindow):
 
         credits_title = QLabel("Credits & usage")
         credits_title.setObjectName("pageTitle")
-        credits_sub = QLabel(
-            "Track API spend for runs in this desktop app. Credit pool is your subscription USD "
-            "equivalent. Used is the billed cost of hosted model runs inside the active paid window. "
-            "Local models (Ollama) are free. Pro hosted plans: sign in and use Refresh from cloud to sync."
-        )
+        credits_sub = QLabel("")
         credits_sub.setObjectName("pageSubtitle")
         credits_sub.setWordWrap(True)
+        self._credits_page_sub = credits_sub
+        self._refresh_credits_page_subtitle()
         page_layout.addWidget(credits_title)
         page_layout.addWidget(credits_sub)
 
@@ -2907,9 +3090,9 @@ class MainWindow(QMainWindow):
         title.setObjectName("pageTitle")
         subtitle = QLabel(
             "Customize the default survey-plan fields — surveyor, company, address, plan "
-            "number, location, and related metadata. On Automated CAD, Input CAD plan prompt "
-            "fills the form from this template. On Console, the same button inserts the full "
-            "prompt text. You can still type any valid generation prompt in Console."
+            "number, location, and related metadata. On Automated CAD, Input CAD Template "
+            "fills only the plan sheet you are on. On Console, the same button inserts the full "
+            "template text. You can still type any valid generation prompt in Console."
         )
         subtitle.setObjectName("pageSubtitle")
         subtitle.setWordWrap(True)
@@ -2923,7 +3106,7 @@ class MainWindow(QMainWindow):
         self._cad_prompt_editor.setMinimumHeight(280)
         self._cad_prompt_editor.setPlaceholderText("Enter your default CAD survey-plan prompt…")
         self._cad_prompt_editor.setToolTip(
-            "Saved on this PC. Used by Input CAD plan prompt on Console and Automated CAD."
+            "Saved on this PC. Used by Input CAD Template on Console and Automated CAD."
         )
         editor_layout.addWidget(self._cad_prompt_editor)
 
@@ -3053,7 +3236,7 @@ class MainWindow(QMainWindow):
             "hover each item for what it does."
         )
         account_menu.menuAction().setStatusTip(
-            "Sign in, manage Pro subscription, credits, Ollama, settings, and PCs."
+            "Sign in, manage Pro subscription, credits, settings, and PCs."
         )
 
         act_cloud = QAction("Sign in or create account…", self)
@@ -3072,7 +3255,9 @@ class MainWindow(QMainWindow):
             "Run free AI models on your own computer — useful offline or when you prefer not to use "
             "cloud APIs. Install Ollama once, then pick a model here.",
         )
+        self._menu_ollama_action = act_ollama
         account_menu.addAction(act_ollama)
+        act_ollama.setVisible(self._free_ai_model_enabled())
 
         act_settings = QAction("Settings…", self)
         act_settings.triggered.connect(self._show_settings_page)
@@ -3095,7 +3280,7 @@ class MainWindow(QMainWindow):
         act_cad_prompt.triggered.connect(self._show_cad_prompt_page)
         self._describe_menu_action(
             act_cad_prompt,
-            "Edit the default survey-plan template. Automated CAD fills the form from it; "
+            "Edit the default survey-plan template. Automated CAD fills the current plan sheet; "
             "Console inserts the full prompt text.",
         )
         account_menu.addAction(act_cad_prompt)
@@ -3329,7 +3514,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(
                     self,
                     "Task in progress",
-                    "Wait for the current task to finish before inserting a CAD plan prompt.",
+                    "Wait for the current task to finish before inserting a CAD template.",
                 )
                 return
         template = resolve_active_cad_prompt(self._state.default_cad_prompt)
@@ -3337,9 +3522,10 @@ class MainWindow(QMainWindow):
             form = getattr(self, "_cad_form", None)
             if form is None:
                 return
-            form.apply_prompt_template(template)
+            msg = form.apply_prompt_template(template)
             self.statusBar().showMessage(
-                "CAD form filled from the default survey-plan prompt.", 4000
+                msg or "Current plan sheet filled from the default CAD template.",
+                4000,
             )
             return
         existing = self._input.toPlainText()
@@ -3365,16 +3551,40 @@ class MainWindow(QMainWindow):
         return bool(self._state.cloud_api_base_url.strip() and self._state.cloud_refresh_token.strip())
 
     def _header_display_name(self) -> str:
-        """Greeting suffix after 'Hi, ': local preference or email local-part."""
+        """Greeting suffix after 'Hi, ': name, then company, then email, then User."""
         me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
-        if self._state.profile.display_name.strip():
-            return self._state.profile.display_name.strip()
-        dn = str(me.get("display_name") or "").strip()
-        if dn:
-            return dn
-        em = str(me.get("email") or "").strip() or self._state.profile.email.strip()
-        local = _email_local_part(em)
-        return local or "there"
+        name = (self._state.profile.display_name or "").strip()
+        if not name:
+            name = str(me.get("display_name") or "").strip()
+        company = (self._state.profile.company or "").strip()
+        email = str(me.get("email") or "").strip() or (self._state.profile.email or "").strip()
+        return _greeting_name(name=name, company=company, email=email)
+
+    def _drop_profile_labels_matching_secret(self, *secrets: str) -> None:
+        """Remove a greeting or company value that repeats a password just typed."""
+        name = self._state.profile.display_name or ""
+        company = self._state.profile.company or ""
+        me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else None
+        cloud_name = str(me.get("display_name") or "") if me else ""
+        changed = False
+        for secret in secrets:
+            if _label_exposes_secret(name, secret):
+                name = ""
+                changed = True
+            if _label_exposes_secret(company, secret):
+                company = ""
+                changed = True
+            if me is not None and _label_exposes_secret(cloud_name, secret):
+                cloud_name = ""
+                changed = True
+        if not changed:
+            return
+        self._state.profile.display_name = name
+        self._state.profile.company = company
+        if me is not None:
+            me["display_name"] = cloud_name
+        self._state_store.save(self._state)
+        self._refresh_account_views()
 
     def _refresh_user_menu(self) -> None:
         self._user_menu.clear()
@@ -3384,10 +3594,16 @@ class MainWindow(QMainWindow):
             suffix = self._header_display_name()
             label = f"Hi, {suffix}" if suffix else "Hi"
             self._user_menu_btn.setText(label + one_chevron)
-            self._user_menu_btn.setToolTip(
-                "Quick profile menu — settings, credits and usage, local Ollama models, diagnostics, "
+            tip = (
+                "Quick profile menu — settings, credits and usage, diagnostics, "
                 "registered PCs, and sign out. Hover each item for details."
             )
+            if self._free_ai_model_enabled():
+                tip = (
+                    "Quick profile menu — settings, credits and usage, local Ollama models, diagnostics, "
+                    "registered PCs, and sign out. Hover each item for details."
+                )
+            self._user_menu_btn.setToolTip(tip)
             act_settings = QAction("Settings", self)
             act_settings.triggered.connect(self._show_settings_page)
             self._describe_menu_action(
@@ -3409,18 +3625,19 @@ class MainWindow(QMainWindow):
             act_cad_prompt.triggered.connect(self._show_cad_prompt_page)
             self._describe_menu_action(
                 act_cad_prompt,
-                "Edit the default survey-plan template used by Input CAD plan prompt "
-                "on Automated CAD (form) and Console (full text).",
+                "Edit the default survey-plan template used by Input CAD Template "
+                "on Automated CAD (current plan sheet) and Console (full text).",
             )
             self._user_menu.addAction(act_cad_prompt)
 
-            act_ollama = QAction("Local models (Ollama)…", self)
-            act_ollama.triggered.connect(self._open_ollama_setup)
-            self._describe_menu_action(
-                act_ollama,
-                "Install or configure Ollama to run free local models on this computer (optional offline use).",
-            )
-            self._user_menu.addAction(act_ollama)
+            if self._free_ai_model_enabled():
+                act_ollama = QAction("Local models (Ollama)…", self)
+                act_ollama.triggered.connect(self._open_ollama_setup)
+                self._describe_menu_action(
+                    act_ollama,
+                    "Install or configure Ollama to run free local models on this computer (optional offline use).",
+                )
+                self._user_menu.addAction(act_ollama)
 
             act_diag = QAction("Diagnostics", self)
             act_diag.triggered.connect(self._show_diagnostics_page)
@@ -3484,17 +3701,19 @@ class MainWindow(QMainWindow):
             act_cad_prompt.triggered.connect(self._show_cad_prompt_page)
             self._describe_menu_action(
                 act_cad_prompt,
-                "Edit the default CAD survey-plan prompt template used by the CAD plan prompt button.",
+                "Edit the default survey-plan template used by Input CAD Template "
+                "on Automated CAD (current sheet) and Console (full text).",
             )
             self._user_menu.addAction(act_cad_prompt)
 
-            act_ollama = QAction("Local models (Ollama)…", self)
-            act_ollama.triggered.connect(self._open_ollama_setup)
-            self._describe_menu_action(
-                act_ollama,
-                "Free local AI — no cloud account required for basic offline models.",
-            )
-            self._user_menu.addAction(act_ollama)
+            if self._free_ai_model_enabled():
+                act_ollama = QAction("Local models (Ollama)…", self)
+                act_ollama.triggered.connect(self._open_ollama_setup)
+                self._describe_menu_action(
+                    act_ollama,
+                    "Free local AI — no cloud account required for basic offline models.",
+                )
+                self._user_menu.addAction(act_ollama)
 
             act_diag = QAction("Diagnostics", self)
             act_diag.triggered.connect(self._show_diagnostics_page)
@@ -3544,7 +3763,7 @@ class MainWindow(QMainWindow):
         # Kick off agent warm-up right away so the engine is ready by the time
         # the user submits their first prompt (eliminates per-prompt cold start).
         QTimer.singleShot(200, self._prewarm_agent)
-        # Non-blocking post-start prompts (e.g. local models setup).
+        # Non-blocking post-start prompts. Local-model setup only if the user opted in.
         QTimer.singleShot(650, self._maybe_prompt_ollama_install)
         self._sync_update_check_timer()
         # Consent-gated background update check after the UI settles.
@@ -3569,6 +3788,8 @@ class MainWindow(QMainWindow):
         - If Ollama isn't installed, offer winget install or open the download page.
         - Always provides a path via the profile dropdown entry.
         """
+        if not self._free_ai_model_enabled():
+            return
         dlg = _OllamaSetupDialog(
             self,
             initial_base_url=self._state.ollama_base_url.strip() or getattr(self._settings, "ollama_base_url", ""),
@@ -3594,8 +3815,10 @@ class MainWindow(QMainWindow):
     def _maybe_prompt_ollama_install(self) -> None:
         """
         Prompt (at most every 3 days) to install Ollama when missing.
-        User can permanently dismiss; profile menu keeps a manual entry.
+        Only when Free AI model abilities are turned on. Off by default: no popup.
         """
+        if not self._free_ai_model_enabled():
+            return
         # Don't prompt if already installed or user dismissed.
         if is_ollama_installed().installed:
             return
@@ -3736,15 +3959,24 @@ class MainWindow(QMainWindow):
             )
         if self._state.preferred_fallback_llm:
             overrides["fallback_llm"] = self._state.preferred_fallback_llm
+        free_ai = self._free_ai_model_enabled()
+        overrides["enable_free_ai_model"] = free_ai
+        if not free_ai:
+            if str(overrides.get("primary_llm") or "").strip().lower() == "ollama":
+                overrides["primary_llm"] = resolve_primary_llm_selection("auto")
+            if str(overrides.get("fallback_llm") or "").strip().lower() in {"", "ollama"}:
+                overrides["fallback_llm"] = "gemini"
         if self._state.safe_mode:
             overrides["vector_store_enabled"] = False
             overrides["auto_context_retrieval"] = False
             overrides["auto_store_conversations"] = False
         # Desktop-local Ollama settings (do not require editing .env).
-        if getattr(self._state, "ollama_base_url", "").strip():
-            overrides["ollama_base_url"] = self._state.ollama_base_url.strip()
-        if getattr(self._state, "ollama_model", "").strip():
-            overrides["ollama_model"] = self._state.ollama_model.strip()
+        # Injected only when Free AI model abilities are on.
+        if free_ai:
+            if getattr(self._state, "ollama_base_url", "").strip():
+                overrides["ollama_base_url"] = self._state.ollama_base_url.strip()
+            if getattr(self._state, "ollama_model", "").strip():
+                overrides["ollama_model"] = self._state.ollama_model.strip()
         overrides["fast_mode_non_file_prompts"] = bool(getattr(self._state, "fast_mode_non_file_prompts", False))
         settings = merge_settings(**overrides)
 
@@ -3772,7 +4004,7 @@ class MainWindow(QMainWindow):
             me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
             plan_slug = str(me.get("plan_slug") or "free")
             policy = policy_for_plan(plan_slug)
-            if policy.slug == "free":
+            if policy.slug == "free" and bool(getattr(settings, "enable_free_ai_model", False)):
                 settings = settings.model_copy(update={"primary_llm": "ollama", "fallback_llm": "ollama"})
 
         return settings
@@ -3968,6 +4200,119 @@ class MainWindow(QMainWindow):
             base_url=base, access_token=token, silent=silent
         )
 
+    def _free_ai_model_enabled(self) -> bool:
+        return bool(getattr(self._state, "free_ai_model_enabled", False))
+
+    def _coerce_providers_if_free_ai_off(self) -> None:
+        """Drop a saved Ollama selection when free local models are off."""
+        if self._free_ai_model_enabled():
+            return
+        changed = False
+        if str(self._state.preferred_primary_llm or "").strip().lower() == "ollama":
+            self._state.preferred_primary_llm = AUTO_PRIMARY_LLM
+            changed = True
+        if str(self._state.preferred_fallback_llm or "").strip().lower() == "ollama":
+            self._state.preferred_fallback_llm = "gemini"
+            changed = True
+        if changed:
+            self._state_store.save(self._state)
+
+    def _fallback_llm_display_value(self) -> str:
+        raw = str(self._state.preferred_fallback_llm or "").strip().lower()
+        if raw and (raw != "ollama" or self._free_ai_model_enabled()):
+            return raw
+        settings_fb = str(getattr(self._settings, "fallback_llm", "") or "").strip().lower()
+        if settings_fb and settings_fb != "ollama":
+            return settings_fb
+        return "gemini"
+
+    def _refresh_llm_provider_combos(self) -> None:
+        if not hasattr(self, "_primary_llm_combo"):
+            return
+        include_ollama = self._free_ai_model_enabled()
+        primary_items = ["auto", "openai", "gemini", "claude", "deepseek"]
+        fallback_items = ["gemini", "openai", "claude", "deepseek"]
+        if include_ollama:
+            primary_items.append("ollama")
+            fallback_items.append("ollama")
+        primary_current = normalize_primary_llm_selection(self._state.preferred_primary_llm)
+        fallback_current = self._fallback_llm_display_value()
+        for combo, items, current in (
+            (self._primary_llm_combo, primary_items, primary_current),
+            (self._fallback_llm_combo, fallback_items, fallback_current),
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(items)
+            self._set_combo_value(combo, current)
+            if combo.currentText() not in items and items:
+                combo.setCurrentIndex(0)
+            combo.blockSignals(False)
+
+    def _sync_ollama_entry_points(self) -> None:
+        visible = self._free_ai_model_enabled()
+        action = getattr(self, "_menu_ollama_action", None)
+        if action is not None:
+            action.setVisible(visible)
+        self._refresh_credits_page_subtitle()
+
+    def _refresh_credits_page_subtitle(self) -> None:
+        label = getattr(self, "_credits_page_sub", None)
+        if label is None:
+            return
+        text = (
+            "Track API spend for runs in this desktop app. Credit pool is your subscription USD "
+            "equivalent. Used is the billed cost of hosted model runs inside the active paid window. "
+        )
+        if self._free_ai_model_enabled():
+            text += "Local models (Ollama) are free. "
+        text += "Pro hosted plans: sign in and use Refresh from cloud to sync."
+        label.setText(text)
+
+    def _apply_free_ai_runtime(self) -> None:
+        """Apply the free-AI flag to the agent after the switch has painted.
+
+        Skips the cloud token refresh. That network call was freezing the
+        Settings page on every flip.
+        """
+        self._rebuild_service(skip_cloud_refresh=True)
+
+    @Slot(bool)
+    def _on_free_ai_model_toggled(self, checked: bool) -> None:
+        if self._thread is not None and self._thread.isRunning():
+            toggle = getattr(self, "_free_ai_toggle", None)
+            if toggle is not None:
+                toggle.blockSignals(True)
+                toggle.setChecked(not checked, animate=False)
+                toggle.blockSignals(False)
+            QMessageBox.warning(
+                self,
+                "Busy",
+                "Wait for the current task to finish before changing Free AI model abilities.",
+            )
+            return
+        self._state.free_ai_model_enabled = bool(checked)
+        if not checked:
+            self._coerce_providers_if_free_ai_off()
+        self._refresh_llm_provider_combos()
+        self._sync_ollama_entry_points()
+        self._refresh_user_menu()
+        self._schedule_desktop_state_save()
+        self.statusBar().showMessage(
+            "Free AI model abilities turned on."
+            if checked
+            else "Free AI model abilities turned off.",
+            4000,
+        )
+        timer = getattr(self, "_free_ai_apply_timer", None)
+        if timer is None:
+            timer = QTimer(self)
+            timer.setSingleShot(True)
+            timer.setInterval(0)
+            timer.timeout.connect(self._apply_free_ai_runtime)
+            self._free_ai_apply_timer = timer
+        timer.start()
+
     def _set_combo_value(self, combo: QComboBox, value: str) -> None:
         idx = combo.findText(value)
         if idx >= 0:
@@ -4021,6 +4366,11 @@ class MainWindow(QMainWindow):
         self._fallback_cb.setChecked(self._state.use_fallback_llm)
         self._fallback_cb.blockSignals(False)
         self._safe_mode_cb.setChecked(self._state.safe_mode)
+        if hasattr(self, "_free_ai_toggle"):
+            self._free_ai_toggle.blockSignals(True)
+            self._free_ai_toggle.setChecked(self._free_ai_model_enabled(), animate=False)
+            self._free_ai_toggle.blockSignals(False)
+        self._refresh_llm_provider_combos()
         self._apply_theme(restyle_conversation=False)
         self._fast_mode_cb.blockSignals(True)
         self._fast_mode_cb.setChecked(bool(getattr(self._state, "fast_mode_non_file_prompts", False)))
@@ -4037,7 +4387,7 @@ class MainWindow(QMainWindow):
         )
         self._set_combo_value(
             self._fallback_llm_combo,
-            self._state.preferred_fallback_llm or self._settings.fallback_llm,
+            self._fallback_llm_display_value(),
         )
 
     def _refresh_all_views(self) -> None:
@@ -4059,14 +4409,12 @@ class MainWindow(QMainWindow):
     def _refresh_account_views(self) -> None:
         profile = self._state.profile
         me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
-        # Prefer the desktop profile name (set at sign-in, e.g. email local-part) over stale cloud display_name.
-        profile_name = (profile.display_name or "").strip()
-        cloud_name = str(me.get("display_name") or "").strip()
+        profile_name = _safe_public_label(profile.display_name or "")
+        cloud_name = _safe_public_label(str(me.get("display_name") or ""))
         email_disp = str(me.get("email") or "").strip() or (profile.email or "").strip()
-        local = _email_local_part(email_disp)
-        name_disp = profile_name or cloud_name or local or "—"
+        name_disp = profile_name or cloud_name or "—"
         email_disp = email_disp or "—"
-        company_disp = profile.company or "—"
+        company_disp = _safe_public_label(profile.company or "") or "—"
         self._account_name_value.setText(name_disp)
         self._account_email_value.setText(email_disp)
         self._account_company_value.setText(company_disp)
@@ -4333,6 +4681,8 @@ class MainWindow(QMainWindow):
             "fit assessment",
             "from the plotted parcel",
             "best way to build on this parcel",
+            "survey notice",
+            "transformation parameters",
         }
         parts: list[str] = []
         saw_text = False
@@ -4364,6 +4714,14 @@ class MainWindow(QMainWindow):
                 saw_text = True
                 continue
             line = self._inline_md_html(html.escape(s))
+            low = s.lower()
+            if low.startswith("survey notice") or s.startswith("SURVEY NOTICE") or s.startswith("⚠"):
+                warn_color = "#fbbf24" if self._is_dark_theme() else "#b45309"
+                parts.append(
+                    f'<span style="color:{warn_color};font-weight:700;">{line}</span><br/>'
+                )
+                saw_text = True
+                continue
             if not saw_text and len(s) <= 90:
                 line = f"<b>{line}</b>"
             parts.append(f"{line}<br/>")
@@ -4862,7 +5220,11 @@ class MainWindow(QMainWindow):
                 self._credit_notice_current_band = "free"
                 self._credit_notice_label.setText(
                     "You are on the free plan with no subscription credit pool ($0). "
-                    "Use local models (Ollama), or sign in and upgrade for hosted usage."
+                    + (
+                        "Use local models (Ollama), or sign in and upgrade for hosted usage."
+                        if self._free_ai_model_enabled()
+                        else "Sign in and upgrade for hosted models. Paid models stay unavailable until you subscribe."
+                    )
                 )
                 self._credit_notice_dismiss_btn.setVisible(False)
                 self._credit_notice_wrap.setMinimumHeight(26)
@@ -4873,16 +5235,21 @@ class MainWindow(QMainWindow):
         pct = (used / budget) * 100.0 if budget > 0 else 0.0
         exhausted = remaining <= eps
 
+        free_local = self._free_ai_model_enabled()
         m50 = "About half of this period's subscription credits (in US dollars) have been used — plan larger jobs accordingly."
-        m80 = "About four fifths of this period's credits are used — consider spacing heavy tasks or switching to a local model if needed."
+        m80 = (
+            "About four fifths of this period's credits are used — consider spacing heavy tasks"
+            + (" or switching to a local model if needed." if free_local else ".")
+        )
         m95 = (
             "Nearly all of this period's credits are used — you may run out soon; "
-            "open Credits and Usage under Account, or use Ollama locally."
+            "open Credits and Usage under Account"
+            + (", or use Ollama locally." if free_local else ".")
         )
         m100 = (
             "You have used 100% of your SurvyAI Pro usage credits for this billing period. "
-            "Kindly purchase more credits or renew your plan (Account → Credits and Usage), "
-            "or switch to a free local model (Ollama)."
+            "Kindly purchase more credits or renew your plan (Account → Credits and Usage)"
+            + (", or switch to a free local model (Ollama)." if free_local else ".")
         )
 
         band = "none"
@@ -4966,6 +5333,17 @@ class MainWindow(QMainWindow):
         return pick or ""
 
     def _platform_credit_exhausted_message(self) -> str:
+        if not self._free_ai_model_enabled():
+            return (
+                "You have used the API credit included with your SurvyAI Pro subscription for this "
+                "billing period. Paid cloud models are paused until you add more capacity or your plan "
+                "renews.\n\n"
+                "What you can do next:\n"
+                "• Open **Account → Credits & Usage** or your Paystack subscription page to purchase or "
+                "upgrade.\n\n"
+                "SurvyAI stops hosted LLM requests when your remaining balance reaches zero so usage stays "
+                "within what your subscription funds."
+            )
         return (
             "You have used the API credit included with your SurvyAI Pro subscription for this "
             "billing period. Paid cloud models are paused until you add more capacity or your plan "
@@ -5280,6 +5658,8 @@ class MainWindow(QMainWindow):
         )
 
     def _auto_switch_to_ollama_after_credit_exhaustion(self) -> None:
+        if not self._free_ai_model_enabled():
+            return
         if self._effective_run_llm_id() == "ollama":
             return
         self._state.preferred_primary_llm = "ollama"
@@ -5549,6 +5929,11 @@ class MainWindow(QMainWindow):
         if not turns:
             return raw_query
         if _is_standalone_knowledge_question(raw_query):
+            return raw_query
+        # Automated CAD / Console Generate-.dwg sheets are complete new plots.
+        # Do not wrap prior CAD/Excel results around them — that sent the job
+        # through LangGraph as a "leftover" continuation and never opened AutoCAD.
+        if _looks_like_cadastral_plot_prompt(raw_query):
             return raw_query
 
         # Use a lightweight heuristic to decide whether to include the *full* recent
@@ -5865,6 +6250,12 @@ class MainWindow(QMainWindow):
             )
             if result_is_active:
                 self._append_assistant_message(body, error=not result.success)
+        if result_is_active and "SURVEY NOTICE" in (body or "").upper():
+            self._append_activity("Survey notice: converted coordinates may be off — check CRS and zone.")
+            self.statusBar().showMessage(
+                "Survey notice: converted coordinates may be off. Check CRS/zone.",
+                8000,
+            )
         if result_is_active and ocr_review and result.success:
             self._maybe_open_ocr_review(ocr_review)
         self._persist_history_from_result(result)
@@ -6202,7 +6593,10 @@ class MainWindow(QMainWindow):
         self._state.preferred_fallback_llm = self._fallback_llm_combo.currentText().strip()
         self._state.fast_mode_non_file_prompts = bool(self._fast_mode_cb.isChecked())
         # If user switches to Ollama from the dropdown, ensure we have a usable local model selected.
-        wants_ollama = self._state.preferred_primary_llm == "ollama" or self._state.preferred_fallback_llm == "ollama"
+        wants_ollama = self._free_ai_model_enabled() and (
+            self._state.preferred_primary_llm == "ollama"
+            or self._state.preferred_fallback_llm == "ollama"
+        )
         if wants_ollama:
             if not self._state.ollama_base_url.strip():
                 self._state.ollama_base_url = str(getattr(self._settings, "ollama_base_url", "") or "").strip() or "http://localhost:11434"
@@ -6708,69 +7102,57 @@ class MainWindow(QMainWindow):
         )
         if not ok or not email.strip():
             return
+        pwd_dlg: _PasswordPromptDialog | _NewPasswordDialog
         if is_register:
             pwd_dlg = _NewPasswordDialog(
                 self,
                 title="Create account",
                 email=email.strip(),
             )
-            if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
-                return
-            password = pwd_dlg.password()
         else:
             pwd_dlg = _PasswordPromptDialog(
                 self,
                 title="Cloud sign-in",
                 label="Password",
             )
-            if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
-                return
-            password = pwd_dlg.password()
-            if not password:
-                return
-        if not is_register:
-            nm, ok_nm = QInputDialog.getText(
-                self,
-                "Sign in",
-                "Name (optional):",
-                text=self._state.profile.display_name.strip(),
+        if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        password = pwd_dlg.password()
+        pwd_dlg.clear()
+        if not password:
+            return
+        ident = _SignInIdentityDialog(
+            self,
+            title="Create account" if is_register else "Sign in",
+            name=(self._state.profile.display_name or "").strip(),
+            company=(self._state.profile.company or "").strip(),
+            secret=password,
+        )
+        if ident.exec() == QDialog.DialogCode.Accepted:
+            display_name_for_profile = ident.name()
+            company_for_profile = ident.company()
+        else:
+            display_name_for_profile = _safe_public_label(
+                self._state.profile.display_name, password
             )
-            display_name_for_profile = (nm or "").strip() if ok_nm else ""
-            co, ok_co = QInputDialog.getText(
-                self,
-                "Sign in",
-                "Company (optional):",
-                text=self._state.profile.company.strip(),
-            )
-            company_for_profile = (co or "").strip() if ok_co else ""
+            company_for_profile = _safe_public_label(self._state.profile.company, password)
+        # Held only until account sync finishes, then wiped. Never written to disk.
+        secret_holder = {"v": password}
+        password = ""
         if is_register:
-            display_name, dok = QInputDialog.getText(
-                self,
-                "Create account",
-                "Display name (optional):",
-                text=(self._state.profile.display_name or "").strip(),
-            )
-            if not dok:
-                display_name = ""
-            display_name_for_profile = (display_name or "").strip()
-            comp_in, ok_comp = QInputDialog.getText(
-                self,
-                "Create account",
-                "Company (optional):",
-                text=self._state.profile.company.strip(),
-            )
-            company_for_profile = (comp_in or "").strip() if ok_comp else ""
             try:
                 cloud_register(
                     base_url=base_url,
                     email=email.strip(),
-                    password=password,
+                    password=secret_holder["v"],
                     display_name=display_name_for_profile or None,
                 )
             except CloudApiError as exc:
+                secret_holder["v"] = ""
                 QMessageBox.warning(self, "Create account failed", user_facing_cloud_message(exc))
                 return
             except Exception as exc:
+                secret_holder["v"] = ""
                 QMessageBox.warning(self, "Create account failed", user_facing_cloud_message(exc))
                 return
             QMessageBox.information(
@@ -6781,12 +7163,18 @@ class MainWindow(QMainWindow):
 
         self._begin_cloud_busy("Signing in…")
         try:
-            tokens = login(base_url=base_url, email=email.strip(), password=password)
+            tokens = login(
+                base_url=base_url,
+                email=email.strip(),
+                password=secret_holder["v"],
+            )
         except CloudApiError as exc:
+            secret_holder["v"] = ""
             self._end_cloud_busy()
             QMessageBox.warning(self, "Couldn't sign in", user_facing_cloud_message(exc))
             return
         except Exception as exc:
+            secret_holder["v"] = ""
             self._end_cloud_busy()
             QMessageBox.warning(self, "Couldn't sign in", user_facing_cloud_message(exc))
             return
@@ -6797,14 +7185,18 @@ class MainWindow(QMainWindow):
         self._state.cloud_access_token_expires_at = access_token_expires_at_iso(
             expires_in_seconds=tokens.expires_in
         )
-        local = _email_local_part(email.strip())
-        entered = (display_name_for_profile or "").strip()
-        self._state.profile.display_name = entered or local
-        self._state.profile.company = (company_for_profile or "").strip()
+        signed_in_secret = secret_holder["v"]
+        if _label_exposes_secret(self._state.profile.display_name, signed_in_secret):
+            self._state.profile.display_name = ""
+        if _label_exposes_secret(self._state.profile.company, signed_in_secret):
+            self._state.profile.company = ""
+        self._state.profile.display_name = display_name_for_profile
+        self._state.profile.company = company_for_profile
         self._state.profile.email = email.strip()
         if not self._state.profile.signed_in_at:
             self._state.profile.signed_in_at = datetime.now(timezone.utc).isoformat()
         self._state_store.save(self._state)
+        self._refresh_account_views()
 
         payload = CloudAccountSyncPayload(
             base_url=base_url.strip(),
@@ -6819,19 +7211,32 @@ class MainWindow(QMainWindow):
         self._cloud_account_sync_thread = thread
 
         def _done() -> None:
+            secret_holder["v"] = ""
             self._end_cloud_busy()
             if self._cloud_account_sync_thread is thread:
                 self._cloud_account_sync_thread = None
 
         def _on_ok(result_obj: object) -> None:
+            secret = secret_holder.get("v") or ""
             result = result_obj if isinstance(result_obj, CloudAccountSyncResult) else None
             if result is None:
+                secret_holder["v"] = ""
                 QMessageBox.warning(self, "Couldn't sign in", "Unexpected sync response.")
                 return
-            from_me = str((result.me or {}).get("display_name") or "").strip()
-            self._state.profile.display_name = entered or local or from_me
-            ent = result.ent if isinstance(result.ent, dict) else {}
             me = result.me if isinstance(result.me, dict) else {}
+            if _label_exposes_secret(str(me.get("display_name") or ""), secret):
+                me = dict(me)
+                me["display_name"] = ""
+                result.me = me
+            safe_cloud = _safe_public_label(str(me.get("display_name") or ""), secret)
+            if display_name_for_profile:
+                self._state.profile.display_name = display_name_for_profile
+            elif not _safe_public_label(self._state.profile.display_name, secret):
+                self._state.profile.display_name = safe_cloud
+            if _label_exposes_secret(self._state.profile.company, secret):
+                self._state.profile.company = ""
+            secret_holder["v"] = ""
+            ent = result.ent if isinstance(result.ent, dict) else {}
             plan = str(ent.get("plan_slug") or me.get("plan_slug") or "")
             status = str(ent.get("subscription_status") or me.get("subscription_status") or "")
             self._apply_cloud_account_sync_result(
@@ -6925,6 +7330,7 @@ class MainWindow(QMainWindow):
         if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
             return
         new_password = pwd_dlg.password()
+        pwd_dlg.clear()
         try:
             cloud_reset_password(
                 base_url=base,
@@ -6938,6 +7344,9 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Reset password failed", user_facing_cloud_message(exc))
             return
+        finally:
+            self._drop_profile_labels_matching_secret(new_password)
+            new_password = ""
         QMessageBox.information(
             self,
             "Password updated",
@@ -6969,16 +7378,20 @@ class MainWindow(QMainWindow):
         if current_dlg.exec() != QDialog.DialogCode.Accepted:
             return
         current = current_dlg.password()
+        current_dlg.clear()
         if not current:
             return
+        self._drop_profile_labels_matching_secret(current)
         pwd_dlg = _NewPasswordDialog(
             self,
             title="Change password",
             email=email or None,
         )
         if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
+            current = ""
             return
         new_password = pwd_dlg.password()
+        pwd_dlg.clear()
         try:
             tokens = cloud_change_password(
                 base_url=base,
@@ -6992,6 +7405,10 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.warning(self, "Change password failed", user_facing_cloud_message(exc))
             return
+        finally:
+            self._drop_profile_labels_matching_secret(current, new_password)
+            current = ""
+            new_password = ""
         if tokens.access_token:
             self._state.cloud_access_token = tokens.access_token
         if tokens.refresh_token:

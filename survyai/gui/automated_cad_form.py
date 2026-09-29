@@ -4,15 +4,19 @@ from __future__ import annotations
 
 from typing import Callable, List, Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QComboBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QToolButton,
     QVBoxLayout,
@@ -25,15 +29,18 @@ from survyai.gui.automated_cad_prompt import (
     FENCE_CONCRETE,
     FENCE_DWARF,
     FENCE_NONE,
+    MAX_CAD_PLANS,
     MODE_BEARINGS,
     MODE_COORDINATES,
     AccessRoad,
     CadFormState,
     TraverseLeg,
     WallFence,
-    compose_cad_prompt,
+    cad_form_state_is_blank,
+    compose_cad_prompts,
     ordinal_label,
     parse_cad_prompt,
+    plan_sheet_caption,
 )
 
 
@@ -73,19 +80,32 @@ class AutomatedCadForm(QWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setObjectName("cadFormRoot")
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
-        root = QVBoxLayout(self)
+        self._plans: List[CadFormState] = [CadFormState()]
+        self._current_index = 0
+        self._plan_chip_group = QButtonGroup(self)
+        self._plan_chip_group.setExclusive(True)
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        outer.addWidget(self._build_plan_strip(), 0)
+
+        fields = QWidget()
+        fields.setObjectName("cadFormFields")
+        root = QVBoxLayout(fields)
         root.setContentsMargins(10, 8, 14, 16)
         root.setSpacing(12)
 
         hint = QLabel(
-            "Fill the survey values below. SurvyAI will plot the plan from these fields — "
-            "you do not need to write a prompt. Switch to Console for follow-ups "
-            "(roads, title, subdivision, save as)."
+            "Each numbered sheet is one survey plan (up to 10). Fill the sheet you are on, "
+            "then Send — empty sheets are skipped. You do not need to write a prompt. "
+            "Switch to Console for follow-ups (roads, title, subdivision, save as)."
         )
         hint.setToolTip(
-            "Send plots from this form. Use Console in the same conversation for later edits."
+            "Send plots completed sheets in this form. Blank extra sheets are ignored. "
+            "Use Console in the same conversation for later edits."
         )
         hint.setObjectName("cadHintLabel")
         hint.setWordWrap(True)
@@ -104,9 +124,222 @@ class AutomatedCadForm(QWidget):
         root.addWidget(self._build_certification_block())
         root.addStretch(1)
 
+        scroll = QScrollArea()
+        self._fields_scroll = scroll
+        scroll.setObjectName("cadFormScroll")
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(fields)
+        scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        outer.addWidget(scroll, 1)
+
         self._set_mode(MODE_COORDINATES)
         self._mode_coords_btn.toggled.connect(self._on_mode_toggled)
         self._mode_bearings_btn.toggled.connect(self._on_mode_toggled)
+        self._rebuild_plan_chips()
+        next_sc = QShortcut(QKeySequence("Alt+Right"), self)
+        next_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        next_sc.activated.connect(self._goto_next_plan)
+        prev_sc = QShortcut(QKeySequence("Alt+Left"), self)
+        prev_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        prev_sc.activated.connect(self._goto_prev_plan)
+
+    # ------------------------------------------------------------------
+    # Plan sheets (horizontal, compact — like drawing layouts)
+    # ------------------------------------------------------------------
+
+    def _build_plan_strip(self) -> QWidget:
+        strip = QWidget()
+        strip.setObjectName("cadPlanStrip")
+        strip.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        layout = QHBoxLayout(strip)
+        layout.setContentsMargins(8, 3, 10, 3)
+        layout.setSpacing(4)
+
+        chip_scroll = QScrollArea()
+        chip_scroll.setObjectName("cadPlanChipScroll")
+        chip_scroll.setWidgetResizable(True)
+        chip_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        chip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        chip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        chip_scroll.setFixedHeight(26)
+        chip_host = QWidget()
+        chip_host.setObjectName("cadPlanChipHost")
+        self._plan_chips_host = QHBoxLayout(chip_host)
+        self._plan_chips_host.setContentsMargins(0, 0, 0, 0)
+        self._plan_chips_host.setSpacing(2)
+        self._plan_chips_host.addStretch(1)
+        chip_scroll.setWidget(chip_host)
+        layout.addWidget(chip_scroll, 1)
+
+        self._plan_add_btn = QToolButton()
+        self._plan_add_btn.setObjectName("cadPlanAdd")
+        self._plan_add_btn.setText("+")
+        self._plan_add_btn.setAutoRaise(False)
+        self._plan_add_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self._plan_add_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._plan_add_btn.setToolTip(
+            "Add another survey-plan sheet (up to 10). "
+            "Sheets with no details are skipped when you Send."
+        )
+        self._plan_add_btn.clicked.connect(self._add_plan_sheet)
+        layout.addWidget(self._plan_add_btn, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        self._plan_count_lab = QLabel("1/10")
+        self._plan_count_lab.setObjectName("cadPlanCount")
+        self._plan_count_lab.setToolTip("Filled sheets plot on Send. Empty extra sheets are ignored.")
+        layout.addWidget(self._plan_count_lab, 0, Qt.AlignmentFlag.AlignVCenter)
+        return strip
+
+    def _stash_current(self) -> None:
+        if not self._plans:
+            self._plans = [CadFormState()]
+            self._current_index = 0
+        idx = max(0, min(self._current_index, len(self._plans) - 1))
+        self._current_index = idx
+        self._plans[idx] = self.collect_state()
+
+    def _goto_plan(self, index: int) -> None:
+        if index < 0 or index >= len(self._plans):
+            return
+        self._stash_current()
+        if index != self._current_index:
+            self._current_index = index
+            self.apply_state(self._plans[index])
+            scroll = getattr(self, "_fields_scroll", None)
+            if scroll is not None:
+                scroll.verticalScrollBar().setValue(0)
+        self._refresh_plan_chip_state()
+
+    def _goto_next_plan(self) -> None:
+        if len(self._plans) < 2:
+            return
+        self._goto_plan((self._current_index + 1) % len(self._plans))
+
+    def _goto_prev_plan(self) -> None:
+        if len(self._plans) < 2:
+            return
+        self._goto_plan((self._current_index - 1) % len(self._plans))
+
+    def _add_plan_sheet(self) -> None:
+        self._stash_current()
+        if len(self._plans) >= MAX_CAD_PLANS:
+            return
+        self._plans.append(CadFormState())
+        self._current_index = len(self._plans) - 1
+        self.apply_state(self._plans[self._current_index])
+        self._rebuild_plan_chips()
+        scroll = getattr(self, "_fields_scroll", None)
+        if scroll is not None:
+            scroll.verticalScrollBar().setValue(0)
+
+    def _remove_plan_sheet(self, index: int) -> None:
+        if index <= 0 or index >= len(self._plans) or len(self._plans) <= 1:
+            return
+        self._stash_current()
+        doomed = self._plans[index]
+        if not cad_form_state_is_blank(doomed):
+            answer = QMessageBox.question(
+                self,
+                "Remove plan sheet",
+                f"Remove {plan_sheet_caption(doomed, index)}?\n\n"
+                "Entered survey values on this sheet will be discarded. "
+                "The first sheet cannot be removed.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        del self._plans[index]
+        if self._current_index == index:
+            self._current_index = max(0, index - 1)
+            self.apply_state(self._plans[self._current_index])
+        elif self._current_index > index:
+            self._current_index -= 1
+        QTimer.singleShot(0, self._rebuild_plan_chips)
+
+    def _rebuild_plan_chips(self) -> None:
+        host = getattr(self, "_plan_chips_host", None)
+        if host is None:
+            return
+        while host.count():
+            item = host.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for btn in list(self._plan_chip_group.buttons()):
+            self._plan_chip_group.removeButton(btn)
+
+        for i, state in enumerate(self._plans):
+            wrap = QWidget()
+            wrap.setObjectName("cadPlanChipWrap")
+            row = QHBoxLayout(wrap)
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(0)
+            chip = QToolButton()
+            chip.setObjectName("cadPlanChip")
+            chip.setText(f"Plan {i + 1}")
+            chip.setCheckable(True)
+            chip.setAutoRaise(True)
+            chip.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            chip.setCursor(Qt.CursorShape.PointingHandCursor)
+            chip.setToolTip(
+                f"{plan_sheet_caption(state, i)}. Click to open this sheet. "
+                "Alt+Left / Alt+Right also moves between sheets."
+            )
+            chip.setChecked(i == self._current_index)
+            chip.clicked.connect(lambda _checked=False, idx=i: self._goto_plan(idx))
+            self._plan_chip_group.addButton(chip, i)
+            row.addWidget(chip, 0)
+            if i > 0:
+                close = QToolButton()
+                close.setObjectName("cadPlanClose")
+                close.setText("\u00d7")
+                close.setAutoRaise(True)
+                close.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                close.setCursor(Qt.CursorShape.PointingHandCursor)
+                close.setToolTip("Remove this plan sheet. The first sheet cannot be removed.")
+                close.clicked.connect(lambda _checked=False, idx=i: self._remove_plan_sheet(idx))
+                row.addWidget(close, 0)
+            host.addWidget(wrap, 0)
+
+        host.addStretch(1)
+        n = len(self._plans)
+        if getattr(self, "_plan_count_lab", None) is not None:
+            self._plan_count_lab.setText(f"{n}/{MAX_CAD_PLANS}")
+        if getattr(self, "_plan_add_btn", None) is not None:
+            at_cap = n >= MAX_CAD_PLANS
+            self._plan_add_btn.setEnabled(not at_cap)
+            self._plan_add_btn.setToolTip(
+                "Maximum of 10 survey-plan sheets."
+                if at_cap
+                else (
+                    "Add another survey-plan sheet (up to 10). "
+                    "Sheets with no details are skipped when you Send."
+                )
+            )
+
+    def _refresh_plan_chip_state(self) -> None:
+        for i, state in enumerate(self._plans):
+            btn = self._plan_chip_group.button(i)
+            if btn is None:
+                continue
+            btn.blockSignals(True)
+            btn.setChecked(i == self._current_index)
+            btn.blockSignals(False)
+            btn.setText(f"Plan {i + 1}")
+            btn.setToolTip(
+                f"{plan_sheet_caption(state, i)}. Click to open this sheet. "
+                "Alt+Left / Alt+Right also moves between sheets."
+            )
+        n = len(self._plans)
+        if getattr(self, "_plan_count_lab", None) is not None:
+            self._plan_count_lab.setText(f"{n}/{MAX_CAD_PLANS}")
+        if getattr(self, "_plan_add_btn", None) is not None:
+            at_cap = n >= MAX_CAD_PLANS
+            self._plan_add_btn.setEnabled(not at_cap)
 
     # ------------------------------------------------------------------
     # Mode
@@ -751,12 +984,19 @@ class AutomatedCadForm(QWidget):
         self._bowditch_cb.blockSignals(False)
 
     def compose_prompt(self) -> tuple[str, str]:
-        return compose_cad_prompt(self.collect_state())
+        self._stash_current()
+        return compose_cad_prompts(self._plans)
 
     def apply_prompt_template(self, text: str) -> str:
         state = parse_cad_prompt(text)
         self.apply_state(state)
-        return "CAD form filled from the default survey-plan prompt."
+        self._stash_current()
+        self._refresh_plan_chip_state()
+        n = self._current_index + 1
+        return (
+            f"Plan {n} filled from the default CAD template. "
+            "Other plan sheets were left unchanged."
+        )
 
     def _sync_simple_rows(
         self,

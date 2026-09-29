@@ -111,6 +111,9 @@ class DesktopState:
     # Symbolic primary selection ("auto" = best paid hosted model; persists across restarts).
     preferred_primary_llm: str = "auto"
     preferred_fallback_llm: str = ""
+    # Optional local Ollama. Off by default so a fresh install never prompts for it.
+    # When False, Ollama is omitted from provider lists and the agent never uses it.
+    free_ai_model_enabled: bool = False
     # Ollama runtime settings for offline/local models.
     # Stored here (not in .env) so end-users don't edit config files.
     ollama_base_url: str = ""
@@ -181,6 +184,7 @@ class DesktopState:
                 str(raw.get("preferred_primary_llm") or "auto").strip().lower() or "auto"
             ),
             preferred_fallback_llm=str(raw.get("preferred_fallback_llm", "")),
+            free_ai_model_enabled=bool(raw.get("free_ai_model_enabled", False)),
             ollama_base_url=str(raw.get("ollama_base_url", "")),
             ollama_model=str(raw.get("ollama_model", "")),
             ollama_last_prompted_at=str(raw.get("ollama_last_prompted_at", "")),
@@ -517,6 +521,7 @@ class AppStateStore:
             "monthly_credits_usd": state.monthly_credits_usd,
             "monthly_credits_used_usd": state.monthly_credits_used_usd,
             "can_use_platform_llm": state.can_use_platform_llm,
+            "free_ai_model_enabled": bool(getattr(state, "free_ai_model_enabled", False)),
             "credits_billing_interval": state.credits_billing_interval,
             "usage_period_anchor": state.usage_period_anchor,
             "subscription_current_period_end": state.subscription_current_period_end,

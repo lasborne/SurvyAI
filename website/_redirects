@@ -1,4 +1,5 @@
 # Stable download aliases — update the target filename when you ship a new build.
+/beta-user           /beta-user/index.html   200
 /get/latest          /updates/SurvyAI-Setup-1.0.1.exe   302
 /updates/latest      /updates/SurvyAI-Setup-1.0.1.exe   302
 /downloads/latest    /updates/SurvyAI-Setup-1.0.1.exe   302

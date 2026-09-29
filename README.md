@@ -39,7 +39,7 @@ examples (also shown once after first install).
 | Tab | Use it for |
 |---|---|
 | **Console** | Free-form prompts, PDF-to-CAD, follow-up edits, GIS, documents, and questions. **Enter** sends; **Shift+Enter** starts a new line. |
-| **Automated CAD section** | Structured cadastral plotting from coordinates or bearings and distances |
+| **Automated CAD section** | Structured cadastral plotting — up to 10 plan sheets from coordinates or bearings and distances |
 | **Output History** | Past agent runs, costs, and “use this query again” |
 
 **Conversations** (left) and **Live activity** (right) stay visible on Console and
@@ -51,9 +51,13 @@ Automated CAD so you can switch tabs without losing the thread.
 
 Fill the form, then press **Send**. SurvyAI plots from those values.
 
-- **Coordinates** or **Bearings and distances** — pick one mode. Bearings need
-  one start coordinate (E, N) plus traverse legs. Blank minutes or seconds are
-  treated as 0.
+- **Plan sheets** — the compact numbered strip at the top holds up to **10**
+  survey plans. Click a number to open that sheet, **+** to add a sheet, and
+  **×** to remove a sheet (the first sheet stays). **Send** plots only sheets
+  that have details; blank extra sheets are skipped.
+- **Coordinates** or **Bearings and distances** — pick one mode per sheet.
+  Bearings need one start coordinate (E, N) plus traverse legs. Blank minutes
+  or seconds are treated as 0.
 - **Save File As** — optional `.dwg` name. Leave blank to use the first owner
   name. If a file already exists, SurvyAI asks before overwriting.
 - **Owners** — add every real owner or buyer. Several names appear together on
@@ -114,21 +118,20 @@ SurvyAI detects and uses these when they are installed; none are bundled:
 | **AutoCAD** (2007 or later) | Cadastral plan generation and drawing edits |
 | **ArcGIS Pro** | GIS analysis and generated ArcPy execution |
 | **Blue Marble Geographic Calculator** | Advanced coordinate transformations |
-| **Ollama** | Free local LLM models (installable from inside the app) |
+| **Ollama** | Optional free local LLM. Off until Settings → Turn on the Free AI model abilities |
 
 ---
 
 ## Billing & credits
 
-- The **free plan** uses local models (Ollama) only — no hosted charges.
+- The **free plan** does not include hosted models. Optional local models (Ollama) are off until you turn on **Settings → Turn on the Free AI model abilities**.
 - **Hosted models** draw from your purchased credit balance. Usage is metered
   on the server per request.
 - Open **Account → Credits & Usage** to see the pool, used amount, remaining
   balance, and a short activity log. The page opens immediately; cloud numbers
   refresh in the background.
 - Reminders appear under the console prompt at about 50%, 80%, and 95%.
-- When credits run out, SurvyAI can continue on a free local model. Top up to
-  resume hosted models.
+- When credits run out, hosted models pause until you top up. If Free AI model abilities are on, SurvyAI can continue on a local model.
 
 ### Account password
 

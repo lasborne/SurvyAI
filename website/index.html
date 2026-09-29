@@ -54,10 +54,23 @@
             AI for land surveyors and geospatial professionals — cadastral plans,
             coordinates, GIS, and reports, driven by plain language on your PC.
           </p>
+          <p class="hero__point">
+            SurvyAI lets you use AI to perform Geospatial tasks and assists the Surveyor.
+          </p>
           <div class="btn-row">
             <a class="btn btn--primary btn--lg" href="/get/latest">Download for Windows</a>
             <a class="btn btn--ghost btn--lg" href="#about">About the product</a>
+            <a class="btn btn--soft btn--lg" href="/beta-user/">Join the first users</a>
           </div>
+          <figure class="demo">
+            <div class="demo__frame">
+              <video id="demo-video" controls playsinline preload="metadata" hidden>
+                <source id="demo-source" src="/assets/survyai-demo.mp4" type="video/mp4" />
+              </video>
+              <p class="demo__pending" id="demo-pending">A 60-second demo of SurvyAI at work will play here.</p>
+            </div>
+            <figcaption>One minute with SurvyAI on a survey job.</figcaption>
+          </figure>
         </div>
       </div>
     </section>
@@ -67,7 +80,7 @@
         <div class="section__head">
           <p class="section__eyebrow">Capabilities</p>
           <h2 id="capabilities-title">Real survey work, not chat demos</h2>
-          <p>SurvyAI runs tools on your machine. Your drawings and data stay local.</p>
+          <p>SurvyAI runs survey tools on your PC. Job files stay in your workspace.</p>
         </div>
         <div class="features">
           <article class="feature">
@@ -79,9 +92,51 @@
             <p>Parse points, transform systems, compute areas, and run ArcGIS workflows when Pro is installed.</p>
           </article>
           <article class="feature">
-            <h3>Local or hosted AI</h3>
-            <p>Use free local models (Ollama) or signed-in hosted models with metered credits — your choice.</p>
+            <h3>Reports &amp; spreadsheets</h3>
+            <p>Turn job data into coordinate schedules, area results, and working spreadsheets in your workspace.</p>
           </article>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="faq" aria-labelledby="faq-title">
+      <div class="wrap">
+        <div class="section__head">
+          <p class="section__eyebrow">FAQ</p>
+          <h2 id="faq-title">Before you install</h2>
+        </div>
+        <div class="faq">
+          <details>
+            <summary>What happens after I join the first users?</summary>
+            <p>We keep your name, email, profession, what you want to use SurvyAI for, and the Windows details you type. That list is how we grant Pro access and see which survey jobs to improve next. Joining does not turn Pro on by itself.</p>
+          </details>
+          <details>
+            <summary>Do I need AutoCAD or ArcGIS?</summary>
+            <p>AutoCAD is required to produce or edit survey plans. Coordinate and document tasks can run without it. ArcGIS Pro is only needed when you ask SurvyAI to drive a GIS project.</p>
+          </details>
+          <details>
+            <summary>Where do my drawings go?</summary>
+            <p>CAD files, spreadsheets, and other job files stay in the workspace folder on your PC. When you are signed in, the task text — and any file content that task needs — is sent to SurvyAI’s hosted model. The desktop tools still run on your computer.</p>
+          </details>
+          <details>
+            <summary>Can I download the beta without joining?</summary>
+            <p>Yes. The Windows installer is on this page. Joining tells us who you are so we can grant access and learn what to build next.</p>
+          </details>
+        </div>
+      </div>
+    </section>
+
+    <section class="section section--alt" id="privacy" aria-labelledby="privacy-title">
+      <div class="wrap">
+        <div class="section__head">
+          <p class="section__eyebrow">Privacy / security</p>
+          <h2 id="privacy-title">Privacy &amp; security</h2>
+        </div>
+        <div class="privacy">
+          <p>Survey files stay in the workspace you choose on your PC. SurvyAI does not keep a copy of your drawing library.</p>
+          <p>Sign-in secrets in the desktop app are stored with Windows DPAPI. Installers published here are checked by SHA-256 in the in-app updater before they are applied.</p>
+          <p>Hosted AI, used when you are signed in, sends that task to SurvyAI’s cloud service so the model can answer. It does not upload your workspace as a backup.</p>
+          <p>The first-user form stores only what you submit: name, email, profession, intended use, and Windows specs. We use it to grant access, improve the product, and understand how surveyors want to work. We do not sell it. Questions go to <a href="mailto:support@survyai.com">support@survyai.com</a>.</p>
         </div>
       </div>
     </section>
@@ -92,7 +147,7 @@
         <div class="section__head">
           <p class="section__eyebrow">Download</p>
           <h2 id="download-title">Get SurvyAI Desktop (beta)</h2>
-          <p>Windows 10/11 installer for the SurvyAI Desktop beta. After setup, pick a workspace and start with a local model or sign in for hosted AI.</p>
+          <p>Windows 10/11 installer for the SurvyAI Desktop beta. After setup, pick a workspace and sign in to start.</p>
         </div>
 
         <div class="panel">
@@ -211,7 +266,7 @@
             </li>
             <li>
               <strong>Integrations</strong>
-              <span>AutoCAD · ArcGIS Pro · Blue Marble · Ollama</span>
+              <span>AutoCAD · ArcGIS Pro · Blue Marble</span>
             </li>
             <li>
               <strong>Company</strong>
@@ -251,7 +306,11 @@
       <p>
         <a href="#download">Download</a>
         ·
-        <a href="#updates">Updates</a>
+        <a href="/beta-user/">First users</a>
+        ·
+        <a href="#faq">FAQ</a>
+        ·
+        <a href="#privacy">Privacy</a>
         ·
         <a href="mailto:support@survyai.com">Support</a>
       </p>
@@ -278,6 +337,22 @@
             toggle.setAttribute("aria-label", "Open menu");
           });
         });
+      }
+
+      var video = document.getElementById("demo-video");
+      var pending = document.getElementById("demo-pending");
+      var source = document.getElementById("demo-source");
+      function showDemoPending() {
+        if (video) video.hidden = true;
+        if (pending) pending.hidden = false;
+      }
+      if (video && pending) {
+        video.addEventListener("loadeddata", function () {
+          pending.hidden = true;
+          video.hidden = false;
+        });
+        video.addEventListener("error", showDemoPending);
+        if (source) source.addEventListener("error", showDemoPending);
       }
     })();
   </script>

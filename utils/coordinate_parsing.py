@@ -221,6 +221,122 @@ def extract_points(text: str, max_points: int = 20) -> List[ParsedPoint]:
     return out
 
 
+# Official EPSG-style datum labels, longest/most specific first.
+# Used to keep NAD83/ETRS89/SIRGAS/etc. on UTM instead of silently substituting WGS 84.
+_NAMED_DATUM_PATTERNS: Tuple[Tuple[str, str], ...] = (
+    (r"international terrestrial reference frame\s*2014", "ITRF2014"),
+    (r"international terrestrial reference frame\s*2008", "ITRF2008"),
+    (r"international terrestrial reference frame\s*2000", "ITRF2000"),
+    (r"nad\s*83\s*\(\s*2011\s*\)", "NAD83(2011)"),
+    (r"nad\s*83\s*\(\s*csrs\s*\)", "NAD83(CSRS)"),
+    (r"nad\s*83\s*\(\s*harn\s*\)", "NAD83(HARN)"),
+    (r"nad\s*83\s*\(\s*nsrs2007\s*\)", "NAD83(NSRS2007)"),
+    (r"sirgas\s*2000", "SIRGAS 2000"),
+    (r"hartebeesthoek\s*94|hartebeesthoek94", "Hartebeesthoek94"),
+    (r"timbalai\s*1948", "Timbalai 1948"),
+    (r"pulkovo\s*1942", "Pulkovo 1942"),
+    (r"pulkovo\s*1995", "Pulkovo 1995"),
+    (r"arc\s*1960", "Arc 1960"),
+    (r"arc\s*1950", "Arc 1950"),
+    (r"gda\s*2020|gda2020", "GDA2020"),
+    (r"gda\s*94|gda94", "GDA94"),
+    (r"etrs[\s\-]?89", "ETRS89"),
+    (r"itrf[\s\-]?2014", "ITRF2014"),
+    (r"itrf[\s\-]?2008", "ITRF2008"),
+    (r"itrf[\s\-]?2000", "ITRF2000"),
+    (r"nad\s*83", "NAD83"),
+    (r"nad\s*27", "NAD27"),
+    (r"sad[\s\-]?69", "SAD69"),
+    (r"psad[\s\-]?56", "PSAD56"),
+    (r"ed[\s\-]?50", "ED50"),
+    (r"wgs[\s\-]?84", "WGS 84"),
+    (r"osgb[\s\-]?36|british national grid", "OSGB36"),
+    (r"nzgd[\s\-]?2000", "NZGD2000"),
+    (r"nzgd[\s\-]?49", "NZGD49"),
+    (r"agd\s*66|agd66", "AGD66"),
+    (r"agd\s*84|agd84", "AGD84"),
+    (r"kertau(?:\s*1968)?", "Kertau 1968"),
+    (r"tokyo", "Tokyo"),
+    (r"minna", "Minna"),
+)
+
+_ELLIPSOID_ONLY_RE = re.compile(
+    r"^(?:grs[\s\-]?80|grs80|clarke[\s\-]?1880|clarke[\s\-]?1866|"
+    r"airy(?:\s*1830)?|bessel(?:\s*1841)?|krass?ovsky(?:\s*1940)?|"
+    r"everest(?:\s*1830)?|wgs[\s\-]?72)$",
+    flags=re.IGNORECASE,
+)
+
+# Tokens that mean the user named a real CRS/datum (not "convert this Excel to CAD").
+CRS_FAMILY_TOKEN = (
+    r"utm|wgs|epsg|wkid|minna|nad|osgb|gda|mga|etrs|itrf|sirgas|sad|psad|"
+    r"ed\s*50|ed50|arc\s*19|hartebeest|pulkovo|nzgd|agd|ntm|bng|lambert|"
+    r"mercator|stereographic|tokyo|kertau|timbalai|nsidc|clarke|datum"
+)
+
+
+def extract_named_datum(text: str) -> Optional[str]:
+    """Return a canonical datum label if the text names one (else None)."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    low = re.sub(r"[\s_\-]+", " ", raw.lower())
+    for pat, label in _NAMED_DATUM_PATTERNS:
+        if re.search(pat, low, flags=re.IGNORECASE):
+            return label
+    return None
+
+
+def is_ellipsoid_only_crs_label(text: str) -> bool:
+    """True when the string is an ellipsoid name, not a coordinate reference system."""
+    t = re.sub(r"[\s_\-]+", " ", (text or "").strip().lower())
+    return bool(t and _ELLIPSOID_ONLY_RE.match(t))
+
+
+def _utm_zone_hemi(text: str) -> Optional[Tuple[str, str]]:
+    low = (text or "").lower()
+    m = re.search(r"utm\s*(?:zone\s*)?(\d{1,2})\s*([ns])\b", low)
+    if not m:
+        m = re.search(r"\butm\b\s*(?:zone\s*)?(\d{1,2})\b", low)
+        if not m:
+            return None
+        return m.group(1), ""
+    return m.group(1), m.group(2).upper()
+
+
+def canonical_projected_crs_label(text: str) -> Optional[str]:
+    """
+    Keep datum + projection together.
+
+    'ETRS89 / UTM zone 32N' stays that name. Bare 'UTM Zone 32N' stays WGS 84 UTM wording.
+    """
+    label = (text or "").strip()
+    if not label:
+        return None
+    low = label.lower()
+    datum = extract_named_datum(label)
+
+    mga = re.search(r"\bmga\s*(?:zone\s*)?(\d{1,2})\b", low)
+    if mga and datum in ("GDA94", "GDA2020"):
+        return f"{datum} / MGA zone {mga.group(1)}"
+
+    um = _utm_zone_hemi(label)
+    if um:
+        zone, hemi = um
+        if datum and datum != "WGS 84":
+            if hemi:
+                return f"{datum} / UTM zone {zone}{hemi}"
+            return f"{datum} / UTM zone {zone}"
+        if datum == "WGS 84":
+            if hemi:
+                return f"WGS 84 / UTM zone {zone}{hemi}"
+            return f"WGS 84 / UTM zone {zone}"
+        if hemi:
+            return f"UTM Zone {zone}{hemi}"
+        return f"UTM Zone {zone}"
+    return None
+
+
 def infer_crs_from_text(text: str) -> Dict[str, Any]:
     """
     Heuristic CRS inference from a free-form query.
@@ -260,11 +376,10 @@ def infer_crs_from_text(text: str) -> Dict[str, Any]:
     dst = _clean_crs(m.group(2)) if m else None
     if not src or not dst:
         m2 = re.search(
-            r"(?i)\b(?:convert(?:ed|ing)?|reproject(?:ed|ing)?|transform(?:ed|ing)?)\b"
-            r".{0,48}?"
-            r"("
-            r"(?:utm|wgs|epsg|minna|nad|osgb)[^,\n;:]{0,48}"
-            r")"
+            r"(?i)\b(?:convert(?:ed|ing)?|reproject(?:ed|ing)?|transform(?:ed|ing)?)\s+"
+            r"(?:(?:it|them|coordinates?|these|the)\s+)?"
+            r"(?:from\s+)?"
+            rf"((?:(?!\b(?:to|into)\b).)*?(?:{CRS_FAMILY_TOKEN})[^,\n;]*?)"
             r"\s+\b(?:to|into)\s+"
             r"(.+?)(?:"
             r",|\band\s+save\b|\bthen\b|\busing\b|\bwith\b|\band\s+use\b|"
@@ -287,19 +402,6 @@ def infer_crs_from_text(text: str) -> Dict[str, Any]:
             else:
                 src = src or f"EPSG:{codes[0]}"
 
-    # UTM hint (keep as a user-friendly string; converter can resolve)
-    utm = re.search(r"(?i)\bUTM\b.*?\bZONE\b\s*(\d{1,2})\s*([NS])\b", q)
-    if utm:
-        zone = int(utm.group(1))
-        hemi = utm.group(2).upper()
-        utm_str = f"UTM Zone {zone}{hemi}"
-        if src and "utm" in src.lower():
-            src = utm_str
-        elif dst and "utm" in dst.lower():
-            dst = utm_str
-        elif not src:
-            src = utm_str
-
     def _canon_named(label: Optional[str]) -> Optional[str]:
         if not label:
             return label
@@ -310,12 +412,21 @@ def infer_crs_from_text(text: str) -> Dict[str, Any]:
             return "Minna / Nigeria West Belt"
         if "minna" in low and re.search(r"east[\s\-]?belt", low):
             return "Minna / Nigeria East Belt"
-        um = re.search(r"utm\s*(?:zone\s*)?(\d{1,2})\s*([ns])\b", low)
-        if um:
-            return f"UTM Zone {um.group(1)}{um.group(2).upper()}"
-        if re.search(r"\bwgs\s*84\b", low):
+        projected = canonical_projected_crs_label(label)
+        if projected:
+            return projected
+        if re.search(r"\bwgs\s*84\b", low) and "utm" not in low and "ups" not in low:
             return "WGS84"
         return label
+
+    # Bare UTM in the query fills a missing source only when that side has no datum.
+    if (not src) or (src and "utm" in src.lower() and not extract_named_datum(src)):
+        projected = canonical_projected_crs_label(src or q)
+        if projected and "UTM" in projected.upper():
+            if not src:
+                src = projected
+            elif src and extract_named_datum(src) is None:
+                src = projected
 
     src = _canon_named(src)
     dst = _canon_named(dst)
