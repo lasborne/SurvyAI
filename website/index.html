@@ -16,7 +16,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/assets/styles.css" />
+  <link rel="stylesheet" href="/assets/styles.css?v=20260929" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
@@ -46,7 +46,7 @@
       <div class="hero__bg" aria-hidden="true"></div>
       <div class="hero__grid" aria-hidden="true"></div>
       <div class="hero__crosshair" aria-hidden="true"></div>
-      <div class="wrap">
+      <div class="wrap hero__layout">
         <div class="hero__content">
           <p class="badge">Windows desktop · Beta</p>
           <h1 id="hero-title"><span>Survy</span>AI</h1>
@@ -60,22 +60,22 @@
           <div class="btn-row">
             <a class="btn btn--primary btn--lg" href="/get/latest">Download for Windows</a>
             <a class="btn btn--ghost btn--lg" href="#about">About the product</a>
-            <a class="btn btn--soft btn--lg" href="/beta-user/">Join the first users</a>
+            <a class="btn btn--ghost btn--lg btn--join" href="/beta-user/">Join the first users</a>
           </div>
-          <figure class="demo">
-            <div class="demo__frame">
-              <video id="demo-video" controls playsinline preload="metadata" hidden>
-                <source id="demo-source" src="/assets/survyai-demo.mp4" type="video/mp4" />
-              </video>
-              <p class="demo__pending" id="demo-pending">A 60-second demo of SurvyAI at work will play here.</p>
-            </div>
-            <figcaption>One minute with SurvyAI on a survey job.</figcaption>
-          </figure>
         </div>
+        <figure class="demo">
+          <div class="demo__frame">
+            <video id="demo-video" controls playsinline preload="metadata" hidden>
+              <source id="demo-source" src="/assets/survyai-demo.mp4" type="video/mp4" />
+            </video>
+            <p class="demo__pending" id="demo-pending">A 60-second demo of SurvyAI at work will play here.</p>
+          </div>
+          <figcaption>One minute with SurvyAI on a survey job.</figcaption>
+        </figure>
       </div>
     </section>
 
-    <section class="section section--alt" aria-labelledby="capabilities-title">
+    <section class="section" aria-labelledby="capabilities-title">
       <div class="wrap">
         <div class="section__head">
           <p class="section__eyebrow">Capabilities</p>
@@ -99,7 +99,7 @@
       </div>
     </section>
 
-    <section class="section" id="faq" aria-labelledby="faq-title">
+    <section class="section section--alt" id="faq" aria-labelledby="faq-title">
       <div class="wrap">
         <div class="section__head">
           <p class="section__eyebrow">FAQ</p>
@@ -108,7 +108,7 @@
         <div class="faq">
           <details>
             <summary>What happens after I join the first users?</summary>
-            <p>We keep your name, email, profession, what you want to use SurvyAI for, and the Windows details you type. That list is how we grant Pro access and see which survey jobs to improve next. Joining does not turn Pro on by itself.</p>
+            <p>We keep your name, email, profession, what you want to use SurvyAI for, and the Windows details you type. During the beta we use that list to grant Pro for the beta period and to see which survey jobs to improve. After the beta, Pro is a paid plan. Joining does not turn Pro on by itself.</p>
           </details>
           <details>
             <summary>Do I need AutoCAD or ArcGIS?</summary>
@@ -120,13 +120,13 @@
           </details>
           <details>
             <summary>Can I download the beta without joining?</summary>
-            <p>Yes. The Windows installer is on this page. Joining tells us who you are so we can grant access and learn what to build next.</p>
+            <p>Yes. The Windows installer is on this page. Joining tells us who you are so we can grant beta Pro access and learn what to build next. After the beta, Pro is paid.</p>
           </details>
         </div>
       </div>
     </section>
 
-    <section class="section section--alt" id="privacy" aria-labelledby="privacy-title">
+    <section class="section" id="privacy" aria-labelledby="privacy-title">
       <div class="wrap">
         <div class="section__head">
           <p class="section__eyebrow">Privacy / security</p>
@@ -147,7 +147,7 @@
         <div class="section__head">
           <p class="section__eyebrow">Download</p>
           <h2 id="download-title">Get SurvyAI Desktop (beta)</h2>
-          <p>Windows 10/11 installer for the SurvyAI Desktop beta. After setup, pick a workspace and sign in to start.</p>
+          <p>Windows 10/11 installer for the SurvyAI Desktop beta. After setup, pick a workspace and sign in. Pro access after the beta is paid.</p>
         </div>
 
         <div class="panel">

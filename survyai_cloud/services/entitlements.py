@@ -21,6 +21,26 @@ ACTIVE_LLM_STATUSES = frozenset(
     }
 )
 
+# Stored on admin_privilege_note until the person chooses a password in the app.
+UNCLAIMED_GRANT_PREFIX = "pending-signup"
+
+
+def is_unclaimed_admin_grant(user: User) -> bool:
+    """True when an admin granted Pro before this email signed up."""
+    note = str(getattr(user, "admin_privilege_note", "") or "")
+    return note.startswith(UNCLAIMED_GRANT_PREFIX) and getattr(user, "password_changed_at", None) is None
+
+
+def claim_unclaimed_admin_grant(user: User) -> None:
+    """Keep the Pro grant and mark the account as signed up."""
+    note = str(getattr(user, "admin_privilege_note", "") or "")
+    if not note.startswith(UNCLAIMED_GRANT_PREFIX):
+        return
+    rest = note[len(UNCLAIMED_GRANT_PREFIX) :].lstrip(": ").strip()
+    if not rest or rest == "Not signed up yet":
+        rest = "Pro granted before signup"
+    user.admin_privilege_note = rest[:500]
+
 
 def _pro_monthly_credit_budget_usd(settings: CloudSettings) -> float:
     """Convert the Pro monthly NGN price to a USD credit balance."""

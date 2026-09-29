@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,7 +36,11 @@ from survyai_cloud.security import (
     verify_password,
 )
 from survyai_cloud.services.email import send_password_reset_email
-from survyai_cloud.services.entitlements import apply_free_defaults
+from survyai_cloud.services.entitlements import (
+    apply_free_defaults,
+    claim_unclaimed_admin_grant,
+    is_unclaimed_admin_grant,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +90,22 @@ async def register(body: UserCreate, db: Annotated[AsyncSession, Depends(get_db)
         raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=err)
 
     now = datetime.now(timezone.utc)
+    existing_res = await db.execute(select(User).where(func.lower(User.email) == email))
+    existing = existing_res.scalar_one_or_none()
+    if existing is not None:
+        if not is_unclaimed_admin_grant(existing):
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Email already registered")
+        # Admin already granted Pro to this email. Signing up claims that grant.
+        existing.password_hash = hash_password(body.password)
+        existing.password_changed_at = now
+        if body.display_name and not (existing.display_name or "").strip():
+            existing.display_name = body.display_name
+        claim_unclaimed_admin_grant(existing)
+        db.add(existing)
+        await db.flush()
+        await db.refresh(existing)
+        return existing
+
     user = User(
         email=email,
         password_hash=hash_password(body.password),
@@ -277,6 +297,7 @@ async def reset_password(
 
     user.password_hash = hash_password(body.new_password, settings)
     user.password_changed_at = now
+    claim_unclaimed_admin_grant(user)
     token.used_at = now
     db.add(user)
     db.add(token)

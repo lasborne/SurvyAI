@@ -324,6 +324,13 @@ class DiagnosticsOut(BaseModel):
 
 
 # --- Admin (support) ---
+class AdminGrantProIn(BaseModel):
+    """Grant Pro to any email, whether or not that person has registered."""
+
+    email: EmailStr
+    note: Optional[str] = Field(default=None, max_length=420)
+
+
 class AdminUserBillingPatch(BaseModel):
     """
     Support override payload. Protected by CLOUD_ADMIN_API_KEY + X-SurvyAI-Admin-Key.
@@ -374,6 +381,7 @@ class AdminUserSnapshot(BaseModel):
     last_payment_reference: Optional[str] = None
     admin_privilege_active: bool = False
     admin_privilege_note: Optional[str] = None
+    awaiting_signup: bool = False
     device_count: int = 0
     created_at: datetime
     updated_at: datetime

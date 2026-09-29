@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
 from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from survyai_cloud.config import get_cloud_settings
 from survyai_cloud.db import get_db
 from survyai_cloud.deps import require_admin
 from survyai_cloud.models import (
@@ -22,13 +24,21 @@ from survyai_cloud.models import (
 )
 from survyai_cloud.schemas import (
     AdminDiagnosticsOut,
+    AdminGrantProIn,
     AdminUsageEventOut,
     AdminUserBillingPatch,
     AdminUserSnapshot,
     BetaSignupOut,
     DeviceOut,
 )
-from survyai_cloud.services.entitlements import apply_free_defaults, apply_pro_defaults
+from survyai_cloud.security import hash_password
+from survyai_cloud.services.entitlements import (
+    ACTIVE_LLM_STATUSES,
+    UNCLAIMED_GRANT_PREFIX,
+    apply_free_defaults,
+    apply_pro_defaults,
+    is_unclaimed_admin_grant,
+)
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -57,6 +67,7 @@ def _snapshot(user: User, device_count: int) -> AdminUserSnapshot:
         last_payment_reference=user.last_payment_reference,
         admin_privilege_active=bool(getattr(user, "admin_privilege_active", False)),
         admin_privilege_note=getattr(user, "admin_privilege_note", None),
+        awaiting_signup=is_unclaimed_admin_grant(user),
         device_count=device_count,
         created_at=user.created_at,
         updated_at=user.updated_at,
@@ -327,6 +338,84 @@ async def admin_patch_user_billing(
         "admin_privilege_active": bool(getattr(user, "admin_privilege_active", False)),
         "admin_privilege_note": getattr(user, "admin_privilege_note", None),
     }
+
+
+_GRANT_PRO_DAYS = 30
+
+
+def _aware(value: Optional[datetime]) -> Optional[datetime]:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
+
+
+def _pending_signup_note(extra: Optional[str]) -> str:
+    text = (extra or "").strip()
+    if text.startswith(UNCLAIMED_GRANT_PREFIX):
+        return text[:500]
+    detail = text or "Not signed up yet"
+    return f"{UNCLAIMED_GRANT_PREFIX}: {detail}"[:500]
+
+
+@router.post("/grant-pro", response_model=AdminUserSnapshot)
+async def admin_grant_pro(
+    body: AdminGrantProIn,
+    _: Annotated[None, Depends(require_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminUserSnapshot:
+    """
+    Grant Pro for 30 days to any email.
+
+    If the email has no SurvyAI account yet, create one and keep the grant
+    until that person registers with the same email.
+    """
+    email = str(body.email).strip().lower()
+    settings = get_cloud_settings()
+    now = datetime.now(timezone.utc)
+    res = await db.execute(select(User).where(func.lower(User.email) == email))
+    user = res.scalar_one_or_none()
+    created = user is None
+    if user is None:
+        signup = await db.execute(select(BetaSignup).where(func.lower(BetaSignup.email) == email))
+        beta = signup.scalar_one_or_none()
+        user = User(
+            email=email,
+            password_hash=hash_password(secrets.token_urlsafe(32)),
+            display_name=(beta.name if beta and beta.name else None),
+        )
+        db.add(user)
+
+    end = _aware(user.subscription_current_period_end)
+    already_pro = (
+        user.plan_slug == settings.pro_plan_slug
+        and user.subscription_status in ACTIVE_LLM_STATUSES
+        and (end is None or end > now)
+    )
+    if not already_pro:
+        apply_pro_defaults(user, settings)
+        if user.subscription_status not in (
+            SubscriptionStatus.active,
+            SubscriptionStatus.non_renewing,
+        ):
+            user.subscription_status = SubscriptionStatus.trialing
+    horizon = now + timedelta(days=_GRANT_PRO_DAYS)
+    end = _aware(user.subscription_current_period_end)
+    if end is None or end < horizon:
+        # Do not put an expiry on a Pro grant that was left open-ended.
+        if not (already_pro and end is None):
+            user.subscription_current_period_end = horizon
+
+    if created or is_unclaimed_admin_grant(user):
+        _mark_admin_privilege(user, note=_pending_signup_note(body.note))
+    else:
+        _mark_admin_privilege(user, note=body.note)
+
+    db.add(user)
+    await db.flush()
+    await db.refresh(user)
+    return _snapshot(user, await _device_count(db, user.id))
 
 
 @router.get("/beta-signups", response_model=list[BetaSignupOut])

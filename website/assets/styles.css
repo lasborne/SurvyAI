@@ -219,15 +219,16 @@ a:hover {
   padding-inline: 1.5rem;
 }
 
-.btn--soft {
-  background: var(--blue-50);
-  border-color: var(--blue-200);
+.btn--join {
+  background: #fff;
+  border: 2px solid var(--blue-600);
   color: var(--blue-800);
+  box-shadow: 0 1px 2px rgb(37 99 235 / 0.14), 0 8px 18px rgb(37 99 235 / 0.1);
 }
 
-.btn--soft:hover {
-  background: var(--blue-100);
-  border-color: var(--blue-400);
+.btn--join:hover {
+  background: var(--blue-50);
+  border-color: var(--blue-700);
   color: var(--blue-800);
 }
 
@@ -242,9 +243,15 @@ a:hover {
   position: relative;
   isolation: isolate;
   overflow: hidden;
-  padding: clamp(3.5rem, 8vw, 6.5rem) 0 clamp(4rem, 9vw, 7rem);
-  min-height: calc(100svh - var(--nav-h));
+  padding: clamp(2.75rem, 6vw, 4.75rem) 0 clamp(3rem, 6vw, 4.5rem);
   display: flex;
+  align-items: center;
+}
+
+.hero__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.05fr) minmax(260px, 0.95fr);
+  gap: clamp(1.5rem, 4vw, 3rem);
   align-items: center;
 }
 
@@ -304,7 +311,11 @@ a:hover {
 }
 
 .hero__content {
-  max-width: 44rem;
+  max-width: 40rem;
+}
+
+.hero__layout .hero__content {
+  max-width: none;
 }
 
 .hero--compact {
@@ -411,7 +422,12 @@ a:hover {
 }
 
 .feature {
-  padding: 0.25rem 0;
+  padding: 1.15rem 1.2rem 1.25rem;
+  background: var(--surface);
+  border: 1px solid var(--slate-200);
+  border-top: 3px solid var(--blue-600);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
 
 .feature h3 {
@@ -428,8 +444,8 @@ a:hover {
 }
 
 .demo {
-  margin: 1.75rem 0 0;
-  max-width: 40rem;
+  margin: 0;
+  max-width: none;
 }
 
 .demo__frame {
@@ -609,12 +625,80 @@ a:hover {
   color: #991b1b;
 }
 
-.hp {
-  position: absolute;
-  left: -9999px;
-  width: 1px;
-  height: 1px;
-  overflow: hidden;
+.hp,
+.hp[hidden] {
+  display: none !important;
+}
+
+.join-page {
+  background:
+    radial-gradient(ellipse 55% 45% at 100% 0%, rgb(37 99 235 / 0.14), transparent 58%),
+    linear-gradient(180deg, #eef3fb 0%, var(--bg) 320px);
+}
+
+.join-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(240px, 0.8fr);
+  gap: 1.25rem;
+  align-items: start;
+}
+
+.signup-card,
+.join-side {
+  background: #fff;
+  border: 1px solid var(--slate-200);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+}
+
+.signup-card {
+  padding: clamp(1.25rem, 3vw, 1.75rem);
+}
+
+.signup-card h1 {
+  margin: 0.7rem 0 0.55rem;
+  font-size: clamp(1.85rem, 4vw, 2.35rem);
+  letter-spacing: -0.035em;
+  line-height: 1.1;
+}
+
+.signup-card h2 {
+  margin: 0 0 0.85rem;
+  font-size: 1.15rem;
+}
+
+.signup-card .lead {
+  margin: 0 0 1.2rem;
+  color: var(--slate-600);
+}
+
+.join-side {
+  padding: 1.25rem 1.2rem 1.35rem;
+}
+
+.join-side h2 {
+  margin: 0 0 0.9rem;
+  font-size: 1.2rem;
+  letter-spacing: -0.02em;
+}
+
+.join-side .can-do {
+  grid-template-columns: 1fr;
+  gap: 0.85rem;
+}
+
+.field input,
+.field select,
+.field textarea {
+  min-height: 2.85rem;
+}
+
+.field input:focus,
+.field select:focus,
+.field textarea:focus {
+  outline: 2px solid var(--blue-500);
+  outline-offset: 1px;
+  border-color: var(--blue-500);
 }
 
 /* Download / Updates panels — interaction containers */
@@ -875,7 +959,9 @@ a:hover {
   .features,
   .panel,
   .about-grid,
-  .can-do {
+  .can-do,
+  .hero__layout,
+  .join-layout {
     grid-template-columns: 1fr;
   }
 

@@ -161,13 +161,17 @@
     </section>
 
     <section>
-      <h2>3. Lookup user</h2>
+      <h2>3. Lookup or grant Pro</h2>
+      <p class="sub">Grant Pro works for any email, including someone who has not downloaded the app, registered, or joined the first-user list. The grant lasts 30 days (use +7 days to extend). If they have not signed up yet, they register in SurvyAI with this same email and the Pro access stays.</p>
       <div class="row">
         <div>
           <label for="email">Customer email</label>
           <input id="email" type="email" placeholder="user@example.com" />
         </div>
-        <button type="button" id="lookupBtn">Lookup</button>
+        <div class="actions">
+          <button type="button" class="secondary" id="lookupBtn">Lookup</button>
+          <button type="button" id="grantProBtn">Grant Pro</button>
+        </div>
       </div>
       <div id="lookupMsg" class="msg"></div>
     </section>
@@ -421,7 +425,7 @@
         document.getElementById("betaWrap").innerHTML = "<p class='sub'>No signups.</p>";
         return;
       }
-      summary.textContent = rows.length + " signup" + (rows.length === 1 ? "" : "s") + ". Find account opens a matching SurvyAI login so you can grant Pro.";
+      summary.textContent = rows.length + " signup" + (rows.length === 1 ? "" : "s") + ". Grant Pro works even if they have not registered yet.";
       let html = "<table><thead><tr>"
         + "<th>Name</th><th>Email</th><th>Profession</th><th>Wants to use for</th><th>Windows</th><th>Joined</th><th></th>"
         + "</tr></thead><tbody>";
@@ -433,15 +437,16 @@
           + "<td>" + esc(betaDetail(row.use_for, row.use_for_other)) + "</td>"
           + "<td>" + esc(row.windows_specs) + "</td>"
           + "<td class='mono'>" + esc(row.created_at) + "</td>"
-          + "<td><button type='button' class='small secondary' data-email='" + esc(row.email) + "'>Find account</button></td>"
+          + "<td><button type='button' class='small' data-email='" + esc(row.email) + "'>Grant Pro</button></td>"
           + "</tr>";
       }
       html += "</tbody></table>";
       document.getElementById("betaWrap").innerHTML = html;
       document.querySelectorAll("#betaWrap button[data-email]").forEach((btn) => {
         btn.addEventListener("click", () => {
-          document.getElementById("email").value = btn.getAttribute("data-email") || "";
-          lookup();
+          const email = btn.getAttribute("data-email") || "";
+          document.getElementById("email").value = email;
+          grantPro(email);
         });
       });
     }
@@ -592,6 +597,32 @@
       renderDiag(diag);
     }
 
+    async function grantPro(email) {
+      const address = (email || document.getElementById("email").value || "").trim();
+      if (!address) {
+        setMsg("lookupMsg", "Enter an email.", false);
+        return;
+      }
+      if (!confirm("Grant Pro to " + address + " for 30 days? This works even if they have not registered.")) return;
+      setMsg("lookupMsg", "");
+      try {
+        const user = await api("/v1/admin/grant-pro", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ email: address }),
+        });
+        renderSnapshot(user);
+        await loadRelated();
+        await refreshPrivileges();
+        const waiting = user.awaiting_signup
+          ? " They have not signed up yet. When they register in the app with this email, Pro stays on the account."
+          : "";
+        setMsg("lookupMsg", "Pro granted to " + user.email + "." + waiting, true);
+      } catch (e) {
+        setMsg("lookupMsg", e.message || String(e), false);
+      }
+    }
+
     async function lookup() {
       setMsg("lookupMsg", "");
       try {
@@ -602,7 +633,12 @@
         await loadRelated();
         setMsg("lookupMsg", "Loaded " + user.email, true);
       } catch (e) {
-        setMsg("lookupMsg", e.message || String(e), false);
+        const text = e.message || String(e);
+        setMsg(
+          "lookupMsg",
+          text.indexOf("404") >= 0 ? text + " Use Grant Pro if this person has not registered yet." : text,
+          false
+        );
       }
     }
 
@@ -688,6 +724,7 @@
       refreshPrivileges();
     });
     document.getElementById("lookupBtn").addEventListener("click", lookup);
+    document.getElementById("grantProBtn").addEventListener("click", () => grantPro());
     document.getElementById("applyOverrideBtn").addEventListener("click", applyOverrides);
     document.getElementById("refreshPrivBtn").addEventListener("click", refreshPrivileges);
     document.getElementById("refreshBetaBtn").addEventListener("click", refreshBetaSignups);
