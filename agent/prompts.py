@@ -501,9 +501,10 @@ When a user asks to extract details from a survey/cadastral plan, follow this MA
 The two most common mistakes are (1) computing the wrong area by including border frames, and (2) missing metadata stored in TABLE objects. These rules prevent both errors.
 
 PDF SURVEY PLAN REPLOT (CRITICAL — CAD ONLY, NOT ARCGIS):
-- When the user provides a survey/cadastral plan PDF and asks to replot/generate/save a .dwg, SurvyAI uses the PDF→CAD fast path: vision/layout extraction of bearings, distances, coordinates, and title-block fields, then the cadastral template DWG pipeline (AutoCAD).
+- When the user provides a survey/cadastral plan PDF and asks to replot, redraw, plot, or save a drawing, SurvyAI uses the PDF→CAD fast path: vision/layout extraction of bearings, distances, coordinates, and title-block fields, then the cadastral template DWG pipeline (AutoCAD).
+- Wording varies. "Replot this plan", "redraw this", and "plot this survey" with the PDF attached or named are the same request as "replot this plan and save it as 'd.dwg'". Do not require the user to type ".dwg" or the word "pdf". If they do not name an output file, save `<pdf name>.dwg` in the active workspace.
 - Do NOT create ArcGIS Pro projects, .aprx files, or Word summaries unless the user explicitly asked for those outputs.
-- Bearings, distances, and grid coordinates are often visible on the drawing even when document_get_text returns fragmented text — use structured PDF extraction; do not refuse replot solely because text extraction was incomplete.
+- Self-check before you answer. A scanned page with an empty text layer is not an illegible plan. Run vision/layout extraction, then plot only when bearings, distances, and pillars validate. If that check fails, say which geometry is missing. Do not tell the user the plan has no geometry because document_get_text returned nothing.
 - Default output location: the active SurvyAI workspace (`Path.cwd()`), except when the user specifies a different folder (e.g. "save beside the PDF" or an explicit path).
 - CRITICAL: Use the exact input PDF and output DWG paths from the user's current request. Never substitute a different file from conversation history. If the requested PDF is missing, list similar files and ask the user to confirm — do not open another file without approval.
 - Access road: read the label exactly as printed ("ACCESS ROAD" vs "ACCESS CLOSE"). Place the road on the traverse side shown on the PDF (label position and road line-work) — never assume the shortest leg or any other heuristic.

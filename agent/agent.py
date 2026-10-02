@@ -2324,6 +2324,10 @@ class SurvyAIAgent:
             and str(getattr(self.settings, "survyai_api_base_url", "") or "").strip()
             and str(getattr(self.settings, "survyai_access_token", "") or "").strip()
         )
+        self._cloud_proxy_auth_failed = False
+        self._auto_providers_tried = set()
+        self._auto_direct_retried = set()
+        self._auto_continue = False
         
         # Provider keys are validated lazily inside _initialize_llm().  Do not
         # fail construction here: packaged desktop installs do not ship provider
@@ -4509,6 +4513,13 @@ class SurvyAIAgent:
 
         affirmation = self._is_pdf_replot_affirmation(scope_q, query)
         if affirmation:
+            return True
+
+        # "Replot this plan" plus the attached PDF is enough. The pipeline names
+        # the DWG and refuses to draw if vision geometry does not validate.
+        from agent.pdf_survey_plan import current_turn_requests_pdf_replot
+
+        if current_turn_requests_pdf_replot(scope_q):
             return True
 
         if ".pdf" not in scope_q:
@@ -14558,10 +14569,12 @@ class SurvyAIAgent:
                 "response": f"Evidence was found but synthesis failed: {exc}",
             }
 
+        from survyai.provider_models import llm_visible_text_from_content
+
         body = report_msg.content if hasattr(report_msg, "content") else str(report_msg)
         return {
             "success": True,
-            "response": str(body or "").strip(),
+            "response": llm_visible_text_from_content(body),
             "model_name": model_name_used,
             "search_queries": variants,
             "result_count": len(evidence),
@@ -15222,6 +15235,119 @@ class SurvyAIAgent:
                 return "openai"
         return raw
 
+    def _primary_is_auto(self) -> bool:
+        return bool(getattr(self.settings, "primary_llm_auto", False))
+
+    def _provider_has_direct_key(self, provider: str) -> bool:
+        name = str(provider or "").strip().lower()
+        settings = self.settings
+        if name == "openai":
+            return bool(str(getattr(settings, "openai_api_key", "") or "").strip())
+        if name == "claude":
+            return bool(str(getattr(settings, "anthropic_api_key", "") or "").strip())
+        if name == "gemini":
+            return bool(str(getattr(settings, "google_api_key", "") or "").strip())
+        if name == "deepseek":
+            return bool(str(getattr(settings, "deepseek_api_key", "") or "").strip())
+        if name == "ollama":
+            return bool(getattr(settings, "enable_free_ai_model", False))
+        return False
+
+    def _provider_is_usable(self, provider: str) -> bool:
+        """True when this provider can run without repeating a failure we already saw."""
+        name = str(provider or "").strip().lower()
+        if not name or name in self._auto_providers_tried:
+            return False
+        if name == "gemini" and bool(getattr(self.settings, "disable_gemini_fallback", False)):
+            return False
+        if name == "ollama":
+            if not bool(getattr(self.settings, "enable_free_ai_model", False)):
+                return False
+            try:
+                ok, _, _ = _ollama_ram_policy(self._resolve_provider_model_name("ollama"))
+                return bool(ok)
+            except Exception:
+                return False
+        proxy_ok = bool(self._cloud_proxy_enabled) and not self._cloud_proxy_auth_failed
+        return proxy_ok or self._provider_has_direct_key(name)
+
+    def _next_auto_provider(self) -> Optional[str]:
+        """Best remaining provider when Primary is Auto. OpenAI first, then the others."""
+        order = ["openai", "claude", "deepseek", "gemini"]
+        if bool(getattr(self.settings, "enable_free_ai_model", False)):
+            order.append("ollama")
+        for provider in order:
+            if self._provider_is_usable(provider):
+                return provider
+        return None
+
+    @staticmethod
+    def _error_is_proxy_auth(exc: BaseException) -> bool:
+        low = str(exc or "").lower()
+        return ("unauthorized" in low and "token" in low) or "access token expired" in low
+
+    def _continue_auto_provider(
+        self,
+        query: str,
+        failed_provider: str,
+        exc: BaseException,
+        *,
+        session_id: Optional[str],
+        interactive_mode: bool,
+    ) -> Optional[Dict]:
+        """Switch Auto to the next provider that can run. None when none remain."""
+        failed = str(failed_provider or "").strip().lower()
+        if self._error_is_proxy_auth(exc):
+            self._cloud_proxy_auth_failed = True
+        nxt = ""
+        if (
+            failed
+            and self._error_is_proxy_auth(exc)
+            and failed not in self._auto_direct_retried
+            and self._provider_has_direct_key(failed)
+        ):
+            self._auto_direct_retried.add(failed)
+            nxt = failed
+        else:
+            if failed:
+                self._auto_providers_tried.add(failed)
+            found = self._next_auto_provider()
+            nxt = found or ""
+        if not nxt:
+            return None
+        logger.info(
+            "Auto primary: %s is unavailable (%s). Using %s.",
+            failed or "current provider",
+            str(exc).splitlines()[0][:180],
+            nxt,
+        )
+        original_settings = self.settings
+        self._auto_continue = True
+        try:
+            self.settings = self.settings.model_copy(update={"primary_llm": nxt})
+            self.llm_primary = self._initialize_llm(nxt)
+            return self.process_query(
+                query,
+                use_fallback=False,
+                session_id=session_id,
+                interactive_mode=interactive_mode,
+            )
+        except Exception as init_exc:
+            self._auto_providers_tried.add(nxt)
+            logger.warning("Auto primary could not start %s: %s", nxt, init_exc)
+            return self._continue_auto_provider(
+                query,
+                nxt,
+                init_exc,
+                session_id=session_id,
+                interactive_mode=interactive_mode,
+            )
+        finally:
+            # The retry already finished. Put the user's Auto selection back so
+            # the next prompt starts from the best provider again.
+            self.settings = original_settings
+            self._auto_continue = False
+
     def _escalate_model_tier(self, current_tier: str, provider: Optional[str] = None) -> Optional[str]:
         """
         Get the next higher tier model for escalation (same provider).
@@ -15690,6 +15816,8 @@ class SurvyAIAgent:
             and str(getattr(self.settings, "survyai_api_base_url", "") or "").strip()
             and str(getattr(self.settings, "survyai_access_token", "") or "").strip()
         )
+        # A freshly applied token can use the proxy again.
+        self._cloud_proxy_auth_failed = False
         new_tok = str(getattr(self.settings, "survyai_access_token", "") or "").strip()
         new_base = str(getattr(self.settings, "survyai_api_base_url", "") or "").strip()
         new_dev = str(getattr(self.settings, "survyai_device_id", "") or "").strip()
@@ -15859,7 +15987,7 @@ class SurvyAIAgent:
             Exception: If API connection fails
         """
         try:
-            if self._cloud_proxy_enabled and llm_type in {"openai", "claude", "gemini", "deepseek"}:
+            if self._cloud_proxy_enabled and not self._cloud_proxy_auth_failed and llm_type in {"openai", "claude", "gemini", "deepseek"}:
                 return self._make_cloud_proxy_llm(llm_type, model_name=model_name)
             if llm_type == "deepseek":
                 # DeepSeek uses an OpenAI-compatible API
@@ -20072,9 +20200,17 @@ class SurvyAIAgent:
             self.set_session_id(session_id)
         current_session_id = self.get_session_id()
         
-        # Reset model switch flag for new query
-        self._model_switched_this_query = False
-        self._openai_models_tried_this_query = []
+        # Reset model switch flag for new query. An Auto failover re-entry keeps
+        # the providers already ruled out and a dead cloud token.
+        if not self._auto_continue:
+            self._model_switched_this_query = False
+            self._openai_models_tried_this_query = []
+            self._auto_providers_tried = set()
+            self._auto_direct_retried = set()
+            self._cloud_proxy_auth_failed = False
+        else:
+            self._model_switched_this_query = False
+            self._openai_models_tried_this_query = []
         self._force_internet_search_this_query = False
         # Bound early so OCR/excel/CAD fast-paths can return before tier selection.
         model_name_used: Optional[str] = None
@@ -22324,6 +22460,17 @@ class SurvyAIAgent:
                                 provider=_failover_provider,
                             )
 
+                    if self._primary_is_auto():
+                        resumed = self._continue_auto_provider(
+                            query,
+                            str(active_provider),
+                            e,
+                            session_id=current_session_id,
+                            interactive_mode=bool(interactive_mode),
+                        )
+                        if resumed is not None:
+                            return resumed
+
                     # No alternate model left — surface a clear message.
                     return {
                         "query": query,
@@ -22347,6 +22494,31 @@ class SurvyAIAgent:
                         "complexity": complexity if "complexity" in locals() else None,
                     }
                 
+                # Auto searches every provider that can run. A named primary and
+                # fallback stay on those two selections only.
+                if self._primary_is_auto():
+                    resumed = self._continue_auto_provider(
+                        query,
+                        str(active_provider),
+                        e,
+                        session_id=current_session_id,
+                        interactive_mode=bool(interactive_mode),
+                    )
+                    if resumed is not None:
+                        return resumed
+                    return {
+                        "query": query,
+                        "response": (
+                            "No language model was available for this request. "
+                            "Auto tried each provider that can run, and none of them succeeded.\n\n"
+                            f"Last error: {str(e)[:500]}"
+                        ),
+                        "success": False,
+                        "error": str(e),
+                        "llm_used": "primary",
+                        "model_name": model_name_used if "model_name_used" in locals() else "unknown",
+                    }
+
                 # Try fallback if primary failed (and it's not a quota error)
                 # Check if Gemini fallback is disabled
                 if not use_fallback:

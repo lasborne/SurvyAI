@@ -347,6 +347,15 @@ class Settings(BaseSettings):
         ),
     )
 
+    primary_llm_auto: bool = Field(
+        default=False,
+        description=(
+            "True when the desktop Primary LLM selection is Auto. The agent then uses "
+            "the best provider that can actually run, instead of stopping when the first "
+            "choice or the named fallback is unavailable."
+        ),
+    )
+
     # ==========================================================================
     # Ollama (local models) Configuration
     # ==========================================================================

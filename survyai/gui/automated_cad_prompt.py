@@ -121,6 +121,7 @@ class CadFormState:
     roads: List[AccessRoad] = field(default_factory=lambda: [AccessRoad()])
     fences: List[WallFence] = field(default_factory=lambda: [WallFence()])
     plan_number: str = ""
+    certification_date: str = ""
     surveyor_name: str = ""
     surveyor_company: str = ""
     surveyor_address: str = ""
@@ -193,6 +194,24 @@ def format_en_display(easting: float, northing: float) -> str:
     return f"{_fmt_num(easting)}, {_fmt_num(northing)}"
 
 
+def normalize_certification_date(text: str) -> str:
+    """Print a numeric plan date as DD-MM-YYYY. Other wording is left as typed."""
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    match = re.fullmatch(r"(\d{1,2})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{2,4})", raw)
+    if not match:
+        return raw
+    day = int(match.group(1))
+    month = int(match.group(2))
+    year = match.group(3)
+    if len(year) == 2:
+        year = f"20{year}"
+    if not (1 <= day <= 31 and 1 <= month <= 12):
+        return raw
+    return f"{day:02d}-{month:02d}-{year}"
+
+
 def _fmt_num(value: float) -> str:
     text = f"{value:.4f}".rstrip("0").rstrip(".")
     return text if text else "0"
@@ -256,6 +275,9 @@ def compose_cad_prompt(state: CadFormState) -> Tuple[str, str]:
 
     if state.plan_number.strip():
         lines.append(f"plan number: {state.plan_number.strip()}")
+    cert_date = normalize_certification_date(state.certification_date)
+    if cert_date:
+        lines.append(f"date on the certification: {cert_date}")
     if state.surveyor_name.strip():
         lines.append(f"Surveyor name: {state.surveyor_name.strip()}")
     company = state.surveyor_company.strip()
@@ -361,6 +383,7 @@ def cad_form_state_is_blank(state: Optional[CadFormState]) -> bool:
         state.state,
         state.origin,
         state.plan_number,
+        state.certification_date,
         state.surveyor_name,
         state.surveyor_company,
         state.surveyor_address,
@@ -510,6 +533,8 @@ def parse_cad_prompt(text: str) -> CadFormState:
         state.origin = origin
     if fields.get("plan_number"):
         state.plan_number = fields["plan_number"]
+    if fields.get("cert_date"):
+        state.certification_date = normalize_certification_date(fields["cert_date"])
     if fields.get("surveyor_name"):
         state.surveyor_name = fields["surveyor_name"]
 
@@ -867,6 +892,8 @@ def format_cad_prompt_for_display(text: str) -> str:
         lines.append(f"Origin: {state.origin.strip()}")
     if state.plan_number.strip():
         lines.append(f"Plan number: {state.plan_number.strip()}")
+    if state.certification_date.strip():
+        lines.append(f"Date: {normalize_certification_date(state.certification_date)}")
     if state.surveyor_name.strip():
         lines.append(f"Surveyor: {state.surveyor_name.strip()}")
     if state.surveyor_company.strip():

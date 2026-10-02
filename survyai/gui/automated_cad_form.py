@@ -872,6 +872,12 @@ class AutomatedCadForm(QWidget):
             "e.g. RV/0000/2026/001",
             tooltip="Plan or job number printed on the title block.",
         )
+        self._cert_date_edit = self._add_single_row(
+            layout,
+            "Date:",
+            "e.g. DD-MM-YYYY",
+            tooltip="Date printed on the certification (MADE BY ME ON). Example: 01-01-2026.",
+        )
         self._surveyor_name_edit = self._add_single_row(
             layout,
             "Surveyor's name:",
@@ -930,6 +936,7 @@ class AutomatedCadForm(QWidget):
             roads=[g.road() for g in self._road_groups],
             fences=[g.fence() for g in self._fence_groups],
             plan_number=self._plan_number_edit.text(),
+            certification_date=self._cert_date_edit.text(),
             surveyor_name=self._surveyor_name_edit.text(),
             surveyor_company=self._surveyor_company_edit.text(),
             surveyor_address=self._surveyor_address_edit.text(),
@@ -972,6 +979,7 @@ class AutomatedCadForm(QWidget):
         self._sync_road_groups(state.roads or [AccessRoad()])
         self._sync_fence_groups(state.fences or [WallFence()])
         self._plan_number_edit.setText(state.plan_number)
+        self._cert_date_edit.setText(state.certification_date)
         self._surveyor_name_edit.setText(state.surveyor_name)
         self._surveyor_company_edit.setText(state.surveyor_company)
         self._surveyor_address_edit.setText(state.surveyor_address)
@@ -982,6 +990,15 @@ class AutomatedCadForm(QWidget):
         self._bearing_adj_cb.setChecked(not bow)
         self._bearing_adj_cb.blockSignals(False)
         self._bowditch_cb.blockSignals(False)
+
+    def clear_inputs(self) -> None:
+        """Empty the plan sheet on screen. Other sheets are left as they are."""
+        self.apply_state(CadFormState())
+        self._stash_current()
+        self._refresh_plan_chip_state()
+        scroll = getattr(self, "_fields_scroll", None)
+        if scroll is not None:
+            scroll.verticalScrollBar().setValue(0)
 
     def compose_prompt(self) -> tuple[str, str]:
         self._stash_current()

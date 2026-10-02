@@ -76,7 +76,7 @@ _EPHEMERAL_SETTINGS_KEYS = frozenset(
 )
 
 # Bump when agent routing/pipelines change so a running app picks up new logic.
-_WORKER_CODE_REV = "20260830-grid-origin-from-axis-intersection-v25"
+_WORKER_CODE_REV = "20261002-pdf-replot-without-named-dwg"
 
 
 def _structural_settings_payload(settings_payload: Dict[str, Any]) -> Dict[str, Any]:

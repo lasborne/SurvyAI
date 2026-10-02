@@ -420,20 +420,63 @@ def _is_reasoning_payload(obj: Any) -> bool:
     return False
 
 
+def _reasoning_summary_text(block: dict) -> str:
+    """Text inside a reasoning block. Shown only when the model sent no answer."""
+    summary = block.get("summary")
+    if isinstance(summary, list):
+        parts = [
+            str(item.get("text") or "").strip()
+            if isinstance(item, dict)
+            else str(item).strip()
+            for item in summary
+        ]
+        return "\n".join(p for p in parts if p)
+    if isinstance(summary, str):
+        return summary.strip()
+    return ""
+
+
+def _norm_answer_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "")).strip().casefold()
+
+
+def collapse_duplicated_answer(text: str) -> str:
+    """Drop a second copy when the whole answer was emitted twice.
+
+    Reasoning models sometimes return the finished answer and then the same
+    answer again. Short text and partial repeats are left unchanged.
+    """
+    raw = (text or "").strip()
+    if len(raw) < 160:
+        return raw
+
+    def _pick(left: str, right: str) -> str:
+        a = _norm_answer_text(left)
+        b = _norm_answer_text(right)
+        if len(a) < 80 or len(b) < 80 or a != b:
+            return ""
+        return left.strip() if len(left) <= len(right) else right.strip()
+
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n", raw) if part.strip()]
+    if len(paragraphs) >= 2 and len(paragraphs) % 2 == 0:
+        mid = len(paragraphs) // 2
+        picked = _pick("\n\n".join(paragraphs[:mid]), "\n\n".join(paragraphs[mid:]))
+        if picked:
+            return picked
+
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    if len(lines) >= 4 and len(lines) % 2 == 0:
+        mid = len(lines) // 2
+        picked = _pick("\n".join(lines[:mid]), "\n".join(lines[mid:]))
+        if picked:
+            return picked
+    return raw
+
+
 def _text_from_content_block(block: Any) -> str:
     if isinstance(block, str):
         return block.strip()
     if not isinstance(block, dict) or _is_reasoning_payload(block):
-        if isinstance(block, dict):
-            summary = block.get("summary")
-            if isinstance(summary, list):
-                parts = [
-                    str(item.get("text") or "").strip()
-                    if isinstance(item, dict)
-                    else str(item).strip()
-                    for item in summary
-                ]
-                return "\n".join(p for p in parts if p)
         return ""
     kind = str(block.get("type") or "").strip().lower()
     if kind in _SKIP_CONTENT_BLOCK_TYPES:
@@ -451,6 +494,11 @@ def _text_from_content_block(block: Any) -> str:
 
 
 def strip_trailing_model_envelope(raw: str) -> str:
+    """Drop a trailing model envelope, then a duplicated copy of the answer."""
+    return collapse_duplicated_answer(_strip_trailing_model_envelope(raw))
+
+
+def _strip_trailing_model_envelope(raw: str) -> str:
     """Drop a trailing Responses-API / chat content-block dump from visible text.
 
     Some models append a Python/JSON envelope such as
@@ -517,7 +565,7 @@ def llm_visible_text_from_content(content: Any) -> str:
         if text:
             return strip_trailing_model_envelope(text)
         if _is_reasoning_payload(content):
-            return ""
+            return strip_trailing_model_envelope(_reasoning_summary_text(content))
         kind = str(content.get("type") or "").strip().lower()
         if kind in _SKIP_CONTENT_BLOCK_TYPES or kind in {"text", "output_text", "refusal"}:
             return ""
@@ -526,17 +574,32 @@ def llm_visible_text_from_content(content: Any) -> str:
         except Exception:
             return ""
     if isinstance(content, list):
-        parts: List[str] = []
+        answers: List[str] = []
+        reasoning: List[str] = []
         for item in content:
             if isinstance(item, str):
-                parts.append(llm_visible_text_from_content(item))
-            elif isinstance(item, dict) and str(item.get("phase") or "").strip().lower() == "final_answer":
-                extra = _text_from_content_block(item)
-                if extra and not parts:
-                    parts.append(extra)
-            else:
-                parts.append(_text_from_content_block(item))
-        return strip_trailing_model_envelope("\n".join(p for p in parts if p).strip())
+                piece = llm_visible_text_from_content(item)
+                if piece:
+                    answers.append(piece)
+                continue
+            if isinstance(item, dict) and _is_reasoning_payload(item):
+                summary = _reasoning_summary_text(item)
+                if summary:
+                    reasoning.append(summary)
+                continue
+            piece = _text_from_content_block(item)
+            if piece:
+                answers.append(piece)
+        # The answer is the user-facing result. A reasoning summary is only a
+        # fallback when the model returned no answer text, so it is not printed
+        # again under the same reply.
+        chosen = answers or reasoning
+        unique: List[str] = []
+        for piece in chosen:
+            if unique and _norm_answer_text(unique[-1]) == _norm_answer_text(piece):
+                continue
+            unique.append(piece)
+        return strip_trailing_model_envelope("\n\n".join(unique).strip())
     if hasattr(content, "model_dump"):
         try:
             return llm_visible_text_from_content(content.model_dump())

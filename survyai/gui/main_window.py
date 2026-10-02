@@ -19,7 +19,7 @@ import uuid
 import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from PySide6.QtCore import QEvent, Qt, QTimer, QUrl, Signal, Slot
 from PySide6.QtGui import QAction, QDesktopServices, QFont, QKeySequence, QTextCursor
@@ -435,6 +435,25 @@ def _looks_like_cadastral_plot_prompt(text: str) -> bool:
     return ("buyer name" in t or "pillar" in t) and (
         "coordinates" in t or "bearing" in t
     )
+
+
+def _operation_outcome_label(query: str, *, success: bool, cancelled: bool = False) -> str:
+    """Short result under Live activity: what finished, and whether it succeeded."""
+    if cancelled:
+        return "Cancelled"
+    q = (query or "").lower()
+    cad = _looks_like_cadastral_plot_prompt(query or "") or (
+        ".dwg" in q and any(word in q for word in ("plot", "generate", "cadastr", "survey plan"))
+    )
+    if cad:
+        return "Survey plan ready" if success else "Plan plotting unsuccessful"
+    if any(word in q for word in (".aprx", ".shp", ".gdb", "arcgis", "geopandas", "shapefile", "geospatial")):
+        return "Analysis ready" if success else "Analysis unsuccessful"
+    if any(word in q for word in (".docx", ".pdf", "survey notice", "report")):
+        return "Document ready" if success else "Document unsuccessful"
+    if any(word in q for word in (".xlsx", ".xls", ".csv", "excel", "spreadsheet")):
+        return "Workbook ready" if success else "Workbook unsuccessful"
+    return "Task ready" if success else "Task unsuccessful"
 
 
 def _is_standalone_knowledge_question(raw_query: str) -> bool:
@@ -1006,21 +1025,57 @@ class _PasswordPromptDialog(QDialog):
         title: str,
         label: str,
         minimum_width: int = 420,
+        verify: Callable[[str], str] | None = None,
     ) -> None:
         super().__init__(parent)
+        self._verify = verify
         self.setWindowTitle(title)
         self.setMinimumWidth(minimum_width)
         root = QVBoxLayout(self)
         root.addWidget(QLabel(label))
         self._password = _PasswordLineEdit(self)
+        self._password.textChanged.connect(lambda _text: self._set_error(""))
         root.addWidget(self._password)
-        buttons = QDialogButtonBox(
+        self._error = QLabel("")
+        self._error.setWordWrap(True)
+        self._error.setObjectName("hintLabel")
+        self._error.setStyleSheet("color: #b45309; font-size: 12px;")
+        self._error.hide()
+        root.addWidget(self._error)
+        self._buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
         )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        root.addWidget(self._buttons)
         self._password.setFocus()
+
+    def _set_error(self, message: str) -> None:
+        text = (message or "").strip()
+        self._error.setText(text)
+        self._error.setVisible(bool(text))
+
+    def accept(self) -> None:  # noqa: N802
+        if self._verify is not None:
+            password = self._password.text()
+            if not password:
+                self._set_error("Enter your password.")
+                self._password.setFocus()
+                return
+            ok_btn = self._buttons.button(QDialogButtonBox.StandardButton.Ok)
+            if ok_btn is not None:
+                ok_btn.setEnabled(False)
+            try:
+                message = (self._verify(password) or "").strip()
+            finally:
+                if ok_btn is not None:
+                    ok_btn.setEnabled(True)
+            if message:
+                self._password.clear()
+                self._set_error(message)
+                self._password.setFocus()
+                return
+        super().accept()
 
     def password(self) -> str:
         cached = getattr(self, "_accepted_password", None)
@@ -1538,6 +1593,7 @@ class MainWindow(QMainWindow):
         # CAD prompt page staging: None | "user" | "system"
         self._cad_prompt_pending: Optional[str] = None
         self._run_started_at = 0.0
+        self._last_run_outcome = ""
         self._run_stage = -1
         self._conversation_list_sync = False
         self._startup_initial_query = (initial_query or "").strip()
@@ -2275,6 +2331,7 @@ class MainWindow(QMainWindow):
         activity_layout.addWidget(self._activity_log, 1)
         self._run_status_label = QLabel("Ready")
         self._run_status_label.setObjectName("runStatusLabel")
+        self._run_status_label.setWordWrap(True)
         self._run_status_label.setToolTip("Status of the current or last run.")
         self._elapsed_label = QLabel("Elapsed: 0s")
         self._elapsed_label.setObjectName("elapsedLabel")
@@ -2341,6 +2398,15 @@ class MainWindow(QMainWindow):
             QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
         )
         controls.addWidget(self._retry_btn)
+
+        self._clear_btn = QPushButton("Clear")
+        self._clear_btn.setObjectName("secondaryButton")
+        self._clear_btn.clicked.connect(self._on_clear_inputs)
+        self._clear_btn.setToolTip("Clear the Console prompt and any attached files.")
+        self._clear_btn.setSizePolicy(
+            QSizePolicy.Policy.MinimumExpanding, QSizePolicy.Policy.Fixed
+        )
+        controls.addWidget(self._clear_btn)
 
         self._cad_prompt_btn = QPushButton("Input CAD Template")
         self._cad_prompt_btn.setObjectName("secondaryButton")
@@ -2556,6 +2622,11 @@ class MainWindow(QMainWindow):
                 )
                 self._send_btn.setDefault(False)
                 self._send_btn.setAutoDefault(False)
+            if getattr(self, "_clear_btn", None) is not None:
+                self._clear_btn.setToolTip(
+                    "Clear the fields on the survey-plan sheet you are viewing. "
+                    "Other sheets are left unchanged."
+                )
             return
         if getattr(self, "_cad_prompt_btn", None) is not None:
             self._cad_prompt_btn.setToolTip(
@@ -2571,6 +2642,8 @@ class MainWindow(QMainWindow):
                 )
             )
             self._send_btn.setDefault(True)
+        if getattr(self, "_clear_btn", None) is not None:
+            self._clear_btn.setToolTip("Clear the Console prompt and any attached files.")
 
     def _build_history_tab(self) -> None:
         tab = QWidget()
@@ -3956,6 +4029,10 @@ class MainWindow(QMainWindow):
         if self._state.preferred_primary_llm:
             overrides["primary_llm"] = resolve_primary_llm_selection(
                 self._state.preferred_primary_llm
+            )
+            overrides["primary_llm_auto"] = (
+                normalize_primary_llm_selection(self._state.preferred_primary_llm)
+                == AUTO_PRIMARY_LLM
             )
         if self._state.preferred_fallback_llm:
             overrides["fallback_llm"] = self._state.preferred_fallback_llm
@@ -5755,6 +5832,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("Fast mode updated.", 2500)
 
     @Slot()
+    def _on_clear_inputs(self) -> None:
+        if self._is_automated_cad_tab():
+            form = getattr(self, "_cad_form", None)
+            if form is not None and hasattr(form, "clear_inputs"):
+                form.clear_inputs()
+            self.statusBar().showMessage("CAD fields cleared.", 2500)
+            return
+        self._input.clear()
+        composer = getattr(self, "_composer", None)
+        if composer is not None:
+            composer.clear_attachments()
+            composer.clear_input()
+        self.statusBar().showMessage("Console input cleared.", 2500)
+
+    @Slot()
     def _on_send_clicked(self) -> None:
         if self._is_automated_cad_tab():
             self._send_automated_cad_form()
@@ -6103,9 +6195,10 @@ class MainWindow(QMainWindow):
         self._retry_btn.setEnabled(False)
         self._cad_prompt_btn.setEnabled(False)
         self._run_started_at = time.monotonic()
+        self._last_run_outcome = ""
         self._run_stage = -1
         self._progress_timer.start()
-        self._run_status_label.setText("Running")
+        self._apply_run_status("Running")
         self._session_settings_label.setText(f"{self._session_id}\nStatus: Task in progress")
         self._append_activity("Task submitted.")
 
@@ -6260,6 +6353,11 @@ class MainWindow(QMainWindow):
             self._maybe_open_ocr_review(ocr_review)
         self._persist_history_from_result(result)
         self._account_for_run_cost(result)
+        ok = bool(result.success) and not (result.error or "")
+        self._last_run_outcome = _operation_outcome_label(
+            self._pending_plain_query or self._last_query or result.query,
+            success=ok,
+        )
 
     def _maybe_open_ocr_review(self, review: dict) -> None:
         """Open click-to-verify dialog for OCR-only results with an image."""
@@ -6351,6 +6449,10 @@ class MainWindow(QMainWindow):
         self._store_conversation_message("assistant", msg, error=True, conversation_id=target_conv_id)
         if target_conv_id == self._active_conversation_id:
             self._append_assistant_message(msg, error=True)
+        self._last_run_outcome = _operation_outcome_label(
+            self._pending_plain_query or self._last_query,
+            success=False,
+        )
 
     @Slot(str)
     def _on_worker_progress(self, text: str) -> None:
@@ -6363,6 +6465,11 @@ class MainWindow(QMainWindow):
         self._persist_cancelled_history(self._pending_plain_query or self._last_query, text)
         self._append_system_line(text)
         self._append_activity(text)
+        self._last_run_outcome = _operation_outcome_label(
+            self._pending_plain_query or self._last_query,
+            success=False,
+            cancelled=True,
+        )
         # Cancelling terminates the warm worker; re-warm it so the next prompt
         # doesn't pay the cold-start cost again.
         QTimer.singleShot(0, self._prewarm_agent)
@@ -6379,9 +6486,12 @@ class MainWindow(QMainWindow):
         self._cancel_btn.setEnabled(False)
         self._retry_btn.setEnabled(bool(self._last_query.strip()))
         self._cad_prompt_btn.setEnabled(True)
-        self._run_status_label.setText("Ready")
-        self._session_settings_label.setText(f"{self._session_id}\nStatus: Ready")
-        self.statusBar().showMessage("Ready.")
+        elapsed = max(0, int(time.monotonic() - self._run_started_at)) if self._run_started_at else 0
+        self._elapsed_label.setText(f"Elapsed: {elapsed}s")
+        outcome = (self._last_run_outcome or "Ready").strip() or "Ready"
+        self._apply_run_status(outcome, final=True)
+        self._session_settings_label.setText(f"{self._session_id}\nStatus: {outcome}")
+        self.statusBar().showMessage(outcome)
 
     @Slot()
     def _request_cancel_current_run(self) -> None:
@@ -7102,6 +7212,7 @@ class MainWindow(QMainWindow):
         )
         if not ok or not email.strip():
             return
+        token_holder: dict[str, object] = {}
         pwd_dlg: _PasswordPromptDialog | _NewPasswordDialog
         if is_register:
             pwd_dlg = _NewPasswordDialog(
@@ -7109,18 +7220,47 @@ class MainWindow(QMainWindow):
                 title="Create account",
                 email=email.strip(),
             )
+            if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            password = pwd_dlg.password()
+            pwd_dlg.clear()
+            if not password:
+                return
         else:
+            def _verify_sign_in_password(typed: str) -> str:
+                app = QApplication.instance()
+                if app is not None:
+                    app.setOverrideCursor(Qt.CursorShape.WaitCursor)
+                self.statusBar().showMessage("Checking password…")
+                try:
+                    token_holder["tokens"] = login(
+                        base_url=base_url,
+                        email=email.strip(),
+                        password=typed,
+                    )
+                except CloudApiError as exc:
+                    if "invalid email or password" in str(exc).lower():
+                        return "That password is incorrect. Please try again."
+                    return user_facing_cloud_message(exc)
+                except Exception as exc:
+                    return user_facing_cloud_message(exc)
+                finally:
+                    if app is not None:
+                        app.restoreOverrideCursor()
+                return ""
+
             pwd_dlg = _PasswordPromptDialog(
                 self,
                 title="Cloud sign-in",
                 label="Password",
+                verify=_verify_sign_in_password,
             )
-        if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        password = pwd_dlg.password()
-        pwd_dlg.clear()
-        if not password:
-            return
+            if pwd_dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            password = pwd_dlg.password()
+            pwd_dlg.clear()
+            if not password or token_holder.get("tokens") is None:
+                return
         ident = _SignInIdentityDialog(
             self,
             title="Create account" if is_register else "Sign in",
@@ -7162,22 +7302,26 @@ class MainWindow(QMainWindow):
             )
 
         self._begin_cloud_busy("Signing in…")
-        try:
-            tokens = login(
-                base_url=base_url,
-                email=email.strip(),
-                password=secret_holder["v"],
-            )
-        except CloudApiError as exc:
-            secret_holder["v"] = ""
-            self._end_cloud_busy()
-            QMessageBox.warning(self, "Couldn't sign in", user_facing_cloud_message(exc))
-            return
-        except Exception as exc:
-            secret_holder["v"] = ""
-            self._end_cloud_busy()
-            QMessageBox.warning(self, "Couldn't sign in", user_facing_cloud_message(exc))
-            return
+        preexisting = token_holder.get("tokens")
+        if preexisting is not None:
+            tokens = preexisting
+        else:
+            try:
+                tokens = login(
+                    base_url=base_url,
+                    email=email.strip(),
+                    password=secret_holder["v"],
+                )
+            except CloudApiError as exc:
+                secret_holder["v"] = ""
+                self._end_cloud_busy()
+                QMessageBox.warning(self, "Couldn't sign in", user_facing_cloud_message(exc))
+                return
+            except Exception as exc:
+                secret_holder["v"] = ""
+                self._end_cloud_busy()
+                QMessageBox.warning(self, "Couldn't sign in", user_facing_cloud_message(exc))
+                return
 
         self._state.cloud_api_base_url = base_url.strip()
         self._state.cloud_access_token = tokens.access_token
@@ -7961,10 +8105,24 @@ class MainWindow(QMainWindow):
             f"Help → Getting started guide for a short playbook.</p>"
         )
 
+    def _apply_run_status(self, text: str, *, final: bool = False) -> None:
+        label = self._run_status_label
+        shown = (text or "Ready").strip() or "Ready"
+        low = shown.lower()
+        if not final or low in {"ready", "running", "cancelled"}:
+            outcome = "neutral"
+        elif "unsuccessful" in low:
+            outcome = "bad"
+        else:
+            outcome = "ok"
+        label.setText(shown)
+        label.setProperty("outcome", outcome)
+        label.style().unpolish(label)
+        label.style().polish(label)
+
     @Slot()
     def _on_progress_tick(self) -> None:
         if self._thread is None or not self._thread.isRunning():
-            self._elapsed_label.setText("Elapsed: 0s")
             return
         elapsed = max(0, int(time.monotonic() - self._run_started_at))
         self._elapsed_label.setText(f"Elapsed: {elapsed}s")
@@ -7984,7 +8142,7 @@ class MainWindow(QMainWindow):
             2: "Still working on a long-running task…",
             3: "Long run in progress. You may cancel now to terminate the active agent run.",
         }[stage]
-        self._run_status_label.setText(stage_text)
+        self._apply_run_status(stage_text)
         self._append_activity(stage_text)
 
     def closeEvent(self, event) -> None:  # noqa: N802

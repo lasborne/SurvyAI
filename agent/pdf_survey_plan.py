@@ -6101,6 +6101,82 @@ _PDF_KEY_DETAIL_EXCLUDE = (
 )
 
 
+def current_turn_requests_pdf_replot(text: str) -> bool:
+    """True when this turn asks to redraw a survey plan from a PDF.
+
+    The output drawing does not have to be named. "Replot this plan" with the
+    PDF attached is the same job as "replot this plan and save it as 'd.dwg'".
+    A details-only or how-to question stays off this path.
+    """
+    raw = text or ""
+    try:
+        from survyai.attachments import parse_attachments_block
+
+        attached, user_text = parse_attachments_block(raw)
+    except Exception:
+        attached, user_text = [], raw
+    user = (user_text or "").strip().lower()
+    if not user:
+        user = raw.lower()
+    pdfs = [p for p in attached if str(p).lower().endswith(".pdf")]
+    if not pdfs:
+        pdfs = extract_pdf_paths_from_text(raw)
+    if not pdfs:
+        return False
+    if user.startswith(("what ", "why ", "how ", "who ", "when ", "explain ", "define ", "describe ")):
+        if not any(k in user for k in (".dwg", "autocad", "save as", "save it as", "to cad", "to dwg")):
+            return False
+    if any(k in user for k in ("replot", "re-plot", "re plot", "redraw")):
+        return not _pdf_turn_is_details_only(user)
+    planish = ("plan", "survey", "cadastral", "parcel", "pillar", "bearing", "pdf")
+    draw_verbs = (
+        "reproduce this",
+        "reproduce the",
+        "digitize",
+        "digitise",
+        "trace this",
+        "trace the",
+        "plot this",
+        "plot the",
+        "draw this",
+        "draw the",
+        "convert this",
+        "convert the",
+        "turn this",
+        "turn the",
+    )
+    has_drawing_target = any(t in user for t in ("dwg", "autocad", "drawing")) or bool(
+        re.search(r"\bcad\b", user)
+    )
+    if any(v in user for v in draw_verbs) and any(p in user for p in planish):
+        if has_drawing_target or any(p in user for p in ("plan", "survey", "cadastral", "parcel")):
+            return not _pdf_turn_is_details_only(user)
+    if any(p in user for p in ("plan", "survey", "cadastral", "pdf")) and any(
+        t in user for t in ("to dwg", "to a dwg", "as a dwg", "as dwg", "into dwg", "to autocad", "into autocad", "to cad", "into cad")
+    ):
+        return not _pdf_turn_is_details_only(user)
+    return False
+
+
+def _pdf_turn_is_details_only(user: str) -> bool:
+    """Extract/summarize requests are not a CAD replot unless they also ask to draw."""
+    if any(k in user for k in ("replot", "re-plot", "redraw", "autocad", ".dwg", "to dwg", "to cad", "into cad")):
+        return False
+    return any(
+        k in user
+        for k in (
+            "key details",
+            "summarize",
+            "summarise",
+            "extract the",
+            "extract all",
+            "what does the plan",
+            "read the plan",
+            "title block",
+        )
+    )
+
+
 def should_fastpath_pdf_plan_key_details(query: str) -> bool:
     """
     True when the user wants key survey-plan details from a PDF (not a CAD replot).

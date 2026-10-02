@@ -626,6 +626,8 @@ QLabel#runStatusLabel {
     font-weight: 600;
     font-size: 9pt;
 }
+QLabel#runStatusLabel[outcome="ok"] { color: #15803d; }
+QLabel#runStatusLabel[outcome="bad"] { color: #b45309; }
 QLabel#elapsedLabel {
     color: #64748b;
     font-size: 9pt;
@@ -1434,6 +1436,8 @@ QLabel#sectionHeader { color: #fafafa; font-size: 9.5pt; padding: 1px 2px 4px 2p
 QLabel#pageTitle { color: #fafafa; }
 QLabel#pageSubtitle, QLabel#elapsedLabel { color: #a1a1aa; }
 QLabel#runStatusLabel { color: #d4d4d8; font-weight: 600; }
+QLabel#runStatusLabel[outcome="ok"] { color: #4ade80; }
+QLabel#runStatusLabel[outcome="bad"] { color: #fdba74; }
 
 QFrame#topBarDivider {
     background: #27272a;
