@@ -65,10 +65,10 @@
         </div>
         <figure class="demo">
           <div class="demo__frame">
-            <video id="demo-video" controls playsinline preload="metadata" hidden>
-              <source id="demo-source" src="/assets/survyai-demo.mp4" type="video/mp4" />
+            <video id="demo-video" controls playsinline preload="auto">
+              <source id="demo-source" src="/assets/survyai-demo.mp4?v=20261011" type="video/mp4" />
             </video>
-            <p class="demo__pending" id="demo-pending">A 2-minute demo of SurvyAI at work will play here.</p>
+            <p class="demo__pending" id="demo-pending" hidden>A 2-minute demo of SurvyAI at work will play here.</p>
           </div>
           <figcaption>Two minutes with SurvyAI automatically generating a typical Survey plan from user prompt.</figcaption>
         </figure>
@@ -347,10 +347,6 @@
         if (pending) pending.hidden = false;
       }
       if (video && pending) {
-        video.addEventListener("loadeddata", function () {
-          pending.hidden = true;
-          video.hidden = false;
-        });
         video.addEventListener("error", showDemoPending);
         if (source) source.addEventListener("error", showDemoPending);
       }
