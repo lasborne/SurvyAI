@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
+import re
 import secrets
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, time, timedelta, timezone
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
-from sqlalchemy import delete, func, select
+from sqlalchemy import case, delete, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from survyai_cloud.config import get_cloud_settings
@@ -18,18 +20,26 @@ from survyai_cloud.models import (
     BetaSignup,
     Device,
     DiagnosticsBundle,
+    SiteEvent,
     SubscriptionStatus,
     UsageEvent,
     User,
 )
+from survyai_cloud.rate_limiting import rate_limit_ip_dependency
 from survyai_cloud.schemas import (
     AdminDiagnosticsOut,
     AdminGrantProIn,
+    AdminGrowthOut,
     AdminUsageEventOut,
     AdminUserBillingPatch,
     AdminUserSnapshot,
     BetaSignupOut,
     DeviceOut,
+    GrowthNow,
+    GrowthPage,
+    GrowthPeriod,
+    SiteCollectIn,
+    SiteCollectOut,
 )
 from survyai_cloud.security import hash_password
 from survyai_cloud.services.entitlements import (
@@ -41,6 +51,19 @@ from survyai_cloud.services.entitlements import (
 )
 
 router = APIRouter(prefix="/admin", tags=["admin"])
+public_router = APIRouter(prefix="/analytics", tags=["analytics"])
+
+_VISITOR_ID = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+_GROWTH_NOTE = (
+    "Visits and download starts are counted from the day this tracking shipped. "
+    "Each browser is counted once per page per day, and once per day when an installer link is opened. "
+    "A click is not proof the file finished downloading. "
+    "Registrations are people who chose a password in the app. "
+    "Pro grants that are still waiting for that signup are listed separately."
+)
 
 
 def _snapshot(user: User, device_count: int) -> AdminUserSnapshot:
@@ -441,3 +464,160 @@ async def admin_delete_user_device(
         raise HTTPException(status_code=404, detail="Device not found")
     await db.execute(delete(Device).where(Device.id == device_id, Device.user_id == user_id))
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+def _event_path(kind: str, path: str) -> Optional[str]:
+    raw = (path or "").split("?", 1)[0].split("#", 1)[0].strip()
+    if kind == "download":
+        if raw in {"/get/latest", "/updates/latest", "/downloads/latest"}:
+            return "/get/latest"
+        if raw.startswith("/updates/") and raw.lower().endswith(".exe"):
+            return "/get/latest"
+        return None
+    if raw in {"", "/"}:
+        return "/"
+    if raw.rstrip("/") == "/beta-user":
+        return "/beta-user"
+    return None
+
+
+@public_router.post(
+    "/collect",
+    response_model=SiteCollectOut,
+    dependencies=[
+        Depends(
+            rate_limit_ip_dependency(
+                "site_collect",
+                "rate_limit_site_events_per_window",
+                window_seconds=3600,
+            )
+        )
+    ],
+)
+async def collect_site_event(
+    body: SiteCollectIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> SiteCollectOut:
+    """Record one anonymous visit or installer click. Invalid calls are ignored."""
+    visitor_id = (body.visitor_id or "").strip().lower()
+    kind = (body.kind or "").strip().lower()
+    path = _event_path(kind, body.path)
+    if kind not in {"pageview", "download"} or path is None or not _VISITOR_ID.match(visitor_id):
+        return SiteCollectOut(stored=False)
+
+    now = datetime.now(timezone.utc)
+    row = SiteEvent(
+        visitor_id=visitor_id,
+        kind=kind,
+        path=path,
+        event_day=now.date(),
+        created_at=now,
+    )
+    db.add(row)
+    try:
+        await db.flush()
+    except IntegrityError:
+        await db.rollback()
+        return SiteCollectOut(stored=False)
+    return SiteCollectOut(stored=True)
+
+
+def _per_100(numerator: int, denominator: int) -> Optional[float]:
+    if denominator <= 0:
+        return None
+    return round(100.0 * numerator / denominator, 1)
+
+
+async def _event_counts(db: AsyncSession, start: Optional[datetime]) -> tuple[int, int, int]:
+    stmt = select(
+        func.count(func.distinct(case((SiteEvent.kind == "pageview", SiteEvent.visitor_id)))),
+        func.count(case((SiteEvent.kind == "pageview", 1))),
+        func.count(case((SiteEvent.kind == "download", 1))),
+    ).select_from(SiteEvent)
+    if start is not None:
+        stmt = stmt.where(SiteEvent.created_at >= start)
+    visitors, views, downloads = (await db.execute(stmt)).one()
+    return int(visitors or 0), int(views or 0), int(downloads or 0)
+
+
+async def _growth_period(db: AsyncSession, start: Optional[datetime]) -> GrowthPeriod:
+    visitors, views, downloads = await _event_counts(db, start)
+    beta = select(func.count()).select_from(BetaSignup)
+    registered = select(func.count()).select_from(User).where(User.password_changed_at.isnot(None))
+    activated = select(func.count(func.distinct(Device.user_id))).select_from(Device)
+    if start is not None:
+        beta = beta.where(BetaSignup.created_at >= start)
+        registered = registered.where(User.password_changed_at >= start)
+        activated = activated.where(Device.created_at >= start)
+    return GrowthPeriod(
+        unique_visitors=visitors,
+        pageviews=views,
+        download_starts=downloads,
+        beta_applications=int((await db.execute(beta)).scalar_one() or 0),
+        registered_accounts=int((await db.execute(registered)).scalar_one() or 0),
+        activated_accounts=int((await db.execute(activated)).scalar_one() or 0),
+    )
+
+
+@router.get("/growth", response_model=AdminGrowthOut)
+async def admin_growth(
+    _: Annotated[None, Depends(require_admin)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+) -> AdminGrowthOut:
+    """Early-growth figures: site reach, installer clicks, applications, and accounts."""
+    now = datetime.now(timezone.utc)
+    start_today = datetime.combine(now.date(), time.min, tzinfo=timezone.utc)
+    week = await _growth_period(db, now - timedelta(days=7))
+    pages = await db.execute(
+        select(
+            SiteEvent.path,
+            func.count(func.distinct(SiteEvent.visitor_id)),
+            func.count(),
+        )
+        .where(SiteEvent.kind == "pageview", SiteEvent.created_at >= now - timedelta(days=7))
+        .group_by(SiteEvent.path)
+        .order_by(func.count(func.distinct(SiteEvent.visitor_id)).desc(), SiteEvent.path.asc())
+    )
+    pro = await db.execute(
+        select(func.count())
+        .select_from(User)
+        .where(
+            User.plan_slug == "pro",
+            User.subscription_status.in_(tuple(ACTIVE_LLM_STATUSES)),
+            or_(
+                User.subscription_current_period_end.is_(None),
+                User.subscription_current_period_end > now,
+            ),
+        )
+    )
+    awaiting = await db.execute(
+        select(func.count())
+        .select_from(User)
+        .where(
+            User.admin_privilege_note.like(f"{UNCLAIMED_GRANT_PREFIX}%"),
+            User.password_changed_at.is_(None),
+        )
+    )
+    current = await _growth_period(db, None)
+    return AdminGrowthOut(
+        generated_at=now,
+        note=_GROWTH_NOTE,
+        now=GrowthNow(
+            registered_accounts=current.registered_accounts,
+            awaiting_signup=int(awaiting.scalar_one() or 0),
+            pro_accounts=int(pro.scalar_one() or 0),
+            activated_accounts=current.activated_accounts,
+            beta_applications=current.beta_applications,
+        ),
+        today=await _growth_period(db, start_today),
+        days_7=week,
+        days_30=await _growth_period(db, now - timedelta(days=30)),
+        all_time=current,
+        pages_7d=[
+            GrowthPage(path=path, visitors=int(visitors or 0), views=int(views or 0))
+            for path, visitors, views in pages.all()
+        ],
+        downloads_per_100_visitors_7d=_per_100(week.download_starts, week.unique_visitors),
+        applications_per_100_visitors_7d=_per_100(week.beta_applications, week.unique_visitors),
+        registrations_per_100_downloads_7d=_per_100(week.registered_accounts, week.download_starts),
+    )

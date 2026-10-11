@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import enum
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Optional
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -226,6 +227,25 @@ class BetaSignup(Base):
     )
 
 
+class SiteEvent(Base):
+    """Anonymous marketing-site visit or installer click. One row per browser, per day, per action."""
+
+    __tablename__ = "site_events"
+    __table_args__ = (
+        UniqueConstraint("visitor_id", "kind", "path", "event_day", name="uq_site_event_visitor_day"),
+        Index("ix_site_events_kind_created", "kind", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    visitor_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    path: Mapped[str] = mapped_column(String(80), nullable=False)
+    event_day: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class DiagnosticsBundle(Base):
     __tablename__ = "diagnostics_bundles"
 
@@ -248,6 +268,7 @@ __all__ = [
     "UsageEvent",
     "PaymentEventLog",
     "BetaSignup",
+    "SiteEvent",
     "DiagnosticsBundle",
     "SubscriptionStatus",
 ]

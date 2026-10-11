@@ -139,6 +139,12 @@ class CloudSettings(BaseSettings):
         le=10_000,
         description="Max POST /v1/beta/join per IP per hour; 0 disables.",
     )
+    rate_limit_site_events_per_window: int = Field(
+        default=180,
+        ge=0,
+        le=100_000,
+        description="Max POST /v1/analytics/collect per IP per hour; 0 disables.",
+    )
 
     # CORS (comma-separated origins; * for dev only)
     cors_origins: str = Field(default="*")

@@ -141,6 +141,7 @@
           <p>Sign-in secrets in the desktop app are stored with Windows DPAPI. Installers published here are checked by SHA-256 in the in-app updater before they are applied.</p>
           <p>Hosted AI, used when you are signed in, sends that task to SurvyAI’s cloud service so the model can answer. It does not upload your workspace as a backup.</p>
           <p>The first-user form stores only what you submit: name, email, profession, intended use, and Windows specs. We use it to grant access, improve the product, and understand how surveyors want to work. We do not sell it. Questions go to <a href="mailto:support@survyai.com">support@survyai.com</a>.</p>
+          <p>This site stores an anonymous id in your browser so we can count visits and installer clicks. It is not your name or email.</p>
         </div>
       </div>
     </section>
@@ -354,6 +355,38 @@
         video.addEventListener("error", showDemoPending);
         if (source) source.addEventListener("error", showDemoPending);
       }
+    })();
+    (function () {
+      var endpoint = "https://survyai-api.onrender.com/v1/analytics/collect";
+      var key = "survyai_vid";
+      var id = "";
+      try { id = localStorage.getItem(key) || ""; } catch (e) { id = ""; }
+      if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+        id = (window.crypto && crypto.randomUUID) ? crypto.randomUUID() : "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, function (c) {
+          var r = Math.random() * 16 | 0;
+          return (c === "x" ? r : (r & 0x3 | 0x8)).toString(16);
+        });
+        try { localStorage.setItem(key, id); } catch (e) {}
+      }
+      function send(kind, path) {
+        var payload = JSON.stringify({ visitor_id: id, kind: kind, path: path });
+        fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: payload,
+          mode: "cors",
+          keepalive: true
+        }).catch(function () {});
+      }
+      send("pageview", location.pathname || "/");
+      document.addEventListener("click", function (ev) {
+        var node = ev.target && ev.target.closest ? ev.target.closest("a[href]") : null;
+        if (!node) return;
+        var href = node.getAttribute("href") || "";
+        if (href === "/get/latest" || href === "/updates/latest" || href === "/downloads/latest" || (href.indexOf("/updates/") === 0 && /\.exe$/i.test(href))) {
+          send("download", href);
+        }
+      });
     })();
   </script>
 </body>

@@ -477,6 +477,53 @@ class BetaJoinOut(BaseModel):
     detail: str = "You're on the first-user list. We'll use this when granting access."
 
 
+class SiteCollectIn(BaseModel):
+    visitor_id: str = Field(default="", max_length=36)
+    kind: str = Field(default="", max_length=16)
+    path: str = Field(default="/", max_length=120)
+
+
+class SiteCollectOut(BaseModel):
+    stored: bool = False
+
+
+class GrowthPeriod(BaseModel):
+    unique_visitors: int = 0
+    pageviews: int = 0
+    download_starts: int = 0
+    beta_applications: int = 0
+    registered_accounts: int = 0
+    activated_accounts: int = 0
+
+
+class GrowthNow(BaseModel):
+    registered_accounts: int = 0
+    awaiting_signup: int = 0
+    pro_accounts: int = 0
+    activated_accounts: int = 0
+    beta_applications: int = 0
+
+
+class GrowthPage(BaseModel):
+    path: str
+    visitors: int
+    views: int
+
+
+class AdminGrowthOut(BaseModel):
+    generated_at: datetime
+    note: str
+    now: GrowthNow
+    today: GrowthPeriod
+    days_7: GrowthPeriod
+    days_30: GrowthPeriod
+    all_time: GrowthPeriod
+    pages_7d: list[GrowthPage]
+    downloads_per_100_visitors_7d: Optional[float] = None
+    applications_per_100_visitors_7d: Optional[float] = None
+    registrations_per_100_downloads_7d: Optional[float] = None
+
+
 class BetaSignupOut(BaseModel):
     id: uuid.UUID
     name: str

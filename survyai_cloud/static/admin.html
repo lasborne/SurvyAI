@@ -66,8 +66,40 @@
       grid-template-columns: 1fr 1fr;
       gap: 0.75rem;
     }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 0.75rem;
+      margin: 0 0 0.9rem;
+    }
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0.75rem 0.8rem;
+      background: #fff;
+    }
+    .metric .k {
+      color: var(--muted);
+      font-size: 0.72rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    .metric .v {
+      margin-top: 0.2rem;
+      font-size: 1.6rem;
+      font-weight: 600;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+    }
+    .metric .s { margin-top: 0.2rem; color: var(--muted); font-size: 0.78rem; }
+    .table-scroll { overflow-x: auto; max-width: 100%; }
+    table.nums { min-width: 36rem; }
+    table.nums th, table.nums td { text-align: right; white-space: nowrap; }
+    table.nums th:first-child, table.nums td:first-child { text-align: left; }
+    .fine { margin: 0.7rem 0 0; color: var(--muted); font-size: 0.82rem; line-height: 1.45; }
     @media (max-width: 720px) {
-      .grid2 { grid-template-columns: 1fr; }
+      .grid2, .metrics { grid-template-columns: 1fr 1fr; }
       .row { grid-template-columns: 1fr; }
     }
     button {
@@ -125,7 +157,7 @@
 <body>
   <header>
     <h1>SurvyAI Support Admin</h1>
-    <p class="sub">Subscriptions, privileged access, devices, usage, and billing overrides. Requires <code>X-SurvyAI-Admin-Key</code>.</p>
+    <p class="sub">Site growth, subscriptions, privileged access, devices, usage, and billing overrides. Requires <code>X-SurvyAI-Admin-Key</code>.</p>
   </header>
   <main>
     <section>
@@ -138,6 +170,16 @@
         <button type="button" id="saveKeyBtn">Save key</button>
       </div>
       <div id="keyMsg" class="msg"></div>
+    </section>
+
+    <section>
+      <h2>Growth</h2>
+      <div class="toolbar">
+        <div class="grow" id="growthSummary">Save an admin key, then refresh to see visits, downloads, and accounts.</div>
+        <button type="button" class="secondary" id="refreshGrowthBtn">Refresh growth</button>
+      </div>
+      <div id="growthWrap"><p class="sub">No figures loaded yet.</p></div>
+      <div id="growthMsg" class="msg"></div>
     </section>
 
     <section>
@@ -712,6 +754,68 @@
       }
     }
 
+    function num(v) {
+      return Number(v || 0).toLocaleString("en-US");
+    }
+
+    function rate(v) {
+      return v === null || v === undefined ? "—" : num(v);
+    }
+
+    function periodCells(p) {
+      return [p.unique_visitors, p.pageviews, p.download_starts, p.beta_applications, p.registered_accounts, p.activated_accounts]
+        .map(num);
+    }
+
+    function renderGrowth(data) {
+      const rows = [
+        ["Unique visitors", 0],
+        ["Page views", 1],
+        ["Download starts", 2],
+        ["Beta applications", 3],
+        ["Registrations", 4],
+        ["Signed in on a PC", 5],
+      ];
+      const periods = [data.today, data.days_7, data.days_30, data.all_time].map(periodCells);
+      const body = rows.map(function (row) {
+        const cells = periods.map(function (p) { return "<td>" + p[row[1]] + "</td>"; }).join("");
+        return "<tr><th>" + row[0] + "</th>" + cells + "</tr>";
+      }).join("");
+      const pages = (data.pages_7d || []).map(function (p) {
+        const label = p.path === "/" ? "Home" : p.path === "/beta-user" ? "Join the first users" : p.path;
+        return "<tr><td>" + esc(label) + "</td><td>" + num(p.visitors) + "</td><td>" + num(p.views) + "</td></tr>";
+      }).join("");
+      const pageTable = pages
+        ? "<h2 style=\"margin-top:1rem;font-size:0.95rem;\">Pages, last 7 days</h2><div class=\"table-scroll\"><table class=\"nums\"><thead><tr><th>Page</th><th>Visitors</th><th>Views</th></tr></thead><tbody>" + pages + "</tbody></table></div>"
+        : "<p class=\"fine\">No page visits recorded in the last 7 days.</p>";
+      document.getElementById("growthSummary").textContent = "Figures in UTC. Refresh after the site has been open.";
+      document.getElementById("growthWrap").innerHTML =
+        "<div class=\"metrics\">" +
+          "<div class=\"metric\"><div class=\"k\">Visitors · 7 days</div><div class=\"v\">" + num(data.days_7.unique_visitors) + "</div><div class=\"s\">" + num(data.today.unique_visitors) + " today</div></div>" +
+          "<div class=\"metric\"><div class=\"k\">Downloads · 7 days</div><div class=\"v\">" + num(data.days_7.download_starts) + "</div><div class=\"s\">" + rate(data.downloads_per_100_visitors_7d) + " per 100 visitors</div></div>" +
+          "<div class=\"metric\"><div class=\"k\">Registered</div><div class=\"v\">" + num(data.now.registered_accounts) + "</div><div class=\"s\">" + num(data.days_7.registered_accounts) + " new in 7 days</div></div>" +
+          "<div class=\"metric\"><div class=\"k\">Beta list</div><div class=\"v\">" + num(data.now.beta_applications) + "</div><div class=\"s\">" + num(data.days_7.beta_applications) + " new in 7 days</div></div>" +
+        "</div>" +
+        "<div class=\"table-scroll\"><table class=\"nums\"><thead><tr><th>New in period</th><th>Today</th><th>7 days</th><th>30 days</th><th>All time</th></tr></thead><tbody>" + body + "</tbody></table></div>" +
+        "<div class=\"metrics\" style=\"margin-top:0.9rem;\">" +
+          "<div class=\"metric\"><div class=\"k\">Pro access now</div><div class=\"v\">" + num(data.now.pro_accounts) + "</div><div class=\"s\">Open Pro or beta grant</div></div>" +
+          "<div class=\"metric\"><div class=\"k\">Waiting to sign up</div><div class=\"v\">" + num(data.now.awaiting_signup) + "</div><div class=\"s\">Pro granted, no password yet</div></div>" +
+          "<div class=\"metric\"><div class=\"k\">Signed in on a PC</div><div class=\"v\">" + num(data.now.activated_accounts) + "</div><div class=\"s\">Accounts with a device</div></div>" +
+          "<div class=\"metric\"><div class=\"k\">Applications / 100 visitors</div><div class=\"v\">" + rate(data.applications_per_100_visitors_7d) + "</div><div class=\"s\">Last 7 days, volume ratio</div></div>" +
+        "</div>" +
+        pageTable +
+        "<p class=\"fine\">" + esc(data.note) + " Registrations per 100 download starts, last 7 days: " + rate(data.registrations_per_100_downloads_7d) + ". These ratios compare totals. They are not the same person followed from the site into the app.</p>";
+    }
+
+    async function refreshGrowth() {
+      setMsg("growthMsg", "");
+      try {
+        renderGrowth(await api("/v1/admin/growth"));
+      } catch (e) {
+        setMsg("growthMsg", e.message || String(e), false);
+      }
+    }
+
     document.getElementById("saveKeyBtn").addEventListener("click", () => {
       const key = document.getElementById("adminKey").value.trim();
       if (!key) {
@@ -720,6 +824,7 @@
       }
       sessionStorage.setItem(KEY_STORAGE, key);
       setMsg("keyMsg", "Admin key saved for this browser session.", true);
+      refreshGrowth();
       refreshBetaSignups();
       refreshPrivileges();
     });
@@ -728,6 +833,7 @@
     document.getElementById("applyOverrideBtn").addEventListener("click", applyOverrides);
     document.getElementById("refreshPrivBtn").addEventListener("click", refreshPrivileges);
     document.getElementById("refreshBetaBtn").addEventListener("click", refreshBetaSignups);
+    document.getElementById("refreshGrowthBtn").addEventListener("click", refreshGrowth);
     document.getElementById("email").addEventListener("keydown", (ev) => {
       if (ev.key === "Enter") lookup();
     });
@@ -736,6 +842,7 @@
     if (existing) {
       document.getElementById("adminKey").value = existing;
       setMsg("keyMsg", "Admin key loaded from sessionStorage.", true);
+      refreshGrowth();
       refreshBetaSignups();
       refreshPrivileges();
     }
