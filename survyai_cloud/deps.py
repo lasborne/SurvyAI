@@ -38,6 +38,27 @@ async def require_admin(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Invalid admin key")
 
 
+async def get_optional_user(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    creds: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],
+) -> Optional[User]:
+    """Signed-in user when a valid access token is present; otherwise None."""
+    if creds is None or not creds.credentials:
+        return None
+    payload = safe_decode_access_token(creds.credentials)
+    if not payload or payload.get("type") != "access":
+        return None
+    sub = payload.get("sub")
+    if not sub:
+        return None
+    try:
+        uid = uuid.UUID(str(sub))
+    except ValueError:
+        return None
+    res = await db.execute(select(User).where(User.id == uid))
+    return res.scalar_one_or_none()
+
+
 async def get_current_user(
     db: Annotated[AsyncSession, Depends(get_db)],
     creds: Annotated[Optional[HTTPAuthorizationCredentials], Depends(security)],

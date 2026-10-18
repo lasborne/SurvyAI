@@ -419,6 +419,62 @@ BETA_PROFESSIONS = frozenset(
         "Others",
     }
 )
+FEEDBACK_USES = frozenset(
+    {
+        "Geospatial/GIS analysis",
+        "Use SurvyAI as a Survey AI assistant",
+        "As a Survey AI assistant",
+        "Survey plan production/Cartography",
+        "Extracting and generating Geoinformation",
+        "Others",
+    }
+)
+
+
+class FeedbackIn(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    email: str = Field(default="", max_length=320)
+    trying_to_do: str
+    trying_other: str = Field(default="", max_length=400)
+    what_happened: str = Field(min_length=2, max_length=4000)
+    expected: str = Field(min_length=2, max_length=4000)
+    rating: int = Field(ge=1, le=5)
+    context: str = Field(default="", max_length=4000)
+
+    @model_validator(mode="after")
+    def _check_trying(self) -> "FeedbackIn":
+        if self.trying_to_do not in FEEDBACK_USES:
+            raise ValueError("Choose what you were trying to do.")
+        other = (self.trying_other or "").strip()
+        if self.trying_to_do == "Others" and len(other) < 2:
+            raise ValueError("Tell us a little more about what you were trying to do.")
+        email = (self.email or "").strip()
+        if email and ("@" not in email or "." not in email.split("@")[-1]):
+            raise ValueError("Enter a valid email, or leave it blank.")
+        self.trying_other = other if self.trying_to_do == "Others" else ""
+        self.email = email
+        self.name = self.name.strip()
+        self.what_happened = self.what_happened.strip()
+        self.expected = self.expected.strip()
+        self.context = (self.context or "").strip()
+        return self
+
+
+class FeedbackOut(BaseModel):
+    id: int
+    email: Optional[str] = None
+    name: str
+    trying_to_do: str
+    trying_other: Optional[str] = None
+    what_happened: str
+    expected: str
+    rating: int
+    context: Optional[str] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
 BETA_USES = frozenset(
     {
         "Not selected",

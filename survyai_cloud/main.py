@@ -35,6 +35,7 @@ from survyai_cloud.routers import (
 )
 
 _ADMIN_UI_PATH = Path(__file__).resolve().parent / "static" / "admin.html"
+_ADMIN_FEEDBACK_PATH = Path(__file__).resolve().parent / "static" / "admin_feedback.html"
 
 
 @asynccontextmanager
@@ -109,6 +110,7 @@ def create_app() -> FastAPI:
                 "docs": "/docs",
                 "openapi": "/openapi.json",
                 "admin_ui": "/admin/ui",
+                "admin_feedback": "/admin/feedback",
             },
         }
 
@@ -124,6 +126,18 @@ def create_app() -> FastAPI:
             _ADMIN_UI_PATH,
             media_type="text/html; charset=utf-8",
             filename="admin.html",
+            content_disposition_type="inline",
+        )
+
+    @app.get("/admin/feedback", include_in_schema=False)
+    async def admin_feedback() -> FileResponse:
+        """Admin-only reader for desktop Feedback submissions."""
+        if not _ADMIN_FEEDBACK_PATH.is_file():
+            raise HTTPException(status_code=404, detail="Feedback admin page not found on server")
+        return FileResponse(
+            _ADMIN_FEEDBACK_PATH,
+            media_type="text/html; charset=utf-8",
+            filename="admin_feedback.html",
             content_disposition_type="inline",
         )
 

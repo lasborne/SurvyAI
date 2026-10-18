@@ -100,6 +100,7 @@ from survyai.cloud_api import (
     paystack_initialize,
     paystack_subscription_manage_url,
     paystack_verify,
+    submit_feedback as cloud_submit_feedback,
     report_usage_batch,
     refresh_tokens,
     register_device,
@@ -3463,6 +3464,243 @@ class MainWindow(QMainWindow):
             "App version, short credits, and legal notices — confirm you are on the build you expect.",
         )
         help_menu.addAction(about)
+
+        feedback_act = QAction("&Feedback", self)
+        feedback_act.triggered.connect(self._show_feedback)
+        self._describe_menu_action(
+            feedback_act,
+            "Tell us what you were trying to do and what happened. Takes a minute.",
+        )
+        menubar.addAction(feedback_act)
+
+    def _feedback_context(self) -> str:
+        """Machine and account facts sent with feedback, not shown in the form."""
+        import platform
+        from datetime import datetime
+
+        me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
+        plan = str(me.get("plan_slug") or "").strip() or "free"
+        if not self._state.cloud_refresh_token.strip():
+            plan = "not signed in"
+        total_mb = avail_mb = 0
+        try:
+            from survyai.ollama_support import host_ram_mb
+
+            total_mb, avail_mb = host_ram_mb()
+        except Exception:
+            pass
+        primary = str(getattr(self._state, "preferred_primary_llm", "") or "").strip() or "auto"
+        fallback = str(getattr(self._state, "preferred_fallback_llm", "") or "").strip()
+        if not fallback:
+            fallback = str(getattr(self._settings, "fallback_llm", "") or "").strip() or "—"
+        use_fb = bool(self._state.use_fallback_llm)
+        local = str(primary).lower() == "ollama" or (
+            bool(self._state.free_ai_model_enabled) and use_fb and str(fallback).lower() == "ollama"
+        )
+        if local:
+            usage = "local"
+        elif use_fb:
+            usage = "fallback LLM"
+        else:
+            usage = "hosted"
+        if getattr(self._state, "fast_mode_non_file_prompts", False):
+            usage += ", fast mode on"
+        else:
+            usage += ", fast mode off"
+        lines = [
+            f"App version: {__version__}",
+            f"When: {datetime.now().astimezone().isoformat(timespec='seconds')}",
+            f"OS: {platform.platform()}",
+            f"RAM: {total_mb} MB total, {avail_mb} MB free" if total_mb else "RAM: unavailable",
+            f"Primary LLM: {primary}",
+            f"Fallback LLM: {fallback}",
+            f"Usage mode: {usage}",
+            f"Plan: {plan}",
+        ]
+        return "\n".join(lines)
+
+    def _show_feedback(self) -> None:
+        signed_in = bool(self._state.cloud_refresh_token.strip())
+        if signed_in:
+            self._ensure_cloud_token_valid(silent=True)
+        me = self._state.cloud_me if isinstance(self._state.cloud_me, dict) else {}
+        email = str(me.get("email") or "").strip() or (self._state.profile.email or "").strip()
+        name = str(me.get("display_name") or "").strip() or (self._state.profile.display_name or "").strip()
+        if signed_in and not email:
+            signed_in = False
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Feedback")
+        dlg.setMinimumWidth(840)
+        form = QFormLayout(dlg)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        form.setContentsMargins(16, 10, 16, 10)
+        form.setSpacing(8)
+
+        intro = QLabel("A short note is enough. We read every message.")
+        intro.setWordWrap(True)
+        form.addRow(intro)
+
+        email_edit = QLineEdit(email if signed_in else "")
+        if signed_in:
+            email_edit.setReadOnly(True)
+            email_edit.setStyleSheet("color:#78716c; background:#f5f5f4;")
+            email_edit.setToolTip("This is the email on your SurvyAI account.")
+        else:
+            email_edit.setPlaceholderText("Optional")
+            email_edit.setToolTip(
+                "Optional. Enter a valid email if you want a reply from the SurvyAI team."
+            )
+        form.addRow("E-mail:", email_edit)
+
+        name_edit = QLineEdit(name)
+        name_edit.setPlaceholderText("Your name")
+        form.addRow("Name:", name_edit)
+
+        trying = QComboBox()
+        trying.addItems(
+            [
+                "Not selected",
+                "Geospatial/GIS analysis",
+                "Use SurvyAI as a Survey AI assistant",
+                "Survey plan production/Cartography",
+                "Extracting and generating Geoinformation",
+                "Others",
+            ]
+        )
+        form.addRow("What were you trying to do?", trying)
+        other = QPlainTextEdit()
+        other.setPlaceholderText("Say what you were trying to do")
+        other.setMinimumHeight(88)
+        other_label = QLabel("Tell us a bit more:")
+        form.addRow(other_label, other)
+        other.hide()
+        other_label.hide()
+
+        def _toggle_other() -> None:
+            show = trying.currentText() == "Others"
+            other.setVisible(show)
+            other_label.setVisible(show)
+            _fit_feedback_dialog()
+
+        trying.currentTextChanged.connect(_toggle_other)
+
+        happened = QPlainTextEdit()
+        happened.setPlaceholderText("What did SurvyAI do?")
+        happened.setMinimumHeight(108)
+        form.addRow("What happened?", happened)
+
+        expected = QPlainTextEdit()
+        expected.setPlaceholderText("What should have happened?")
+        expected.setMinimumHeight(108)
+        form.addRow("What did you expect to happen?", expected)
+
+        rating_row = QWidget()
+        rating_lay = QHBoxLayout(rating_row)
+        rating_lay.setContentsMargins(0, 0, 0, 0)
+        group = QButtonGroup(dlg)
+        for n, caption in (
+            (1, "1 Terrible"),
+            (2, "2 Not good"),
+            (3, "3 Average"),
+            (4, "4 Good"),
+            (5, "5 Excellent"),
+        ):
+            rb = QRadioButton(caption)
+            group.addButton(rb, n)
+            rating_lay.addWidget(rb)
+        rating_lay.addStretch(1)
+        form.addRow("How satisfied were you?", rating_row)
+
+        buttons = QDialogButtonBox()
+        send = buttons.addButton("Send Feedback", QDialogButtonBox.ButtonRole.AcceptRole)
+        buttons.addButton(QDialogButtonBox.StandardButton.Cancel)
+        form.addRow(buttons)
+        buttons.rejected.connect(dlg.reject)
+
+        def _send() -> None:
+            chosen = trying.currentText()
+            if chosen == "Not selected":
+                QMessageBox.warning(dlg, "Feedback", "Choose what you were trying to do.")
+                return
+            extra = other.toPlainText().strip()
+            if chosen == "Others" and len(extra) < 2:
+                QMessageBox.warning(dlg, "Feedback", "Say a little more about what you were trying to do.")
+                return
+            who = name_edit.text().strip()
+            if not who:
+                QMessageBox.warning(dlg, "Feedback", "Enter your name.")
+                return
+            typed_email = email if signed_in else email_edit.text().strip()
+            if typed_email and ("@" not in typed_email or "." not in typed_email.split("@")[-1]):
+                QMessageBox.warning(
+                    dlg,
+                    "Feedback",
+                    "Enter a valid email, or leave it blank.",
+                )
+                return
+            did = happened.toPlainText().strip()
+            want = expected.toPlainText().strip()
+            if len(did) < 2 or len(want) < 2:
+                QMessageBox.warning(
+                    dlg,
+                    "Feedback",
+                    "Tell us what happened and what you expected.",
+                )
+                return
+            score = group.checkedId()
+            if score < 1:
+                QMessageBox.warning(dlg, "Feedback", "Choose a rating from 1 to 5.")
+                return
+            token = ""
+            if signed_in:
+                if not self._ensure_cloud_token_valid(silent=False):
+                    return
+                _base, token = self._cloud_base_and_token()
+            base = self._default_cloud_api_base_url()
+            try:
+                cloud_submit_feedback(
+                    base_url=base,
+                    access_token=token,
+                    name=who,
+                    email=typed_email,
+                    trying_to_do=chosen,
+                    trying_other=extra,
+                    what_happened=did,
+                    expected=want,
+                    rating=score,
+                    context=self._feedback_context(),
+                )
+            except CloudApiError as exc:
+                QMessageBox.warning(dlg, "Could not send feedback", str(exc))
+                return
+            QMessageBox.information(dlg, "Feedback", "Thank you for your feedback.")
+            dlg.accept()
+
+        send.clicked.connect(_send)
+
+        def _fit_feedback_dialog() -> None:
+            app = QApplication.instance()
+            screen = dlg.screen() or (app.primaryScreen() if app is not None else None)
+            dlg.adjustSize()
+            if screen is None:
+                return
+            avail = screen.availableGeometry()
+            max_h = max(460, avail.height() - 72)
+            hint = dlg.sizeHint()
+            overflow = hint.height() - max_h
+            if overflow > 0:
+                shrink = min(28, (overflow // 2) + 4)
+                happened.setMinimumHeight(max(80, happened.minimumHeight() - shrink))
+                expected.setMinimumHeight(max(80, expected.minimumHeight() - shrink))
+                dlg.adjustSize()
+                hint = dlg.sizeHint()
+            width = min(max(hint.width(), 840), max(640, avail.width() - 48))
+            height = min(hint.height(), max_h)
+            dlg.resize(width, height)
+
+        _fit_feedback_dialog()
+        dlg.exec()
 
     # ------------------------------------------------------------------
     # State / configuration helpers

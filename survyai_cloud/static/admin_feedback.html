@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>SurvyAI feedback</title>
+  <style>
+    :root { --bg:#f4f1ea; --card:#fffdf8; --ink:#1c1917; --muted:#57534e; --line:#d6d3d1; --accent:#0f766e; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:"Segoe UI",system-ui,sans-serif; color:var(--ink); background:var(--bg); }
+    header { padding:1.1rem 1.4rem; border-bottom:1px solid var(--line); background:#fffdf8; }
+    h1 { margin:0 0 .2rem; font-size:1.3rem; }
+    a { color:var(--accent); }
+    p.sub { margin:0; color:var(--muted); font-size:.9rem; }
+    main { max-width:1100px; margin:0 auto; padding:1.2rem 1.4rem 2.5rem; display:grid; gap:1rem; }
+    section { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:1rem 1.1rem; }
+    label { display:block; font-size:.8rem; color:var(--muted); margin-bottom:.25rem; }
+    input { width:min(420px,100%); padding:.45rem .55rem; border:1px solid var(--line); border-radius:8px; }
+    button { background:var(--accent); color:#fff; border:0; border-radius:8px; padding:.45rem .8rem; cursor:pointer; }
+    table { width:100%; border-collapse:collapse; font-size:.92rem; }
+    th, td { text-align:left; padding:.45rem .35rem; border-bottom:1px solid var(--line); vertical-align:top; }
+    tr { cursor:pointer; }
+    tr.active { background:#ecfdf5; }
+    .detail { display:grid; gap:.45rem; }
+    .detail p { margin:0; }
+    .k { color:var(--muted); font-size:.78rem; }
+    .err { color:#b91c1c; }
+    .stars { letter-spacing:.05em; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>SurvyAI feedback</h1>
+    <p class="sub">Each row is one person's feedback from the desktop app. <a href="/admin/ui">Back to admin</a></p>
+  </header>
+  <main>
+    <section>
+      <label for="adminKey">Admin API key (session only)</label>
+      <input id="adminKey" type="password" autocomplete="off" />
+      <button id="saveKey" type="button">Save key and load</button>
+      <p id="status" class="sub"></p>
+    </section>
+    <section>
+      <table>
+        <thead>
+          <tr><th>When</th><th>Name</th><th>Email</th><th>Trying to do</th><th>Rating</th></tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </section>
+    <section id="detail" hidden>
+      <div class="detail" id="detailBody"></div>
+    </section>
+  </main>
+  <script>
+    const KEY = "survyai_admin_key";
+    const rowsEl = document.getElementById("rows");
+    const statusEl = document.getElementById("status");
+    let items = [];
+
+    function esc(s) {
+      return String(s ?? "").replace(/[&<>"']/g, c => ({ "&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;" }[c]));
+    }
+    function when(iso) {
+      const d = new Date(iso);
+      return Number.isNaN(d.getTime()) ? esc(iso) : d.toLocaleString();
+    }
+    function stars(n) {
+      const v = Number(n) || 0;
+      return "★".repeat(v) + "☆".repeat(Math.max(0, 5 - v)) + " (" + v + "/5)";
+    }
+    async function api(path) {
+      const key = (sessionStorage.getItem(KEY) || "").trim();
+      if (!key) throw new Error("Save the admin key first.");
+      const res = await fetch(path, { headers: { "X-SurvyAI-Admin-Key": key } });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || res.statusText || "Request failed");
+      return body;
+    }
+    function show(item) {
+      const box = document.getElementById("detail");
+      box.hidden = false;
+        const other = item.trying_other ? "<p><span class='k'>Specified</span><br>" + esc(item.trying_other) + "</p>" : "";
+        const ctx = item.context ? "<p><span class='k'>App and PC</span><br><pre style='white-space:pre-wrap;margin:.2rem 0 0'>" + esc(item.context) + "</pre></p>" : "";
+        document.getElementById("detailBody").innerHTML =
+          "<p><span class='k'>From</span><br><strong>" + esc(item.name) + "</strong> · " + esc(item.email || "No email") + "</p>" +
+          "<p><span class='k'>When</span><br>" + when(item.created_at) + "</p>" +
+          "<p><span class='k'>What were you trying to do?</span><br>" + esc(item.trying_to_do) + "</p>" +
+          other +
+          "<p><span class='k'>What happened?</span><br>" + esc(item.what_happened).replace(/\n/g, "<br>") + "</p>" +
+          "<p><span class='k'>What did you expect to happen?</span><br>" + esc(item.expected).replace(/\n/g, "<br>") + "</p>" +
+          "<p class='stars'><span class='k'>How satisfied were you?</span><br>" + stars(item.rating) + "</p>" +
+          ctx;
+      document.querySelectorAll("#rows tr").forEach(tr => tr.classList.toggle("active", tr.dataset.id === String(item.id)));
+    }
+    function render() {
+      rowsEl.innerHTML = items.map(item =>
+        "<tr data-id='" + item.id + "'><td>" + when(item.created_at) + "</td><td>" + esc(item.name) +
+        "</td><td>" + esc(item.email || "") + "</td><td>" + esc(item.trying_to_do) +
+        "</td><td>" + esc(item.rating) + "/5</td></tr>"
+      ).join("") || "<tr><td colspan='5'>No feedback yet.</td></tr>";
+      rowsEl.querySelectorAll("tr[data-id]").forEach(tr => {
+        tr.addEventListener("click", () => {
+          const item = items.find(x => String(x.id) === tr.dataset.id);
+          if (item) show(item);
+        });
+      });
+    }
+    async function load() {
+      statusEl.textContent = "Loading…";
+      statusEl.className = "sub";
+      try {
+        items = await api("/v1/admin/feedback?limit=200");
+        statusEl.textContent = items.length + " feedback message" + (items.length === 1 ? "" : "s") + ".";
+        render();
+        if (items[0]) show(items[0]);
+      } catch (err) {
+        statusEl.textContent = err.message || String(err);
+        statusEl.className = "err";
+      }
+    }
+    document.getElementById("saveKey").addEventListener("click", () => {
+      const key = document.getElementById("adminKey").value.trim();
+      if (!key) { statusEl.textContent = "Enter the admin key."; statusEl.className = "err"; return; }
+      sessionStorage.setItem(KEY, key);
+      load();
+    });
+    const saved = sessionStorage.getItem(KEY) || "";
+    if (saved) { document.getElementById("adminKey").value = saved; load(); }
+  </script>
+</body>
+</html>

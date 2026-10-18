@@ -246,6 +246,28 @@ class SiteEvent(Base):
     )
 
 
+class UserFeedback(Base):
+    """Beta feedback sent from the desktop Feedback window."""
+
+    __tablename__ = "user_feedback"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    email: Mapped[Optional[str]] = mapped_column(String(320), nullable=True, index=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    trying_to_do: Mapped[str] = mapped_column(String(120), nullable=False)
+    trying_other: Mapped[Optional[str]] = mapped_column(String(400))
+    what_happened: Mapped[str] = mapped_column(Text, nullable=False)
+    expected: Mapped[str] = mapped_column(Text, nullable=False)
+    rating: Mapped[int] = mapped_column(Integer, nullable=False)
+    context: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class DiagnosticsBundle(Base):
     __tablename__ = "diagnostics_bundles"
 
@@ -269,6 +291,7 @@ __all__ = [
     "PaymentEventLog",
     "BetaSignup",
     "SiteEvent",
+    "UserFeedback",
     "DiagnosticsBundle",
     "SubscriptionStatus",
 ]

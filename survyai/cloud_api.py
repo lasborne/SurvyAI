@@ -571,6 +571,47 @@ def paystack_verify(
     return body if isinstance(body, dict) else {}
 
 
+def submit_feedback(
+    *,
+    base_url: str,
+    access_token: str = "",
+    name: str,
+    email: str = "",
+    trying_to_do: str,
+    trying_other: str,
+    what_happened: str,
+    expected: str,
+    rating: int,
+    context: str = "",
+    timeout_s: int = 30,
+) -> dict[str, Any]:
+    """POST /v1/feedback. A signed-in token locks the email to that account."""
+    base = _norm_base(base_url)
+    headers = {"Content-Type": "application/json"}
+    token = (access_token or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    resp = _cloud_post(
+        f"{base}/v1/feedback",
+        headers=headers,
+        json={
+            "name": name.strip(),
+            "email": (email or "").strip(),
+            "trying_to_do": trying_to_do,
+            "trying_other": (trying_other or "").strip(),
+            "what_happened": what_happened.strip(),
+            "expected": expected.strip(),
+            "rating": int(rating),
+            "context": context or "",
+        },
+        timeout=timeout_s,
+    )
+    body = _parse_json(resp, what="Send feedback")
+    if not resp.ok:
+        raise CloudApiError(_api_error_detail(body, status_code=resp.status_code))
+    return body if isinstance(body, dict) else {}
+
+
 def paystack_subscription_manage_url(
     *,
     base_url: str,

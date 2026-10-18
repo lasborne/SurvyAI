@@ -24,6 +24,7 @@ from survyai_cloud.models import (
     SubscriptionStatus,
     UsageEvent,
     User,
+    UserFeedback,
 )
 from survyai_cloud.rate_limiting import rate_limit_ip_dependency
 from survyai_cloud.schemas import (
@@ -40,6 +41,7 @@ from survyai_cloud.schemas import (
     GrowthPeriod,
     SiteCollectIn,
     SiteCollectOut,
+    FeedbackOut,
 )
 from survyai_cloud.security import hash_password
 from survyai_cloud.services.entitlements import (
@@ -621,3 +623,15 @@ async def admin_growth(
         applications_per_100_visitors_7d=_per_100(week.beta_applications, week.unique_visitors),
         registrations_per_100_downloads_7d=_per_100(week.registered_accounts, week.download_starts),
     )
+
+
+@router.get("/feedback", response_model=list[FeedbackOut])
+async def list_feedback(
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin)],
+    limit: int = Query(default=200, ge=1, le=500),
+) -> list[UserFeedback]:
+    rows = await db.execute(
+        select(UserFeedback).order_by(UserFeedback.created_at.desc()).limit(limit)
+    )
+    return list(rows.scalars().all())

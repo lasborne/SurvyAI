@@ -1,14 +1,14 @@
 from __future__ import annotations
 
-from typing import Annotated
+from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from survyai_cloud.db import get_db
-from survyai_cloud.deps import get_current_user
-from survyai_cloud.models import User
-from survyai_cloud.schemas import MeOut
+from survyai_cloud.deps import get_current_user, get_optional_user
+from survyai_cloud.models import User, UserFeedback
+from survyai_cloud.schemas import FeedbackIn, FeedbackOut, MeOut
 from survyai_cloud.services.entitlements import ensure_usage_month_rolled, entitlements_for_user
 
 router = APIRouter(tags=["me"])
@@ -40,3 +40,27 @@ async def get_me(
         can_use_platform_llm=ent.can_use_platform_llm,
         primary_llm=ent.primary_llm or "",
     )
+
+
+@router.post("/feedback", response_model=FeedbackOut)
+async def submit_feedback(
+    body: FeedbackIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    user: Annotated[Optional[User], Depends(get_optional_user)],
+) -> UserFeedback:
+    email = (user.email or "").strip() if user is not None else (body.email or "").strip()
+    row = UserFeedback(
+        user_id=user.id if user is not None else None,
+        email=email or None,
+        name=body.name,
+        trying_to_do=body.trying_to_do,
+        trying_other=body.trying_other or None,
+        what_happened=body.what_happened,
+        expected=body.expected,
+        rating=body.rating,
+        context=body.context or None,
+    )
+    db.add(row)
+    await db.commit()
+    await db.refresh(row)
+    return row

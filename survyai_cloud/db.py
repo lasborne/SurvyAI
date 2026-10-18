@@ -216,6 +216,10 @@ async def init_db() -> None:
                     await asyncio.to_thread(_alembic_upgrade_head_sync)
                 except Exception as exc:
                     logger.error("Alembic migration failed: %s", exc)
+            try:
+                await _ensure_feedback_columns()
+            except Exception as exc:
+                logger.warning("Could not align user_feedback columns: %s", exc)
         else:
             _database_available = False
             _database_detail = detail
@@ -249,6 +253,24 @@ async def init_db() -> None:
         _database_available = False
         _database_detail = str(exc).strip() or type(exc).__name__
         logger.error("SQLite init failed — degraded mode: %s", exc)
+
+
+async def _ensure_feedback_columns() -> None:
+    """Add columns from the feedback form even if revision 20261017_010 already ran."""
+    from sqlalchemy import inspect
+
+    async with engine.begin() as conn:
+        def _patch(sync_conn) -> None:
+            insp = inspect(sync_conn)
+            if "user_feedback" not in set(insp.get_table_names()):
+                return
+            cols = {c["name"] for c in insp.get_columns("user_feedback")}
+            if "context" not in cols:
+                sync_conn.execute(text("ALTER TABLE user_feedback ADD COLUMN context TEXT"))
+            if sync_conn.dialect.name == "postgresql":
+                sync_conn.execute(text("ALTER TABLE user_feedback ALTER COLUMN email DROP NOT NULL"))
+
+        await conn.run_sync(_patch)
 
 
 async def _sqlite_migrate(conn) -> None:
@@ -333,6 +355,11 @@ async def _sqlite_migrate(conn) -> None:
     ev_cols = {row[1] for row in ev_info}
     if "cost_usd" not in ev_cols:
         await conn.execute(text("ALTER TABLE usage_events ADD COLUMN cost_usd FLOAT NOT NULL DEFAULT 0.0"))
+
+    res = await conn.execute(text("PRAGMA table_info(user_feedback)"))
+    fb_cols = {row[1] for row in res.fetchall()}
+    if fb_cols and "context" not in fb_cols:
+        await conn.execute(text("ALTER TABLE user_feedback ADD COLUMN context TEXT"))
 
     # SQLite autoincrement fix: older dev DBs may have been created with BIGINT PK
     # which does not auto-populate, causing IntegrityError: NOT NULL constraint failed.
