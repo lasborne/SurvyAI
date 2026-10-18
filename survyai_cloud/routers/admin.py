@@ -42,6 +42,7 @@ from survyai_cloud.schemas import (
     SiteCollectIn,
     SiteCollectOut,
     FeedbackOut,
+    FeedbackStatusIn,
 )
 from survyai_cloud.security import hash_password
 from survyai_cloud.services.entitlements import (
@@ -635,3 +636,19 @@ async def list_feedback(
         select(UserFeedback).order_by(UserFeedback.created_at.desc()).limit(limit)
     )
     return list(rows.scalars().all())
+
+
+@router.patch("/feedback/{feedback_id}", response_model=FeedbackOut)
+async def set_feedback_status(
+    feedback_id: int,
+    body: FeedbackStatusIn,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    _: Annotated[None, Depends(require_admin)],
+) -> UserFeedback:
+    row = await db.get(UserFeedback, feedback_id)
+    if row is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Feedback not found")
+    row.status = body.status
+    await db.commit()
+    await db.refresh(row)
+    return row

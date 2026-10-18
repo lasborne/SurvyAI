@@ -3569,30 +3569,30 @@ class MainWindow(QMainWindow):
             ]
         )
         form.addRow("What were you trying to do?", trying)
+        def _lock_note(edit: QPlainTextEdit, height: int) -> None:
+            # Fixed height: a plain-text box otherwise prefers ~192px and
+            # pushes the dialog below the screen. Extra text scrolls inside.
+            edit.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            edit.setFixedHeight(max(0, height))
+
         other = QPlainTextEdit()
         other.setPlaceholderText("Say what you were trying to do")
-        other.setMinimumHeight(88)
+        _lock_note(other, 0)
         other_label = QLabel("Tell us a bit more:")
         form.addRow(other_label, other)
         other.hide()
         other_label.hide()
-
-        def _toggle_other() -> None:
-            show = trying.currentText() == "Others"
-            other.setVisible(show)
-            other_label.setVisible(show)
-            _fit_feedback_dialog()
-
-        trying.currentTextChanged.connect(_toggle_other)
+        if hasattr(form, "setRowVisible"):
+            form.setRowVisible(other, False)
 
         happened = QPlainTextEdit()
         happened.setPlaceholderText("What did SurvyAI do?")
-        happened.setMinimumHeight(108)
+        _lock_note(happened, 96)
         form.addRow("What happened?", happened)
 
         expected = QPlainTextEdit()
         expected.setPlaceholderText("What should have happened?")
-        expected.setMinimumHeight(108)
+        _lock_note(expected, 96)
         form.addRow("What did you expect to happen?", expected)
 
         rating_row = QWidget()
@@ -3610,6 +3610,7 @@ class MainWindow(QMainWindow):
             group.addButton(rb, n)
             rating_lay.addWidget(rb)
         rating_lay.addStretch(1)
+        rating_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         form.addRow("How satisfied were you?", rating_row)
 
         buttons = QDialogButtonBox()
@@ -3674,31 +3675,58 @@ class MainWindow(QMainWindow):
             except CloudApiError as exc:
                 QMessageBox.warning(dlg, "Could not send feedback", str(exc))
                 return
+            except Exception as exc:
+                QMessageBox.warning(dlg, "Could not send feedback", str(exc) or "Could not send feedback.")
+                return
             QMessageBox.information(dlg, "Feedback", "Thank you for your feedback.")
             dlg.accept()
 
         send.clicked.connect(_send)
 
+        def _set_other_row(show: bool) -> None:
+            other.setVisible(show)
+            other_label.setVisible(show)
+            if hasattr(form, "setRowVisible"):
+                form.setRowVisible(other, show)
+            _lock_note(other, 72 if show else 0)
+
         def _fit_feedback_dialog() -> None:
             app = QApplication.instance()
             screen = dlg.screen() or (app.primaryScreen() if app is not None else None)
-            dlg.adjustSize()
             if screen is None:
+                dlg.adjustSize()
                 return
             avail = screen.availableGeometry()
-            max_h = max(460, avail.height() - 72)
-            hint = dlg.sizeHint()
-            overflow = hint.height() - max_h
-            if overflow > 0:
-                shrink = min(28, (overflow // 2) + 4)
-                happened.setMinimumHeight(max(80, happened.minimumHeight() - shrink))
-                expected.setMinimumHeight(max(80, expected.minimumHeight() - shrink))
-                dlg.adjustSize()
-                hint = dlg.sizeHint()
-            width = min(max(hint.width(), 840), max(640, avail.width() - 48))
-            height = min(hint.height(), max_h)
-            dlg.resize(width, height)
+            # Title bar and borders sit outside the client area. Stay clear of the taskbar.
+            budget = max(360, avail.height() - 80)
+            widest = max(520, avail.width() - 32)
+            dlg.setMinimumWidth(min(840, widest))
+            dlg.setMaximumWidth(widest)
+            dlg.setMaximumHeight(16777215)
+            for _ in range(4):
+                hint_h = dlg.sizeHint().height()
+                if hint_h <= budget:
+                    break
+                smaller = max(64, happened.height() - max(8, (hint_h - budget) // 2))
+                if smaller >= happened.height() and not other.isVisible():
+                    break
+                _lock_note(happened, smaller)
+                _lock_note(expected, smaller)
+                if other.isVisible():
+                    _lock_note(other, max(48, other.height() - 8))
+            hint_h = dlg.sizeHint().height()
+            if hint_h <= budget:
+                dlg.setMaximumHeight(budget)
+            dlg.adjustSize()
 
+        def _toggle_other() -> None:
+            show = trying.currentText() == "Others"
+            if other.isVisible() == show:
+                return
+            _set_other_row(show)
+            _fit_feedback_dialog()
+
+        trying.currentTextChanged.connect(_toggle_other)
         _fit_feedback_dialog()
         dlg.exec()
 

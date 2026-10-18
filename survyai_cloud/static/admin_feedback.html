@@ -21,6 +21,14 @@
     th, td { text-align:left; padding:.45rem .35rem; border-bottom:1px solid var(--line); vertical-align:top; }
     tr { cursor:pointer; }
     tr.active { background:#ecfdf5; }
+    .tick { display:inline-flex; align-items:center; gap:.28rem; background:#047857; color:#fff; font-size:.75rem; font-weight:700; letter-spacing:.01em; border-radius:999px; padding:.12rem .55rem .14rem; }
+    .tick::before { content:"✓"; font-size:.85rem; }
+    .unclear { display:inline-flex; align-items:center; background:#fef3c7; color:#92400e; font-size:.75rem; font-weight:650; border-radius:999px; padding:.12rem .5rem; }
+    .open { color:var(--muted); font-size:.8rem; }
+    button.ghost { background:#fff; color:var(--ink); border:1px solid var(--line); }
+    button.mark.on { outline:2px solid #047857; outline-offset:1px; }
+    button.mark.ghost.on { outline-color:#b45309; }
+    .acts { display:flex; flex-wrap:wrap; gap:.45rem; align-items:center; }
     .detail { display:grid; gap:.45rem; }
     .detail p { margin:0; }
     .k { color:var(--muted); font-size:.78rem; }
@@ -43,7 +51,7 @@
     <section>
       <table>
         <thead>
-          <tr><th>When</th><th>Name</th><th>Email</th><th>Trying to do</th><th>Rating</th></tr>
+          <tr><th>When</th><th>Name</th><th>Email</th><th>Trying to do</th><th>Rating</th><th>Status</th></tr>
         </thead>
         <tbody id="rows"></tbody>
       </table>
@@ -69,36 +77,54 @@
       const v = Number(n) || 0;
       return "★".repeat(v) + "☆".repeat(Math.max(0, 5 - v)) + " (" + v + "/5)";
     }
-    async function api(path) {
+    function badge(status) {
+      if (status === "resolved") return "<span class='tick'>Resolved</span>";
+      if (status === "unclear") return "<span class='unclear'>Unclear</span>";
+      return "<span class='open'>Open</span>";
+    }
+    async function api(path, opts) {
       const key = (sessionStorage.getItem(KEY) || "").trim();
       if (!key) throw new Error("Save the admin key first.");
-      const res = await fetch(path, { headers: { "X-SurvyAI-Admin-Key": key } });
+      const headers = { "X-SurvyAI-Admin-Key": key };
+      if (opts && opts.body) headers["Content-Type"] = "application/json";
+      const res = await fetch(path, {
+        method: (opts && opts.method) || "GET",
+        headers,
+        body: opts && opts.body ? JSON.stringify(opts.body) : undefined,
+      });
       const body = await res.json().catch(() => ({}));
-      if (!res.ok) throw new Error(body.detail || res.statusText || "Request failed");
+      if (!res.ok) {
+        const detail = body.detail;
+        throw new Error(typeof detail === "string" ? detail : (res.statusText || "Request failed"));
+      }
       return body;
     }
     function show(item) {
       const box = document.getElementById("detail");
       box.hidden = false;
-        const other = item.trying_other ? "<p><span class='k'>Specified</span><br>" + esc(item.trying_other) + "</p>" : "";
-        const ctx = item.context ? "<p><span class='k'>App and PC</span><br><pre style='white-space:pre-wrap;margin:.2rem 0 0'>" + esc(item.context) + "</pre></p>" : "";
-        document.getElementById("detailBody").innerHTML =
-          "<p><span class='k'>From</span><br><strong>" + esc(item.name) + "</strong> · " + esc(item.email || "No email") + "</p>" +
-          "<p><span class='k'>When</span><br>" + when(item.created_at) + "</p>" +
-          "<p><span class='k'>What were you trying to do?</span><br>" + esc(item.trying_to_do) + "</p>" +
-          other +
-          "<p><span class='k'>What happened?</span><br>" + esc(item.what_happened).replace(/\n/g, "<br>") + "</p>" +
-          "<p><span class='k'>What did you expect to happen?</span><br>" + esc(item.expected).replace(/\n/g, "<br>") + "</p>" +
-          "<p class='stars'><span class='k'>How satisfied were you?</span><br>" + stars(item.rating) + "</p>" +
-          ctx;
+      const status = item.status || "open";
+      const other = item.trying_other ? "<p><span class='k'>Specified</span><br>" + esc(item.trying_other) + "</p>" : "";
+      const ctx = item.context ? "<p><span class='k'>App and PC</span><br><pre style='white-space:pre-wrap;margin:.2rem 0 0'>" + esc(item.context) + "</pre></p>" : "";
+      document.getElementById("detailBody").innerHTML =
+        "<p data-feedback-id='" + item.id + "'>" + badge(status) + "</p>" +
+        "<p><span class='k'>From</span><br><strong>" + esc(item.name) + "</strong> · " + esc(item.email || "No email") + "</p>" +
+        "<p><span class='k'>When</span><br>" + when(item.created_at) + "</p>" +
+        "<p><span class='k'>What were you trying to do?</span><br>" + esc(item.trying_to_do) + "</p>" +
+        other +
+        "<p><span class='k'>What happened?</span><br>" + esc(item.what_happened).replace(/\n/g, "<br>") + "</p>" +
+        "<p><span class='k'>What did you expect to happen?</span><br>" + esc(item.expected).replace(/\n/g, "<br>") + "</p>" +
+        "<p class='stars'><span class='k'>How satisfied were you?</span><br>" + stars(item.rating) + "</p>" +
+        ctx +
+        "<p class='acts'><button type='button' class='mark" + (status === "resolved" ? " on" : "") + "' data-set='resolved'>Resolved</button>" +
+        "<button type='button' class='mark ghost" + (status === "unclear" ? " on" : "") + "' data-set='unclear'>Unclear</button></p>";
       document.querySelectorAll("#rows tr").forEach(tr => tr.classList.toggle("active", tr.dataset.id === String(item.id)));
     }
     function render() {
       rowsEl.innerHTML = items.map(item =>
         "<tr data-id='" + item.id + "'><td>" + when(item.created_at) + "</td><td>" + esc(item.name) +
         "</td><td>" + esc(item.email || "") + "</td><td>" + esc(item.trying_to_do) +
-        "</td><td>" + esc(item.rating) + "/5</td></tr>"
-      ).join("") || "<tr><td colspan='5'>No feedback yet.</td></tr>";
+        "</td><td>" + esc(item.rating) + "/5</td><td>" + badge(item.status) + "</td></tr>"
+      ).join("") || "<tr><td colspan='6'>No feedback yet.</td></tr>";
       rowsEl.querySelectorAll("tr[data-id]").forEach(tr => {
         tr.addEventListener("click", () => {
           const item = items.find(x => String(x.id) === tr.dataset.id);
@@ -119,6 +145,29 @@
         statusEl.className = "err";
       }
     }
+    document.getElementById("detailBody").addEventListener("click", async (ev) => {
+      const btn = ev.target.closest("button[data-set]");
+      if (!btn) return;
+      const holder = document.querySelector("#detailBody [data-feedback-id]");
+      const id = holder && holder.dataset.feedbackId;
+      const item = items.find(x => String(x.id) === String(id));
+      if (!item) return;
+      const next = (item.status || "open") === btn.dataset.set ? "open" : btn.dataset.set;
+      btn.disabled = true;
+      try {
+        const saved = await api("/v1/admin/feedback/" + id, { method: "PATCH", body: { status: next } });
+        const idx = items.findIndex(x => String(x.id) === String(id));
+        if (idx >= 0) items[idx] = saved;
+        render();
+        show(saved);
+        statusEl.textContent = next === "resolved" ? "Marked resolved." : (next === "unclear" ? "Marked unclear." : "Mark cleared.");
+        statusEl.className = "sub";
+      } catch (err) {
+        statusEl.textContent = err.message || String(err);
+        statusEl.className = "err";
+        btn.disabled = false;
+      }
+    });
     document.getElementById("saveKey").addEventListener("click", () => {
       const key = document.getElementById("adminKey").value.trim();
       if (!key) { statusEl.textContent = "Enter the admin key."; statusEl.className = "err"; return; }

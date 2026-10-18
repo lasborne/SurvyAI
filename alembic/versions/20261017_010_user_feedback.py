@@ -35,6 +35,7 @@ def upgrade() -> None:
             sa.Column("expected", sa.Text(), nullable=False),
             sa.Column("rating", sa.Integer(), nullable=False),
             sa.Column("context", sa.Text(), nullable=True),
+            sa.Column("status", sa.String(length=16), nullable=False, server_default="open"),
             sa.Column(
                 "created_at",
                 sa.DateTime(timezone=True),
@@ -50,6 +51,11 @@ def upgrade() -> None:
     cols = {c["name"] for c in insp.get_columns("user_feedback")}
     if "context" not in cols:
         op.add_column("user_feedback", sa.Column("context", sa.Text(), nullable=True))
+    if "status" not in cols:
+        op.add_column(
+            "user_feedback",
+            sa.Column("status", sa.String(length=16), nullable=False, server_default="open"),
+        )
     if "email" in cols:
         op.alter_column("user_feedback", "email", existing_type=sa.String(length=320), nullable=True)
 

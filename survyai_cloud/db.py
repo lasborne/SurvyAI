@@ -267,6 +267,13 @@ async def _ensure_feedback_columns() -> None:
             cols = {c["name"] for c in insp.get_columns("user_feedback")}
             if "context" not in cols:
                 sync_conn.execute(text("ALTER TABLE user_feedback ADD COLUMN context TEXT"))
+            if "status" not in cols:
+                sync_conn.execute(
+                    text(
+                        "ALTER TABLE user_feedback ADD COLUMN status VARCHAR(16) "
+                        "NOT NULL DEFAULT 'open'"
+                    )
+                )
             if sync_conn.dialect.name == "postgresql":
                 sync_conn.execute(text("ALTER TABLE user_feedback ALTER COLUMN email DROP NOT NULL"))
 
@@ -360,6 +367,10 @@ async def _sqlite_migrate(conn) -> None:
     fb_cols = {row[1] for row in res.fetchall()}
     if fb_cols and "context" not in fb_cols:
         await conn.execute(text("ALTER TABLE user_feedback ADD COLUMN context TEXT"))
+    if fb_cols and "status" not in fb_cols:
+        await conn.execute(
+            text("ALTER TABLE user_feedback ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT 'open'")
+        )
 
     # SQLite autoincrement fix: older dev DBs may have been created with BIGINT PK
     # which does not auto-populate, causing IntegrityError: NOT NULL constraint failed.

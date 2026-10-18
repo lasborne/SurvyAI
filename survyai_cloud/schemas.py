@@ -470,9 +470,14 @@ class FeedbackOut(BaseModel):
     expected: str
     rating: int
     context: Optional[str] = None
+    status: str = "open"
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class FeedbackStatusIn(BaseModel):
+    status: Literal["open", "resolved", "unclear"]
 
 
 BETA_USES = frozenset(
