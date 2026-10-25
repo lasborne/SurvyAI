@@ -3,15 +3,15 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Join the first users — SurvyAI</title>
-  <meta name="description" content="Join the first SurvyAI users. Tell us your profession and what you want the app to help with so we can grant access and improve the product." />
+  <title>Join the SurvyAI beta</title>
+  <meta name="description" content="Request a place in the SurvyAI beta. Name and email are enough. Profession and Windows details are optional." />
   <meta name="theme-color" content="#2563eb" />
   <link rel="canonical" href="https://survyai.com/beta-user/" />
   <link rel="icon" href="/assets/logo.svg" type="image/svg+xml" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@500&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/assets/styles.css?v=20260929" />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/assets/styles.css?v=20261025" />
 </head>
 <body>
   <a class="skip" href="#main">Skip to content</a>
@@ -26,9 +26,9 @@
         <span></span><span></span><span></span>
       </button>
       <ul class="nav__links" id="nav-menu">
+        <li><a href="/#how">How it works</a></li>
         <li><a href="/#download">Download</a></li>
-        <li><a href="/#updates">Updates</a></li>
-        <li><a href="/#about">About</a></li>
+        <li><a href="/#privacy">Privacy</a></li>
         <li><a href="/#support">Support</a></li>
         <li><a class="btn btn--primary" href="/#download">Get the beta</a></li>
       </ul>
@@ -40,10 +40,10 @@
       <div class="wrap join-layout">
         <div class="signup-card">
           <p class="badge">Windows desktop · Beta</p>
-          <h1 id="join-title">Join the first users</h1>
+          <h1 id="join-title">Join the beta</h1>
           <p class="lead">
-            The beta is a short early period. Tell us who you are so we can grant Pro
-            for that period and see which survey jobs to improve. After the beta, Pro is a paid plan.
+            Name and email are enough. If we grant Pro for the beta, register in the app with this same email.
+            Joining does not turn Pro on by itself. After the beta, Pro is paid.
           </p>
           <h2 id="form-title">Your details</h2>
         <form class="signup" id="join-form" novalidate>
@@ -56,7 +56,7 @@
             <input id="email" name="email" type="email" autocomplete="email" maxlength="320" required />
           </div>
           <div class="field">
-            <label for="profession">What do you do / profession?</label>
+            <label for="profession">Profession <span class="opt">optional</span></label>
             <select id="profession" name="profession">
               <option>Not selected</option>
               <option>Geospatial/GIS analyst</option>
@@ -71,7 +71,7 @@
             <p class="guide">A few words is enough — your role, not a full CV.</p>
           </div>
           <div class="field">
-            <label for="use-for">What do you want to use the app for?</label>
+            <label for="use-for">What do you want SurvyAI to help with? <span class="opt">optional</span></label>
             <select id="use-for" name="use_for">
               <option>Not selected</option>
               <option>Geospatial/GIS analysis</option>
@@ -87,7 +87,7 @@
             <p class="guide">One sentence on the main job you want SurvyAI to help with.</p>
           </div>
           <div class="field">
-            <label for="windows">Windows version / specs</label>
+            <label for="windows">Windows version <span class="opt">optional</span></label>
             <input id="windows" name="windows_specs" type="text" maxlength="400" placeholder="e.g. Windows 11, 16 GB RAM" />
           </div>
           <div class="hp" hidden aria-hidden="true">
@@ -104,54 +104,23 @@
         </div>
         </div>
         <aside class="join-side" aria-labelledby="can-title">
-          <p class="section__eyebrow">What SurvyAI can do</p>
-          <h2 id="can-title">Work it already takes on</h2>
+          <p class="section__eyebrow">Beta</p>
+          <h2 id="can-title">What you get</h2>
         <ul class="can-do">
           <li>
-            <strong>Cadastral plans</strong>
-            <span>Produce and edit AutoCAD survey plans from plain language and coordinates.</span>
+            <strong>A place in the beta</strong>
+            <span>We use this list to grant Pro while the beta is open.</span>
           </li>
           <li>
-            <strong>Coordinates</strong>
-            <span>Parse points, transform coordinate systems, and compute areas.</span>
+            <strong>The same installer</strong>
+            <span>You can download SurvyAI before you are approved.</span>
           </li>
           <li>
-            <strong>GIS projects</strong>
-            <span>Drive ArcGIS Pro workflows when Pro is installed on the PC.</span>
-          </li>
-          <li>
-            <strong>Reports and sheets</strong>
-            <span>Build coordinate schedules, area results, and working spreadsheets in your workspace.</span>
+            <strong>Plans, coordinates, GIS, reports</strong>
+            <span>AutoCAD for drawings. ArcGIS Pro only when the task needs it.</span>
           </li>
         </ul>
         </aside>
-      </div>
-    </section>
-
-    <section class="section" id="faq" aria-labelledby="faq-title">
-      <div class="wrap">
-        <div class="section__head">
-          <p class="section__eyebrow">FAQ</p>
-          <h2 id="faq-title">Before you join</h2>
-        </div>
-        <div class="faq">
-          <details>
-            <summary>What happens after I join the first users?</summary>
-            <p>We keep your name, email, profession, what you want to use SurvyAI for, and the Windows details you type. During the beta we use that list to grant Pro for the beta period and to see which survey jobs to improve. After the beta, Pro is a paid plan. Joining does not turn Pro on by itself.</p>
-          </details>
-          <details>
-            <summary>Do I need AutoCAD or ArcGIS?</summary>
-            <p>AutoCAD is required to produce or edit survey plans. Coordinate and document tasks can run without it. ArcGIS Pro is only needed when you ask SurvyAI to drive a GIS project.</p>
-          </details>
-          <details>
-            <summary>Where do my drawings go?</summary>
-            <p>CAD files, spreadsheets, and other job files stay in the workspace folder on your PC. When you are signed in, the task text — and any file content that task needs — is sent to SurvyAI’s hosted model. The desktop tools still run on your computer.</p>
-          </details>
-          <details>
-            <summary>Can I download the beta without joining?</summary>
-            <p>Yes. The Windows installer is on the homepage. Joining tells us who you are so we can grant beta Pro access and learn what to build next. After the beta, Pro is paid.</p>
-          </details>
-        </div>
       </div>
     </section>
   </main>
@@ -163,6 +132,8 @@
         <a href="/">Home</a>
         ·
         <a href="/#download">Download</a>
+        ·
+        <a href="/#faq">FAQ</a>
         ·
         <a href="/#privacy">Privacy</a>
         ·

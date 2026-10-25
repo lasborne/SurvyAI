@@ -1,5 +1,8 @@
-# Stable download aliases — update the target filename when you ship a new build.
+# Stable download aliases. Point these at the current published installer.
 /beta-user           /beta-user/index.html   200
-/get/latest          /updates/SurvyAI-Setup-1.0.1.exe   302
-/updates/latest      /updates/SurvyAI-Setup-1.0.1.exe   302
-/downloads/latest    /updates/SurvyAI-Setup-1.0.1.exe   302
+/get/latest          https://downloads.survyai.com/SurvyAI-Setup-1.0.5.exe   302
+/updates/latest      https://downloads.survyai.com/SurvyAI-Setup-1.0.5.exe   302
+/downloads/latest    https://downloads.survyai.com/SurvyAI-Setup-1.0.5.exe   302
+/updates/SurvyAI-Setup-1.0.5.exe   https://downloads.survyai.com/SurvyAI-Setup-1.0.5.exe   302
+/wrangler.toml       /   302
+/updates/.gitkeep    /   302
