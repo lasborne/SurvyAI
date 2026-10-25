@@ -16,7 +16,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/assets/styles.css?v=20261025" />
+  <link rel="stylesheet" href="/assets/styles.css?v=20261025b" />
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -69,7 +69,7 @@
           </div>
           <p class="beta-invite">
             Windows 10/11, 64-bit. AutoCAD is needed for drawings. ArcGIS Pro is needed only for GIS tasks.
-            We are inviting 20 surveyors to try Pro free during the beta.
+            We are inviting 20 users to try Pro free during the beta.
             <a href="/beta-user/">Request a place</a>.
           </p>
         </div>
@@ -85,12 +85,12 @@
       </div>
     </section>
 
-    <section class="section" aria-labelledby="capabilities-title">
+    <section class="section" id="about" aria-labelledby="capabilities-title">
       <div class="wrap">
         <div class="section__head">
           <p class="section__eyebrow">What you can do</p>
           <h2 id="capabilities-title">Practical survey jobs</h2>
-          <p>The work happens with the software already on your computer. Results stay in the workspace you choose.</p>
+          <p>The work runs with the software already on your computer. Results stay in the workspace you choose.</p>
         </div>
         <div class="features">
           <article class="feature">
@@ -132,29 +132,35 @@
       </div>
     </section>
 
-    <section class="section" id="privacy" aria-labelledby="privacy-title">
+    <section class="section" id="download" aria-labelledby="download-title">
       <div class="wrap">
         <div class="section__head">
-          <p class="section__eyebrow">Privacy</p>
-          <h2 id="privacy-title">Your workspace stays on your PC</h2>
-          <p>This is the privacy notice for survyai.com and for SurvyAI Desktop. Questions: <a href="mailto:support@survyai.com">support@survyai.com</a>.</p>
+          <p class="section__eyebrow">Download</p>
+          <h2 id="download-title">SurvyAI Desktop 1.0.5</h2>
+          <p id="updates">Windows 10/11, 64-bit · 19 Oct 2026 · 202 MB. After setup, choose a workspace and sign in. The app checks an update before it installs.</p>
         </div>
-        <div class="privacy">
-          <h3>Files</h3>
-          <p>Drawings, spreadsheets, and other job files stay in the workspace folder you choose. SurvyAI does not keep a copy of that library, and it does not upload the folder as a backup.</p>
-          <h3>Hosted AI</h3>
-          <p>When you are signed in and use a hosted model, the task text and any file content that task needs are sent to SurvyAI’s cloud service so the model can respond. Desktop tools still run on your computer. A local model, if you turn one on, runs on this PC instead.</p>
-          <h3>Account</h3>
-          <p>The desktop app stores sign-in secrets with Windows DPAPI. We use your account email to sign you in, manage beta or paid access, and send account messages. Password-reset mail comes from noreply@survyai.com.</p>
-          <h3>Beta signup</h3>
-          <p>The first-user form stores the name, email, and any optional profession, intended use, and Windows details you submit. We use that list to grant beta access and to see which jobs to improve. We do not sell it. Joining does not turn Pro on by itself. After the beta, Pro is a paid plan. Email support to correct or delete a signup.</p>
-          <h3>This website</h3>
-          <p>Pages are served over HTTPS. The site stores an anonymous id in your browser so we can count visits and installer clicks. It is not your name or email, and we do not sell it.</p>
+        <div class="btn-row">
+          <a class="btn btn--primary" id="download-btn" href="/get/latest">Download for Windows</a>
+          <a class="btn btn--ghost" href="/updates/SurvyAI-Setup-1.0.5.exe">Direct file</a>
         </div>
       </div>
     </section>
 
-    <section class="section section--alt" id="faq" aria-labelledby="faq-title">
+    <section class="section section--alt" id="privacy" aria-labelledby="privacy-title">
+      <div class="wrap">
+        <div class="section__head">
+          <p class="section__eyebrow">Privacy</p>
+          <h2 id="privacy-title">Your files stay on your PC</h2>
+        </div>
+        <div class="privacy">
+          <p>Drawings and spreadsheets stay in the workspace you choose. SurvyAI does not keep a copy of that library.</p>
+          <p>When you are signed in, the task text and any file content that task needs go to SurvyAI’s hosted model. A local model, if you turn one on, stays on this PC. Windows protects the saved sign-in.</p>
+          <p>The beta form stores your name, email, and any optional details you add, so we can grant access and improve the product. We do not sell that information. This site keeps an anonymous id only to count visits and downloads. To correct or delete a signup, email <a href="mailto:support@survyai.com">support@survyai.com</a>.</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section" id="faq" aria-labelledby="faq-title">
       <div class="wrap">
         <div class="section__head">
           <p class="section__eyebrow">FAQ</p>
@@ -162,119 +168,17 @@
         </div>
         <div class="faq">
           <details>
-            <summary>What can I do in the beta?</summary>
-            <p>Produce and edit AutoCAD survey plans, work with coordinates and areas, drive ArcGIS Pro when it is installed, and write schedules and spreadsheets into your workspace. You review the output before you use it.</p>
-          </details>
-          <details>
-            <summary>Which Windows versions are supported?</summary>
-            <p>Windows 10 and Windows 11, 64-bit.</p>
-          </details>
-          <details>
             <summary>Do I need AutoCAD or ArcGIS?</summary>
-            <p>AutoCAD is required to produce or edit survey plans. Coordinate and document tasks can run without it. ArcGIS Pro is only needed when you ask SurvyAI to drive a GIS project.</p>
-          </details>
-          <details>
-            <summary>What data is sent to hosted AI?</summary>
-            <p>When you are signed in, the task text and any file content that task needs go to SurvyAI’s hosted model. The rest of the workspace is not uploaded as a backup. See <a href="#privacy">Privacy</a>.</p>
+            <p>AutoCAD is required for survey plans. Coordinate and document tasks can run without it. ArcGIS Pro is only needed for a GIS project.</p>
           </details>
           <details>
             <summary>Can I download without joining?</summary>
-            <p>Yes. The installer is on this page. Joining tells us who you are so we can grant Pro for the beta. Joining does not turn Pro on by itself. After the beta, Pro is paid.</p>
+            <p>Yes. Joining lets us grant Pro during the beta. It does not turn Pro on by itself. After the beta, Pro is paid.</p>
           </details>
           <details>
             <summary>How do I report a problem?</summary>
-            <p>Email <a href="mailto:support@survyai.com">support@survyai.com</a> with what you were trying to do and what happened. You can also send feedback from the desktop app.</p>
+            <p>Email <a href="mailto:support@survyai.com">support@survyai.com</a>, or use Feedback in the desktop app.</p>
           </details>
-        </div>
-      </div>
-    </section>
-
-    <section class="section" id="download" aria-labelledby="download-title">
-      <div class="wrap">
-        <div class="section__head">
-          <p class="section__eyebrow">Download</p>
-          <h2 id="download-title">SurvyAI Desktop for Windows</h2>
-          <p>The official beta installer. After setup, choose a workspace and sign in.</p>
-        </div>
-        <div class="panel">
-          <div>
-            <h3>Current release</h3>
-            <p class="muted">Windows 10/11, 64-bit. Use the button below. If a browser blocks the download, use the direct file.</p>
-            <p class="meta">
-              <span>Version <strong id="app-version">1.0.5</strong></span>
-              <span>Published <strong>19 Oct 2026</strong></span>
-              <span>Size <strong>202 MB</strong></span>
-              <span>Platform <strong>Windows 10/11, 64-bit</strong></span>
-            </p>
-            <div class="btn-row">
-              <a class="btn btn--primary" id="download-btn" href="/get/latest">Download installer</a>
-              <a class="btn btn--ghost" href="/updates/SurvyAI-Setup-1.0.5.exe">Direct file</a>
-            </div>
-            <p class="note">
-              If the file is not available yet, this build has not been published.
-              Email <a href="mailto:support@survyai.com">support@survyai.com</a>.
-            </p>
-          </div>
-          <aside class="panel__aside" aria-label="Release details">
-            <dl class="kv">
-              <dt>File</dt>
-              <dd><code class="code">SurvyAI-Setup-1.0.5.exe</code></dd>
-              <dt>Check</dt>
-              <dd>The app verifies SHA-256 before it applies an update</dd>
-              <dt>SHA-256</dt>
-              <dd><code class="code">2B5879D53F9CE89595C9DEE663DBCDC6D61A8F0A672DCFF9829DC23708D1C479</code></dd>
-            </dl>
-          </aside>
-        </div>
-      </div>
-    </section>
-
-    <section class="section section--alt" id="updates" aria-labelledby="updates-title">
-      <div class="wrap">
-        <div class="section__head">
-          <p class="section__eyebrow">Updates</p>
-          <h2 id="updates-title">Updates are checked before they install</h2>
-          <p>SurvyAI Desktop can download a newer installer and checks that it matches the published SHA-256 before applying it. You can also install the current build yourself.</p>
-        </div>
-        <div class="panel">
-          <div>
-            <h3>Release 1.0.5</h3>
-            <p class="muted">Windows x64 beta. This is the build linked above.</p>
-            <div class="btn-row">
-              <a class="btn btn--primary" href="#download">Get this build</a>
-              <a class="btn btn--ghost" href="#support">Contact support</a>
-            </div>
-          </div>
-          <aside class="panel__aside" aria-label="This release">
-            <dl class="kv">
-              <dt>Version</dt>
-              <dd>1.0.5 · 19 Oct 2026 · 202 MB</dd>
-              <dt>Platform</dt>
-              <dd>Windows 10/11, 64-bit</dd>
-              <dt>Notes</dt>
-              <dd>Current public beta installer</dd>
-            </dl>
-          </aside>
-        </div>
-      </div>
-    </section>
-
-    <section class="section" id="about" aria-labelledby="about-title">
-      <div class="wrap">
-        <div class="section__head">
-          <p class="section__eyebrow">About</p>
-          <h2 id="about-title">Built for the survey desk</h2>
-        </div>
-        <div class="about-grid">
-          <p>
-            SurvyAI Desktop is for land surveyors and geospatial teams who want an assistant
-            that can follow a surveying instruction and use the CAD and GIS tools already on the workstation.
-          </p>
-          <ul class="stat-list">
-            <li><strong>Product</strong><span>SurvyAI Desktop for Windows</span></li>
-            <li><strong>Works with</strong><span>AutoCAD · ArcGIS Pro · Blue Marble</span></li>
-            <li><strong>Status</strong><span>Public beta · Pro is paid after the beta</span></li>
-          </ul>
         </div>
       </div>
     </section>
@@ -283,7 +187,7 @@
       <div class="wrap">
         <div class="section__head">
           <p class="section__eyebrow">Support</p>
-          <h2 id="support-title">Help with install, access, or billing</h2>
+          <h2 id="support-title">Install, access, or billing</h2>
         </div>
         <div class="contact-row">
           <a class="contact-mail" href="mailto:support@survyai.com">
@@ -292,22 +196,7 @@
               <small>We read every message</small>
             </span>
           </a>
-          <p class="muted support-note">For a password reset, look for mail from noreply@survyai.com, including the spam folder.</p>
-        </div>
-      </div>
-    </section>
-
-    <section class="section" aria-labelledby="cta-title">
-      <div class="wrap">
-        <div class="cta">
-          <div>
-            <h2 id="cta-title">Try the beta on your PC</h2>
-            <p>Download the installer, or tell us who you are so we can grant Pro during the beta.</p>
-          </div>
-          <div class="btn-row">
-            <a class="btn btn--primary" href="/get/latest">Download for Windows</a>
-            <a class="btn btn--ghost btn--join" href="/beta-user/">Join the first users</a>
-          </div>
+          <p class="muted support-note">For a password reset, look for mail from noreply@survyai.com, including spam.</p>
         </div>
       </div>
     </section>
