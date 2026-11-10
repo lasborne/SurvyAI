@@ -13,6 +13,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
@@ -147,29 +148,67 @@ class AccountDialog(QDialog):
         )
 
 
+def _email_is_acceptable(text: str) -> bool:
+    """Blank is allowed. A typed address needs a normal email shape."""
+    raw = (text or "").strip()
+    if not raw:
+        return True
+    if " " in raw or raw.count("@") != 1:
+        return False
+    local, _, domain = raw.partition("@")
+    return bool(local and domain and "." in domain and not domain.startswith("."))
+
+
 class _SignInPage(QWizardPage):
     def __init__(self, initial_profile: Optional[AccountProfile] = None) -> None:
         super().__init__()
-        self.setTitle("Account sign-in")
+        self.setTitle("Your name")
         self.setSubTitle(
-            "Name and company shown in the desktop app. Cloud sign-in for hosted models "
-            "is available later from the account menu."
+            "Shown in the app. Email and company are optional. "
+            "Sign in for hosted models later, from your name menu."
         )
 
         initial_profile = initial_profile or AccountProfile()
         layout = QFormLayout(self)
         self.name_edit = QLineEdit(initial_profile.display_name)
-        self.name_edit.setToolTip("Display name shown in the title bar after you finish setup.")
+        self.name_edit.setPlaceholderText("Your name")
+        self.name_edit.setToolTip("Name shown beside your account in the app.")
         self.email_edit = QLineEdit(initial_profile.email)
-        self.email_edit.setToolTip("Optional contact email stored on this PC.")
+        self.email_edit.setPlaceholderText("Optional")
+        self.email_edit.setToolTip("Optional email stored on this computer.")
         self.company_edit = QLineEdit(initial_profile.company)
-        self.company_edit.setToolTip("Optional company shown on your local profile.")
-        self.registerField("profile_name*", self.name_edit)
+        self.company_edit.setPlaceholderText("Optional")
+        self.company_edit.setToolTip("Optional company on your local profile.")
+        self._email_hint = QLabel("")
+        self._email_hint.setWordWrap(True)
+        self._email_hint.setObjectName("hintLabel")
+        # No asterisk: a prefilled name must enable Next without another keystroke.
+        self.registerField("profile_name", self.name_edit)
         self.registerField("profile_email", self.email_edit)
         self.registerField("profile_company", self.company_edit)
         layout.addRow("Name", self.name_edit)
         layout.addRow("Email", self.email_edit)
         layout.addRow("Company", self.company_edit)
+        layout.addRow("", self._email_hint)
+        self.name_edit.textChanged.connect(self._refresh_complete)
+        self.email_edit.textChanged.connect(self._refresh_complete)
+        self._refresh_complete()
+
+    def _refresh_complete(self, *_args: object) -> None:
+        raw = self.email_edit.text().strip()
+        if raw and not _email_is_acceptable(raw):
+            self._email_hint.setText("Enter a valid email, or leave it blank.")
+        else:
+            self._email_hint.setText("")
+        self.completeChanged.emit()
+
+    def isComplete(self) -> bool:  # noqa: N802
+        return bool(self.name_edit.text().strip()) and _email_is_acceptable(self.email_edit.text())
+
+    def initializePage(self) -> None:  # noqa: N802
+        super().initializePage()
+        self._refresh_complete()
+        QTimer.singleShot(0, self.completeChanged.emit)
 
 
 class _EnvironmentPage(QWizardPage):
@@ -221,7 +260,16 @@ class _DataFolderPage(QWizardPage):
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
-        self.registerField("data_folder*", self.path_edit)
+        self.registerField("data_folder", self.path_edit)
+        self.path_edit.textChanged.connect(self.completeChanged.emit)
+
+    def isComplete(self) -> bool:  # noqa: N802
+        return bool(self.path_edit.text().strip())
+
+    def initializePage(self) -> None:  # noqa: N802
+        super().initializePage()
+        self.completeChanged.emit()
+        QTimer.singleShot(0, self.completeChanged.emit)
 
     def _browse(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "Choose data folder", self.path_edit.text().strip())
@@ -242,9 +290,10 @@ class _TutorialPage(QWizardPage):
             "press Send to plot (up to 10 plan sheets; empty extra sheets are skipped). "
             "Output History stores previous runs.\n"
             "3. Follow-up CAD edits (roads, title, subdivision, save as) stay in the same conversation.\n"
-            "4. Fast mode and Fallback LLM start unchecked. Turn them on only when you need them.\n"
-            "5. Use the sun/moon control for light or dark mode. Safe mode in Settings limits "
-            "integrations while troubleshooting. File → Export diagnostics bundle for support."
+            "4. Conversations stay hidden until you click the menu icon beside the logo. "
+            "Hover an icon to see what it does. SurvyAI chooses the model for each request.\n"
+            "5. Use the sun/moon control for light or dark mode. Safe mode is in Settings. "
+            "Export a diagnostics bundle from your name menu if support asks."
         )
         info.setWordWrap(True)
         layout.addWidget(info)

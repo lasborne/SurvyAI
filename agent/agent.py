@@ -2110,6 +2110,91 @@ def _surveyor_line_fits(text: str, *, usable_w: float, text_height: float, scale
     return width <= float(usable_w) + 1e-6
 
 
+# Title beside the name, e.g. (MNIS), is two-thirds of the name height at 1:500
+# (name 1.5, title 1.0). Shrink neither below 0.9 of that size.
+_SURVEYOR_TITLE_REL = 1.0 / 1.5
+_SURVEYOR_MIN_HEIGHT_SCALE = 0.9
+
+
+def _surveyor_name_title_width(
+    name: str,
+    title: str,
+    *,
+    name_height: float,
+    name_scale: float,
+    title_rel: float,
+    title_scale: float,
+) -> float:
+    """Drawn width of the name at its height plus the title at its own height."""
+    # Bold title-block capitals (M, W, O) are far wider than the 0.50
+    # factor used for small labels. Underestimating leaves (MNIS) wrapped.
+    factor = 0.92
+    nh = max(0.01, float(name_height) * float(name_scale))
+    width = _mtext_plain_len(name) * nh * factor
+    if title:
+        th = max(0.01, float(name_height) * float(title_rel) * float(title_scale))
+        width += 0.55 * nh * factor
+        width += _mtext_plain_len(title) * th * factor
+    return width
+
+
+def _fit_surveyor_name_scales(
+    name: str,
+    title: str,
+    *,
+    usable_w: float,
+    name_height: float,
+    title_rel: float,
+) -> Tuple[float, float]:
+    """
+    Full size, or 0.9 on the name and the credential together.
+
+    A shrink is never applied to only one of them. 0.9x of both is what
+    keeps ``SURV. … (MNIS)`` on one line. Past that, the line may wrap.
+    """
+    floor = _SURVEYOR_MIN_HEIGHT_SCALE
+
+    def fits(name_scale: float, title_scale: float) -> bool:
+        if usable_w <= 1e-6:
+            return True
+        return (
+            _surveyor_name_title_width(
+                name,
+                title,
+                name_height=name_height,
+                name_scale=name_scale,
+                title_rel=title_rel,
+                title_scale=title_scale,
+            )
+            <= float(usable_w) + 1e-6
+        )
+
+    if fits(1.0, 1.0):
+        return 1.0, 1.0
+    if title:
+        return floor, floor
+    return floor, 1.0
+
+
+def _compose_surveyor_name_mtext(
+    name: str,
+    title: str,
+    *,
+    name_scale: float,
+    title_rel: float,
+    title_scale: float,
+) -> str:
+    """Name and credential on one run, each at its own height."""
+    body = re.sub(r"(?:\\[Pp]|\s)+", " ", (name or "")).strip()
+    if name_scale < 0.999:
+        body = _mtext_rel_height(name_scale) + body
+    if title:
+        abs_title = float(title_rel) * float(title_scale)
+        credential = re.sub(r"(?:\\[Pp]|\s)+", " ", title).strip()
+        body = f"{body} {_mtext_rel_height(abs_title)}{credential}"
+    return body.strip()
+
+
 def _layout_surveyor_address_mtext(
     raw_address: str,
     *,
@@ -4565,8 +4650,6 @@ class SurvyAIAgent:
         Returns a cancellation result when the user declines, otherwise None. On
         approval a one-shot token is recorded so the plotting step does not re-ask.
         """
-        # Reset first: an approval only ever applies to the request that made it.
-        self._overwrite_confirmed_outputs = set()
         try:
             outp = Path(str(output_dwg_path))
             if not outp.is_absolute():
@@ -4574,6 +4657,22 @@ class SurvyAIAgent:
             outp = outp.resolve()
         except Exception:
             return None
+        # A batch request already asked for every file. Do not wipe those answers.
+        if getattr(self, "_overwrite_batch_locked", False):
+            if self._output_was_declined(str(outp)):
+                return {
+                    "success": False,
+                    "cancelled": True,
+                    "stage": "output",
+                    "error": (
+                        f"Kept existing drawing unchanged: {str(outp)}\n"
+                        "Overwrite was declined. Change the output name or choose Overwrite to replace it."
+                    ),
+                }
+            return None
+        # Reset first: an approval only ever applies to the request that made it.
+        self._overwrite_confirmed_outputs = set()
+        self._overwrite_declined_outputs = set()
         try:
             # Only the on-disk case is decidable this early; a drawing that is open
             # but unsaved is still caught by the plotting step's own check.
@@ -4593,12 +4692,67 @@ class SurvyAIAgent:
                     "Overwrite was declined. Change the output name or choose Overwrite to replace it."
                 ),
             }
-        self._overwrite_confirmed_outputs.add(str(outp).lower())
+        self._overwrite_confirmed_outputs.add(self._overwrite_path_key(str(outp)))
         return None
+
+    @staticmethod
+    def _overwrite_path_key(path: str) -> str:
+        text = str(path or "").strip()
+        if not text:
+            return ""
+        try:
+            return str(Path(text).resolve()).lower()
+        except Exception:
+            return text.lower()
+
+    def _confirm_existing_files_in_order(self, paths: List[str]) -> None:
+        """Ask about every existing output before any of them is written.
+
+        Two or more plans used to prompt only when that plan's turn arrived, so
+        the user waited through the first plot to answer the second. Every
+        existing file is confirmed here, in order, and the answers are reused.
+        """
+        self._overwrite_confirmed_outputs = set()
+        self._overwrite_declined_outputs = set()
+        seen: set = set()
+        for raw in paths:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            try:
+                outp = Path(text)
+                if not outp.is_absolute():
+                    outp = self._resolve_user_output_path("", text)
+                outp = outp.resolve()
+            except Exception:
+                continue
+            key = self._overwrite_path_key(str(outp))
+            if key in seen or self._is_protected_template_path(str(outp)):
+                continue
+            seen.add(key)
+            try:
+                exists = outp.exists()
+            except Exception:
+                exists = False
+            if not exists:
+                continue
+            if _confirm_overwrite_existing_dwg(str(outp), mode="overwrite"):
+                self._overwrite_confirmed_outputs.add(key)
+                self._overwrite_declined_outputs.discard(key)
+            else:
+                self._overwrite_declined_outputs.add(key)
+                self._overwrite_confirmed_outputs.discard(key)
+
+    def _output_was_declined(self, path: str) -> bool:
+        key = self._overwrite_path_key(path)
+        if not key:
+            return False
+        declined = getattr(self, "_overwrite_declined_outputs", None)
+        return isinstance(declined, set) and key in declined
 
     def _consume_overwrite_confirmation(self, resolved_output: str) -> bool:
         """True when this output was already approved for overwrite in this request."""
-        key = str(resolved_output or "").lower()
+        key = self._overwrite_path_key(resolved_output)
         try:
             confirmed = self._overwrite_confirmed_outputs
         except AttributeError:
@@ -5362,61 +5516,87 @@ class SurvyAIAgent:
                 pass
             jobs_list = list(jobs_built.get("jobs") or [])
             n_jobs = len(jobs_list)
-            for i, job in enumerate(jobs_list):
-                # True single-parcel route per owner; reuse CAD session/template after the first.
-                is_first = i == 0
-                is_last = i >= n_jobs - 1
-                plot = self._run_cadastral_cad_prompt_pipeline(
-                    job["subprompt"],
-                    skip_intent_assessment=True,
-                    # Parent scope keeps access-road / fence extras from the user prompt.
-                    user_scope_for_extras=scope,
-                    extra_parcels=[],
-                    extent_points=[],
-                    main_parcel_label="",
-                    skip_session_prep=not is_first,
-                    batch_mode=not is_first,
-                    template_override_path=batch_template,
-                    profile_override_path=batch_profile,
-                    # Close finished owner DWGs between plans so Documents does not wedge.
-                    close_output_after_save=not is_last,
-                    source_scale_denom=job.get("scale_denom") or scope_scale,
-                )
-                entry = {
-                    "owner_name": job.get("owner_name"),
-                    "plan_number": job.get("plan_number"),
-                    "output_dwg": plot.get("output_dwg") or job.get("output_dwg"),
-                    "success": bool(plot.get("success")),
-                    "error": plot.get("error"),
-                }
-                plan_results.append(entry)
-                if plot.get("success"):
-                    ok += 1
-                    self._last_cadastral_output_dwg = plot.get("output_dwg")
-                    self._last_cadastral_profile_path = plot.get("profile_path")
-                    if plot.get("template_path"):
-                        batch_template = str(plot.get("template_path"))
-                    if plot.get("profile_path"):
-                        batch_profile = str(plot.get("profile_path"))
-                    try:
-                        store_compose_example(
-                            getattr(self, "vector_store", None),
-                            query=scope,
-                            composed_subprompt=job["subprompt"],
-                            source_files=composed.get("source_files") or [],
+            job_outs = [str(job.get("output_dwg") or "") for job in jobs_list]
+            self._overwrite_batch_locked = True
+            self._confirm_existing_files_in_order(job_outs)
+            live_jobs = [
+                i
+                for i, ref in enumerate(job_outs)
+                if not (ref and self._output_was_declined(ref))
+            ]
+            try:
+                for i, job in enumerate(jobs_list):
+                    if i not in live_jobs:
+                        plan_results.append(
+                            {
+                                "owner_name": job.get("owner_name"),
+                                "plan_number": job.get("plan_number"),
+                                "output_dwg": job.get("output_dwg"),
+                                "success": False,
+                                "cancelled": True,
+                                "error": (
+                                    f"Kept existing drawing unchanged: {job.get('output_dwg')}\n"
+                                    "Overwrite was declined. Change the output name or choose Overwrite to replace it."
+                                ),
+                            }
                         )
-                    except Exception:
-                        pass
-                elif not is_last:
-                    # Failed mid-batch: drop any half-open tab and recover COM before next owner.
-                    try:
-                        out_try = plot.get("output_dwg") or job.get("output_dwg")
-                        if out_try and hasattr(self.autocad, "save_and_close_drawing"):
-                            self.autocad.save_and_close_drawing(str(out_try), save=False)
-                        elif hasattr(self.autocad, "recover_com_session"):
-                            self.autocad.recover_com_session(reason="separate-owner plan failed")
-                    except Exception:
-                        pass
+                        continue
+                    # True single-parcel route per owner; reuse CAD session/template after the first.
+                    is_first = i == live_jobs[0]
+                    is_last = i == live_jobs[-1]
+                    plot = self._run_cadastral_cad_prompt_pipeline(
+                        job["subprompt"],
+                        skip_intent_assessment=True,
+                        # Parent scope keeps access-road / fence extras from the user prompt.
+                        user_scope_for_extras=scope,
+                        extra_parcels=[],
+                        extent_points=[],
+                        main_parcel_label="",
+                        skip_session_prep=not is_first,
+                        batch_mode=not is_first,
+                        template_override_path=batch_template,
+                        profile_override_path=batch_profile,
+                        # Close finished owner DWGs between plans so Documents does not wedge.
+                        close_output_after_save=not is_last,
+                        source_scale_denom=job.get("scale_denom") or scope_scale,
+                    )
+                    entry = {
+                        "owner_name": job.get("owner_name"),
+                        "plan_number": job.get("plan_number"),
+                        "output_dwg": plot.get("output_dwg") or job.get("output_dwg"),
+                        "success": bool(plot.get("success")),
+                        "error": plot.get("error"),
+                    }
+                    plan_results.append(entry)
+                    if plot.get("success"):
+                        ok += 1
+                        self._last_cadastral_output_dwg = plot.get("output_dwg")
+                        self._last_cadastral_profile_path = plot.get("profile_path")
+                        if plot.get("template_path"):
+                            batch_template = str(plot.get("template_path"))
+                        if plot.get("profile_path"):
+                            batch_profile = str(plot.get("profile_path"))
+                        try:
+                            store_compose_example(
+                                getattr(self, "vector_store", None),
+                                query=scope,
+                                composed_subprompt=job["subprompt"],
+                                source_files=composed.get("source_files") or [],
+                            )
+                        except Exception:
+                            pass
+                    elif not is_last:
+                        # Failed mid-batch: drop any half-open tab and recover COM before next owner.
+                        try:
+                            out_try = plot.get("output_dwg") or job.get("output_dwg")
+                            if out_try and hasattr(self.autocad, "save_and_close_drawing"):
+                                self.autocad.save_and_close_drawing(str(out_try), save=False)
+                            elif hasattr(self.autocad, "recover_com_session"):
+                                self.autocad.recover_com_session(reason="separate-owner plan failed")
+                        except Exception:
+                            pass
+            finally:
+                self._overwrite_batch_locked = False
 
             outputs = [r.get("output_dwg") for r in plan_results if r.get("success")]
             return {
@@ -5828,74 +6008,100 @@ class SurvyAIAgent:
                 pass
             jobs_list = list(jobs_built.get("jobs") or [])
             n_jobs = len(jobs_list)
-            for i, job in enumerate(jobs_list):
-                # True single-parcel route per owner; reuse CAD session/template after the first.
-                is_first = i == 0
-                is_last = i >= n_jobs - 1
-                plot = self._run_cadastral_cad_prompt_pipeline(
-                    job["subprompt"],
-                    skip_intent_assessment=True,
-                    # Parent scope keeps access-road / fence extras from the user prompt.
-                    user_scope_for_extras=scope,
-                    extra_parcels=[],
-                    extent_points=[],
-                    main_parcel_label="",
-                    skip_session_prep=not is_first,
-                    batch_mode=not is_first,
-                    template_override_path=batch_template,
-                    profile_override_path=batch_profile,
-                    # Close finished owner DWGs between plans so Documents does not wedge.
-                    close_output_after_save=not is_last,
-                    source_scale_denom=job.get("scale_denom") or scope_scale,
-                )
-                entry = {
-                    "owner_name": job.get("owner_name"),
-                    "plan_number": job.get("plan_number"),
-                    "output_dwg": plot.get("output_dwg") or job.get("output_dwg"),
-                    "success": bool(plot.get("success")),
-                    "error": plot.get("error"),
-                    "cancelled": bool(plot.get("cancelled")),
-                    "locked": bool(plot.get("locked")),
-                    "geometry": plot.get("geometry"),
-                    "profile_path": plot.get("profile_path"),
-                    "access_road_title": plot.get("access_road_title"),
-                }
-                plan_results.append(entry)
-                if plot.get("success"):
-                    ok += 1
-                    self._last_cadastral_output_dwg = plot.get("output_dwg")
-                    self._last_cadastral_profile_path = plot.get("profile_path")
-                    if plot.get("template_path"):
-                        batch_template = str(plot.get("template_path"))
-                    if plot.get("profile_path"):
-                        batch_profile = str(plot.get("profile_path"))
-                elif plot.get("cancelled") or plot.get("locked"):
-                    return {
-                        "success": False,
+            job_outs = [str(job.get("output_dwg") or "") for job in jobs_list]
+            self._overwrite_batch_locked = True
+            self._confirm_existing_files_in_order(job_outs)
+            live_jobs = [
+                i
+                for i, ref in enumerate(job_outs)
+                if not (ref and self._output_was_declined(ref))
+            ]
+            try:
+                for i, job in enumerate(jobs_list):
+                    if i not in live_jobs:
+                        plan_results.append(
+                            {
+                                "owner_name": job.get("owner_name"),
+                                "plan_number": job.get("plan_number"),
+                                "output_dwg": job.get("output_dwg"),
+                                "success": False,
+                                "cancelled": True,
+                                "error": (
+                                    f"Kept existing drawing unchanged: {job.get('output_dwg')}\n"
+                                    "Overwrite was declined. Change the output name or choose Overwrite to replace it."
+                                ),
+                            }
+                        )
+                        continue
+                    # True single-parcel route per owner; reuse CAD session/template after the first.
+                    is_first = i == live_jobs[0]
+                    is_last = i == live_jobs[-1]
+                    plot = self._run_cadastral_cad_prompt_pipeline(
+                        job["subprompt"],
+                        skip_intent_assessment=True,
+                        # Parent scope keeps access-road / fence extras from the user prompt.
+                        user_scope_for_extras=scope,
+                        extra_parcels=[],
+                        extent_points=[],
+                        main_parcel_label="",
+                        skip_session_prep=not is_first,
+                        batch_mode=not is_first,
+                        template_override_path=batch_template,
+                        profile_override_path=batch_profile,
+                        # Close finished owner DWGs between plans so Documents does not wedge.
+                        close_output_after_save=not is_last,
+                        source_scale_denom=job.get("scale_denom") or scope_scale,
+                    )
+                    entry = {
+                        "owner_name": job.get("owner_name"),
+                        "plan_number": job.get("plan_number"),
+                        "output_dwg": plot.get("output_dwg") or job.get("output_dwg"),
+                        "success": bool(plot.get("success")),
+                        "error": plot.get("error"),
                         "cancelled": bool(plot.get("cancelled")),
                         "locked": bool(plot.get("locked")),
-                        "error": plot.get("error") or "CAD generation stopped.",
-                        "normalized_xlsx": dup_path,
-                        "dup_xlsx": dup_path,
-                        "plans": plan_results,
-                        "plans_success": ok,
-                        "plans_total": n_jobs,
-                        "parcel_count": len(parcels),
-                        "reference_dwg": str(ref_dwg) if ref_dwg else None,
-                        "excel_path": str(excel_path),
-                        "notes": meta_notes,
-                        "mode": "separate_owner_plans",
+                        "geometry": plot.get("geometry"),
+                        "profile_path": plot.get("profile_path"),
+                        "access_road_title": plot.get("access_road_title"),
                     }
-                elif not is_last:
-                    # Failed mid-batch: drop any half-open tab and recover COM before next owner.
-                    try:
-                        out_try = plot.get("output_dwg") or job.get("output_dwg")
-                        if out_try and hasattr(self.autocad, "save_and_close_drawing"):
-                            self.autocad.save_and_close_drawing(str(out_try), save=False)
-                        elif hasattr(self.autocad, "recover_com_session"):
-                            self.autocad.recover_com_session(reason="separate-owner plan failed")
-                    except Exception:
-                        pass
+                    plan_results.append(entry)
+                    if plot.get("success"):
+                        ok += 1
+                        self._last_cadastral_output_dwg = plot.get("output_dwg")
+                        self._last_cadastral_profile_path = plot.get("profile_path")
+                        if plot.get("template_path"):
+                            batch_template = str(plot.get("template_path"))
+                        if plot.get("profile_path"):
+                            batch_profile = str(plot.get("profile_path"))
+                    elif plot.get("cancelled") or plot.get("locked"):
+                        return {
+                            "success": False,
+                            "cancelled": bool(plot.get("cancelled")),
+                            "locked": bool(plot.get("locked")),
+                            "error": plot.get("error") or "CAD generation stopped.",
+                            "normalized_xlsx": dup_path,
+                            "dup_xlsx": dup_path,
+                            "plans": plan_results,
+                            "plans_success": ok,
+                            "plans_total": n_jobs,
+                            "parcel_count": len(parcels),
+                            "reference_dwg": str(ref_dwg) if ref_dwg else None,
+                            "excel_path": str(excel_path),
+                            "notes": meta_notes,
+                            "mode": "separate_owner_plans",
+                        }
+                    elif not is_last:
+                        # Failed mid-batch: drop any half-open tab and recover COM before next owner.
+                        try:
+                            out_try = plot.get("output_dwg") or job.get("output_dwg")
+                            if out_try and hasattr(self.autocad, "save_and_close_drawing"):
+                                self.autocad.save_and_close_drawing(str(out_try), save=False)
+                            elif hasattr(self.autocad, "recover_com_session"):
+                                self.autocad.recover_com_session(reason="separate-owner plan failed")
+                        except Exception:
+                            pass
+            finally:
+                self._overwrite_batch_locked = False
 
             outputs = [r.get("output_dwg") for r in plan_results if r.get("success")]
             return {
@@ -6233,47 +6439,99 @@ class SurvyAIAgent:
         except Exception:
             pass
 
-        for i, sub in enumerate(subs, start=1):
-            is_first = i == 1
-            is_last = i >= n_jobs
+        out_re = re.compile(
+            r"(?is)\b(?:generate|create|produce)\s*[-]?\s*"
+            r"(?:cad\s+drawing\s+|cad\s+|drawing\s+|file\s+)?['\"]?"
+            r"([^'\"\s,]+?\.dwg)"
+        )
+        resolved_outs: List[str] = []
+        for sub in subs:
+            found = out_re.search(sub)
+            if not found:
+                resolved_outs.append("")
+                continue
             try:
-                r = self._run_cadastral_cad_prompt_pipeline(
-                    sub,
-                    # Each Plan N block already carries its own roads/fences/coords.
-                    # Do not assess against the whole batch (or vector-store of prior plots).
-                    skip_intent_assessment=True,
-                    extra_parcels=[],
-                    extent_points=[],
-                    main_parcel_label="",
-                    skip_session_prep=not is_first,
-                    batch_mode=not is_first,
-                    template_override_path=batch_template,
-                    profile_override_path=batch_profile,
-                    close_output_after_save=not is_last,
+                resolved_outs.append(
+                    str(self._resolve_user_output_path(sub, found.group(1).strip()))
                 )
-            except Exception as e:
-                r = {"success": False, "error": f"Unhandled exception: {type(e).__name__}: {e}"}
-            r["_plan_index"] = i
-            results.append(r)
-            if r.get("success"):
-                ok += 1
-                # Keep last successful plan for in-session modifications.
-                self._last_cadastral_output_dwg = r.get("output_dwg")
-                self._last_cadastral_profile_path = r.get("profile_path")
-                if r.get("template_path"):
-                    batch_template = str(r.get("template_path"))
-                if r.get("profile_path"):
-                    batch_profile = str(r.get("profile_path"))
-            elif not is_last:
-                # Failed mid-batch: drop any half-open tab before the next plan.
+            except Exception:
+                resolved_outs.append(found.group(1).strip())
+
+        self._overwrite_batch_locked = True
+        try:
+            self._confirm_existing_files_in_order(resolved_outs)
+            runnable = [
+                i
+                for i, ref in enumerate(resolved_outs)
+                if not (ref and self._output_was_declined(ref))
+            ]
+            for i, sub in enumerate(subs, start=1):
+                idx0 = i - 1
+                plan_nums = [
+                    int(n)
+                    for n in re.findall(
+                        r"(?:^|\n)\s*(?:plan|plot)\s*#?\s*(\d+)\s*[:\-]",
+                        self._cadastral_user_message_body(query),
+                        flags=re.IGNORECASE,
+                    )
+                ]
+                plan_index = plan_nums[idx0] if idx0 < len(plan_nums) else i
+                if idx0 not in runnable:
+                    results.append(
+                        {
+                            "success": False,
+                            "cancelled": True,
+                            "output_dwg": resolved_outs[idx0] or None,
+                            "error": (
+                                f"Kept existing drawing unchanged: {resolved_outs[idx0]}\n"
+                                "Overwrite was declined. Change the output name or choose Overwrite to replace it."
+                            ),
+                            "_plan_index": plan_index,
+                        }
+                    )
+                    continue
+                is_first = bool(runnable) and idx0 == runnable[0]
+                is_last = bool(runnable) and idx0 == runnable[-1]
                 try:
-                    out_try = r.get("output_dwg")
-                    if out_try and hasattr(self.autocad, "save_and_close_drawing"):
-                        self.autocad.save_and_close_drawing(str(out_try), save=False)
-                    elif hasattr(self.autocad, "recover_com_session"):
-                        self.autocad.recover_com_session(reason="batch cadastral plan failed")
-                except Exception:
-                    pass
+                    r = self._run_cadastral_cad_prompt_pipeline(
+                        sub,
+                        # Each Plan N block already carries its own roads/fences/coords.
+                        # Do not assess against the whole batch (or vector-store of prior plots).
+                        skip_intent_assessment=True,
+                        extra_parcels=[],
+                        extent_points=[],
+                        main_parcel_label="",
+                        skip_session_prep=not is_first,
+                        batch_mode=not is_first,
+                        template_override_path=batch_template,
+                        profile_override_path=batch_profile,
+                        close_output_after_save=not is_last,
+                    )
+                except Exception as e:
+                    r = {"success": False, "error": f"Unhandled exception: {type(e).__name__}: {e}"}
+                r["_plan_index"] = plan_index
+                results.append(r)
+                if r.get("success"):
+                    ok += 1
+                    # Keep last successful plan for in-session modifications.
+                    self._last_cadastral_output_dwg = r.get("output_dwg")
+                    self._last_cadastral_profile_path = r.get("profile_path")
+                    if r.get("template_path"):
+                        batch_template = str(r.get("template_path"))
+                    if r.get("profile_path"):
+                        batch_profile = str(r.get("profile_path"))
+                elif not is_last:
+                    # Failed mid-batch: drop any half-open tab before the next plan.
+                    try:
+                        out_try = r.get("output_dwg")
+                        if out_try and hasattr(self.autocad, "save_and_close_drawing"):
+                            self.autocad.save_and_close_drawing(str(out_try), save=False)
+                        elif hasattr(self.autocad, "recover_com_session"):
+                            self.autocad.recover_com_session(reason="batch cadastral plan failed")
+                    except Exception:
+                        pass
+        finally:
+            self._overwrite_batch_locked = False
 
         outputs = [r.get("output_dwg") for r in results if r.get("success")]
         return {
@@ -6334,11 +6592,20 @@ class SurvyAIAgent:
             if fast.get("success"):
                 from agent.cadastral_intent import format_cadastral_status_message
 
+                from agent.cadastral_intent import survey_report_text, traverse_accuracy_sentence
+
                 extra_lines = []
+                survey_reports = []
                 for item in fast.get("results") or []:
                     idx = item.get("_plan_index")
+                    survey_reports.append(survey_report_text(item, int(idx or 0)))
                     if item.get("success"):
                         extra_lines.append(f"• Plan {idx}: {item.get('output_dwg')}")
+                        geom = item.get("geometry") if isinstance(item.get("geometry"), dict) else {}
+                        bow = geom.get("bowditch") if isinstance(geom.get("bowditch"), dict) else {}
+                        accuracy = traverse_accuracy_sentence(bow)
+                        if accuracy:
+                            extra_lines.append(f"• Plan {idx}: {accuracy}")
                     else:
                         err = item.get("error") or "Failed"
                         extra_lines.append(f"• Plan {idx}: Failed ({err})")
@@ -6354,6 +6621,7 @@ class SurvyAIAgent:
                     ),
                     success=True,
                     output_path=fast.get("output_dwg"),
+                    survey_reports=survey_reports,
                 )
             return _base(
                 response=str(fast),
@@ -6386,10 +6654,20 @@ class SurvyAIAgent:
                         "Cadastral plan ready.\n\n"
                         f"File\n{fast.get('output_dwg') or '—'}\n"
                     )
+                from agent.cadastral_intent import survey_report_text
+
+                sheet_no = re.search(
+                    r"(?:plan|plot)\s*#?\s*(\d+)\s*[:\-]",
+                    tool_routing_query,
+                    flags=re.IGNORECASE,
+                )
                 return _base(
                     response=success_text,
                     success=True,
                     output_path=fast.get("output_dwg"),
+                    survey_reports=[
+                        survey_report_text(fast, int(sheet_no.group(1)) if sheet_no else 1)
+                    ],
                 )
             err_txt = str((fast or {}).get("error") or "")
             if coordinates_deferred_to_external_source(tool_routing_query) or (
@@ -6626,6 +6904,13 @@ class SurvyAIAgent:
                 rf"state\s*[:=]\s*(.+?){_CADASTRAL_NEXT_FIELD}",
             ]
         )
+        if state:
+            try:
+                from agent.pdf_survey_plan import format_state_for_plan
+
+                state = format_state_for_plan(state)
+            except Exception:
+                pass
         origin = _pick(
             [
                 r"(?:crs_?origin|origin_?crs|origin(?:_crs|/crs)?)\s*[:=]\s*'([^']+)'",
@@ -7317,6 +7602,16 @@ class SurvyAIAgent:
                 output_exists = False
 
         if output_exists:
+            # A batch already asked, in order, before the first plot. Do not ask again.
+            if self._output_was_declined(str(outp)):
+                return {
+                    "success": False,
+                    "cancelled": True,
+                    "error": (
+                        f"Kept existing drawing unchanged: {str(outp)}\n"
+                        "Overwrite was declined. Change the output name or choose Overwrite to replace it."
+                    ),
+                }
             # The pipeline may already have asked before doing the expensive work;
             # only the prompt is skipped, never the lock release below.
             already_confirmed = self._consume_overwrite_confirmation(str(outp))
@@ -7637,7 +7932,13 @@ class SurvyAIAgent:
                 lga_content = ""
             if lga_content:
                 _set_cell(title_h, 5, 0, _mtxt_replace(lga_cell, lga_content))
-            _set_cell(title_h, 6, 0, _mtxt_replace(_get_cell(title_h, 6), state.strip().upper()))
+            try:
+                from agent.pdf_survey_plan import format_state_for_plan
+
+                state_line = format_state_for_plan(state)
+            except Exception:
+                state_line = (state or "").strip()
+            _set_cell(title_h, 6, 0, _mtxt_replace(_get_cell(title_h, 6), state_line.upper()))
             _set_cell(title_h, 11, 0, _replace_after_label(_get_cell(title_h, 11), "ORIGIN:-", origin_crs.strip().upper()))
             # Title-block shrink is applied after sheet scale (clustered 25% / mild 10%).
 
@@ -7663,8 +7964,48 @@ class SurvyAIAgent:
                 pass
 
         if surv_h:
-            # Surveyor name: keep professional title (SURV.) and optional bracket credentials.
-            def _format_surveyor_name(raw: str) -> str:
+            # Surveyor name and the credential beside it stay on one line.
+            # When they do not fit, both drop to 0.9x together.
+            surv_cell = _get_cell(surv_h, 0, 0)
+            surv_th = 1.5
+            surv_cell_w = 0.0
+            try:
+                step_res = self.autocad.get_table_cell_mtext_line_step(surv_h, 0, 0, surv_cell)
+                if step_res.get("success") and step_res.get("text_height"):
+                    surv_th = float(step_res.get("text_height") or surv_th)
+            except Exception:
+                pass
+            try:
+                ext = self.autocad.get_table_cell_extents(surv_h, 0, 0, outer=False)
+                if not (ext.get("success") and float(ext["maxx"]) > float(ext["minx"])):
+                    ext = self.autocad.get_table_cell_extents(surv_h, 0, 0, outer=True)
+                if ext.get("success"):
+                    surv_cell_w = float(ext["maxx"]) - float(ext["minx"])
+            except Exception:
+                pass
+            if surv_cell_w <= 1.0:
+                try:
+                    col = self.autocad.get_table_column_width(surv_h, 0)
+                    if col.get("success"):
+                        surv_cell_w = float(col.get("width") or 0.0)
+                except Exception:
+                    pass
+            if surv_cell_w <= 1.0:
+                surv_cell_w = max(12.0, surv_th * 16.0)
+            title_rel = _SURVEYOR_TITLE_REL
+            rel_m = re.search(r"\\H\s*([0-9.]+)\s*x", surv_cell or "", flags=re.IGNORECASE)
+            if rel_m:
+                try:
+                    found = float(rel_m.group(1))
+                    if 0.4 <= found <= 1.0:
+                        title_rel = found
+                except ValueError:
+                    pass
+            # Inner width still includes the table's horizontal margins.
+            pad_x = max(0.4, surv_th * 0.7)
+            surv_usable_w = max(surv_cell_w - 2.0 * pad_x, surv_th * 4.0)
+
+            def _format_surveyor_name(raw: str, *, cell_height_holds_name_scale: bool):
                 try:
                     from agent.pdf_survey_plan import (
                         ensure_surveyor_professional_title,
@@ -7680,41 +8021,104 @@ class SurvyAIAgent:
                         s = f"SURV. {s}"
                 s = s.upper()
                 if not s:
-                    return s
-                # Prefer bracket at end: "SURV. ... (MNIS)"
-                m = re.match(r"^(.*?)(\s*\([^)]*\))\s*$", s)
-                if m:
-                    main = m.group(1).strip()
-                    br = m.group(2).strip()
-                    return f"{main} {{\\H0.67x;{br}}}".strip()
-                return s
+                    return "", 1.0, 1.0
+                m = re.match(r"^(.*?)((?:\s*\([^)]*\))+)\s*$", s, flags=re.DOTALL)
+                if not m:
+                    main, br = s, ""
+                    name_scale, title_scale = _fit_surveyor_name_scales(
+                        s,
+                        "",
+                        usable_w=surv_usable_w,
+                        name_height=surv_th,
+                        title_rel=title_rel,
+                    )
+                else:
+                    main = re.sub(r"\s+", " ", m.group(1)).strip()
+                    br = re.sub(r"\s+", " ", m.group(2)).strip()
+                    name_scale, title_scale = _fit_surveyor_name_scales(
+                        main,
+                        br,
+                        usable_w=surv_usable_w,
+                        name_height=surv_th,
+                        title_rel=title_rel,
+                    )
+                # Cell text height carries the name shrink, so AutoCAD wraps
+                # against the smaller size. The credential stays relative to that.
+                if cell_height_holds_name_scale:
+                    rel = float(title_rel) * float(title_scale) / max(float(name_scale), 0.5)
+                    text = _compose_surveyor_name_mtext(
+                        main,
+                        br,
+                        name_scale=1.0,
+                        title_rel=rel,
+                        title_scale=1.0,
+                    )
+                else:
+                    text = _compose_surveyor_name_mtext(
+                        main,
+                        br,
+                        name_scale=name_scale,
+                        title_rel=title_rel,
+                        title_scale=title_scale,
+                    )
+                return text, float(name_scale), float(title_scale)
 
-            surv_cell = _get_cell(surv_h, 0, 0)
-            surv_fmt = _format_surveyor_name(surveyor_name)
-            if re.search(r"\bSURV\.?\b", surv_cell or "", flags=re.IGNORECASE) and surv_fmt:
-                # Preserve template "SURV." label when present; replace the name tail.
-                name_tail = re.sub(
-                    r"^(?:SURV\.?|SURVEYOR)\s*",
-                    "",
-                    surv_fmt,
-                    count=1,
-                    flags=re.IGNORECASE,
-                ).strip()
-                _set_cell(
-                    surv_h,
-                    0,
-                    0,
-                    _replace_after_label(surv_cell, "SURV.", name_tail)
-                    if re.search(r"SURV\.", surv_cell or "", flags=re.IGNORECASE)
-                    else _mtext_preserve_style_set_content(surv_cell, surv_fmt),
+            base_surv_h = float(surv_th)
+            for _fit_try in range(4):
+                surv_fmt, name_scale, title_scale = _format_surveyor_name(
+                    surveyor_name,
+                    cell_height_holds_name_scale=True,
                 )
-            else:
-                _set_cell(
-                    surv_h,
-                    0,
-                    0,
-                    _mtext_preserve_style_set_content(surv_cell, surv_fmt),
-                )
+                height_set = False
+                try:
+                    height_res = self.autocad.set_table_cell_text_height(
+                        surv_h, 0, 0, max(0.05, base_surv_h * float(name_scale))
+                    )
+                    height_set = bool(height_res.get("success"))
+                except Exception:
+                    height_set = False
+                if not height_set and name_scale < 0.999:
+                    surv_fmt, name_scale, title_scale = _format_surveyor_name(
+                        surveyor_name,
+                        cell_height_holds_name_scale=False,
+                    )
+                # A template \\H would pin the name at full size after the cell
+                # height has been set to 0.9x, and (MNIS) would wrap again.
+                cell_src = surv_cell or ""
+                if name_scale < 0.999:
+                    cell_src = re.sub(r"\\H[^;]*;", "", cell_src, flags=re.IGNORECASE)
+                if re.search(r"\bSURV\.?\b", cell_src, flags=re.IGNORECASE) and surv_fmt:
+                    # Preserve template "SURV." label when present; replace the name tail.
+                    tail_m = re.match(
+                        r"^((?:\\H[0-9.]+x;)*)(?:SURV\.?|SURVEYOR)\s*(.*)$",
+                        surv_fmt,
+                        flags=re.IGNORECASE | re.DOTALL,
+                    )
+                    name_tail = (
+                        (tail_m.group(1) + tail_m.group(2)).strip()
+                        if tail_m
+                        else surv_fmt.strip()
+                    )
+                    _set_cell(
+                        surv_h,
+                        0,
+                        0,
+                        _replace_after_label(cell_src, "SURV.", name_tail)
+                        if re.search(r"SURV\.", cell_src, flags=re.IGNORECASE)
+                        else _mtext_preserve_style_set_content(cell_src, surv_fmt),
+                    )
+                else:
+                    _set_cell(
+                        surv_h,
+                        0,
+                        0,
+                        _mtext_preserve_style_set_content(cell_src, surv_fmt),
+                    )
+                written = _get_cell(surv_h, 0, 0)
+                wrapped = bool(re.search(r"\\[Pp](?![A-Za-z])", written or ""))
+                if (not wrapped) or (name_scale <= 0.901 and title_scale <= 0.901):
+                    break
+                surv_usable_w = max(surv_th * 4.0, float(surv_usable_w) * 0.82)
 
             # Company on one line; street address starts on the next (uniform shrink per class).
             try:
@@ -8075,7 +8479,24 @@ class SurvyAIAgent:
                                         {"idx": i, "e": float(p["e"]), "n": float(p["n"])}
                                         for i, p in enumerate(coord_pairs[: min(6, len(coord_pairs))])
                                     ],
+                                    "station_count": int(len(coord_pairs)),
+                                    "pillar_labels": [
+                                        p.strip()
+                                        for p in re.split(r"[,;\n]+", str(pillar_numbers or ""))
+                                        if p.strip()
+                                    ][:16],
                                 }
+                                try:
+                                    ring = [(float(p["e"]), float(p["n"])) for p in coord_pairs]
+                                    if len(ring) >= 3:
+                                        if ring[0] != ring[-1]:
+                                            ring = ring + [ring[0]]
+                                        acc = 0.0
+                                        for _i in range(len(ring) - 1):
+                                            acc += ring[_i][0] * ring[_i + 1][1] - ring[_i + 1][0] * ring[_i][1]
+                                        bowditch_info["area_m2"] = abs(acc) / 2.0
+                                except Exception:
+                                    pass
                 except Exception:
                     pass
 
@@ -8093,6 +8514,15 @@ class SurvyAIAgent:
         geometry = {"pillars_moved": 0, "boundary_redrawn": False, "bearing_mtext": 0, "access_road_title": None}
         if bowditch_info:
             geometry["bowditch"] = bowditch_info
+        _pillar_labels = [
+            p.strip()
+            for p in re.split(r"[,;\n]+", str(pillar_numbers or ""))
+            if p.strip()
+        ][:16]
+        if _pillar_labels:
+            geometry["pillar_labels"] = _pillar_labels
+            if isinstance(bowditch_info, dict) and not bowditch_info.get("pillar_labels"):
+                bowditch_info["pillar_labels"] = _pillar_labels
 
         # Plan-scale state (updated inside the coordinate plotting block when present).
         scale_k = 1.0
@@ -9527,15 +9957,58 @@ class SurvyAIAgent:
                     # Place the TABLE close to the pillar but not on it.
                     # TABLE insertion points are often at a corner, so use its bounding box
                     # to position the *nearest table edge* a small gap away from the pillar.
-                    dxv, dyv = vx - cxp, vy - cyp
-                    Lvv = math.hypot(dxv, dyv) or 1.0
-                    ux, uy = dxv / Lvv, dyv / Lvv  # outward from centroid
+                    # Exterior bisector of the two boundary legs at this pillar.
+                    # Centroid-outward sends neighbouring pillars the same way, so
+                    # 1004 and 1005 land on top of each other.
+                    _ring_pn = local_pts or []
+                    _npn = len(_ring_pn)
+                    if _npn >= 3:
+                        _bi = min(
+                            range(_npn),
+                            key=lambda ii, _vx=vx, _vy=vy: (
+                                float(_ring_pn[ii]["x"]) - _vx
+                            )
+                            ** 2
+                            + (float(_ring_pn[ii]["y"]) - _vy) ** 2,
+                        )
+                        _prev = _ring_pn[(_bi - 1) % _npn]
+                        _nxt = _ring_pn[(_bi + 1) % _npn]
+                        _ax = vx - float(_prev["x"])
+                        _ay = vy - float(_prev["y"])
+                        _bx = float(_nxt["x"]) - vx
+                        _by = float(_nxt["y"]) - vy
+                        _la = math.hypot(_ax, _ay) or 1.0
+                        _lb = math.hypot(_bx, _by) or 1.0
+                        _ax, _ay, _bx, _by = _ax / _la, _ay / _la, _bx / _lb, _by / _lb
+                        _area2 = 0.0
+                        for _ii in range(_npn):
+                            _x1 = float(_ring_pn[_ii]["x"])
+                            _y1 = float(_ring_pn[_ii]["y"])
+                            _x2 = float(_ring_pn[(_ii + 1) % _npn]["x"])
+                            _y2 = float(_ring_pn[(_ii + 1) % _npn]["y"])
+                            _area2 += _x1 * _y2 - _x2 * _y1
+                        if _area2 >= 0.0:
+                            _n1x, _n1y = -_ay, _ax
+                            _n2x, _n2y = -_by, _bx
+                        else:
+                            _n1x, _n1y = _ay, -_ax
+                            _n2x, _n2y = _by, -_bx
+                        _ix, _iy = -(_n1x + _n2x), -(_n1y + _n2y)
+                        _il = math.hypot(_ix, _iy)
+                        if _il < 1e-6:
+                            _ix, _iy = -_n1x, -_n1y
+                            _il = math.hypot(_ix, _iy) or 1.0
+                        ux, uy = _ix / _il, _iy / _il
+                    else:
+                        dxv, dyv = vx - cxp, vy - cyp
+                        Lvv = math.hypot(dxv, dyv) or 1.0
+                        ux, uy = dxv / Lvv, dyv / Lvv
                     try:
                         pn_meta.append({"handle": h, "vx": vx, "vy": vy, "ux": ux, "uy": uy, "off": float(off)})
                     except Exception:
                         pass
-                    # Gap target (survey drafting): ~1.0 unit from peg, except primary peg ~1.5 units.
-                    gap = 1.5 if i_v == primary_idx else 1.0
+                    # 0.5 m from the pillar symbol to the label when the space is clear.
+                    gap = 0.5
                     try:
                         ms = self.autocad.doc.ModelSpace
                         ent = None
@@ -9678,9 +10151,12 @@ class SurvyAIAgent:
                                         pass
                                     break
 
-                            base_r = p_ext + gap + ext
+                            # Use the visible text reach, not a padded table, or the number sits too far out.
+                            label_reach = min(float(ext), 1.2)
+                            base_r = p_ext + gap + label_reach
                             perp_x, perp_y = -uy, ux
                             best_pos = None
+                            best_bb = None
                             best_cost = 1e18
                             for r_mult in (1.0, 1.15, 1.35, 1.6):
                                 rr = base_r * r_mult
@@ -9701,6 +10177,16 @@ class SurvyAIAgent:
                                             cost += 5000.0
                                     if _crosses_traverse(cand_bb):
                                         cost += 10000.0
+                                    _ccx = (
+                                        float((cand_bb.get("min") or {}).get("x", 0.0))
+                                        + float((cand_bb.get("max") or {}).get("x", 0.0))
+                                    ) * 0.5
+                                    _ccy = (
+                                        float((cand_bb.get("min") or {}).get("y", 0.0))
+                                        + float((cand_bb.get("max") or {}).get("y", 0.0))
+                                    ) * 0.5
+                                    if _point_in_poly(_ccx, _ccy):
+                                        cost += 8000.0
                                     for pb in placed_bbs:
                                         if _aabb_overlaps_local(cand_bb, pb, pad0=0.1):
                                             cost += 2500.0
@@ -9710,6 +10196,7 @@ class SurvyAIAgent:
                                     if cost < best_cost:
                                         best_cost = cost
                                         best_pos = (tcx, tcy)
+                                        best_bb = cand_bb
                                     if cost <= 1e-6:
                                         break
                                 if best_cost <= 1e-6:
@@ -9722,12 +10209,14 @@ class SurvyAIAgent:
                             tx = tcx - dcx
                             ty = tcy - dcy
                             self.autocad.move_entity_to_xy(h, tx, ty)
+                            if best_bb is not None:
+                                placed_bbs.append(best_bb)
                         else:
                             # fallback: simple outward offset
-                            self.autocad.move_entity_to_xy(h, vx + ux * 4.0, vy + uy * 4.0)
+                            self.autocad.move_entity_to_xy(h, vx + ux * 1.15, vy + uy * 1.15)
                     except Exception:
                         # fallback: simple outward offset
-                        self.autocad.move_entity_to_xy(h, vx + ux * 4.0, vy + uy * 4.0)
+                        self.autocad.move_entity_to_xy(h, vx + ux * 1.15, vy + uy * 1.15)
 
                 for t in pn_tables:
                     h = str(t.get("handle") or "")
@@ -10044,16 +10533,24 @@ class SurvyAIAgent:
                 midx = (p1["x"] + p2["x"]) / 2.0
                 midy = (p1["y"] + p2["y"]) / 2.0
 
-                poly_cx = sum(p["x"] for p in _ring) / len(_ring)
-                poly_cy = sum(p["y"] for p in _ring) / len(_ring)
-                vx = poly_cx - midx
-                vy = poly_cy - midy
-                n1x, n1y = dy / L_geom, -dx / L_geom
-                n2x, n2y = -dy / L_geom, dx / L_geom
-                if (n1x * vx + n1y * vy) >= (n2x * vx + n2y * vy):
-                    inx, iny = n1x, n1y
+                # Interior is to the left of travel on a counter-clockwise ring.
+                # A vertex average can fall on the wrong side of one leg; confirm
+                # with a point just off the line so bearing/distance do not swap.
+                _ring_area2 = 0.0
+                _nr = len(_ring)
+                for _ia in range(_nr):
+                    _ax, _ay = float(_ring[_ia]["x"]), float(_ring[_ia]["y"])
+                    _bx, _by = float(_ring[(_ia + 1) % _nr]["x"]), float(_ring[(_ia + 1) % _nr]["y"])
+                    _ring_area2 += _ax * _by - _bx * _ay
+                if _ring_area2 >= 0.0:
+                    inx, iny = -dy / L_geom, dx / L_geom
                 else:
-                    inx, iny = n2x, n2y
+                    inx, iny = dy / L_geom, -dx / L_geom
+                _eps = max(0.2, min(0.6, 0.06 * L_geom))
+                _in_hit = _point_in_polygon(midx + inx * _eps, midy + iny * _eps, _ring)
+                _out_hit = _point_in_polygon(midx - inx * _eps, midy - iny * _eps, _ring)
+                if _out_hit and not _in_hit:
+                    inx, iny = -inx, -iny
                 outx, outy = -inx, -iny
 
                 if multi_parcel_layout:
@@ -10064,58 +10561,66 @@ class SurvyAIAgent:
                     use_projecting_arrow = L_geom < _min_text_span
 
                 if not use_projecting_arrow:
-                    # --- Normal on-leg placement (unchanged logic) ---
-                    target_span = 0.6 * L_geom
-                    base_span_est = 4.6 * _bd_height
-                    space_span_est = 0.6 * _bd_height
-                    hs = 1
-                    if target_span > base_span_est and space_span_est > 1e-9:
-                        hs = 1 + int(math.ceil((target_span - base_span_est) / space_span_est))
-                        hs = max(1, min(hs, 60))
-                    bearing_str = _bearing_ddmm(az, hard_spaces=hs)
+                    # Bearing stays outside the parcel; distance stays inside.
+                    # Two labels, not one stacked note — line order was flipping on some azimuths.
+                    bearing_str = _bearing_ddmm(az, hard_spaces=1)
                     dist_str = f"{L_disp:.2f}m"
-                    first_line_out = -math.sin(rot) * outx + math.cos(rot) * outy
-                    if first_line_out > 0:
-                        stacked_text = f"{{\\fVerdana|b0|i0|c0|p34;{bearing_str}\\P{dist_str}}}"
-                    else:
-                        stacked_text = f"{{\\fVerdana|b0|i0|c0|p34;{dist_str}\\P{bearing_str}}}"
-                    w = min(max(2.0, 0.75 * L_geom), 0.95 * L_geom)
-                    h_est = 2.2 * _bd_height
-                    margin_bd = 2.0 * _bd_height
-                    tcx, tcy = midx, midy
-                    tw = float(w)
-                    try:
-                        if _interior_bb is not None and not _aabb_inside_interior(
-                            _aabb_for_centered_rect(tcx, tcy, tw, h_est, rot), margin_bd
+                    h_bd = float(_bd_height)
+                    char_w = 0.62 * h_bd
+                    side_off = 0.72 * h_bd
+                    bearing_w = min(max(3.6 * h_bd, char_w * 9.0), max(3.6 * h_bd, 0.55 * L_geom))
+                    dist_w = min(max(3.0 * h_bd, char_w * 6.5), max(3.0 * h_bd, 0.40 * L_geom))
+                    h_est = 1.35 * h_bd
+                    margin_bd = 1.1 * h_bd
+                    tux, tuy = dx / L_geom, dy / L_geom
+
+                    def _on_sheet(cx: float, cy: float, box_w: float) -> Tuple[float, float]:
+                        if _interior_bb is None:
+                            return cx, cy
+                        if _aabb_inside_interior(
+                            _aabb_for_centered_rect(cx, cy, box_w, h_est, rot), margin_bd
                         ):
-                            for _nz in range(36):
-                                tcx += 0.18 * (poly_cx - tcx)
-                                tcy += 0.18 * (poly_cy - tcy)
-                                if _aabb_inside_interior(_aabb_for_centered_rect(tcx, tcy, tw, h_est, rot), margin_bd):
-                                    break
-                            else:
-                                tw2 = tw
-                                for _sw in range(22):
-                                    tw2 *= 0.9
-                                    tw2 = max(2.0, tw2)
-                                    if _aabb_inside_interior(_aabb_for_centered_rect(tcx, tcy, tw2, h_est, rot), margin_bd):
-                                        tw = tw2
-                                        break
-                    except Exception:
-                        tcx, tcy, tw = midx, midy, float(w)
+                            return cx, cy
+                        for slide in (0.10, -0.10, 0.18, -0.18, 0.28, -0.28):
+                            sx = cx + tux * slide * L_geom
+                            sy = cy + tuy * slide * L_geom
+                            if _aabb_inside_interior(
+                                _aabb_for_centered_rect(sx, sy, box_w, h_est, rot), margin_bd
+                            ):
+                                return sx, sy
+                        return cx, cy
+
+                    bcx, bcy = _on_sheet(midx + outx * side_off, midy + outy * side_off, bearing_w)
+                    dcx, dcy = _on_sheet(midx + inx * side_off, midy + iny * side_off, dist_w)
                     self.autocad.add_mtext(
-                        stacked_text,
-                        tcx,
-                        tcy,
+                        f"{{\\fVerdana|b0|i0|c0|p34;{bearing_str}}}",
+                        bcx,
+                        bcy,
                         layer="CADA_BEARING_DIST",
                         rotation_rad=rot,
-                        height=_bd_height,
-                        width=tw,
+                        height=h_bd,
+                        width=bearing_w,
+                        attachment_point=5,
+                        assume_active=True,
+                    )
+                    self.autocad.add_mtext(
+                        f"{{\\fVerdana|b0|i0|c0|p34;{dist_str}}}",
+                        dcx,
+                        dcy,
+                        layer="CADA_BEARING_DIST",
+                        rotation_rad=rot,
+                        height=h_bd,
+                        width=dist_w,
                         attachment_point=5,
                         assume_active=True,
                     )
                     try:
-                        _placed_label_bboxes.append(_aabb_for_centered_rect(tcx, tcy, tw, h_est, rot))
+                        _placed_label_bboxes.append(
+                            _aabb_for_centered_rect(bcx, bcy, bearing_w, h_est, rot)
+                        )
+                        _placed_label_bboxes.append(
+                            _aabb_for_centered_rect(dcx, dcy, dist_w, h_est, rot)
+                        )
                     except Exception:
                         pass
                 else:
@@ -10146,12 +10651,16 @@ class SurvyAIAgent:
                     # Unit directions along the leg vector.
                     # NOTE: Use L_geom (the computed leg length) rather than an undefined `L`.
                     t_ux, t_uy = dx / L_geom, dy / L_geom
-                    stem_dirs = [
-                        (outx, outy),            # outward normal
-                        (-outx, -outy),          # inward normal
-                        (t_ux, t_uy),            # along the leg
-                        (-t_ux, -t_uy),          # reverse along the leg
-                    ]
+
+                    def _fan(vx0: float, vy0: float, deg: float) -> Tuple[float, float]:
+                        th = math.radians(deg)
+                        c, s = math.cos(th), math.sin(th)
+                        return (vx0 * c - vy0 * s, vx0 * s + vy0 * c)
+
+                    # Leaders stay outside the parcel. An inward stem cuts through the lot.
+                    stem_dirs = [(outx, outy)]
+                    for _ang in (22.0, -22.0, 45.0, -45.0, 70.0, -70.0):
+                        stem_dirs.append(_fan(outx, outy, _ang))
                     # Branch options in preference order: horizontal (E/W), vertical (N/S), then along-leg.
                     branch_opts = [
                         (1.0, 0.0, 0.0),     # East, rotation 0
@@ -10169,7 +10678,13 @@ class SurvyAIAgent:
                             ex = midx + sdx * stem_len
                             ey = midy + sdy * stem_len
                             ex, ey = _clamp_xy(ex, ey, margin)
+                            if _point_in_polygon(ex, ey, _ring) or _point_in_polygon(
+                                0.5 * (midx + ex), 0.5 * (midy + ey), _ring
+                            ):
+                                continue
                             for (bdx, bdy, text_rot) in branch_opts:
+                                if (bdx * outx + bdy * outy) < -0.2:
+                                    continue
                                 for bm in (1.0, 1.35, 1.8):
                                     bl = branch_base * bm
                                     bx = ex + bdx * bl
@@ -10462,8 +10977,8 @@ class SurvyAIAgent:
                         dy0 = 0.0 if (miny <= py <= maxy) else (miny - py if py < miny else py - maxy)
                         return math.hypot(dx0, dy0)
 
-                    target_min_gap = 0.8
-                    target_max_gap = 2.0
+                    target_min_gap = 0.35
+                    target_max_gap = 0.5
                     for meta in pn_meta:
                         h_raw = str(meta.get("handle") or "")
                         hh = h_raw.upper()

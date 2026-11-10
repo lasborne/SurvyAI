@@ -264,7 +264,14 @@ def compose_cad_prompt(state: CadFormState) -> Tuple[str, str]:
     if state.lga.strip():
         lines.append(f"local government area: {state.lga.strip()}")
     if state.state.strip():
-        lines.append(f"state: {state.state.strip()}")
+        try:
+            from agent.pdf_survey_plan import format_state_for_plan
+
+            state_line = format_state_for_plan(state.state)
+        except Exception:
+            state_line = state.state.strip()
+        if state_line:
+            lines.append(f"state: {state_line}")
     if state.origin.strip():
         lines.append(f"origin_crs: {state.origin.strip()}")
 
@@ -436,7 +443,7 @@ def compose_cad_prompts(states: Sequence[CadFormState]) -> Tuple[str, str]:
     if not pages:
         pages = [CadFormState()]
 
-    ready: List[CadFormState] = []
+    ready: List[tuple[int, CadFormState]] = []
     errors: List[str] = []
     for i, raw in enumerate(pages):
         state = raw or CadFormState()
@@ -446,7 +453,7 @@ def compose_cad_prompts(states: Sequence[CadFormState]) -> Tuple[str, str]:
         if err:
             errors.append(f"Plan {i + 1}: {err}")
             continue
-        ready.append(state)
+        ready.append((i, state))
 
     if errors:
         extra = (
@@ -461,11 +468,16 @@ def compose_cad_prompts(states: Sequence[CadFormState]) -> Tuple[str, str]:
         return prompt, err
 
     if len(ready) == 1:
-        return compose_cad_prompt(ready[0])
+        sheet_i, only = ready[0]
+        prompt, err = compose_cad_prompt(only)
+        if err or sheet_i == 0:
+            return prompt, err
+        return f"Plan {sheet_i + 1}:\n{prompt}", err
 
     used: set[str] = set()
     chunks: List[str] = []
-    for i, state in enumerate(ready, start=1):
+    for sheet_i, state in ready:
+        i = sheet_i + 1
         adjusted = deepcopy(state)
         owners = _nonempty(adjusted.owners)
         stem = _sanitize_dwg_stem(

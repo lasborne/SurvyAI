@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional
+import copy
+from typing import Callable, List, Optional, Tuple
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QKeySequence, QShortcut
@@ -77,10 +78,16 @@ def _info_button(tooltip: str) -> QToolButton:
 class AutomatedCadForm(QWidget):
     """Vertical field/value strip for automated cadastral plan plotting."""
 
-    def __init__(self, parent: Optional[QWidget] = None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QWidget] = None,
+        *,
+        template_mode: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.setObjectName("cadFormRoot")
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._template_mode = bool(template_mode)
 
         self._plans: List[CadFormState] = [CadFormState()]
         self._current_index = 0
@@ -90,7 +97,24 @@ class AutomatedCadForm(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
-        outer.addWidget(self._build_plan_strip(), 0)
+        self._plan_strip = self._build_plan_strip()
+        outer.addWidget(self._plan_strip, 0)
+        if self._template_mode:
+            self._plan_strip.hide()
+        else:
+            self._cad_status_row = QWidget()
+            self._cad_status_row.setObjectName("cadRunStatusRow")
+            self._cad_status_row.setFixedHeight(20)
+            status_lay = QHBoxLayout(self._cad_status_row)
+            status_lay.setContentsMargins(8, 0, 8, 0)
+            status_lay.setSpacing(8)
+            status_lay.addStretch(1)
+            self._cad_status_mid = QHBoxLayout()
+            self._cad_status_mid.setContentsMargins(0, 0, 0, 0)
+            self._cad_status_mid.setSpacing(10)
+            status_lay.addLayout(self._cad_status_mid)
+            status_lay.addStretch(1)
+            outer.addWidget(self._cad_status_row, 0)
 
         fields = QWidget()
         fields.setObjectName("cadFormFields")
@@ -98,18 +122,22 @@ class AutomatedCadForm(QWidget):
         root.setContentsMargins(10, 8, 14, 16)
         root.setSpacing(12)
 
-        hint = QLabel(
-            "Each numbered sheet is one survey plan (up to 10). Fill the sheet you are on, "
-            "then Send — empty sheets are skipped. You do not need to write a prompt. "
-            "Switch to Console for follow-ups (roads, title, subdivision, save as)."
-        )
-        hint.setToolTip(
-            "Send plots completed sheets in this form. Blank extra sheets are ignored. "
-            "Use Console in the same conversation for later edits."
-        )
-        hint.setObjectName("cadHintLabel")
-        hint.setWordWrap(True)
-        root.addWidget(hint)
+        if self._template_mode:
+            hint = None
+        else:
+            hint = QLabel(
+                "Each numbered sheet is one survey plan (up to 10). Fill the sheet you are on, "
+                "then Send — empty sheets are skipped. You do not need to write a prompt. "
+                "Switch to Console for follow-ups (roads, title, subdivision, save as)."
+            )
+            hint.setToolTip(
+                "Send plots completed sheets in this form. Blank extra sheets are ignored. "
+                "Use Console in the same conversation for later edits."
+            )
+        if hint is not None:
+            hint.setObjectName("cadHintLabel")
+            hint.setWordWrap(True)
+            root.addWidget(hint)
 
         root.addWidget(self._build_mode_switch())
         root.addWidget(self._build_identity_block())
@@ -134,17 +162,54 @@ class AutomatedCadForm(QWidget):
         scroll.setWidget(fields)
         scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         outer.addWidget(scroll, 1)
+        if not self._template_mode:
+            self._survey_reports = QWidget()
+            self._survey_reports.setObjectName("cadSurveyReports")
+            self._survey_reports_layout = QVBoxLayout(self._survey_reports)
+            self._survey_reports_layout.setContentsMargins(8, 4, 8, 6)
+            self._survey_reports_layout.setSpacing(0)
+            card = QFrame()
+            card.setObjectName("cadSurveyReport")
+            card_lay = QVBoxLayout(card)
+            card_lay.setContentsMargins(10, 6, 8, 8)
+            card_lay.setSpacing(4)
+            head = QHBoxLayout()
+            head.setContentsMargins(0, 0, 0, 0)
+            head.setSpacing(8)
+            self._survey_title = QLabel("")
+            self._survey_title.setObjectName("cadSurveyTitle")
+            head.addWidget(self._survey_title, 1)
+            self._survey_toggle = QToolButton()
+            self._survey_toggle.setObjectName("cadSurveyToggle")
+            self._survey_toggle.setAutoRaise(True)
+            self._survey_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+            self._survey_toggle.setFixedSize(22, 22)
+            self._survey_toggle.setText("\u2039")
+            self._survey_toggle.setToolTip("Hide this plan result")
+            self._survey_toggle.clicked.connect(self._toggle_survey_report)
+            head.addWidget(self._survey_toggle, 0, Qt.AlignmentFlag.AlignVCenter)
+            card_lay.addLayout(head)
+            self._survey_body = QLabel("")
+            self._survey_body.setObjectName("cadSurveyBody")
+            self._survey_body.setWordWrap(True)
+            self._survey_body.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            card_lay.addWidget(self._survey_body)
+            self._survey_reports_layout.addWidget(card)
+            self._survey_open_by_plan: dict[int, bool] = {}
+            self._survey_reports.hide()
+            outer.addWidget(self._survey_reports, 0)
 
         self._set_mode(MODE_COORDINATES)
         self._mode_coords_btn.toggled.connect(self._on_mode_toggled)
         self._mode_bearings_btn.toggled.connect(self._on_mode_toggled)
         self._rebuild_plan_chips()
-        next_sc = QShortcut(QKeySequence("Alt+Right"), self)
-        next_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        next_sc.activated.connect(self._goto_next_plan)
-        prev_sc = QShortcut(QKeySequence("Alt+Left"), self)
-        prev_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        prev_sc.activated.connect(self._goto_prev_plan)
+        if not self._template_mode:
+            next_sc = QShortcut(QKeySequence("Alt+Right"), self)
+            next_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            next_sc.activated.connect(self._goto_next_plan)
+            prev_sc = QShortcut(QKeySequence("Alt+Left"), self)
+            prev_sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+            prev_sc.activated.connect(self._goto_prev_plan)
 
     # ------------------------------------------------------------------
     # Plan sheets (horizontal, compact — like drawing layouts)
@@ -162,9 +227,10 @@ class AutomatedCadForm(QWidget):
         chip_scroll.setObjectName("cadPlanChipScroll")
         chip_scroll.setWidgetResizable(True)
         chip_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        chip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        chip_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         chip_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        chip_scroll.setFixedHeight(26)
+        chip_scroll.setFixedHeight(28)
+        self._plan_chip_scroll = chip_scroll
         chip_host = QWidget()
         chip_host.setObjectName("cadPlanChipHost")
         self._plan_chips_host = QHBoxLayout(chip_host)
@@ -172,7 +238,7 @@ class AutomatedCadForm(QWidget):
         self._plan_chips_host.setSpacing(2)
         self._plan_chips_host.addStretch(1)
         chip_scroll.setWidget(chip_host)
-        layout.addWidget(chip_scroll, 1)
+        layout.addWidget(chip_scroll, 1, Qt.AlignmentFlag.AlignVCenter)
 
         self._plan_add_btn = QToolButton()
         self._plan_add_btn.setObjectName("cadPlanAdd")
@@ -191,6 +257,10 @@ class AutomatedCadForm(QWidget):
         self._plan_count_lab.setObjectName("cadPlanCount")
         self._plan_count_lab.setToolTip("Filled sheets plot on Send. Empty extra sheets are ignored.")
         layout.addWidget(self._plan_count_lab, 0, Qt.AlignmentFlag.AlignVCenter)
+        self._template_slot = QHBoxLayout()
+        self._template_slot.setContentsMargins(8, 0, 0, 0)
+        self._template_slot.setSpacing(0)
+        layout.addLayout(self._template_slot)
         return strip
 
     def _stash_current(self) -> None:
@@ -212,6 +282,7 @@ class AutomatedCadForm(QWidget):
             if scroll is not None:
                 scroll.verticalScrollBar().setValue(0)
         self._refresh_plan_chip_state()
+        self._show_current_survey_report()
 
     def _goto_next_plan(self) -> None:
         if len(self._plans) < 2:
@@ -224,6 +295,8 @@ class AutomatedCadForm(QWidget):
         self._goto_plan((self._current_index - 1) % len(self._plans))
 
     def _add_plan_sheet(self) -> None:
+        if self._template_mode:
+            return
         self._stash_current()
         if len(self._plans) >= MAX_CAD_PLANS:
             return
@@ -236,6 +309,8 @@ class AutomatedCadForm(QWidget):
             scroll.verticalScrollBar().setValue(0)
 
     def _remove_plan_sheet(self, index: int) -> None:
+        if self._template_mode:
+            return
         if index <= 0 or index >= len(self._plans) or len(self._plans) <= 1:
             return
         self._stash_current()
@@ -258,6 +333,7 @@ class AutomatedCadForm(QWidget):
             self.apply_state(self._plans[self._current_index])
         elif self._current_index > index:
             self._current_index -= 1
+        self._show_current_survey_report()
         QTimer.singleShot(0, self._rebuild_plan_chips)
 
     def _rebuild_plan_chips(self) -> None:
@@ -272,6 +348,7 @@ class AutomatedCadForm(QWidget):
         for btn in list(self._plan_chip_group.buttons()):
             self._plan_chip_group.removeButton(btn)
 
+        wraps: List[QWidget] = []
         for i, state in enumerate(self._plans):
             wrap = QWidget()
             wrap.setObjectName("cadPlanChipWrap")
@@ -304,8 +381,22 @@ class AutomatedCadForm(QWidget):
                 close.clicked.connect(lambda _checked=False, idx=i: self._remove_plan_sheet(idx))
                 row.addWidget(close, 0)
             host.addWidget(wrap, 0)
+            wraps.append(wrap)
 
         host.addStretch(1)
+        self._plan_chip_wraps = wraps
+        host_widget = host.parentWidget()
+        if host_widget is not None:
+            host_widget.setMinimumWidth(max(1, len(wraps) * 62))
+        QTimer.singleShot(0, self._reveal_current_plan_chip)
+
+    def _reveal_current_plan_chip(self) -> None:
+        scroll = getattr(self, "_plan_chip_scroll", None)
+        wraps = getattr(self, "_plan_chip_wraps", None) or []
+        idx = int(getattr(self, "_current_index", 0))
+        if scroll is None or not (0 <= idx < len(wraps)):
+            return
+        scroll.ensureWidgetVisible(wraps[idx], 28, 0)
         n = len(self._plans)
         if getattr(self, "_plan_count_lab", None) is not None:
             self._plan_count_lab.setText(f"{n}/{MAX_CAD_PLANS}")
@@ -991,6 +1082,91 @@ class AutomatedCadForm(QWidget):
         self._bearing_adj_cb.blockSignals(False)
         self._bowditch_cb.blockSignals(False)
 
+    def snapshot_plans(self) -> Tuple[List[CadFormState], int]:
+        """All sheets, including the one on screen, safe to keep after the form changes."""
+        self._stash_current()
+        return copy.deepcopy(self._plans), int(self._current_index)
+
+    def plans_have_content(self) -> bool:
+        self._stash_current()
+        return any(not cad_form_state_is_blank(plan) for plan in self._plans)
+
+    def restore_plans(self, plans: List[CadFormState], index: int = 0) -> None:
+        """Put a saved set of sheets back on screen. Does not send."""
+        if not plans:
+            return
+        self._plans = copy.deepcopy(list(plans))
+        self._current_index = max(0, min(int(index), len(self._plans) - 1))
+        self.apply_state(self._plans[self._current_index])
+        self._rebuild_plan_chips()
+        self._show_current_survey_report()
+        scroll = getattr(self, "_fields_scroll", None)
+        if scroll is not None:
+            scroll.verticalScrollBar().setValue(0)
+
+    def set_survey_reports(self, reports: List[str]) -> None:
+        """Keep one note per sent sheet, and show only the sheet on screen."""
+        import re
+
+        self._stash_current()
+        filled = [
+            i for i, plan in enumerate(self._plans) if not cad_form_state_is_blank(plan)
+        ]
+        stored: dict[int, str] = {}
+        pending: List[str] = []
+        for text in reports or []:
+            raw = str(text or "").strip()
+            if not raw:
+                continue
+            match = re.match(r"Plan\s+(\d+)\b", raw)
+            key = int(match.group(1)) - 1 if match else None
+            if key is not None and key in filled:
+                stored[key] = raw
+            else:
+                pending.append(raw)
+        for raw in pending:
+            for key in filled:
+                if key not in stored:
+                    stored[key] = raw
+                    break
+        self._survey_report_by_plan = stored
+        self._show_current_survey_report()
+
+    def _toggle_survey_report(self) -> None:
+        idx = int(getattr(self, "_current_index", 0))
+        opened = getattr(self, "_survey_open_by_plan", None)
+        if not isinstance(opened, dict):
+            opened = {}
+            self._survey_open_by_plan = opened
+        opened[idx] = not opened.get(idx, True)
+        self._show_current_survey_report()
+
+    def _show_current_survey_report(self) -> None:
+        host = getattr(self, "_survey_reports", None)
+        title = getattr(self, "_survey_title", None)
+        body = getattr(self, "_survey_body", None)
+        toggle = getattr(self, "_survey_toggle", None)
+        if host is None or title is None or body is None:
+            return
+        stored = getattr(self, "_survey_report_by_plan", None) or {}
+        idx = int(getattr(self, "_current_index", 0))
+        text = str(stored.get(idx, "") or "").strip() if isinstance(stored, dict) else ""
+        if not text:
+            body.clear()
+            title.clear()
+            host.hide()
+            return
+        lines = text.split("\n", 1)
+        title.setText(lines[0].strip())
+        body.setText(lines[1].strip() if len(lines) > 1 else "")
+        opened = getattr(self, "_survey_open_by_plan", None)
+        is_open = True if not isinstance(opened, dict) else bool(opened.get(idx, True))
+        body.setVisible(is_open)
+        if toggle is not None:
+            toggle.setText("<" if is_open else ">")
+            toggle.setToolTip("Hide this plan result" if is_open else "Show this plan result")
+        host.show()
+
     def clear_inputs(self) -> None:
         """Empty the plan sheet on screen. Other sheets are left as they are."""
         self.apply_state(CadFormState())
@@ -1006,13 +1182,22 @@ class AutomatedCadForm(QWidget):
 
     def apply_prompt_template(self, text: str) -> str:
         state = parse_cad_prompt(text)
+        if self._template_mode:
+            self._plans = [state]
+            self._current_index = 0
+            self.apply_state(state)
+            self._stash_current()
+            scroll = getattr(self, "_fields_scroll", None)
+            if scroll is not None:
+                scroll.verticalScrollBar().setValue(0)
+            return "Input Plan Template loaded."
         self.apply_state(state)
         self._stash_current()
         self._refresh_plan_chip_state()
         n = self._current_index + 1
         return (
-            f"Plan {n} filled from the default CAD template. "
-            "Other plan sheets were left unchanged."
+            f"Plan {n} filled from your plan template. "
+            "Other sheets were left unchanged."
         )
 
     def _sync_simple_rows(

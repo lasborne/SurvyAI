@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from pydantic import BaseModel, Field
@@ -627,44 +628,174 @@ def _shoelace_area_m2(points: Sequence[Any]) -> Optional[float]:
     return abs(acc) / 2.0
 
 
+# Nigerian cadastral practice: linear misclosure / traverse perimeter shall not exceed 1:5000.
+ALLOWABLE_MISCLOSURE_DENOM = 5000
+
+
+def traverse_accuracy_sentence(bow: Optional[Dict[str, Any]]) -> str:
+    """Misclosure against traverse perimeter only. Roads and fences are not included."""
+    if not isinstance(bow, dict):
+        return ""
+    try:
+        mis = float(bow.get("misclosure_m"))
+        peri = float(bow.get("perimeter_m"))
+    except (TypeError, ValueError):
+        return ""
+    if peri <= 1e-6 or mis < 0:
+        return ""
+    if mis < 0.001:
+        return (
+            f"Misclosure under 1 mm on a {peri:.2f} m traverse. "
+            "Within the 1:5000 cadastral limit."
+        )
+    denom = peri / mis
+    verdict = "Within" if denom + 1e-6 >= ALLOWABLE_MISCLOSURE_DENOM else "Exceeds"
+    return (
+        f"Misclosure {_fmt_metres(mis)} on a {peri:.2f} m traverse (1:{denom:,.0f}). "
+        f"{verdict} the 1:5000 cadastral limit."
+    )
+
+
+def _scale_sentence(geometry: Optional[Dict[str, Any]]) -> str:
+    geom = geometry if isinstance(geometry, dict) else {}
+    debug = geom.get("scale_debug") if isinstance(geom.get("scale_debug"), dict) else {}
+    chosen = geom.get("output_plan_denom") or debug.get("chosen_denom")
+    requested = debug.get("user_scale_denom")
+    try:
+        chosen_i = int(chosen) if chosen else 0
+    except (TypeError, ValueError):
+        chosen_i = 0
+    try:
+        requested_i = int(requested) if requested else 0
+    except (TypeError, ValueError):
+        requested_i = 0
+    if chosen_i <= 0:
+        return ""
+    if requested_i and requested_i != chosen_i:
+        return (
+            f"Scale 1:{chosen_i}. The 1:{requested_i} you entered did not fit the sheet, "
+            "so the next scale that encloses the traverse was used."
+        )
+    return f"Scale 1:{chosen_i}."
+
+
+def _adjustment_sentence(bow: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(bow, dict) or bow.get("mode") != "bearing_distance":
+        return ""
+    method = str(bow.get("method") or "").strip()
+    names = {
+        "bearing_adjustment": "Bearing adjustment (distances held constant)",
+        "bowditch": "Bowditch (compass rule)",
+        "bearing_adjustment_failed": "Bearing adjustment failed; plotted unadjusted",
+        "pdf_auto_adjust_forbidden": "Unadjusted (PDF geometry)",
+    }
+    label = names.get(method, method.replace("_", " ") if method else "")
+    if not label:
+        return ""
+    if not bow.get("applied") and method in {"bearing_adjustment", "bowditch"}:
+        return "Adjustment: none. The traverse already closed within 1 cm."
+    return f"Adjustment: {label}."
+
+
+def survey_report_text(plot: Optional[Dict[str, Any]], plan_index: int) -> str:
+    """One concise sheet note. Does not replace the Console plot report."""
+    item = plot if isinstance(plot, dict) else {}
+    ready = bool(item.get("success"))
+    when = datetime.now().astimezone().strftime("%d %b %Y")
+    title = f"Plan {int(plan_index)}"
+    if not ready:
+        err = str(item.get("error") or "This plan was not plotted.").strip()
+        return f"{title} · Not ready\n{when}\n{err}"
+    geom = item.get("geometry") if isinstance(item.get("geometry"), dict) else {}
+    bow = geom.get("bowditch") if isinstance(geom.get("bowditch"), dict) else {}
+    lines = [f"{title} · Ready", when]
+    accuracy = traverse_accuracy_sentence(bow)
+    if accuracy:
+        me = _fmt_metres(bow.get("misclosure_e_m"))
+        mn = _fmt_metres(bow.get("misclosure_n_m"))
+        lines.append(f"{accuracy} Easting {me}, Northing {mn}.")
+    else:
+        lines.append("Traverse misclosure was not computed for this plot.")
+    area = bow.get("area_m2")
+    labels = bow.get("pillar_labels") if isinstance(bow.get("pillar_labels"), list) else []
+    if not labels and isinstance(geom.get("pillar_labels"), list):
+        labels = geom.get("pillar_labels")
+    labels = [str(p).strip() for p in labels if str(p).strip()]
+    facts: List[str] = []
+    try:
+        if area and float(area) > 1e-6:
+            facts.append(f"Area {float(area):,.3f} m²")
+    except (TypeError, ValueError):
+        pass
+    if labels:
+        facts.append("Pillars " + ", ".join(labels))
+    elif bow.get("station_count") or geom.get("pillar_inserts"):
+        try:
+            count = int(bow.get("station_count") or geom.get("pillar_inserts") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count > 0:
+            facts.append(f"Pillars {count}")
+    if facts:
+        lines.append(" · ".join(facts))
+    method = _adjustment_sentence(bow)
+    if method:
+        lines.append(method)
+    scale = _scale_sentence(geom)
+    if scale:
+        lines.append(scale)
+    path = str(item.get("output_dwg") or "").strip()
+    lines.append(path or "Saved path was not recorded.")
+    return "\n".join(lines)
+
+
 def format_traverse_adjustment_chat_lines(bow: Optional[Dict[str, Any]]) -> List[str]:
     """User-visible summary that names the method actually applied."""
     if not isinstance(bow, dict) or bow.get("mode") != "bearing_distance":
-        return []
+        note = traverse_accuracy_sentence(bow if isinstance(bow, dict) else None)
+        return [f"• {note}"] if note else []
     method = str(bow.get("method") or "")
     mis_s = _fmt_metres(bow.get("misclosure_m"))
     me = _fmt_metres(bow.get("misclosure_e_m"))
     mn = _fmt_metres(bow.get("misclosure_n_m"))
     shift = _fmt_metres(bow.get("max_point_shift_m"))
 
+    note = traverse_accuracy_sentence(bow)
+    accuracy = [f"• {note}"] if note else []
     if method == "pdf_auto_adjust_forbidden":
         return [
-            f"• Traverse left unadjusted (PDF-derived geometry). Misclosure: {mis_s}."
+            f"• Traverse left unadjusted (PDF-derived geometry). Misclosure: {mis_s}.",
+            *accuracy,
         ]
     if method == "bearing_adjustment_failed":
         return [
-            f"• Bearing adjustment failed; traverse plotted unadjusted. Misclosure: {mis_s}."
+            f"• Bearing adjustment failed; traverse plotted unadjusted. Misclosure: {mis_s}.",
+            *accuracy,
         ]
     if not bow.get("applied"):
         return [
-            f"• Traverse already closed within 1 cm (misclosure {mis_s}); no adjustment applied."
+            f"• Traverse already closed within 1 cm (misclosure {mis_s}); no adjustment applied.",
+            *accuracy,
         ]
     if method == "bowditch":
         return [
             "• Method: Bowditch (compass rule) — bearings and distances both adjusted",
             f"• Misclosure: {mis_s}  (E {me}, N {mn})",
             f"• Largest station shift: {shift}",
+            *accuracy,
         ]
     if method == "bearing_adjustment":
         return [
             "• Method: Bearing adjustment (distances held constant)",
             f"• Misclosure: {mis_s}  (E {me}, N {mn})",
             f"• Largest station shift: {shift}",
+            *accuracy,
         ]
     return [
         f"• Method: {method or 'traverse adjustment'}",
         f"• Misclosure: {mis_s}",
         f"• Largest station shift: {shift}",
+        *accuracy,
     ]
 
 

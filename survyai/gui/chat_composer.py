@@ -7,8 +7,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QDragEnterEvent, QDropEvent, QImage, QKeyEvent
+from PySide6.QtCore import QPointF, QRectF, QSize, Qt, Signal
+from PySide6.QtGui import (
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QImage,
+    QKeyEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -29,6 +39,78 @@ from survyai.attachments import (
     is_attachable_path,
     max_file_mb_for_path,
 )
+
+
+def _stroke_icon(kind: str, color: str, *, logical: int = 16) -> QIcon:
+    """One optical size for the prompt marks, so +, retry, x, and C sit evenly."""
+    pm = QPixmap(logical * 2, logical * 2)
+    pm.setDevicePixelRatio(2.0)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor(color))
+    pen.setWidthF(1.6)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    s = float(logical)
+    inset = 3.2
+    if kind == "plus":
+        mid = s / 2
+        painter.drawLine(QPointF(inset, mid), QPointF(s - inset, mid))
+        painter.drawLine(QPointF(mid, inset), QPointF(mid, s - inset))
+    elif kind == "retry":
+        import math
+
+        radius = (s - 5.4) / 2.0
+        origin = (s - 2.0 * radius) / 2.0
+        painter.drawArc(
+            QRectF(origin, origin, radius * 2.0, radius * 2.0),
+            125 * 16,
+            290 * 16,
+        )
+        end = math.radians(125 + 290)
+        cx = origin + radius
+        cy = origin + radius
+        ex = cx + radius * math.cos(end)
+        ey = cy - radius * math.sin(end)
+        tx, ty = -math.sin(end), -math.cos(end)
+        px, py = -ty, tx
+        tip = QPointF(ex + tx * 3.4, ey + ty * 3.4)
+        painter.drawLine(QPointF(ex + px * 2.15, ey + py * 2.15), tip)
+        painter.drawLine(QPointF(ex - px * 2.15, ey - py * 2.15), tip)
+    elif kind == "clear":
+        painter.drawArc(QRectF(4.2, 3.2, s - 7.2, s - 6.4), 50 * 16, 260 * 16)
+    else:
+        painter.drawLine(QPointF(inset + 0.4, inset + 0.4), QPointF(s - inset, s - inset))
+        painter.drawLine(QPointF(s - inset, inset + 0.4), QPointF(inset + 0.4, s - inset))
+    painter.end()
+    icon = QIcon()
+    icon.addPixmap(pm)
+    return icon
+
+
+def _send_arrow_icon() -> QIcon:
+    """A slightly larger right arrow, white, for the blue send control."""
+    logical = 18
+    pm = QPixmap(logical * 2, logical * 2)
+    pm.setDevicePixelRatio(2.0)
+    pm.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pm)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    pen = QPen(QColor("#ffffff"))
+    pen.setWidthF(2.0)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    painter.setPen(pen)
+    painter.drawLine(QPointF(4.2, 9.0), QPointF(13.2, 9.0))
+    painter.drawLine(QPointF(9.2, 4.6), QPointF(13.8, 9.0))
+    painter.drawLine(QPointF(9.2, 13.4), QPointF(13.8, 9.0))
+    painter.end()
+    icon = QIcon()
+    icon.addPixmap(pm)
+    return icon
 
 
 class _AttachmentChip(QWidget):
@@ -104,31 +186,98 @@ class ChatComposer(QWidget):
         self._chips_wrap.setVisible(False)
         root.addWidget(self._chips_wrap, 0)
 
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
+        shell = QWidget()
+        shell.setObjectName("consolePromptShell")
+        shell.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        shell_row = QHBoxLayout(shell)
+        shell_row.setContentsMargins(10, 8, 10, 8)
+        shell_row.setSpacing(8)
 
-        self._attach_btn = QToolButton()
-        self._attach_btn.setObjectName("attachButton")
-        self._attach_btn.setText("+")
-        self._attach_btn.setToolTip(
+        self._retry_sign = self._console_sign(
+            _stroke_icon("retry", "#475569"),
+            "Re-run the last prompt in this conversation.",
+        )
+        self._attach_btn = self._console_sign(
+            _stroke_icon("plus", "#475569"),
             "Attach files for this prompt: images, Excel/CSV, CAD (.dwg/.dxf/.dwf),\n"
             "GIS (.shp/.gpkg/.kml/.las), PDF/Word, PowerPoint, text, survey data, …\n"
-            "You can also drag-and-drop or type a file path in the prompt."
+            "You can also drag-and-drop or type a file path in the prompt.",
         )
-        self._attach_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._attach_btn.setAutoRaise(True)
         self._attach_btn.clicked.connect(self._on_attach_clicked)
-        row.addWidget(self._attach_btn, 0, Qt.AlignmentFlag.AlignBottom)
+        self._retry_sign.setEnabled(False)
+        left_col = QVBoxLayout()
+        left_col.setContentsMargins(0, 0, 0, 0)
+        left_col.setSpacing(4)
+        left_col.addStretch(1)
+        left_col.addWidget(self._retry_sign, 0, Qt.AlignmentFlag.AlignLeft)
+        left_col.addWidget(self._attach_btn, 0, Qt.AlignmentFlag.AlignLeft)
+
+        self._cancel_sign = self._console_sign(
+            _stroke_icon("x", "#475569"),
+            "Stop the current run. Partial files already written stay on disk.",
+        )
+        self._cancel_sign.setEnabled(False)
+        self._clear_sign = self._console_sign(
+            _stroke_icon("clear", "#475569"),
+            "Clear the Console prompt and any attached files.",
+        )
+        self._send_sign = self._console_sign(
+            _send_arrow_icon(),
+            "Send the Console prompt. Enter sends; Shift+Enter starts a new line.",
+            object_name="consoleSendSign",
+            side=34,
+            icon_side=18,
+        )
+        right_col = QVBoxLayout()
+        right_col.setContentsMargins(0, 0, 0, 0)
+        right_col.setSpacing(4)
+        right_col.addStretch(1)
+        right_col.addWidget(self._cancel_sign, 0, Qt.AlignmentFlag.AlignRight)
+        right_col.addWidget(self._clear_sign, 0, Qt.AlignmentFlag.AlignRight)
+        right_col.addWidget(self._send_sign, 0, Qt.AlignmentFlag.AlignRight)
 
         self._input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        row.addWidget(self._input, 1)
-        root.addLayout(row)
+        shell_row.addLayout(left_col, 0)
+        shell_row.addWidget(self._input, 1)
+        shell_row.addLayout(right_col, 0)
+        root.addWidget(shell)
+        self.set_prompt_icon_tone(False)
 
         # Paste images into the chat input (Ctrl+V).
         if hasattr(self._input, "keyPressEvent"):
             self._orig_input_key_press = self._input.keyPressEvent
             self._input.keyPressEvent = self._input_key_press  # type: ignore[method-assign]
+
+    @staticmethod
+    def _console_sign(
+        icon: QIcon,
+        tip: str,
+        object_name: str = "consoleSign",
+        *,
+        side: int = 28,
+        icon_side: int = 16,
+    ) -> QToolButton:
+        btn = QToolButton()
+        btn.setObjectName(object_name)
+        btn.setIcon(icon)
+        btn.setIconSize(QSize(icon_side, icon_side))
+        btn.setToolTip(tip)
+        btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn.setAutoRaise(True)
+        btn.setFixedSize(side, side)
+        return btn
+
+    def set_prompt_icon_tone(self, dark: bool) -> None:
+        """Match the prompt marks to light or dark without changing their size."""
+        color = "#e4e4e7" if dark else "#334155"
+        for button, kind in (
+            (self._retry_sign, "retry"),
+            (self._attach_btn, "plus"),
+            (self._cancel_sign, "x"),
+            (self._clear_sign, "clear"),
+        ):
+            button.setIcon(_stroke_icon(kind, color))
+        self._send_sign.setIcon(_send_arrow_icon())
 
     # ------------------------------------------------------------------
     # Public API

@@ -95,17 +95,15 @@ conversation that started it, even if you switch tabs while it is working.
 
 ---
 
-## Fast Mode and Fallback LLM
+## Model choice
 
-Both start **off** on a new install. Turn them on only when you need them.
+SurvyAI chooses the model for each request. Primary LLM defaults to **Auto**
+(best paid hosted model for the task). If that provider cannot run, SurvyAI
+uses the backup provider from Settings. CAD, documents, and other file jobs
+keep the fuller planning path.
 
-| Control | When to use it |
-|---|---|
-| **Fast mode (non-file prompts)** | Quicker answers to general questions by skipping tool planning. CAD, documents, ArcGIS, and other file jobs are unchanged. |
-| **Use fallback LLM** | Force the fallback provider even when the primary is healthy. Leave off unless you are testing or the primary is failing. Disabled while Primary is Ollama. |
-
-Primary LLM defaults to **Auto** on each launch (best paid hosted model for the
-task). You can lock a provider in Settings for the session.
+Open past chats with the menu icon beside the logo. Hover an icon to see what
+it does.
 
 ---
 

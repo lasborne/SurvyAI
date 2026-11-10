@@ -89,7 +89,7 @@ QDialog#helpDialog {
     background-color: #f8fafc;
 }
 QLabel#helpDialogTitle {
-    font-size: 16pt;
+    font-size: 18pt;
     font-weight: 700;
     color: #0f172a;
     padding-bottom: 2px;
@@ -169,6 +169,33 @@ QLabel#cadHintLabel {
     color: #64748b;
     font-size: 9.5pt;
     line-height: 1.35;
+}
+QFrame#cadSurveyReport {
+    background: #ffffff;
+    border: 1px solid #e8edf4;
+    border-radius: 10px;
+}
+QLabel#cadSurveyTitle {
+    color: #0f172a;
+    font-size: 9.5pt;
+    font-weight: 700;
+}
+QLabel#cadSurveyBody {
+    color: #334155;
+    font-size: 9pt;
+}
+QToolButton#cadSurveyToggle {
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #64748b;
+    font-size: 14pt;
+    font-weight: 600;
+    padding: 0;
+}
+QToolButton#cadSurveyToggle:hover {
+    background: #f1f5f9;
+    color: #0f172a;
 }
 QLabel#cadSectionTitle {
     color: #0f172a;
@@ -283,9 +310,22 @@ QCheckBox#cadAutoScaleCheck {
 QWidget#cadPlanStrip {
     background: transparent;
     border: none;
+    border-bottom: none;
+    min-height: 36px;
+    max-height: 46px;
+}
+QWidget#cadRunStatusRow {
+    background: transparent;
+    border: none;
     border-bottom: 1px solid #e8edf4;
-    min-height: 26px;
-    max-height: 30px;
+    min-height: 18px;
+    max-height: 20px;
+}
+QWidget#cadRunStatusRow QLabel {
+    font-size: 8pt;
+    font-weight: 500;
+    padding: 0;
+    margin: 0;
 }
 QWidget#cadPlanChipHost,
 QWidget#cadPlanChipWrap {
@@ -293,30 +333,32 @@ QWidget#cadPlanChipWrap {
 }
 QLabel#cadPlanCount {
     color: #94a3b8;
-    font-size: 8pt;
+    font-size: 10pt;
     font-weight: 500;
     padding: 0 2px 0 4px;
 }
 QToolButton#cadPlanChip {
-    background: transparent;
+    background: #f8fafc;
     color: #64748b;
-    border: none;
+    border: 1px solid #e2e8f0;
     border-radius: 4px;
-    padding: 1px 8px;
-    min-width: 48px;
+    padding: 1px 6px;
+    min-width: 40px;
     max-height: 22px;
     min-height: 20px;
     font-size: 8.5pt;
-    font-weight: 500;
+    font-weight: 600;
 }
 QToolButton#cadPlanChip:hover {
     background: #f1f5f9;
     color: #334155;
+    border-color: #cbd5e1;
 }
 QToolButton#cadPlanChip:checked {
-    background: #e8edf4;
-    color: #0f172a;
-    font-weight: 600;
+    background: #eff6ff;
+    color: #1d4ed8;
+    border-color: #bfdbfe;
+    font-weight: 700;
 }
 QToolButton#cadPlanClose {
     background: transparent;
@@ -374,6 +416,29 @@ QLineEdit, QTextEdit, QPlainTextEdit, QListWidget {
 }
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QListWidget:focus {
     border-color: #3b82f6;
+}
+QWidget#workspaceField {
+    background: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 17px;
+}
+QLineEdit#workspaceInput, QLineEdit#workspaceInput:focus, QLineEdit#workspaceInput:hover {
+    border: none;
+    background: transparent;
+    padding: 0 4px;
+    border-radius: 0;
+}
+QToolButton#workspaceBrowse {
+    border: none;
+    border-radius: 12px;
+    background: transparent;
+    color: #2563eb;
+    font-size: 9pt;
+    font-weight: 600;
+    padding: 2px 10px;
+}
+QToolButton#workspaceBrowse:hover {
+    background: #eff6ff;
 }
 QTextEdit#chatTranscript {
     background-color: #fafbfc;
@@ -730,24 +795,87 @@ QToolTip {
 }
 
 /* --- Chat input & sidebar ------------------------------------------- */
-QPlainTextEdit#chatInput {
-    border: 1px solid #cbd5e1;
-    border-radius: 10px;
-    padding: 8px 12px;
-    background: #ffffff;
+QPlainTextEdit#chatInput, QPlainTextEdit#chatInput:focus {
+    border: none;
+    border-radius: 0;
+    padding: 4px 2px;
+    background: transparent;
     font-size: 10.5pt;
     line-height: 1.4;
 }
-QPlainTextEdit#chatInput:focus {
-    border-color: #3b82f6;
-    background: #fafcff;
+QWidget#consolePromptShell {
+    background: #ffffff;
+    border: 1px solid #cbd5e1;
+    border-radius: 16px;
+}
+QToolButton#consoleSign {
+    border: none;
+    border-radius: 14px;
+    background: transparent;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+    padding: 0;
+}
+QToolButton#consoleSign:hover {
+    background: #f1f5f9;
+}
+QToolButton#consoleSign:disabled {
+    background: transparent;
+}
+QToolButton#consoleSendSign {
+    border: none;
+    border-radius: 17px;
+    background: #2563eb;
+    min-width: 34px;
+    max-width: 34px;
+    min-height: 34px;
+    max-height: 34px;
+    padding: 0;
+}
+QToolButton#consoleSendSign:hover {
+    background: #1d4ed8;
+}
+QToolButton#consoleSendSign:disabled {
+    background: #93c5fd;
+    color: #ffffff;
+}
+QPushButton#sendButton[rail="true"] {
+    background-color: #2563eb;
+    border: none;
+    border-radius: 17px;
+    padding: 0;
+    min-width: 34px;
+    max-width: 34px;
+    min-height: 34px;
+    max-height: 34px;
+}
+QPushButton#sendButton[rail="true"]:hover { background-color: #1d4ed8; }
+QPushButton#sendButton[rail="true"]:disabled { background-color: #93c5fd; }
+QPushButton#secondaryButton[rail="true"] {
+    background: transparent;
+    border: none;
+    border-radius: 14px;
+    padding: 0;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+}
+QPushButton#secondaryButton[rail="true"]:hover { background: #f1f5f9; }
+QPushButton#secondaryButton[rail="true"]:disabled { background: transparent; }
+QWidget#activityPanel {
+    background: transparent;
+    border: none;
+    border-left: 1px solid #e8edf4;
 }
 QToolButton#attachButton {
     border: 1px solid #cbd5e1;
     border-radius: 10px;
     background: #f8fafc;
     color: #334155;
-    font-size: 16pt;
+    font-size: 18pt;
     font-weight: 600;
     min-width: 36px;
     max-width: 36px;
@@ -762,6 +890,114 @@ QToolButton#attachButton:hover {
 }
 QToolButton#attachButton:pressed {
     background: #dbeafe;
+}
+QToolButton#conversationsToggle {
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    padding: 0;
+    min-width: 26px;
+    max-width: 26px;
+    min-height: 26px;
+    max-height: 26px;
+}
+QToolButton#conversationsToggle:hover {
+    background: rgba(15, 23, 42, 0.06);
+}
+QToolButton#conversationsToggle:pressed,
+QToolButton#conversationsToggle:checked {
+    background: rgba(15, 23, 42, 0.09);
+}
+QPushButton#convSectionToggle {
+    border: none;
+    background: transparent;
+    color: #0f172a;
+    text-align: left;
+    font-size: 10pt;
+    font-weight: 600;
+    padding: 2px 4px;
+}
+QPushButton#convSectionToggle:hover {
+    background: rgba(15, 23, 42, 0.05);
+    border-radius: 6px;
+}
+QToolButton#sidebarMoreButton {
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: #334155;
+    font-size: 16pt;
+    font-weight: 700;
+    padding: 0 0 6px 0;
+}
+QToolButton#sidebarMoreButton:hover {
+    background: rgba(15, 23, 42, 0.06);
+    color: #0f172a;
+}
+QToolButton#sidebarMoreButton::menu-indicator {
+    image: none;
+    width: 0px;
+}
+QToolButton#surfaceToggle {
+    border: 1px solid #e2e8f0;
+    border-radius: 17px;
+    background: #ffffff;
+    color: #334155;
+    padding: 0 12px;
+    font-size: 9.5pt;
+    font-weight: 600;
+    min-height: 32px;
+}
+QToolButton#surfaceToggle:hover {
+    background: #f8fafc;
+    border-color: #cbd5e1;
+}
+QToolButton#activityToggle {
+    border: 1px solid #e2e8f0;
+    border-radius: 17px;
+    background: #ffffff;
+    color: #64748b;
+    padding: 0 12px;
+    font-size: 9.5pt;
+    font-weight: 600;
+    min-height: 32px;
+}
+QToolButton#activityToggle:hover {
+    background: #f8fafc;
+    color: #334155;
+}
+QToolButton#activityToggle:checked {
+    background: #eff6ff;
+    border-color: #bfdbfe;
+    color: #1d4ed8;
+}
+QToolButton#settingsMode {
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    background: #ffffff;
+    color: #64748b;
+    padding: 4px 14px;
+    font-size: 9.5pt;
+    font-weight: 600;
+    min-height: 28px;
+}
+QToolButton#settingsMode:hover { color: #0f172a; }
+QToolButton#settingsMode:checked {
+    background: #0f172a;
+    border-color: #0f172a;
+    color: #ffffff;
+}
+QToolButton#activityHide {
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #64748b;
+    font-size: 14pt;
+    padding: 0;
+}
+QToolButton#activityHide:hover {
+    background: rgba(15, 23, 42, 0.06);
+    color: #0f172a;
 }
 QWidget#attachmentChip {
     background: #eef2ff;
@@ -812,6 +1048,67 @@ QWidget#sidebarConversations {
     background: #f8fafc;
     border: 1px solid #e2e8f0;
     border-radius: 12px;
+}
+QPushButton#sidebarNavButton {
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #334155;
+    text-align: left;
+    padding: 6px 8px 6px 2px;
+    font-size: 10pt;
+    font-weight: 400;
+}
+QPushButton#sidebarNavButton:hover {
+    background: rgba(15, 23, 42, 0.06);
+}
+QPushButton#sidebarNavButton:pressed {
+    background: rgba(15, 23, 42, 0.1);
+}
+QPushButton#sidebarNavButton::menu-indicator {
+    image: none;
+    width: 0px;
+    height: 0px;
+}
+QPushButton#sidebarUserButton {
+    text-align: left;
+    background: transparent;
+    color: #0f172a;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 10px 8px 8px;
+    font-size: 10pt;
+    font-weight: 500;
+}
+QPushButton#sidebarUserButton:hover {
+    background: rgba(15, 23, 42, 0.06);
+}
+QPushButton#sidebarUserButton:pressed {
+    background: rgba(15, 23, 42, 0.1);
+}
+QPushButton#sidebarUserButton::menu-indicator,
+QPushButton#sidebarUserButtonGuest::menu-indicator {
+    image: none;
+    width: 0px;
+    height: 0px;
+}
+QPushButton#sidebarUserButtonGuest {
+    text-align: left;
+    background: transparent;
+    color: #0f172a;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 10px 8px 8px;
+    font-size: 10pt;
+    font-weight: 500;
+}
+QPushButton#sidebarUserButtonGuest:hover {
+    background: rgba(15, 23, 42, 0.06);
+}
+QFrame#sidebarNavRule {
+    background: #e2e8f0;
+    border: none;
+    max-height: 1px;
 }
 QListWidget#conversationList {
     border: none;
@@ -999,7 +1296,7 @@ QDialog#helpDialog {
     background-color: #0c0c0f;
 }
 QLabel#helpDialogTitle {
-    font-size: 16pt;
+    font-size: 18pt;
     font-weight: 700;
     color: #fafafa;
     padding-bottom: 2px;
@@ -1069,18 +1366,48 @@ QTabBar::tab:hover:!selected {
     color: #a1a1aa;
 }
 
-QWidget#cadFormRoot {
-    background: transparent;
+QWidget#cadFormRoot,
+QWidget#cadFormFields,
+QScrollArea#cadFormScroll,
+QScrollArea#cadFormScroll::viewport {
+    background: #141416;
+    color: #e4e4e7;
 }
 QScrollArea#cadFormScroll,
 QScrollArea#cadFormScroll::viewport {
-    background: transparent;
     border: none;
 }
 QLabel#cadHintLabel {
     color: #a1a1aa;
     font-size: 9.5pt;
     line-height: 1.35;
+}
+QFrame#cadSurveyReport {
+    background: #18181b;
+    border: 1px solid #27272a;
+    border-radius: 10px;
+}
+QLabel#cadSurveyTitle {
+    color: #fafafa;
+    font-size: 9.5pt;
+    font-weight: 700;
+}
+QLabel#cadSurveyBody {
+    color: #e4e4e7;
+    font-size: 9pt;
+}
+QToolButton#cadSurveyToggle {
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #a1a1aa;
+    font-size: 14pt;
+    font-weight: 600;
+    padding: 0;
+}
+QToolButton#cadSurveyToggle:hover {
+    background: #27272a;
+    color: #fafafa;
 }
 QLabel#cadSectionTitle {
     color: #fafafa;
@@ -1195,9 +1522,22 @@ QCheckBox#cadAutoScaleCheck {
 QWidget#cadPlanStrip {
     background: transparent;
     border: none;
+    border-bottom: none;
+    min-height: 36px;
+    max-height: 46px;
+}
+QWidget#cadRunStatusRow {
+    background: transparent;
+    border: none;
     border-bottom: 1px solid #27272a;
-    min-height: 26px;
-    max-height: 30px;
+    min-height: 18px;
+    max-height: 20px;
+}
+QWidget#cadRunStatusRow QLabel {
+    font-size: 8pt;
+    font-weight: 500;
+    padding: 0;
+    margin: 0;
 }
 QWidget#cadPlanChipHost,
 QWidget#cadPlanChipWrap {
@@ -1205,30 +1545,32 @@ QWidget#cadPlanChipWrap {
 }
 QLabel#cadPlanCount {
     color: #71717a;
-    font-size: 8pt;
+    font-size: 10pt;
     font-weight: 500;
     padding: 0 2px 0 4px;
 }
 QToolButton#cadPlanChip {
-    background: transparent;
-    color: #71717a;
-    border: none;
+    background: #18181b;
+    color: #a1a1aa;
+    border: 1px solid #3f3f46;
     border-radius: 4px;
-    padding: 1px 8px;
-    min-width: 48px;
+    padding: 1px 6px;
+    min-width: 40px;
     max-height: 22px;
     min-height: 20px;
     font-size: 8.5pt;
-    font-weight: 500;
+    font-weight: 600;
 }
 QToolButton#cadPlanChip:hover {
     background: #27272a;
-    color: #d4d4d8;
+    color: #e4e4e7;
+    border-color: #52525b;
 }
 QToolButton#cadPlanChip:checked {
-    background: #27272a;
-    color: #fafafa;
-    font-weight: 600;
+    background: #172554;
+    color: #bfdbfe;
+    border-color: #1e3a8a;
+    font-weight: 700;
 }
 QToolButton#cadPlanClose {
     background: transparent;
@@ -1287,6 +1629,30 @@ QLineEdit, QTextEdit, QPlainTextEdit, QListWidget {
 QLineEdit:focus, QTextEdit:focus, QPlainTextEdit:focus, QListWidget:focus {
     border-color: #60a5fa;
     background-color: #1c1c1f;
+}
+QWidget#workspaceField {
+    background: #18181b;
+    border: 1px solid #3f3f46;
+    border-radius: 17px;
+}
+QLineEdit#workspaceInput, QLineEdit#workspaceInput:focus, QLineEdit#workspaceInput:hover {
+    border: none;
+    background: transparent;
+    color: #f4f4f5;
+    padding: 0 4px;
+    border-radius: 0;
+}
+QToolButton#workspaceBrowse {
+    border: none;
+    border-radius: 12px;
+    background: transparent;
+    color: #93c5fd;
+    font-size: 9pt;
+    font-weight: 600;
+    padding: 2px 10px;
+}
+QToolButton#workspaceBrowse:hover {
+    background: #1e3a5f;
 }
 QLineEdit:hover, QTextEdit:hover, QPlainTextEdit:hover, QListWidget:hover {
     border-color: #52525b;
@@ -1435,6 +1801,15 @@ QLabel#hintLabel, QLabel#consoleHintLabel { color: #a1a1aa; }
 QLabel#sectionHeader { color: #fafafa; font-size: 9.5pt; padding: 1px 2px 4px 2px; }
 QLabel#pageTitle { color: #fafafa; }
 QLabel#pageSubtitle, QLabel#elapsedLabel { color: #a1a1aa; }
+QLabel#statusChip {
+    background-color: #172554;
+    color: #bfdbfe;
+    border: 1px solid #1e3a8a;
+    border-radius: 10px;
+    padding: 4px 10px;
+    font-size: 9pt;
+    font-weight: 600;
+}
 QLabel#runStatusLabel { color: #d4d4d8; font-weight: 600; }
 QLabel#runStatusLabel[outcome="ok"] { color: #4ade80; }
 QLabel#runStatusLabel[outcome="bad"] { color: #fdba74; }
@@ -1462,6 +1837,10 @@ QGroupBox::title {
 }
 
 QScrollArea { border: none; background: transparent; }
+QScrollArea > QWidget > QWidget {
+    background-color: #141416;
+    color: #e4e4e7;
+}
 QScrollArea#appScroll { border: none; }
 
 QMenuBar { background: transparent; padding: 2px 0; }
@@ -1499,24 +1878,87 @@ QToolTip {
     padding: 6px 10px;
 }
 
-QPlainTextEdit#chatInput {
-    border: 1px solid #3f3f46;
-    background: #18181b;
+QPlainTextEdit#chatInput, QPlainTextEdit#chatInput:focus {
+    border: none;
+    background: transparent;
     color: #f4f4f5;
-    border-radius: 10px;
-    padding: 8px 12px;
+    border-radius: 0;
+    padding: 4px 2px;
     font-size: 10.5pt;
 }
-QPlainTextEdit#chatInput:focus {
-    border-color: #60a5fa;
-    background: #1c1c1f;
+QWidget#consolePromptShell {
+    background: #18181b;
+    border: 1px solid #3f3f46;
+    border-radius: 16px;
+}
+QToolButton#consoleSign {
+    border: none;
+    border-radius: 14px;
+    background: transparent;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+    padding: 0;
+}
+QToolButton#consoleSign:hover {
+    background: #27272a;
+}
+QToolButton#consoleSign:disabled {
+    background: transparent;
+}
+QToolButton#consoleSendSign {
+    border: none;
+    border-radius: 17px;
+    background: #2563eb;
+    min-width: 34px;
+    max-width: 34px;
+    min-height: 34px;
+    max-height: 34px;
+    padding: 0;
+}
+QToolButton#consoleSendSign:hover {
+    background: #1d4ed8;
+}
+QToolButton#consoleSendSign:disabled {
+    background: #1e3a8a;
+    color: #dbeafe;
+}
+QPushButton#sendButton[rail="true"] {
+    background-color: #2563eb;
+    border: none;
+    border-radius: 17px;
+    padding: 0;
+    min-width: 34px;
+    max-width: 34px;
+    min-height: 34px;
+    max-height: 34px;
+}
+QPushButton#sendButton[rail="true"]:hover { background-color: #1d4ed8; }
+QPushButton#sendButton[rail="true"]:disabled { background-color: #1e3a8a; }
+QPushButton#secondaryButton[rail="true"] {
+    background: transparent;
+    border: none;
+    border-radius: 14px;
+    padding: 0;
+    min-width: 28px;
+    max-width: 28px;
+    min-height: 28px;
+    max-height: 28px;
+}
+QPushButton#secondaryButton[rail="true"]:hover { background: #27272a; }
+QPushButton#secondaryButton[rail="true"]:disabled { background: transparent; }
+QWidget#activityPanel {
+    background: transparent;
+    border: none;
+    border-left: 1px solid #27272a;
 }
 QToolButton#attachButton {
     border: 1px solid #3f3f46;
     border-radius: 10px;
     background: #27272a;
     color: #e4e4e7;
-    font-size: 16pt;
+    font-size: 18pt;
     font-weight: 600;
     min-width: 36px;
     max-width: 36px;
@@ -1531,6 +1973,114 @@ QToolButton#attachButton:hover {
 }
 QToolButton#attachButton:pressed {
     background: #52525b;
+}
+QToolButton#conversationsToggle {
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    padding: 0;
+    min-width: 26px;
+    max-width: 26px;
+    min-height: 26px;
+    max-height: 26px;
+}
+QToolButton#conversationsToggle:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+QToolButton#conversationsToggle:pressed,
+QToolButton#conversationsToggle:checked {
+    background: rgba(255, 255, 255, 0.12);
+}
+QPushButton#convSectionToggle {
+    border: none;
+    background: transparent;
+    color: #f4f4f5;
+    text-align: left;
+    font-size: 10pt;
+    font-weight: 600;
+    padding: 2px 4px;
+}
+QPushButton#convSectionToggle:hover {
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+}
+QToolButton#sidebarMoreButton {
+    border: none;
+    border-radius: 8px;
+    background: transparent;
+    color: #e4e4e7;
+    font-size: 16pt;
+    font-weight: 700;
+    padding: 0 0 6px 0;
+}
+QToolButton#sidebarMoreButton:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fafafa;
+}
+QToolButton#sidebarMoreButton::menu-indicator {
+    image: none;
+    width: 0px;
+}
+QToolButton#surfaceToggle {
+    border: 1px solid #3f3f46;
+    border-radius: 17px;
+    background: #18181b;
+    color: #f4f4f5;
+    padding: 0 12px;
+    font-size: 9.5pt;
+    font-weight: 600;
+    min-height: 32px;
+}
+QToolButton#surfaceToggle:hover {
+    background: #27272a;
+    border-color: #52525b;
+}
+QToolButton#activityToggle {
+    border: 1px solid #3f3f46;
+    border-radius: 17px;
+    background: #18181b;
+    color: #a1a1aa;
+    padding: 0 12px;
+    font-size: 9.5pt;
+    font-weight: 600;
+    min-height: 32px;
+}
+QToolButton#activityToggle:hover {
+    background: #27272a;
+    color: #f4f4f5;
+}
+QToolButton#activityToggle:checked {
+    background: #172554;
+    border-color: #1e3a8a;
+    color: #bfdbfe;
+}
+QToolButton#settingsMode {
+    border: 1px solid #3f3f46;
+    border-radius: 8px;
+    background: #18181b;
+    color: #a1a1aa;
+    padding: 4px 14px;
+    font-size: 9.5pt;
+    font-weight: 600;
+    min-height: 28px;
+}
+QToolButton#settingsMode:hover { color: #fafafa; }
+QToolButton#settingsMode:checked {
+    background: #fafafa;
+    border-color: #fafafa;
+    color: #18181b;
+}
+QToolButton#activityHide {
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #a1a1aa;
+    font-size: 14pt;
+    padding: 0;
+}
+QToolButton#activityHide:hover {
+    background: rgba(255, 255, 255, 0.08);
+    color: #fafafa;
 }
 QWidget#attachmentChip {
     background: #1e293b;
@@ -1556,6 +2106,67 @@ QWidget#sidebarConversations {
     background: #141416;
     border: 1px solid #27272a;
     border-radius: 12px;
+}
+QPushButton#sidebarNavButton {
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: #e4e4e7;
+    text-align: left;
+    padding: 6px 8px 6px 2px;
+    font-size: 10pt;
+    font-weight: 400;
+}
+QPushButton#sidebarNavButton:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+QPushButton#sidebarNavButton:pressed {
+    background: rgba(255, 255, 255, 0.12);
+}
+QPushButton#sidebarNavButton::menu-indicator {
+    image: none;
+    width: 0px;
+    height: 0px;
+}
+QPushButton#sidebarUserButton {
+    text-align: left;
+    background: transparent;
+    color: #f4f4f5;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 10px 8px 8px;
+    font-size: 10pt;
+    font-weight: 500;
+}
+QPushButton#sidebarUserButton:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+QPushButton#sidebarUserButton:pressed {
+    background: rgba(255, 255, 255, 0.12);
+}
+QPushButton#sidebarUserButton::menu-indicator,
+QPushButton#sidebarUserButtonGuest::menu-indicator {
+    image: none;
+    width: 0px;
+    height: 0px;
+}
+QPushButton#sidebarUserButtonGuest {
+    text-align: left;
+    background: transparent;
+    color: #f4f4f5;
+    border: none;
+    border-radius: 8px;
+    padding: 8px 10px 8px 8px;
+    font-size: 10pt;
+    font-weight: 500;
+}
+QPushButton#sidebarUserButtonGuest:hover {
+    background: rgba(255, 255, 255, 0.08);
+}
+QFrame#sidebarNavRule {
+    background: #27272a;
+    border: none;
+    max-height: 1px;
 }
 QListWidget#conversationList {
     border: none;

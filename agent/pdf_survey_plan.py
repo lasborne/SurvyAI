@@ -1467,6 +1467,29 @@ _LGA_PAREN_RE = re.compile(
 )
 
 
+def format_state_for_plan(raw: str) -> str:
+    """State line always ends with one 'state', and never 'state state'.
+
+    ``Rivers`` and ``Rivers state`` both become ``Rivers state``.
+    FCT and Abuja stay ``FCT`` — they are not a state name plus the word state.
+    """
+    text = re.sub(r"\s+", " ", (raw or "").strip())
+    if not text:
+        return ""
+    text = re.sub(r"^state\s+of\s+", "", text, flags=re.IGNORECASE).strip()
+    for _ in range(3):
+        nxt = re.sub(r"\s+state\.?$", "", text, flags=re.IGNORECASE).strip(" ,;:-")
+        if nxt == text:
+            break
+        text = nxt
+    if not text:
+        return ""
+    key = re.sub(r"[^A-Z]", "", text.upper())
+    if key in {"FCT", "FEDERALCAPITALTERRITORY", "ABUJA"}:
+        return "FCT"
+    return f"{text} state"
+
+
 def normalize_lga_name(raw: str) -> str:
     """
     Return only the bare Local Government Area name.

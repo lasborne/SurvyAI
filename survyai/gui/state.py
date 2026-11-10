@@ -125,9 +125,8 @@ class DesktopState:
     fast_mode_non_file_prompts: bool = False
     # UI theme: "light" (default) or "dark"
     theme: str = "light"
-    # App updates (opt-in). When enabled, SurvyAI checks the cloud manifest
-    # on a 12-hour cadence and notifies when a newer installer is available.
-    auto_check_updates: bool = False
+    # App updates. SurvyAI checks the cloud manifest on a 12-hour cadence.
+    auto_check_updates: bool = True
     update_channel: str = "stable"
     last_update_check_at: str = ""
     dismissed_update_version: str = ""
@@ -191,7 +190,7 @@ class DesktopState:
             ollama_prompt_dismissed=bool(raw.get("ollama_prompt_dismissed", False)),
             fast_mode_non_file_prompts=bool(raw.get("fast_mode_non_file_prompts", False)),
             theme=str(raw.get("theme", "light") or "light"),
-            auto_check_updates=bool(raw.get("auto_check_updates", False)),
+            auto_check_updates=bool(raw.get("auto_check_updates", True)),
             update_channel=str(raw.get("update_channel", "stable") or "stable"),
             last_update_check_at=str(raw.get("last_update_check_at", "") or ""),
             dismissed_update_version=str(raw.get("dismissed_update_version", "") or ""),

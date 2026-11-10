@@ -30,8 +30,9 @@ anytime. Hover a control in the app for a one-line tip.
 
 Tip: Keep related files in one workspace so you can mention short file names.
 
-**Fast mode** and **Use fallback LLM** start unchecked. Leave them off unless
-you want quicker general answers (Fast mode) or to force the fallback provider.
+The conversation list stays closed until you open it. Use the menu icon beside
+the SurvyAI logo; hover any icon to see what it does. SurvyAI picks the model
+for each request and uses the backup provider only when the primary cannot run.
 
 ---
 
@@ -61,10 +62,10 @@ helps; SurvyAI also ships a default template.
 11. Press **Send**. If the file already exists, confirm overwrite or pick
     another name.
 
-**Input CAD Template** fills **only the sheet you are on** from
-**Account → Edit Default CAD Prompt** (surveyor defaults, plan number, and
-similar). Other sheets stay as you left them. Console still inserts the full
-template text.
+**Plan template** fills **only the sheet you are on** from
+**Manage Plan template** in the name menu (surveyor, plan number, and the
+other saved fields). Other sheets stay as you left them. Console still inserts
+the full template text.
 
 ---
 
